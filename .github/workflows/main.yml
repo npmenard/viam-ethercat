@@ -1,0 +1,53 @@
+name: EtherCAT CI Pipeline
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    branches: ['main']
+  push:
+    branches:
+      - '**'
+  release:
+    types: [published]
+
+jobs:
+  build-test-lint:
+    name: Build, Test, and Lint (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # The container image is built from this repo's Dockerfile and published to
+    # ghcr.io/viam-modules/ethercat:{amd64,arm64}. It ships the clang-19
+    # toolchain, cmake, boost, and a prebuilt viam-cpp-sdk so the module's
+    # find_package(viam-cpp-sdk) resolves without a from-source SDK build.
+    container: ghcr.io/viam-modules/ethercat:${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-4cpu-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure
+        run: make configure
+
+      - name: Format
+        run: make format-check
+
+      - name: Clang-check
+        run: make run-clang-check
+
+      - name: Clang-tidy
+        run: make run-clang-tidy-parallel
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test

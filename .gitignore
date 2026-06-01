@@ -1,0 +1,15 @@
+# Build / install output
+build/
+install/
+*.tar.gz
+
+# Editor / OS cruft
+.vscode/*
+*~
+.DS_Store
+logs
+
+# Read-only third-party reference sources (each carries its own nested .git
+# history and licensing; ~120MB). Kept on disk for the team to read, but not
+# tracked in this repo.
+reference-src/
