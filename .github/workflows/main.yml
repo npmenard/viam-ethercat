@@ -51,3 +51,32 @@ jobs:
 
       - name: Test
         run: make test
+
+  thread-sanitizer:
+    name: ThreadSanitizer (RT boundary, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container: ghcr.io/viam-modules/ethercat:${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-4cpu-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Build the RT-boundary tests under ThreadSanitizer. The seqlock +
+      # lock-free TxPDO handoff must be race-free with ZERO suppressions.
+      - name: Configure (TSan)
+        run: cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DETHERCAT_BUILD_MODULE=OFF -DETHERCAT_SANITIZE_THREAD=ON
+
+      - name: Build (TSan)
+        run: cmake --build build-tsan --target pdo_cache_test_tsan -- -j4
+
+      - name: Run TSan tests
+        run: ctest --test-dir build-tsan -L tsan --output-on-failure

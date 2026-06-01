@@ -12,6 +12,7 @@
 #include <ostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -132,6 +133,20 @@ std::string format_eq(const std::string& expr, const A& got, const B& expected) 
         if (!etest_threw) {                                                                        \
             ::etest::fail(__FILE__, __LINE__, std::string("expected " #ExType " from: ") + #expr); \
         }                                                                                          \
+    } while (0)
+
+// Assert that evaluating expr throws ExType whose what() CONTAINS `needle`.
+#define CHECK_THROWS_MSG(expr, ExType, needle)                                                                                   \
+    do {                                                                                                                         \
+        bool etest_ok = false;                                                                                                   \
+        try {                                                                                                                    \
+            (void)(expr);                                                                                                        \
+        } catch (const ExType& etest_ex) {                                                                                       \
+            etest_ok = std::string_view(etest_ex.what()).find(needle) != std::string_view::npos;                                 \
+        }                                                                                                                        \
+        if (!etest_ok) {                                                                                                         \
+            ::etest::fail(__FILE__, __LINE__, std::string("expected " #ExType " containing \"") + (needle) + "\" from: " #expr); \
+        }                                                                                                                        \
     } while (0)
 
 #define TEST_MAIN()                \

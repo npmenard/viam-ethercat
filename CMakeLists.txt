@@ -20,6 +20,13 @@ option(VIAM_USE_WALL_WERROR "Build with -Wall and -Werror flags" ON)
 # the library in isolation). Default ON so the full module always builds.
 option(ETHERCAT_BUILD_MODULE "Build the Viam motor module (requires viam-cpp-sdk)" ON)
 
+# When ON, additionally build the RT-boundary tests under ThreadSanitizer as
+# separate targets, registered with the ctest label "tsan". These must pass with
+# ZERO suppressions. The source for these tests is compiled directly (with TSan)
+# rather than linked from libethercat, so the seqlock / lock-free code under test
+# is itself instrumented.
+option(ETHERCAT_SANITIZE_THREAD "Also build RT-boundary tests under ThreadSanitizer (ctest label 'tsan')" OFF)
+
 # Function to apply strict warning flags to one of OUR targets. SOEM and the
 # viam-cpp-sdk are pulled in as SYSTEM dependencies, so their warnings never
 # reach this.
@@ -151,6 +158,7 @@ target_sources(ethercat
   PRIVATE
     src/ethercat/version.cpp
     src/ethercat/cia402.cpp
+    src/ethercat/pdo_cache.cpp
 )
 
 target_include_directories(ethercat
@@ -251,6 +259,32 @@ endfunction()
 
 viam_add_test(pdo_buffer_test tests/pdo_buffer_test.cpp)
 viam_add_test(cia402_test tests/cia402_test.cpp)
+viam_add_test(pdo_cache_test tests/pdo_cache_test.cpp)
+
+# ThreadSanitizer build of the RT-boundary test. Compiles the pdo_cache TU
+# directly (with -fsanitize=thread) so the seqlock / lock-free handoff code is
+# instrumented, rather than linking the un-instrumented libethercat.
+if (ETHERCAT_SANITIZE_THREAD)
+  add_executable(pdo_cache_test_tsan
+    tests/pdo_cache_test.cpp
+    src/ethercat/pdo_cache.cpp
+  )
+  target_include_directories(pdo_cache_test_tsan
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  )
+  target_link_libraries(pdo_cache_test_tsan
+    PRIVATE
+      Threads::Threads
+      Boost::headers
+  )
+  target_compile_options(pdo_cache_test_tsan PRIVATE -fsanitize=thread -O1 -g)
+  target_link_options(pdo_cache_test_tsan PRIVATE -fsanitize=thread)
+  viam_apply_wall_werror(pdo_cache_test_tsan)
+  add_test(NAME pdo_cache_test_tsan COMMAND pdo_cache_test_tsan)
+  set_tests_properties(pdo_cache_test_tsan PROPERTIES LABELS "tsan")
+endif()
 
 
 #

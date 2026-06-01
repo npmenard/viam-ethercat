@@ -52,7 +52,25 @@ RUN apt-get -y --no-install-recommends install -t llvm-toolchain-jammy-19 \
     clang-tidy-19 \
     clangd-19 \
     clang-tools-19 \
+    libclang-rt-19-dev \
     lldb-19
+
+# ThreadSanitizer runtime layout shim: some clang-19 packagings ship the
+# sanitizer runtimes under .../lib/clang/19/lib/linux/ (legacy, arch-suffixed)
+# while the driver looks in .../lib/clang/19/lib/<triple>/. Bridge them with
+# suffix-stripped symlinks if the per-triple dir is missing, so
+# -fsanitize=thread links. No-op when the layout already matches.
+RUN set -e; \
+    RTDIR="$(dirname "$(clang-19 -print-runtime-dir)")"; \
+    TRIPLE="$(basename "$(clang-19 -print-runtime-dir)")"; \
+    if [ ! -e "$RTDIR/$TRIPLE/libclang_rt.tsan.a" ] && [ -d "$RTDIR/linux" ]; then \
+      mkdir -p "$RTDIR/$TRIPLE"; \
+      for f in "$RTDIR"/linux/*-x86_64.a "$RTDIR"/linux/*-x86_64.so "$RTDIR"/linux/*-aarch64.a "$RTDIR"/linux/*-aarch64.so; do \
+        [ -e "$f" ] || continue; \
+        b="$(basename "$f")"; n="$(echo "$b" | sed -E 's/-(x86_64|aarch64)//')"; \
+        ln -sf "../linux/$b" "$RTDIR/$TRIPLE/$n"; \
+      done; \
+    fi
 
 RUN mkdir -p /root/opt/src
 

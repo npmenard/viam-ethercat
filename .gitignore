@@ -1,5 +1,6 @@
 # Build / install output
 build/
+build-tsan/
 install/
 *.tar.gz
 
