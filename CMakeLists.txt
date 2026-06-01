@@ -275,6 +275,7 @@ viam_add_test(soem_backend_test tests/soem_backend_test.cpp)
 viam_add_test(conversion_test tests/conversion_test.cpp)
 viam_add_test(servo_config_test tests/servo_config_test.cpp)
 viam_add_test(controller_offline_test tests/controller_offline_test.cpp)
+viam_add_test(teardown_under_load_test tests/teardown_under_load_test.cpp)
 
 # ThreadSanitizer build of the RT-boundary test. Compiles the pdo_cache TU
 # directly (with -fsanitize=thread) so the seqlock / lock-free handoff code is
@@ -299,6 +300,41 @@ if (ETHERCAT_SANITIZE_THREAD)
   viam_apply_wall_werror(pdo_cache_test_tsan)
   add_test(NAME pdo_cache_test_tsan COMMAND pdo_cache_test_tsan)
   set_tests_properties(pdo_cache_test_tsan PROPERTIES LABELS "tsan")
+
+  # ThreadSanitizer build of the ServoController teardown-under-load test. The
+  # whole RT/non-RT controller stack is compiled directly with -fsanitize=thread
+  # (linking the un-instrumented libethercat would leave the teardown/atomics
+  # code uninstrumented). SOEM is referenced (the production SoemBackend ctor)
+  # but never executed -- the test injects a SimBackend factory.
+  add_executable(teardown_under_load_test_tsan
+    tests/teardown_under_load_test.cpp
+    src/ethercat/cia402.cpp
+    src/ethercat/pdo_cache.cpp
+    src/ethercat/pdo_mapping.cpp
+    src/ethercat/backend.cpp
+    src/ethercat/sim_backend.cpp
+    src/ethercat/soem_backend.cpp
+    src/ethercat/master.cpp
+    src/viam/lib/motion_profile.cpp
+    src/viam/lib/servo_config.cpp
+    src/viam/lib/servo_controller.cpp
+  )
+  target_include_directories(teardown_under_load_test_tsan
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  )
+  target_link_libraries(teardown_under_load_test_tsan
+    PRIVATE
+      soem
+      Threads::Threads
+      Boost::headers
+  )
+  target_compile_options(teardown_under_load_test_tsan PRIVATE -fsanitize=thread -O1 -g)
+  target_link_options(teardown_under_load_test_tsan PRIVATE -fsanitize=thread)
+  viam_apply_wall_werror(teardown_under_load_test_tsan)
+  add_test(NAME teardown_under_load_test_tsan COMMAND teardown_under_load_test_tsan)
+  set_tests_properties(teardown_under_load_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
 endif()
 
 
