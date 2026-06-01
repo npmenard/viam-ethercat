@@ -157,6 +157,25 @@ TEST("ServoController: Stop (Halt) is sticky -- motor stays stopped, then re-com
     CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);
 }
 
+TEST("ServoController(PV): a displaced, stopped motor reports is_moving == false") {
+    // Regression for the PP-predicate-in-PV bug: target_counts_ is never set in PV,
+    // so the old position-tolerance predicate reported a stopped-but-displaced PV
+    // motor as moving forever. PV is_moving must be velocity-based.
+    ServoConfig cfg = make_config(ControlMode::ProfileVelocity);
+    cfg.velocity_threshold = 1000;  // counts/s; PV is_moving = |velocity| > this
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfileVelocity, nullptr)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    ctrl.set_rpm(60.0);  // integrate a nonzero velocity -> the motor turns
+    CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(300)));
+    CHECK(std::abs(ctrl.position_revs()) > 0.01);  // displaced from zero
+
+    ctrl.set_rpm(0.0);  // stop commanding velocity -> actual stops advancing
+    CHECK(wait_until([&] { return !ctrl.is_moving(); }, std::chrono::milliseconds(500)));
+    CHECK(std::abs(ctrl.position_revs()) > 0.01);  // STILL displaced, but NOT moving
+}
+
 TEST("ServoController: a stalled move (target unreachable) makes go_to throw") {
     ServoConfig cfg = make_config(ControlMode::ProfilePosition);
     cfg.move_timeout_ms = 100;  // fail fast

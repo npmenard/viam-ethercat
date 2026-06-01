@@ -92,13 +92,14 @@ void ServoController::start() {
     state_.completed_generation.store(0, std::memory_order_relaxed);
     state_.failed_generation.store(0, std::memory_order_relaxed);
     next_generation_.store(0, std::memory_order_relaxed);
-    expected_wkc_published_ = master_->expected_wkc();
+    state_.expected_wkc.store(master_->expected_wkc(), std::memory_order_relaxed);  // constant; read lock-free by last_error()
     lifecycle_ = Init{};
     last_cw_ = 0;
     handshake_ = Handshake::Idle;
     prev_actual_ = 0;
     first_cycle_ = true;
     halted_ = false;
+    latched_ctrl_error_ = RtError::None;
     last_progress_actual_ = 0;
     stall_cycles_ = 0;
 
@@ -161,13 +162,14 @@ void ServoController::reconfigure(ServoConfig config) {
     state_.completed_generation.store(0, std::memory_order_relaxed);
     state_.failed_generation.store(0, std::memory_order_relaxed);
     next_generation_.store(0, std::memory_order_relaxed);
-    expected_wkc_published_ = master_->expected_wkc();
+    state_.expected_wkc.store(master_->expected_wkc(), std::memory_order_relaxed);  // constant; read lock-free by last_error()
     lifecycle_ = Init{};
     last_cw_ = 0;
     handshake_ = Handshake::Idle;
     prev_actual_ = 0;
     first_cycle_ = true;
     halted_ = false;
+    latched_ctrl_error_ = RtError::None;
     last_progress_actual_ = 0;
     stall_cycles_ = 0;
     const std::uint64_t period_ns = kNsPerSec / config_.target_loop_rate_hz;
@@ -251,7 +253,7 @@ std::uint16_t ServoController::step_handshake(std::uint16_t base_cw, Status stat
                 return ControlWord::with_new_setpoint(base_cw, true);
             }
             if (handshake_cycles_remaining_ == 0) {
-                rt_error_.store(RtError::HandshakeTimeout, std::memory_order_relaxed);
+                latched_ctrl_error_ = RtError::HandshakeTimeout;  // one-shot latch; cleared by fault_reset, published by publish_state
                 handshake_ = Handshake::Idle;
                 return base_cw;  // drop bit4
             }
@@ -265,7 +267,7 @@ std::uint16_t ServoController::step_handshake(std::uint16_t base_cw, Status stat
             if (!status.setpoint_acknowledged()) {
                 handshake_ = Handshake::Idle;
             } else if (handshake_cycles_remaining_ == 0) {
-                rt_error_.store(RtError::HandshakeTimeout, std::memory_order_relaxed);
+                latched_ctrl_error_ = RtError::HandshakeTimeout;  // one-shot latch; cleared by fault_reset, published by publish_state
                 handshake_ = Handshake::Idle;
             } else {
                 --handshake_cycles_remaining_;
@@ -346,6 +348,10 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
     }
     if (std::holds_alternative<Faulted>(lifecycle_)) {
         if (batch.fault_reset) {
+            // The ONE clear: drop the controller-error latch AND drive the CiA402
+            // rising-edge re-arm. (A persistent bus WkcFault still reappears next
+            // cycle via the live tier -- it needs reconfigure, not fault_reset.)
+            latched_ctrl_error_ = RtError::None;
             lifecycle_ = Enabling{};
             return fault_reset_with_rearm(status);
         }
@@ -365,32 +371,30 @@ void ServoController::publish_state(Status status, std::int32_t actual, std::int
     const bool powered = status.operation_enabled();
     state_.powered.store(powered, std::memory_order_relaxed);
 
-    // Bus fault: publish the WKC payload (relaxed) THEN the rt_error_ flag
-    // (release) -- the fault-pair pattern so last_error() never reads a stale WKC.
-    if (master_->fault()) {
-        state_.fault_wkc.store(master_->working_counter(), std::memory_order_relaxed);
-        rt_error_.store(RtError::WkcFault, std::memory_order_release);
-    }
-    const bool faulted = master_->fault() || status.fault();
-    state_.faulted.store(faulted, std::memory_order_release);
-
     const std::uint32_t g = state_.active_generation.load(std::memory_order_relaxed);
     const bool move_active = g != 0 && state_.completed_generation.load(std::memory_order_relaxed) != g &&
                              state_.failed_generation.load(std::memory_order_relaxed) != g;
 
-    // Move-complete: |target - actual| <= tol && |vel| <= vthresh (NEVER bit10).
+    // Move-complete predicate: |target - actual| <= tol && |vel| <= vthresh (NEVER
+    // bit10). Only meaningful in PP (move_active implies a go_to generation).
     const bool at_target =
         std::abs(actual - target_counts_) <= config_.position_tolerance_counts && std::abs(velocity) <= config_.velocity_threshold;
-    const bool moving = powered && move_active && !at_target;
+
+    // is_moving: PP = an active positioned move not yet at target; PV = the drive
+    // is actually turning (|velocity| above the threshold). target_counts_ is
+    // never assigned in PV, so the PP position predicate must NOT drive PV moving.
+    const bool moving = (config_.mode == ControlMode::ProfilePosition) ? (powered && move_active && !at_target)
+                                                                       : (powered && std::abs(velocity) > config_.velocity_threshold);
     state_.moving.store(moving, std::memory_order_relaxed);
 
+    // PP generation protocol: completion + no-progress watchdog (PP-only via move_active).
     if (powered && move_active && at_target && handshake_ == Handshake::Idle) {
         state_.completed_generation.store(g, std::memory_order_release);  // publish BEFORE notify
         completion_cv_.notify_all();                                      // no completion_mutex_ held
     } else if (move_active) {
         // No-progress watchdog: if the actual isn't advancing toward target for
         // too long, fail the move (wakes its waiter to throw, instead of a silent
-        // 30s wait). Default window = move_timeout_ms (or 4x the stall threshold).
+        // wait). Window = move_timeout_ms (or 4x the stall threshold).
         if (std::abs(actual - last_progress_actual_) <= config_.position_tolerance_counts) {
             ++stall_cycles_;
         } else {
@@ -401,11 +405,23 @@ void ServoController::publish_state(Status status, std::int32_t actual, std::int
         const std::uint32_t limit = config_.move_timeout_ms != 0 ? static_cast<std::uint32_t>(config_.move_timeout_ms * rate / 1000ULL)
                                                                  : static_cast<std::uint32_t>(config_.stall_threshold_cycles * 4);
         if (stall_cycles_ > limit) {
-            rt_error_.store(RtError::MoveStalled, std::memory_order_release);
-            state_.failed_generation.store(g, std::memory_order_release);
+            latched_ctrl_error_ = RtError::MoveStalled;                    // one-shot latch (cleared by fault_reset)
+            state_.failed_generation.store(g, std::memory_order_release);  // publish BEFORE notify
             completion_cv_.notify_all();
         }
     }
+
+    // Two-tier fault publish (AFTER the watchdog, so a stall set this cycle shows
+    // now). Bus WkcFault is LIVE (mirrors master_->fault(), sticky-til-reconfigure)
+    // and WINS precedence; controller errors latch until fault_reset. Publish the
+    // fault_wkc payload (relaxed) BEFORE the rt_error_ flag (release) so last_error()
+    // never reads a stale WKC.
+    const RtError eff = master_->fault() ? RtError::WkcFault : latched_ctrl_error_;
+    if (eff == RtError::WkcFault) {
+        state_.fault_wkc.store(master_->working_counter(), std::memory_order_relaxed);
+    }
+    rt_error_.store(eff, std::memory_order_release);
+    state_.faulted.store(master_->fault() || status.fault() || eff != RtError::None, std::memory_order_release);
 
     state_.last_cycle_time_ns.store(monotonic_ns(), std::memory_order_release);
     state_.loop_cycle.fetch_add(1, std::memory_order_relaxed);
@@ -501,16 +517,18 @@ void ServoController::go_to(double rpm, double position) {
     }
     lk.unlock();
 
-    // Classify the wake (order matters: stop/dead first, then fault, then the
-    // move's own outcome).
+    // Classify the wake (order matters: stop/dead first; then this move's own
+    // stall -- which also sets faulted via MoveStalled, so check it BEFORE the
+    // generic faulted branch to report the precise reason; then a real drive/bus
+    // fault; then the move's success).
     if (stopping_.load(std::memory_order_acquire) || watchdog_expired()) {
         throw BusError("go_to: controller stopped / RT loop not alive");
     }
-    if (state_.faulted.load(std::memory_order_acquire)) {
-        throw BusError("go_to: drive faulted during the move");
-    }
     if (state_.failed_generation.load(std::memory_order_acquire) >= g && state_.completed_generation.load(std::memory_order_acquire) < g) {
         throw BusError("go_to: move stalled / no progress");
+    }
+    if (state_.faulted.load(std::memory_order_acquire)) {
+        throw BusError("go_to: drive faulted during the move");
     }
     if (state_.completed_generation.load(std::memory_order_acquire) >= g || state_.active_generation.load(std::memory_order_acquire) > g) {
         return;  // completed (or superseded by a newer move -- benign)
@@ -556,7 +574,7 @@ void ServoController::halt() noexcept {
 }
 
 void ServoController::set_zero() noexcept {
-    const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    // Pure state_ atomics (master_-free, config_-free) -> no lifecycle lock needed.
     state_.zero_offset_counts.store(state_.position_counts.load(std::memory_order_acquire), std::memory_order_release);
 }
 
@@ -580,15 +598,14 @@ bool ServoController::is_disconnected() const noexcept {
 }
 
 std::string ServoController::last_error() const {
-    // Fully master_-FREE: compose from rt_error_ (acquire) + the published
-    // fault_wkc payload + the constant expected_wkc_published_. The shared lock
-    // only guards expected_wkc_published_ (a plain int set under the exclusive
-    // lock at start()).
-    const std::shared_lock<std::shared_mutex> api_lk(api_mutex_);
-    switch (rt_error_.load(std::memory_order_acquire)) {  // pairs with the RT release store
+    // Cold-but-LOCK-FREE and master_-FREE (symmetric with is_powered/is_moving):
+    // compose from rt_error_ (acquire) + the published fault_wkc payload + the
+    // constant expected_wkc atom. No api_mutex_ (it would block for the full
+    // ~2s reconfigure), no master_ deref.
+    switch (rt_error_.load(std::memory_order_acquire)) {  // pairs with the RT release store; reads fault_wkc after
         case RtError::WkcFault:
             return "EtherCAT working-counter fault: got " + std::to_string(state_.fault_wkc.load(std::memory_order_relaxed)) +
-                   ", expected " + std::to_string(expected_wkc_published_);
+                   ", expected " + std::to_string(state_.expected_wkc.load(std::memory_order_relaxed));
         case RtError::HandshakeTimeout:
             return "Profile-Position set-point acknowledge timed out";
         case RtError::MoveStalled:

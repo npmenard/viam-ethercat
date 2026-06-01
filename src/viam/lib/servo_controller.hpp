@@ -54,8 +54,9 @@ struct ControllerState {
     std::atomic<std::int32_t> velocity{0};               // device velocity units
     std::atomic<bool> powered{false};                    // OperationEnabled this cycle
     std::atomic<bool> moving{false};                     // !move-complete
-    std::atomic<bool> faulted{false};                    // RT sets from master_->fault() || status.fault() (RT-side master_ deref)
-    std::atomic<std::int32_t> fault_wkc{0};              // WKC at the latched bus fault (payload; published by rt_error_ release)
+    std::atomic<bool> faulted{false};                    // master_->fault() || status.fault() || rt_error_!=None (RT-side master_ deref)
+    std::atomic<std::int32_t> fault_wkc{0};              // WKC at a live bus fault (payload; published by rt_error_ release)
+    std::atomic<std::int32_t> expected_wkc{0};           // constant after start(); for last_error() (lock-free, master_-free)
     std::atomic<std::uint64_t> loop_cycle{0};            // heartbeat counter
     std::atomic<std::uint64_t> last_cycle_time_ns{0};    // CLOCK_MONOTONIC ns at last iteration (watchdog; 0 = never published)
     std::atomic<std::int32_t> zero_offset_counts{0};     // SetZero software offset
@@ -150,7 +151,6 @@ class ServoController {
     std::atomic<bool> stopping_{false};
     std::atomic<std::uint32_t> next_generation_{0};  // non-RT: assigns unique move ids
     std::atomic<std::uint64_t> watchdog_ns_{0};      // RT-liveness window (set at start; config-free reads)
-    int expected_wkc_published_ = 0;                 // constant after start(); read by last_error() under shared lock
 
     mutable std::shared_mutex api_mutex_;  // API=shared, lifecycle(start/stop/reconfigure)=exclusive
 
@@ -170,6 +170,11 @@ class ServoController {
     std::int32_t prev_actual_ = 0;  // previous-cycle actual (instantaneous velocity estimate)
     bool first_cycle_ = true;       // skip the velocity estimate on the first cycle
     bool halted_ = false;           // STICKY Stop: Halt stays asserted until a new motion command
+    // Controller-error tier: one-shot latches (HandshakeTimeout/MoveStalled) set by
+    // the FSM, cleared ONLY by an explicit fault_reset. The bus WkcFault tier is
+    // LIVE (recomputed from master_->fault() each cycle) and is NOT stored here, so a
+    // persistent bus fault correctly reappears after a fault_reset.
+    RtError latched_ctrl_error_ = RtError::None;
 
     // FSM helpers (RT-only). Defined in the .cpp.
     std::uint16_t step_lifecycle(Status status, const CommandBatch& batch, std::int32_t actual) noexcept;

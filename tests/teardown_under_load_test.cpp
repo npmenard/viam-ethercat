@@ -90,6 +90,7 @@ void hammer(ServoController& ctrl, const std::atomic<bool>& stop) {
         (void)ctrl.is_powered();
         (void)ctrl.is_moving();
         (void)ctrl.position_revs();
+        (void)ctrl.last_error();  // exercise the lock-free fault-pair read (rt_error_/fault_wkc/expected_wkc) vs the RT publisher
         ctrl.halt();
     }
 }
