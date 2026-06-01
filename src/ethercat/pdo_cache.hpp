@@ -109,6 +109,11 @@ struct SetTarget {
     std::int32_t counts = 0;             // absolute or relative target, in counts
     std::uint32_t profile_velocity = 0;  // PP profile velocity
     bool relative = false;
+    // Monotonic move id assigned by the non-RT caller. The RT loop ADOPTS this
+    // into its active_generation after drain() coalescing, so "which move is
+    // active" always matches the command actually applied (a superseded move's
+    // waiter wakes via active_generation > its gen). See ServoController.
+    std::uint32_t generation = 0;
 };
 struct SetVelocity {
     std::int32_t velocity = 0;  // PV target velocity, device units
