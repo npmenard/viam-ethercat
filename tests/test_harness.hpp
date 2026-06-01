@@ -9,8 +9,10 @@
 #include <cstdio>
 #include <exception>
 #include <functional>
+#include <ostream>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace etest {
@@ -65,10 +67,28 @@ template <class... Parts>
     throw Failure{os.str()};
 }
 
+// Stream a value for diagnostics, coping with types that don't stream nicely:
+// scoped enums (print the underlying value) and char-like 8-bit ints (print as
+// a number, not a control character).
+template <class T>
+void stream_value(std::ostream& os, const T& value) {
+    if constexpr (std::is_enum_v<T>) {
+        os << static_cast<long long>(value);
+    } else if constexpr (std::is_same_v<T, char> || std::is_same_v<T, signed char> || std::is_same_v<T, unsigned char>) {
+        os << static_cast<int>(value);
+    } else {
+        os << value;
+    }
+}
+
 template <class A, class B>
 std::string format_eq(const std::string& expr, const A& got, const B& expected) {
     std::ostringstream os;
-    os << expr << "  (got " << got << ", expected " << expected << ')';
+    os << expr << "  (got ";
+    stream_value(os, got);
+    os << ", expected ";
+    stream_value(os, expected);
+    os << ')';
     return os.str();
 }
 

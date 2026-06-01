@@ -150,6 +150,7 @@ add_library(ethercat)
 target_sources(ethercat
   PRIVATE
     src/ethercat/version.cpp
+    src/ethercat/cia402.cpp
 )
 
 target_include_directories(ethercat
@@ -249,6 +250,7 @@ function(viam_add_test test_name source)
 endfunction()
 
 viam_add_test(pdo_buffer_test tests/pdo_buffer_test.cpp)
+viam_add_test(cia402_test tests/cia402_test.cpp)
 
 
 #
