@@ -12,17 +12,18 @@
 # Findings from inspecting https://github.com/OpenEtherCATsociety/SOEM
 # (verified 2026-06-01 by cloning and reading the tagged CMakeLists.txt):
 #
-#   * Tags available: v1.3.1, v1.3.2, v1.3.3-beta.1, v1.4.0, v2.0.0.
+#   * Tags available: v1.3.1, v1.3.2, v1.3.3-beta.1, v1.4.0, v2.0.0 (sparse).
 #
 #   * master / v2.0.0 is a *redesigned* API (project version 2.0.0). It drops
-#     the classic global `ec_slave[]` / `ec_slavecount` state and the
-#     `ec_init()` / `ec_config_init()` free-function flow that our master
-#     library (and src/tools/ec_scan.cpp) is written against. We therefore
-#     deliberately DO NOT track master.
+#     the classic `ec_slave[]` / `ec_slavecount` global state and the matching
+#     reentrant `ecx_*` flow that our master library (and src/tools/ec_scan.cpp)
+#     is written against. We therefore deliberately DO NOT track master.
 #
-#   * We pin **v1.4.0**, the last release of the classic 1.x API. It provides
-#     the global-state EtherCAT API the plan relies on
-#     (ec_init / ec_config_init / ec_slave[] / ec_slavecount / ec_config_map …).
+#   * We pin the **v1.4.0** release, but BY COMMIT SHA rather than by tag, since
+#     the tags are sparse/stale and a SHA is fully reproducible:
+#         abbf0d42e38d6cfbaa4c1e9e8e07ace651c386fd  == tag v1.4.0
+#     v1.4.0 provides the reentrant `ecx_init(ctx,…)` / `ecx_config_init(ctx,…)`
+#     API with a caller-owned `ecx_contextt` (no global state) that we build on.
 #
 #   * CMake target name is the unqualified **`soem`** (a STATIC library).
 #     There is NO namespaced `SOEM::soem` alias and NO installed package
@@ -48,13 +49,18 @@
 
 include(FetchContent)
 
-set(ETHERCAT_SOEM_GIT_TAG "v1.4.0" CACHE STRING "SOEM git tag to build against")
+# Pinned by commit SHA (== tag v1.4.0) for reproducibility. GIT_SHALLOW is left
+# FALSE on purpose: a shallow clone cannot reliably fetch an arbitrary commit
+# SHA on every server/CMake combination, whereas a full clone of this small
+# repo always can.
+set(ETHERCAT_SOEM_GIT_TAG "abbf0d42e38d6cfbaa4c1e9e8e07ace651c386fd"
+    CACHE STRING "SOEM git commit SHA to build against (== tag v1.4.0)")
 
 FetchContent_Declare(
   soem
   GIT_REPOSITORY https://github.com/OpenEtherCATsociety/SOEM
   GIT_TAG ${ETHERCAT_SOEM_GIT_TAG}
-  GIT_SHALLOW TRUE
+  GIT_SHALLOW FALSE
   SYSTEM
   # v1.4.0 hardcodes `set(BUILD_TESTS TRUE)` and builds its sample executables
   # (slaveinfo/eepromtool/simple_test) under their own `-Werror`, which clang-19
