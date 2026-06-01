@@ -237,25 +237,18 @@ endif()
 #
 # Tests
 #
+# One executable per test file, registered with ctest. Each links the ethercat
+# library and gets the header-only test harness on its include path.
 
-add_executable(ethercat-test)
+function(viam_add_test test_name source)
+  add_executable(${test_name} ${source})
+  target_link_libraries(${test_name} PRIVATE ethercat)
+  target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  viam_apply_wall_werror(${test_name})
+  add_test(NAME ${test_name} COMMAND ${test_name})
+endfunction()
 
-target_sources(ethercat-test
-  PRIVATE
-    tests/placeholder_test.cpp
-)
-
-target_link_libraries(ethercat-test
-  PRIVATE
-    ethercat
-)
-
-viam_apply_wall_werror(ethercat-test)
-
-add_test(
-  NAME ethercat-test
-  COMMAND ethercat-test
-)
+viam_add_test(pdo_buffer_test tests/pdo_buffer_test.cpp)
 
 
 #
