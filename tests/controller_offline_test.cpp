@@ -125,6 +125,22 @@ TEST("ServoController: mode guards reject the wrong API with clear errors") {
     }
 }
 
+TEST("ServoController: a wrong-mode rejection is Tier-2 (stays powered, next command works)") {
+    // The most common Tier-2 path: a bad API call (set_rpm in PP) must fail the
+    // CALL but NOT fault/de-power the drive -- a subsequent valid command then
+    // succeeds with NO fault_reset.
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, nullptr)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    CHECK_THROWS_MSG(ctrl.set_rpm(100.0), ConfigError, "Profile Velocity");  // wrong-mode reject
+    CHECK(ctrl.is_powered());                                                // still energized -- NOT faulted
+    CHECK(!ctrl.is_disconnected());
+
+    ctrl.go_to(1000.0, 1.0);  // a valid command then works with no fault_reset
+    CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);
+}
+
 TEST("ServoController: reset_zero offsets the reported position") {
     ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, nullptr)};
     ctrl.start();

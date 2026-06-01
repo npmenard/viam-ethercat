@@ -301,11 +301,16 @@ void ServoMotor::set_rpm(double rpm, const ProtoStruct& /*extra*/) {
 }
 
 void ServoMotor::go_for(double rpm, double revolutions, const ProtoStruct& /*extra*/) {
-    controller_->go_for(rpm, revolutions);  // PP relative move / PV timed run
+    // RDK convention: distance = |revolutions|, direction = sign(rpm)*sign(revolutions)
+    // (both-negative = forward), speed = |rpm|. The controller takes signed revs
+    // (direction) + magnitude rpm (profile velocity is always the magnitude).
+    const double signed_revs = (rpm < 0.0 ? -1.0 : 1.0) * revolutions;
+    controller_->go_for(std::abs(rpm), signed_revs);  // PP relative move / PV timed run
 }
 
 void ServoMotor::go_to(double rpm, double position_revolutions, const ProtoStruct& /*extra*/) {
-    controller_->go_to(rpm, position_revolutions);  // PP only; the controller throws in PV / on stall / on timeout
+    // Absolute target (from the reset_zero zero); direction is inherent, speed = |rpm|.
+    controller_->go_to(std::abs(rpm), position_revolutions);  // PP only; controller throws in PV / on stall / timeout
 }
 
 void ServoMotor::reset_zero_position(double offset, const ProtoStruct& /*extra*/) {
