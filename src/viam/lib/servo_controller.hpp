@@ -59,12 +59,14 @@ struct ControllerState {
     std::atomic<std::int32_t> velocity{0};               // device velocity units
     std::atomic<bool> powered{false};                    // OperationEnabled this cycle
     std::atomic<bool> moving{false};                     // !move-complete
-    std::atomic<bool> faulted{false};                    // RT sets from master_->fault() || rt_error_ (master_ deref safe in-loop)
+    std::atomic<bool> faulted{false};                    // RT sets from master_->fault() || status.fault() (RT-side master_ deref)
+    std::atomic<std::int32_t> fault_wkc{0};              // WKC at the latched bus fault (payload; published by rt_error_ release)
     std::atomic<std::uint64_t> loop_cycle{0};            // heartbeat counter
     std::atomic<std::uint64_t> last_cycle_time_ns{0};    // CLOCK_MONOTONIC ns at last iteration (watchdog; 0 = never published)
     std::atomic<std::int32_t> zero_offset_counts{0};     // SetZero software offset
     std::atomic<std::uint32_t> active_generation{0};     // gen RT adopted from the applied SetTarget (post-coalescing)
     std::atomic<std::uint32_t> completed_generation{0};  // gen that reached target; RT stores-release then notify (no lock)
+    std::atomic<std::uint32_t> failed_generation{0};     // gen that stalled/timed out; wakes its waiter to throw
 };
 
 class ServoController {
@@ -129,11 +131,10 @@ class ServoController {
     // thread (reconfigure-safe). On exit: leave outputs safe (Halt/disable) + a
     // final process(), then return so join() completes.
     void run_rt_loop(const std::stop_token& st, std::promise<void> started) noexcept;
-    bool setup_realtime() const noexcept;      // mlockall + mallopt + SCHED_FIFO; false on RT-sched failure
-    void resolve_fields();                     // cache controlword/status/target/actual/velocity FieldLocations
-    bool rt_alive() const noexcept;            // !watchdog_expired() && !state_.faulted  (master_-FREE)
-    bool watchdog_expired() const noexcept;    // (now - last_cycle_time_ns) > watchdog_ns
-    void set_last_error(std::string message);  // NON-RT only
+    bool setup_realtime() const noexcept;    // mlockall + mallopt + SCHED_FIFO; false on RT-sched failure
+    void resolve_fields();                   // cache controlword/status/target/actual/velocity FieldLocations
+    bool rt_alive() const noexcept;          // !watchdog_expired() && !state_.faulted  (master_-FREE)
+    bool watchdog_expired() const noexcept;  // (now - last_cycle_time_ns) > watchdog_ns
 
     ServoConfig config_;
     BackendFactory backend_factory_;
@@ -154,10 +155,9 @@ class ServoController {
     std::atomic<bool> stopping_{false};
     std::atomic<std::uint32_t> next_generation_{0};  // non-RT: assigns unique move ids
     std::atomic<std::uint64_t> watchdog_ns_{0};      // RT-liveness window (set at start; config-free reads)
+    int expected_wkc_published_ = 0;                 // constant after start(); read by last_error() under shared lock
 
     mutable std::shared_mutex api_mutex_;  // API=shared, lifecycle(start/stop/reconfigure)=exclusive
-    mutable std::mutex error_mutex_;       // guards last_error_ (NON-RT only)
-    std::string last_error_;
 
     std::mutex completion_mutex_;  // go_to/go_for waiter side only; RT NEVER locks it
     std::condition_variable completion_cv_;
@@ -173,6 +173,8 @@ class ServoController {
     std::int32_t last_progress_actual_ = 0;  // move no-progress watchdog
     std::uint32_t stall_cycles_ = 0;
     std::int32_t prev_actual_ = 0;  // previous-cycle actual (instantaneous velocity estimate)
+    bool first_cycle_ = true;       // skip the velocity estimate on the first cycle
+    bool halted_ = false;           // STICKY Stop: Halt stays asserted until a new motion command
 
     // FSM helpers (RT-only). Defined in the .cpp.
     std::uint16_t step_lifecycle(Status status, const CommandBatch& batch, std::int32_t actual) noexcept;

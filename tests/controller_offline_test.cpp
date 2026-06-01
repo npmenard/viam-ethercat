@@ -143,6 +143,32 @@ TEST("ServoController: after stop() the fail-safe reports not-powered/disconnect
     CHECK(ctrl.is_disconnected());
 }
 
+TEST("ServoController: Stop (Halt) is sticky -- motor stays stopped, then re-commandable") {
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, nullptr)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    ctrl.halt();
+    // Several cycles later it must STILL not be moving (Halt latched, not 1-shot).
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(!ctrl.is_moving());
+    // A new motion command clears Halt and moves again.
+    ctrl.go_to(1000.0, 1.0);
+    CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);
+}
+
+TEST("ServoController: a stalled move (target unreachable) makes go_to throw") {
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition);
+    cfg.move_timeout_ms = 100;  // fail fast
+    SimBackend* sim = nullptr;
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    // Inject a fault so the sim stops advancing -> the move never completes.
+    sim->inject_fault(1);
+    CHECK_THROWS(ctrl.go_to(1000.0, 5.0), ethercat::Error);  // BusError (faulted / stalled / disconnected)
+}
+
 TEST("ServoController: fault inject -> not powered; fault_reset recovers") {
     SimBackend* sim = nullptr;
     ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};

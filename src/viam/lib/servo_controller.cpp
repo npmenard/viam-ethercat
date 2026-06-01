@@ -88,10 +88,19 @@ void ServoController::start() {
     state_.faulted.store(false, std::memory_order_relaxed);
     state_.loop_cycle.store(0, std::memory_order_relaxed);
     state_.last_cycle_time_ns.store(0, std::memory_order_relaxed);
+    state_.active_generation.store(0, std::memory_order_relaxed);
+    state_.completed_generation.store(0, std::memory_order_relaxed);
+    state_.failed_generation.store(0, std::memory_order_relaxed);
+    next_generation_.store(0, std::memory_order_relaxed);
+    expected_wkc_published_ = master_->expected_wkc();
     lifecycle_ = Init{};
     last_cw_ = 0;
     handshake_ = Handshake::Idle;
     prev_actual_ = 0;
+    first_cycle_ = true;
+    halted_ = false;
+    last_progress_actual_ = 0;
+    stall_cycles_ = 0;
 
     const std::uint64_t period_ns = kNsPerSec / config_.target_loop_rate_hz;
     const std::uint64_t stall_ns = config_.stall_threshold_cycles * period_ns;
@@ -148,10 +157,19 @@ void ServoController::reconfigure(ServoConfig config) {
     state_.faulted.store(false, std::memory_order_relaxed);
     state_.loop_cycle.store(0, std::memory_order_relaxed);
     state_.last_cycle_time_ns.store(0, std::memory_order_relaxed);
+    state_.active_generation.store(0, std::memory_order_relaxed);
+    state_.completed_generation.store(0, std::memory_order_relaxed);
+    state_.failed_generation.store(0, std::memory_order_relaxed);
+    next_generation_.store(0, std::memory_order_relaxed);
+    expected_wkc_published_ = master_->expected_wkc();
     lifecycle_ = Init{};
     last_cw_ = 0;
     handshake_ = Handshake::Idle;
     prev_actual_ = 0;
+    first_cycle_ = true;
+    halted_ = false;
+    last_progress_actual_ = 0;
+    stall_cycles_ = 0;
     const std::uint64_t period_ns = kNsPerSec / config_.target_loop_rate_hz;
     watchdog_ns_.store(std::max<std::uint64_t>(config_.stall_threshold_cycles * period_ns, 20'000'000ULL), std::memory_order_release);
     std::promise<void> started;
@@ -261,12 +279,22 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
     const Cia402State dev = status.decode();
     const bool bus_fault = master_->fault();
 
+    // A new motion command (or enable) clears the sticky Halt.
+    if (batch.set_target.has_value() || batch.set_velocity.has_value() || batch.enable) {
+        halted_ = false;
+    }
+    if (batch.halt) {
+        halted_ = true;  // STICKY: stays asserted across cycles until a new motion command
+    }
+
     // Adopt a new PP target (generation rides in the command, post-coalescing).
     if (config_.mode == ControlMode::ProfilePosition && batch.set_target.has_value()) {
         const SetTarget& t = *batch.set_target;
         if (t.generation != state_.active_generation.load(std::memory_order_relaxed)) {
             target_counts_ = t.relative ? static_cast<std::int32_t>(actual + t.counts) : t.counts;
             profile_vel_ = t.profile_velocity;
+            last_progress_actual_ = actual;
+            stall_cycles_ = 0;
             state_.active_generation.store(t.generation, std::memory_order_release);
             handshake_ = Handshake::WriteTarget;  // restart the PP handshake for the new target
         }
@@ -286,7 +314,7 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
     if (std::holds_alternative<Enabling>(lifecycle_)) {
         if (dev == Cia402State::Fault) {
             lifecycle_ = Faulted{};
-            return fault_reset_with_rearm(status);
+            return ControlWord::disable_voltage();  // latch the fault; reset is EXPLICIT (Faulted handles it)
         }
         if (dev == Cia402State::OperationEnabled) {
             lifecycle_ = Operational{};
@@ -311,8 +339,8 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
         } else if (f_velocity_.byte_width != 0) {
             store_le<std::int32_t>(master_->outputs(config_.slave_id).subspan(f_velocity_.byte_offset, 4), pv_velocity_);
         }
-        if (batch.halt) {
-            cw = ControlWord::with_halt(cw, true);  // Stop = Halt (bit8), NOT QuickStop
+        if (halted_) {
+            cw = ControlWord::with_halt(cw, true);  // Stop = Halt (bit8, sticky), NOT QuickStop
         }
         return cw;
     }
@@ -337,20 +365,45 @@ void ServoController::publish_state(Status status, std::int32_t actual, std::int
     const bool powered = status.operation_enabled();
     state_.powered.store(powered, std::memory_order_relaxed);
 
-    const bool faulted = master_->fault() || status.fault() || rt_error_.load(std::memory_order_relaxed) != RtError::None;
+    // Bus fault: publish the WKC payload (relaxed) THEN the rt_error_ flag
+    // (release) -- the fault-pair pattern so last_error() never reads a stale WKC.
+    if (master_->fault()) {
+        state_.fault_wkc.store(master_->working_counter(), std::memory_order_relaxed);
+        rt_error_.store(RtError::WkcFault, std::memory_order_release);
+    }
+    const bool faulted = master_->fault() || status.fault();
     state_.faulted.store(faulted, std::memory_order_release);
+
+    const std::uint32_t g = state_.active_generation.load(std::memory_order_relaxed);
+    const bool move_active = g != 0 && state_.completed_generation.load(std::memory_order_relaxed) != g &&
+                             state_.failed_generation.load(std::memory_order_relaxed) != g;
 
     // Move-complete: |target - actual| <= tol && |vel| <= vthresh (NEVER bit10).
     const bool at_target =
         std::abs(actual - target_counts_) <= config_.position_tolerance_counts && std::abs(velocity) <= config_.velocity_threshold;
-    const bool moving = powered && !at_target;
+    const bool moving = powered && move_active && !at_target;
     state_.moving.store(moving, std::memory_order_relaxed);
 
-    if (powered && at_target && handshake_ == Handshake::Idle) {
-        const std::uint32_t g = state_.active_generation.load(std::memory_order_relaxed);
-        if (state_.completed_generation.load(std::memory_order_relaxed) != g) {
-            state_.completed_generation.store(g, std::memory_order_release);  // publish BEFORE notify
-            completion_cv_.notify_all();                                      // no completion_mutex_ held
+    if (powered && move_active && at_target && handshake_ == Handshake::Idle) {
+        state_.completed_generation.store(g, std::memory_order_release);  // publish BEFORE notify
+        completion_cv_.notify_all();                                      // no completion_mutex_ held
+    } else if (move_active) {
+        // No-progress watchdog: if the actual isn't advancing toward target for
+        // too long, fail the move (wakes its waiter to throw, instead of a silent
+        // 30s wait). Default window = move_timeout_ms (or 4x the stall threshold).
+        if (std::abs(actual - last_progress_actual_) <= config_.position_tolerance_counts) {
+            ++stall_cycles_;
+        } else {
+            stall_cycles_ = 0;
+            last_progress_actual_ = actual;
+        }
+        const std::uint64_t rate = config_.target_loop_rate_hz;
+        const std::uint32_t limit = config_.move_timeout_ms != 0 ? static_cast<std::uint32_t>(config_.move_timeout_ms * rate / 1000ULL)
+                                                                 : static_cast<std::uint32_t>(config_.stall_threshold_cycles * 4);
+        if (stall_cycles_ > limit) {
+            rt_error_.store(RtError::MoveStalled, std::memory_order_release);
+            state_.failed_generation.store(g, std::memory_order_release);
+            completion_cv_.notify_all();
         }
     }
 
@@ -377,6 +430,10 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
         const std::span<const std::byte> in = master_->input_image(slave);
         const Status status{load_le<std::uint16_t>(in.subspan(f_statusword_.byte_offset, 2))};
         const std::int32_t actual = load_le<std::int32_t>(in.subspan(f_actual_.byte_offset, 4));
+        if (first_cycle_) {
+            prev_actual_ = actual;  // avoid a spurious huge velocity on cycle 0
+            first_cycle_ = false;
+        }
         const std::int32_t velocity =
             static_cast<std::int32_t>(static_cast<std::int64_t>(actual - prev_actual_) * config_.target_loop_rate_hz);
         prev_actual_ = actual;
@@ -414,6 +471,7 @@ void ServoController::set_rpm(double rpm) {
 
 void ServoController::go_to(double rpm, double position) {
     std::uint32_t g = 0;
+    std::chrono::milliseconds move_timeout{0};
     {
         const std::shared_lock<std::shared_mutex> lk(api_mutex_);
         if (config_.mode != ControlMode::ProfilePosition) {
@@ -423,29 +481,41 @@ void ServoController::go_to(double rpm, double position) {
         const double clamped_rpm = clamp_rpm(rpm, config_.max_motor_speed_rpm);
         const std::int32_t prof = rpm_to_device_velocity(clamped_rpm, config_.counts_per_rev, config_.gear_ratio);
         g = next_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+        move_timeout = config_.move_timeout_ms != 0 ? std::chrono::milliseconds(config_.move_timeout_ms) : std::chrono::milliseconds(30000);
         (void)commands_.push(Command{SetTarget{counts, static_cast<std::uint32_t>(std::abs(prof)), false, g}});
     }  // release the shared lock BEFORE parking (so reconfigure isn't blocked for the whole move)
 
     // Bounded wait_for re-check loop (lost-wakeup-immune; RT never locks the CV).
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    // Predicate is master_-FREE (state_ atomics + stopping_ + watchdog).
+    const auto deadline = std::chrono::steady_clock::now() + move_timeout;
     constexpr auto slice = std::chrono::milliseconds(2);
     std::unique_lock<std::mutex> lk(completion_mutex_);
     auto done = [&] {
-        return state_.completed_generation.load(std::memory_order_acquire) == g ||
+        return state_.completed_generation.load(std::memory_order_acquire) >= g ||
                state_.active_generation.load(std::memory_order_acquire) > g ||
-               state_.completed_generation.load(std::memory_order_acquire) > g || state_.faulted.load(std::memory_order_acquire) ||
+               state_.failed_generation.load(std::memory_order_acquire) >= g || state_.faulted.load(std::memory_order_acquire) ||
                stopping_.load(std::memory_order_acquire) || watchdog_expired();
     };
     while (!done() && std::chrono::steady_clock::now() < deadline) {
         completion_cv_.wait_for(lk, slice);
     }
+    lk.unlock();
+
+    // Classify the wake (order matters: stop/dead first, then fault, then the
+    // move's own outcome).
     if (stopping_.load(std::memory_order_acquire) || watchdog_expired()) {
         throw BusError("go_to: controller stopped / RT loop not alive");
     }
     if (state_.faulted.load(std::memory_order_acquire)) {
         throw BusError("go_to: drive faulted during the move");
     }
-    // completed==g -> success; active>g||completed>g -> superseded (benign); timeout -> return.
+    if (state_.failed_generation.load(std::memory_order_acquire) >= g && state_.completed_generation.load(std::memory_order_acquire) < g) {
+        throw BusError("go_to: move stalled / no progress");
+    }
+    if (state_.completed_generation.load(std::memory_order_acquire) >= g || state_.active_generation.load(std::memory_order_acquire) > g) {
+        return;  // completed (or superseded by a newer move -- benign)
+    }
+    throw BusError("go_to: move timed out");
 }
 
 void ServoController::go_for(double rpm, double revs) {
@@ -472,6 +542,10 @@ void ServoController::go_for(double rpm, double revs) {
     set_rpm(rpm);
     if (duration_s > 0.0) {
         std::this_thread::sleep_for(std::chrono::duration<double>(duration_s));
+    }
+    {
+        const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+        (void)commands_.push(Command{SetVelocity{0}});  // command zero velocity so the run actually stops
     }
     halt();
 }
@@ -505,41 +579,26 @@ bool ServoController::is_disconnected() const noexcept {
     return stopping_.load(std::memory_order_acquire) || watchdog_expired();
 }
 
-void ServoController::set_last_error(std::string message) {
-    const std::lock_guard<std::mutex> lk(error_mutex_);
-    last_error_ = std::move(message);
-}
-
 std::string ServoController::last_error() const {
+    // Fully master_-FREE: compose from rt_error_ (acquire) + the published
+    // fault_wkc payload + the constant expected_wkc_published_. The shared lock
+    // only guards expected_wkc_published_ (a plain int set under the exclusive
+    // lock at start()).
     const std::shared_lock<std::shared_mutex> api_lk(api_mutex_);
-    std::string out;
-    switch (rt_error_.load(std::memory_order_acquire)) {
+    switch (rt_error_.load(std::memory_order_acquire)) {  // pairs with the RT release store
         case RtError::WkcFault:
-            out = "EtherCAT working-counter fault";
-            break;
+            return "EtherCAT working-counter fault: got " + std::to_string(state_.fault_wkc.load(std::memory_order_relaxed)) +
+                   ", expected " + std::to_string(expected_wkc_published_);
         case RtError::HandshakeTimeout:
-            out = "Profile-Position set-point acknowledge timed out";
-            break;
+            return "Profile-Position set-point acknowledge timed out";
         case RtError::MoveStalled:
-            out = "move stalled (no progress)";
-            break;
+            return "move stalled (no progress)";
         case RtError::NotOperational:
-            out = "drive not operational";
-            break;
+            return "drive not operational";
         case RtError::None:
-            break;
+            return {};
     }
-    if (master_ && master_->fault()) {
-        const std::string m = master_->last_error();
-        if (!m.empty()) {
-            out = out.empty() ? m : (out + "; " + m);
-        }
-    }
-    const std::lock_guard<std::mutex> err_lk(error_mutex_);
-    if (!last_error_.empty()) {
-        out = out.empty() ? last_error_ : (out + "; " + last_error_);
-    }
-    return out;
+    return {};
 }
 
 }  // namespace ethercat::servo
