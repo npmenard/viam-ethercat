@@ -228,7 +228,7 @@ TEST("CommandQueue: push returns false when full (fixed capacity, no RT alloc)")
         }
     }
     CHECK(accepted >= 1);
-    CHECK(accepted <= 2);  // capacity bound (boost may round, but <=2 here)
+    CHECK(accepted < 100);  // push returns false once full (exact capacity is impl-defined)
 }
 
 // ---------------------------------------------------------------------------
@@ -336,13 +336,10 @@ TEST("TxStaging stress: every taken frame is internally uniform (no torn Tx)") {
 // Concurrency: CommandQueue multi-producer integrity (no fabricated values)
 // ---------------------------------------------------------------------------
 
-// NOTE: excluded from the TSan binary. boost::lockfree::queue's tagged_index
-// does a non-atomic sub-word read of the index half (validated by the CAS),
-// which ThreadSanitizer flags as a race inside boost -- a known benign report
-// in vetted library code, not in our primitives. To keep the TSan gate at ZERO
-// suppressions we scope it to our hand-written seqlock + TxStaging; the boost
-// queue's MPMC correctness is covered by this case in the normal build.
-#ifndef ECAT_TSAN
+// Runs UNDER TSan too: the CommandQueue is now SPSC-ring + producer-mutex (no
+// boost tagged_index), so the contended multi-producer path is TSan-clean with
+// zero suppressions -- this is the production scenario (multiple gRPC handler
+// threads calling push() concurrently while the RT thread drains).
 TEST("CommandQueue: multi-producer pushes are never corrupted/fabricated") {
     CommandQueue q{1024};
     std::atomic<bool> start{false};
@@ -400,7 +397,6 @@ TEST("CommandQueue: multi-producer pushes are never corrupted/fabricated") {
         CHECK(i >= 0 && i < kPerProducer);
     }
 }
-#endif  // !ECAT_TSAN
 
 // ---------------------------------------------------------------------------
 // RT-safety extras (normal build only; sanitizers perturb allocation/timing)

@@ -3,9 +3,10 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <mutex>
 #include <string>
 
-#include <boost/lockfree/queue.hpp>
+#include <boost/lockfree/spsc_queue.hpp>
 
 #include "ethercat/errors.hpp"
 
@@ -95,9 +96,17 @@ PdoSnapshot RxSnapshot::read() const noexcept {
 // CommandQueue -- MPMC lock-free, boost hidden behind the pimpl
 // ----------------------------------------------------------------------------
 
+// MPSC via SPSC + a producer-side mutex. We use boost::lockfree::spsc_queue
+// (a plain atomic head/tail ring -- NO tagged_index, so it is TSan-clean) and
+// serialize the multiple non-RT producers with a mutex. The single RT consumer
+// pops lock-free and NEVER touches the mutex, so there is zero priority
+// inversion. The mutex release/acquire between successive producers also
+// supplies the happens-before that satisfies spsc_queue's single-producer
+// contract. Capacity is fixed at construction (no allocation on push/pop).
 struct CommandQueue::Impl {
     explicit Impl(std::size_t capacity) : queue(capacity) {}
-    boost::lockfree::queue<Command, boost::lockfree::fixed_sized<true>> queue;
+    boost::lockfree::spsc_queue<Command> queue;
+    std::mutex producer_mutex;  // non-RT producers only; the RT consumer never locks it
 };
 
 CommandQueue::CommandQueue(std::size_t capacity) : impl_(std::make_unique<Impl>(capacity)) {}
@@ -105,7 +114,15 @@ CommandQueue::~CommandQueue() = default;
 CommandQueue::CommandQueue(CommandQueue&&) noexcept = default;
 CommandQueue& CommandQueue::operator=(CommandQueue&&) noexcept = default;
 
+// push() is the NON-RT producer side. It takes the producer mutex so concurrent
+// gRPC-handler threads serialize into the single-producer ring. The RT thread
+// must NEVER call push() (it is the consumer) -- that is what keeps the lock off
+// the RT path. A std::mutex lock/unlock does not allocate, so the malloc-counter
+// stays zero. noexcept: a std::mutex failure is unrecoverable here, so letting
+// it terminate is the correct outcome for an RT system.
+// NOLINTNEXTLINE(bugprone-exception-escape)
 bool CommandQueue::push(const Command& command) noexcept {
+    const std::lock_guard<std::mutex> lock(impl_->producer_mutex);
     return impl_->queue.push(command);
 }
 

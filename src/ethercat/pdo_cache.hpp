@@ -134,9 +134,16 @@ struct CommandBatch {
     }
 };
 
-// MPMC lock-free command queue, capacity fixed at construction (no RT
-// allocation). Producers are non-RT Viam handlers; the single consumer is the
-// RT loop. Move-only; boost is hidden behind the pimpl.
+// MPSC command queue, capacity fixed at construction (no RT allocation).
+// Implemented as boost::lockfree::spsc_queue (a TSan-clean atomic head/tail
+// ring) plus a producer-side mutex that serializes the multiple non-RT Viam
+// handler threads into the single-producer ring. The single RT consumer pops
+// lock-free and NEVER takes the mutex -> zero priority inversion. Move-only;
+// boost is hidden behind the pimpl.
+//
+// THREADING CONTRACT: push() is non-RT (gRPC handlers) and takes the mutex;
+// drain() is the RT consumer and is lock-free. The RT thread must never call
+// push().
 class CommandQueue {
    public:
     explicit CommandQueue(std::size_t capacity);
@@ -146,16 +153,17 @@ class CommandQueue {
     CommandQueue(const CommandQueue&) = delete;
     CommandQueue& operator=(const CommandQueue&) = delete;
 
-    // Non-RT producer. Returns false if the queue is full (setpoints coalesce
-    // anyway, so a drop is benign; the caller may still report it).
+    // Non-RT producer (gRPC handler threads). Serializes on the producer mutex.
+    // Returns false if the queue is full (setpoints coalesce anyway, so a drop
+    // is benign; the caller may still report it).
     bool push(const Command& command) noexcept;
 
-    // RT consumer. Drains everything currently queued and coalesces it. Never
-    // allocates, never blocks.
+    // RT consumer. Drains everything currently queued and coalesces it. Lock-free
+    // (never takes the producer mutex); never allocates, never blocks.
     CommandBatch drain() noexcept;
 
    private:
-    struct Impl;  // hides boost::lockfree::queue from this header
+    struct Impl;  // hides boost::lockfree::spsc_queue from this header
     std::unique_ptr<Impl> impl_;
 };
 
