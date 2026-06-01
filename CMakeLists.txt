@@ -166,6 +166,7 @@ target_sources(ethercat
     src/ethercat/soem_backend.cpp
     src/viam/lib/motion_profile.cpp
     src/viam/lib/servo_config.cpp
+    src/viam/lib/servo_controller.cpp
 )
 
 target_include_directories(ethercat
@@ -273,6 +274,7 @@ viam_add_test(master_test tests/master_test.cpp)
 viam_add_test(soem_backend_test tests/soem_backend_test.cpp)
 viam_add_test(conversion_test tests/conversion_test.cpp)
 viam_add_test(servo_config_test tests/servo_config_test.cpp)
+viam_add_test(controller_offline_test tests/controller_offline_test.cpp)
 
 # ThreadSanitizer build of the RT-boundary test. Compiles the pdo_cache TU
 # directly (with -fsanitize=thread) so the seqlock / lock-free handoff code is

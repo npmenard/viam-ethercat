@@ -156,6 +156,15 @@ std::span<std::byte> Master::outputs(std::uint16_t slave) noexcept {
     return {};
 }
 
+std::span<const std::byte> Master::input_image(std::uint16_t slave) const noexcept {
+    for (const SlaveRuntime& rt : slaves_) {
+        if (rt.slave_id == slave) {
+            return rt.io.inputs;
+        }
+    }
+    return {};
+}
+
 PdoSnapshot Master::read_inputs(std::uint16_t slave) const noexcept {
     for (const SlaveRuntime& rt : slaves_) {
         if (rt.slave_id == slave) {

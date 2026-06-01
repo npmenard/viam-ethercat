@@ -71,6 +71,11 @@ class Master {
     // directly into this span. 1-based slave id.
     std::span<std::byte> outputs(std::uint16_t slave) noexcept;
 
+    // The RT loop reads a slave's live feedback image (TxPDO: statusword, actual)
+    // directly -- the values from the last exchange(), without going through the
+    // seqlock snapshot (which is for the NON-RT side). 1-based slave id.
+    std::span<const std::byte> input_image(std::uint16_t slave) const noexcept;
+
     // --- accessors (non-RT) -------------------------------------------------
 
     std::size_t slave_count() const noexcept {

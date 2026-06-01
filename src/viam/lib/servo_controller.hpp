@@ -128,8 +128,8 @@ class ServoController {
     // && require_realtime) -> bounded start() handshake. The promise lives in the
     // thread (reconfigure-safe). On exit: leave outputs safe (Halt/disable) + a
     // final process(), then return so join() completes.
-    void run_rt_loop(std::stop_token st, std::promise<void> started) noexcept;
-    bool setup_realtime() noexcept;            // mlockall + mallopt + SCHED_FIFO; false on RT-sched failure
+    void run_rt_loop(const std::stop_token& st, std::promise<void> started) noexcept;
+    bool setup_realtime() const noexcept;      // mlockall + mallopt + SCHED_FIFO; false on RT-sched failure
     void resolve_fields();                     // cache controlword/status/target/actual/velocity FieldLocations
     bool rt_alive() const noexcept;            // !watchdog_expired() && !state_.faulted  (master_-FREE)
     bool watchdog_expired() const noexcept;    // (now - last_cycle_time_ns) > watchdog_ns
@@ -153,6 +153,7 @@ class ServoController {
     // drives the go_to/go_for wait predicate + the accessors' fail-safe.
     std::atomic<bool> stopping_{false};
     std::atomic<std::uint32_t> next_generation_{0};  // non-RT: assigns unique move ids
+    std::atomic<std::uint64_t> watchdog_ns_{0};      // RT-liveness window (set at start; config-free reads)
 
     mutable std::shared_mutex api_mutex_;  // API=shared, lifecycle(start/stop/reconfigure)=exclusive
     mutable std::mutex error_mutex_;       // guards last_error_ (NON-RT only)
@@ -171,6 +172,13 @@ class ServoController {
     std::int32_t pv_velocity_ = 0;           // latched PV target velocity
     std::int32_t last_progress_actual_ = 0;  // move no-progress watchdog
     std::uint32_t stall_cycles_ = 0;
+    std::int32_t prev_actual_ = 0;  // previous-cycle actual (instantaneous velocity estimate)
+
+    // FSM helpers (RT-only). Defined in the .cpp.
+    std::uint16_t step_lifecycle(Status status, const CommandBatch& batch, std::int32_t actual) noexcept;
+    std::uint16_t step_handshake(std::uint16_t base_cw, Status status) noexcept;
+    std::uint16_t fault_reset_with_rearm(Status status) noexcept;
+    void publish_state(Status status, std::int32_t actual, std::int32_t velocity) noexcept;
 
     // commands_ BY VALUE -> never reset until dtor (no stop-time push-vs-destroy
     // UAF). master_ unique_ptr -> rebuilt by reconfigure() AFTER join (RT thread
