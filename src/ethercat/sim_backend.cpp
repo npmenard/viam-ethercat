@@ -49,12 +49,12 @@ SimBackend::SimBackend(std::vector<SimSlaveModel> slaves) {
     }
 }
 
-std::size_t SimBackend::scan(std::string_view ifname) {
+std::size_t SimBackend::open(std::string_view ifname) {
     if (open_) {
-        throw ConfigError("SimBackend::scan: bus already open on '" + std::string(ifname) + "' (one master per backend; close() first)");
+        throw ConfigError("SimBackend::open: bus already open on '" + std::string(ifname) + "' (one master per backend; close() first)");
     }
     if (slaves_.empty()) {
-        throw InitError("SimBackend::scan: no simulated slaves configured on '" + std::string(ifname) + "'");
+        throw InitError("SimBackend::open: no simulated slaves configured on '" + std::string(ifname) + "'");
     }
     open_ = true;
     for (auto& slave : slaves_) {
@@ -105,7 +105,7 @@ std::size_t SimBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::
     return n;
 }
 
-void SimBackend::map_process_image() {
+void SimBackend::map_process_data() {
     expected_wkc_ = 0;
     for (auto& s : slaves_) {
         s.output_image.assign(s.model.output_bytes, std::byte{0});
@@ -130,7 +130,7 @@ void SimBackend::request_state(std::uint16_t slave, EcatState target) {
     slaves_[slave - 1].state = target;
 }
 
-EcatState SimBackend::state(std::uint16_t slave) const {
+EcatState SimBackend::slave_state(std::uint16_t slave) const {
     if (slave == 0) {
         EcatState worst = EcatState::Op;
         for (const auto& s : slaves_) {
@@ -144,18 +144,12 @@ EcatState SimBackend::state(std::uint16_t slave) const {
     return slaves_[slave - 1].state;
 }
 
-std::span<std::byte> SimBackend::outputs(std::uint16_t slave) noexcept {
+SlaveIo SimBackend::slave_io(std::uint16_t slave) noexcept {
     if (slave < 1 || slave > slaves_.size()) {
         return {};
     }
-    return slaves_[slave - 1].output_image;
-}
-
-std::span<const std::byte> SimBackend::inputs(std::uint16_t slave) const noexcept {
-    if (slave < 1 || slave > slaves_.size()) {
-        return {};
-    }
-    return slaves_[slave - 1].input_image;
+    Slave& s = slaves_[slave - 1];
+    return SlaveIo{std::span<std::byte>(s.output_image), std::span<const std::byte>(s.input_image)};
 }
 
 void SimBackend::step_device(Slave& s) noexcept {
@@ -281,7 +275,7 @@ void SimBackend::step_device(Slave& s) noexcept {
     s.prev_ctrlword = cw;
 }
 
-int SimBackend::send_receive() noexcept {
+int SimBackend::exchange() noexcept {
     if (!open_) {
         return -1;
     }

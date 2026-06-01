@@ -38,17 +38,17 @@ SimSlaveModel a6_like_model() {
 // Bring a freshly-constructed backend to OP (SimBackend is non-movable -- it
 // inherits EcatBackend's deleted move -- so configure it in place by reference).
 void bring_up_to_op(SimBackend& be) {
-    be.scan("sim0");
-    be.map_process_image();
+    be.open("sim0");
+    be.map_process_data();
     be.request_state(0, EcatState::Op);
 }
 
 void write_ctrl(SimBackend& be, std::uint16_t cw) {
-    ethercat::store_le<std::uint16_t>(be.outputs(1).subspan(0, 2), cw);
+    ethercat::store_le<std::uint16_t>(be.slave_io(1).outputs.subspan(0, 2), cw);
 }
 
 Status read_status(SimBackend& be) {
-    return Status{ethercat::load_le<std::uint16_t>(be.inputs(1).subspan(0, 2))};
+    return Status{ethercat::load_le<std::uint16_t>(be.slave_io(1).inputs.subspan(0, 2))};
 }
 
 }  // namespace
@@ -59,22 +59,22 @@ TEST("SimBackend: device walks the DS402 enable ladder; bit10 always 1") {
 
     // First exchange auto-advances NotReady -> SwitchOnDisabled.
     write_ctrl(be, ControlWord::disable_voltage());
-    be.send_receive();
+    be.exchange();
     CHECK_EQ(read_status(be).decode(), Cia402State::SwitchOnDisabled);
 
     // Shutdown (0x06) -> ReadyToSwitchOn.
     write_ctrl(be, ControlWord::shutdown());
-    be.send_receive();
+    be.exchange();
     CHECK_EQ(read_status(be).decode(), Cia402State::ReadyToSwitchOn);
 
     // Switch on (0x07) -> SwitchedOn.
     write_ctrl(be, ControlWord::switch_on());
-    be.send_receive();
+    be.exchange();
     CHECK_EQ(read_status(be).decode(), Cia402State::SwitchedOn);
 
     // Enable operation (0x0F) -> OperationEnabled.
     write_ctrl(be, ControlWord::enable_operation());
-    be.send_receive();
+    be.exchange();
     CHECK_EQ(read_status(be).decode(), Cia402State::OperationEnabled);
 
     // The A6 quirk: bit10 must be set in every statusword observed above.
@@ -88,20 +88,20 @@ TEST("SimBackend: PP set-point-acknowledge bit12 handshake") {
     for (std::uint16_t cw :
          {ControlWord::disable_voltage(), ControlWord::shutdown(), ControlWord::switch_on(), ControlWord::enable_operation()}) {
         write_ctrl(be, cw);
-        be.send_receive();
+        be.exchange();
     }
     CHECK_EQ(read_status(be).decode(), Cia402State::OperationEnabled);
     CHECK(!read_status(be).setpoint_acknowledged());
 
     // Set a target, then raise bit4 (new set-point) -> ack (bit12) within a cycle.
-    ethercat::store_le<std::int32_t>(be.outputs(1).subspan(2, 4), 50000);
+    ethercat::store_le<std::int32_t>(be.slave_io(1).outputs.subspan(2, 4), 50000);
     write_ctrl(be, ControlWord::with_new_setpoint(ControlWord::enable_operation(), true));  // 0x1F
-    be.send_receive();
+    be.exchange();
     CHECK(read_status(be).setpoint_acknowledged());  // bit12
 
     // Drop bit4 -> ack clears.
     write_ctrl(be, ControlWord::enable_operation());  // 0x0F
-    be.send_receive();
+    be.exchange();
     CHECK(!read_status(be).setpoint_acknowledged());
 }
 
@@ -111,15 +111,15 @@ TEST("SimBackend: PP actual position chases the latched target") {
     for (std::uint16_t cw :
          {ControlWord::disable_voltage(), ControlWord::shutdown(), ControlWord::switch_on(), ControlWord::enable_operation()}) {
         write_ctrl(be, cw);
-        be.send_receive();
+        be.exchange();
     }
     // Target = 2500 counts; counts_per_step = 1000 -> reached in 3 cycles.
-    ethercat::store_le<std::int32_t>(be.outputs(1).subspan(2, 4), 2500);
+    ethercat::store_le<std::int32_t>(be.slave_io(1).outputs.subspan(2, 4), 2500);
     write_ctrl(be, ControlWord::with_new_setpoint(ControlWord::enable_operation(), true));
     for (int i = 0; i < 5; ++i) {
-        be.send_receive();
+        be.exchange();
     }
-    const std::int32_t actual = ethercat::load_le<std::int32_t>(be.inputs(1).subspan(2, 4));
+    const std::int32_t actual = ethercat::load_le<std::int32_t>(be.slave_io(1).inputs.subspan(2, 4));
     CHECK_EQ(actual, std::int32_t{2500});
 }
 
@@ -127,34 +127,34 @@ TEST("SimBackend: fault inject decodes Fault; fault-reset edge recovers") {
     SimBackend be{std::vector<SimSlaveModel>{a6_like_model()}};
     bring_up_to_op(be);
     write_ctrl(be, ControlWord::disable_voltage());
-    be.send_receive();
+    be.exchange();
     CHECK_EQ(read_status(be).decode(), Cia402State::SwitchOnDisabled);
 
     be.inject_fault(1);
-    be.send_receive();
+    be.exchange();
     CHECK_EQ(read_status(be).decode(), Cia402State::Fault);
 
     // Fault reset requires a RISING edge on bit7: clear, then set.
     write_ctrl(be, 0x0000);
-    be.send_receive();
+    be.exchange();
     CHECK_EQ(read_status(be).decode(), Cia402State::Fault);  // still faulted, no edge yet
     write_ctrl(be, ControlWord::fault_reset());              // 0x80 rising
-    be.send_receive();
+    be.exchange();
     CHECK_EQ(read_status(be).decode(), Cia402State::SwitchOnDisabled);
 }
 
 TEST("SimBackend: double scan throws; short-WKC hook fires once") {
     SimBackend be{std::vector<SimSlaveModel>{a6_like_model()}};
-    CHECK_EQ(be.scan("sim0"), std::size_t{1});
-    CHECK_THROWS(be.scan("sim0"), ethercat::ConfigError);
+    CHECK_EQ(be.open("sim0"), std::size_t{1});
+    CHECK_THROWS(be.open("sim0"), ethercat::ConfigError);
 
-    be.map_process_image();
+    be.map_process_data();
     be.request_state(0, EcatState::Op);
     const int expected = be.expected_wkc();
     CHECK(expected > 0);
     be.force_short_wkc_once();
-    CHECK_EQ(be.send_receive(), expected - 1);  // short once
-    CHECK_EQ(be.send_receive(), expected);      // back to normal
+    CHECK_EQ(be.exchange(), expected - 1);  // short once
+    CHECK_EQ(be.exchange(), expected);      // back to normal
 }
 
 TEST_MAIN()

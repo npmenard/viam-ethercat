@@ -45,7 +45,7 @@ enum class EcatState : std::uint8_t {
 const char* to_string(EcatState state) noexcept;
 
 // SOEM-type-free projection of a slave's identity + image sizes (from
-// ec_slave[]). Populated after scan().
+// ec_slave[]). Populated after open().
 struct SlaveInfo {
     std::uint16_t position = 0;  // 1-based ring position (SOEM convention)
     std::uint32_t vendor_id = 0;
@@ -53,6 +53,15 @@ struct SlaveInfo {
     std::string name;
     std::size_t input_bytes = 0;   // TxPDO feedback image size (slave -> master)
     std::size_t output_bytes = 0;  // RxPDO command image size (master -> slave)
+};
+
+// A slave's process-data windows inside the backend's IO image, valid after
+// map_process_data(). Spans point into backend-owned storage that stays valid
+// until close(). See the ORIENTATION note above: outputs = RxPDO command image
+// (writable), inputs = TxPDO feedback image (read-only).
+struct SlaveIo {
+    std::span<std::byte> outputs;       // RxPDO command (master writes)
+    std::span<const std::byte> inputs;  // TxPDO feedback (master reads)
 };
 
 // Abstract EtherCAT bus backend. One instance per master/NIC. Setup methods run
@@ -73,9 +82,9 @@ class EcatBackend {
 
     // Open the NIC and enumerate the bus into PRE-OP. Returns the slave count
     // (>= 1) or throws InitError (no privileges / no NIC / no slaves). Throws
-    // ConfigError on a second scan of an already-open backend (double-init
+    // ConfigError on a second open of an already-open backend (double-init
     // guard; SOEM has process-global resources per NIC).
-    virtual std::size_t scan(std::string_view ifname) = 0;
+    virtual std::size_t open(std::string_view ifname) = 0;
 
     // Identity + image sizes for a slave (1-based).
     virtual SlaveInfo slave_info(std::uint16_t slave) const = 0;
@@ -88,25 +97,24 @@ class EcatBackend {
     virtual std::size_t sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) = 0;
 
     // Map the (already remapped) PDOs into the process-data image. Call AFTER the
-    // SDO remap. After this, outputs()/inputs() return valid spans. Throws
+    // SDO remap. After this, slave_io() returns valid spans. Throws
     // PdoMappingError/BusError naming the offending slave.
-    virtual void map_process_image() = 0;
+    virtual void map_process_data() = 0;
 
     // Drive `slave` (0 = all) to `target` and wait. Throws InitError naming the
     // slave + target (and the state actually reached) on timeout.
     virtual void request_state(std::uint16_t slave, EcatState target) = 0;
-    virtual EcatState state(std::uint16_t slave) const = 0;
+    virtual EcatState slave_state(std::uint16_t slave) const = 0;
 
     // --- cyclic (RT hot path; noexcept, no alloc, no block) -----------------
 
-    // Process-data windows for a slave (1-based), valid after map_process_image.
-    virtual std::span<std::byte> outputs(std::uint16_t slave) noexcept = 0;             // RxPDO command (writable)
-    virtual std::span<const std::byte> inputs(std::uint16_t slave) const noexcept = 0;  // TxPDO feedback (read-only)
+    // Process-data windows for a slave (1-based), valid after map_process_data.
+    virtual SlaveIo slave_io(std::uint16_t slave) noexcept = 0;
 
     // One cyclic exchange (send + receive process data). Returns the actual
     // working counter; < 0 signals a link error. Never throws -- the master
     // interprets the WKC (consecutive-error threshold -> latched BusError).
-    virtual int send_receive() noexcept = 0;
+    virtual int exchange() noexcept = 0;
 
     // Expected WKC for a fully-operational bus, computed at map time.
     virtual int expected_wkc() const noexcept = 0;

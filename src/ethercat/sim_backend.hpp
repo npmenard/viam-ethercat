@@ -51,18 +51,17 @@ class SimBackend final : public EcatBackend {
     explicit SimBackend(std::vector<SimSlaveModel> slaves);
 
     // EcatBackend -- setup
-    std::size_t scan(std::string_view ifname) override;
+    std::size_t open(std::string_view ifname) override;
     SlaveInfo slave_info(std::uint16_t slave) const override;
     void sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) override;
     std::size_t sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) override;
-    void map_process_image() override;
+    void map_process_data() override;
     void request_state(std::uint16_t slave, EcatState target) override;
-    EcatState state(std::uint16_t slave) const override;
+    EcatState slave_state(std::uint16_t slave) const override;
 
     // EcatBackend -- cyclic
-    std::span<std::byte> outputs(std::uint16_t slave) noexcept override;
-    std::span<const std::byte> inputs(std::uint16_t slave) const noexcept override;
-    int send_receive() noexcept override;
+    SlaveIo slave_io(std::uint16_t slave) noexcept override;
+    int exchange() noexcept override;
     int expected_wkc() const noexcept override;
     void close() noexcept override;
 
