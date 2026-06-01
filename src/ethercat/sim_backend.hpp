@@ -71,6 +71,10 @@ class SimBackend final : public EcatBackend {
     // Force the next send_receive() to report a short WKC (one cycle), to test
     // the master's WKC-fault latch.
     void force_short_wkc_once() noexcept;
+    // Toggle whether a slave asserts the PP set-point-acknowledge (bit12). When
+    // suppressed, the controller's new-set-point handshake times out; re-enabling
+    // lets a subsequent move complete (handshake-timeout-then-recovery test).
+    void suppress_setpoint_ack(std::uint16_t slave, bool on = true) noexcept;
     // Read back a recorded SDO value (latest write to that object).
     std::vector<std::byte> recorded_sdo(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const;
     // Ordered log of SDO write keys ((index<<8)|sub) for asserting the remap
@@ -91,6 +95,7 @@ class SimBackend final : public EcatBackend {
         std::int32_t actual = 0;
         bool setpoint_ack = false;  // PP bit12 latch
         bool faulted = false;
+        bool suppress_ack = false;  // test hook: never assert bit12 (force handshake timeout)
     };
 
     static void step_device(Slave& s) noexcept;

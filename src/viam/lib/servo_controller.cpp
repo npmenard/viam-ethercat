@@ -237,6 +237,19 @@ std::uint16_t ServoController::fault_reset_with_rearm(Status status) noexcept {
     return level;
 }
 
+void ServoController::abort_active_move(RtError reason) noexcept {
+    latched_ctrl_error_ = reason;  // diagnostic tier (last_error)
+    // Publish the reason BEFORE failed_generation so last_error() is consistent the
+    // instant the waiter observes the abort (publish_state recomputes rt_error_
+    // again this cycle -- idempotent for a controller error). NOT for WkcFault.
+    rt_error_.store(reason, std::memory_order_release);
+    const std::uint32_t g = state_.active_generation.load(std::memory_order_relaxed);
+    if (g != 0 && state_.completed_generation.load(std::memory_order_relaxed) != g) {
+        state_.failed_generation.store(g, std::memory_order_release);  // abort tier: wakes the go_to waiter
+        completion_cv_.notify_all();                                   // RT never LOCKS completion_mutex_
+    }
+}
+
 std::uint16_t ServoController::step_handshake(std::uint16_t base_cw, Status status) noexcept {
     const std::uint16_t s = config_.slave_id;
     switch (handshake_) {
@@ -253,7 +266,7 @@ std::uint16_t ServoController::step_handshake(std::uint16_t base_cw, Status stat
                 return ControlWord::with_new_setpoint(base_cw, true);
             }
             if (handshake_cycles_remaining_ == 0) {
-                latched_ctrl_error_ = RtError::HandshakeTimeout;  // one-shot latch; cleared by fault_reset, published by publish_state
+                abort_active_move(RtError::HandshakeTimeout);  // latch + wake the waiter PROMPTLY (correct reason)
                 handshake_ = Handshake::Idle;
                 return base_cw;  // drop bit4
             }
@@ -267,7 +280,7 @@ std::uint16_t ServoController::step_handshake(std::uint16_t base_cw, Status stat
             if (!status.setpoint_acknowledged()) {
                 handshake_ = Handshake::Idle;
             } else if (handshake_cycles_remaining_ == 0) {
-                latched_ctrl_error_ = RtError::HandshakeTimeout;  // one-shot latch; cleared by fault_reset, published by publish_state
+                abort_active_move(RtError::HandshakeTimeout);  // latch + wake the waiter PROMPTLY (correct reason)
                 handshake_ = Handshake::Idle;
             } else {
                 --handshake_cycles_remaining_;
@@ -297,6 +310,7 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
             profile_vel_ = t.profile_velocity;
             last_progress_actual_ = actual;
             stall_cycles_ = 0;
+            latched_ctrl_error_ = RtError::None;  // a fresh move starts with a clean diagnostic slate
             state_.active_generation.store(t.generation, std::memory_order_release);
             handshake_ = Handshake::WriteTarget;  // restart the PP handshake for the new target
         }
@@ -405,9 +419,7 @@ void ServoController::publish_state(Status status, std::int32_t actual, std::int
         const std::uint32_t limit = config_.move_timeout_ms != 0 ? static_cast<std::uint32_t>(config_.move_timeout_ms * rate / 1000ULL)
                                                                  : static_cast<std::uint32_t>(config_.stall_threshold_cycles * 4);
         if (stall_cycles_ > limit) {
-            latched_ctrl_error_ = RtError::MoveStalled;                    // one-shot latch (cleared by fault_reset)
-            state_.failed_generation.store(g, std::memory_order_release);  // publish BEFORE notify
-            completion_cv_.notify_all();
+            abort_active_move(RtError::MoveStalled);  // latch + wake the waiter (same invariant as the handshake timeout)
         }
     }
 
@@ -421,7 +433,11 @@ void ServoController::publish_state(Status status, std::int32_t actual, std::int
         state_.fault_wkc.store(master_->working_counter(), std::memory_order_relaxed);
     }
     rt_error_.store(eff, std::memory_order_release);
-    state_.faulted.store(master_->fault() || status.fault() || eff != RtError::None, std::memory_order_release);
+    // state_.faulted is the DRIVE/BUS fault tier ONLY (de-powers the motor + wakes
+    // the waiter's fault branch). Controller move-errors (HandshakeTimeout/
+    // MoveStalled) deliberately stay OUT: they fail the in-flight move (via
+    // failed_generation) but must NOT de-power an otherwise-healthy drive.
+    state_.faulted.store(master_->fault() || status.fault(), std::memory_order_release);
 
     state_.last_cycle_time_ns.store(monotonic_ns(), std::memory_order_release);
     state_.loop_cycle.fetch_add(1, std::memory_order_relaxed);
@@ -518,14 +534,14 @@ void ServoController::go_to(double rpm, double position) {
     lk.unlock();
 
     // Classify the wake (order matters: stop/dead first; then this move's own
-    // stall -- which also sets faulted via MoveStalled, so check it BEFORE the
-    // generic faulted branch to report the precise reason; then a real drive/bus
-    // fault; then the move's success).
+    // abort -- handshake-timeout or stall, which set failed_generation but NOT
+    // faulted, so check it BEFORE the generic drive-fault branch; last_error()
+    // carries the precise reason enum; then a real drive/bus fault; then success).
     if (stopping_.load(std::memory_order_acquire) || watchdog_expired()) {
         throw BusError("go_to: controller stopped / RT loop not alive");
     }
     if (state_.failed_generation.load(std::memory_order_acquire) >= g && state_.completed_generation.load(std::memory_order_acquire) < g) {
-        throw BusError("go_to: move stalled / no progress");
+        throw BusError("go_to: move aborted (" + last_error() + ")");
     }
     if (state_.faulted.load(std::memory_order_acquire)) {
         throw BusError("go_to: drive faulted during the move");

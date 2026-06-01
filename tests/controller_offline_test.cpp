@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -176,16 +177,46 @@ TEST("ServoController(PV): a displaced, stopped motor reports is_moving == false
     CHECK(std::abs(ctrl.position_revs()) > 0.01);  // STILL displaced, but NOT moving
 }
 
-TEST("ServoController: a stalled move (target unreachable) makes go_to throw") {
+TEST("ServoController(PP): handshake timeout aborts the move PROMPTLY, then recovers") {
+    // Drive withholds the PP set-point-acknowledge (bit12) -> the new-set-point
+    // handshake times out. The move must abort promptly with the CORRECT reason
+    // (not the slower stall watchdog), the drive must stay powered (a controller
+    // move-error is NOT a drive fault), and a subsequent move must recover with a
+    // clean last_error() (the latch cleared on the new move).
     ServoConfig cfg = make_config(ControlMode::ProfilePosition);
-    cfg.move_timeout_ms = 100;  // fail fast
+    cfg.handshake_timeout_cycles = 5;  // time out fast
     SimBackend* sim = nullptr;
     ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim)};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
-    // Inject a fault so the sim stops advancing -> the move never completes.
-    sim->inject_fault(1);
-    CHECK_THROWS(ctrl.go_to(1000.0, 5.0), ethercat::Error);  // BusError (faulted / stalled / disconnected)
+    CHECK(sim != nullptr);
+
+    sim->suppress_setpoint_ack(1, true);
+    CHECK_THROWS_MSG(ctrl.go_to(1000.0, 1.0), ethercat::Error, "acknowledge");
+    CHECK(ctrl.is_powered());  // move-error must NOT de-power a healthy drive
+    CHECK(ctrl.last_error().find("acknowledge") != std::string::npos);
+
+    sim->suppress_setpoint_ack(1, false);  // recovery: ack again
+    ctrl.go_to(1000.0, 1.0);               // fresh move adopts (clears the latch) + completes -- must NOT throw
+    CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);
+    CHECK(ctrl.last_error().empty());  // stale handshake-timeout cleared
+}
+
+TEST("ServoController(PP): a no-progress move trips the stall watchdog; drive stays powered") {
+    // A genuine no-progress stall (not a device fault): the drive stays enabled but
+    // physically frozen (counts_per_step=0), so the move never reaches target. The
+    // watchdog (move_timeout_ms=0 -> stall_threshold_cycles*4) must fail the move
+    // via go_to throwing, WITHOUT de-powering the healthy drive.
+    auto factory = [] {
+        SimSlaveModel m = make_model(ControlMode::ProfilePosition);
+        m.counts_per_step = 0;  // commanded but frozen
+        return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m}));
+    };
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), factory};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    CHECK_THROWS_MSG(ctrl.go_to(1000.0, 5.0), ethercat::Error, "stalled");
+    CHECK(ctrl.is_powered());  // a stall fails the MOVE, not the drive
 }
 
 TEST("ServoController: fault inject -> not powered; fault_reset recovers") {

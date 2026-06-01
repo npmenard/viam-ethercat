@@ -181,6 +181,10 @@ class ServoController {
     std::uint16_t step_handshake(std::uint16_t base_cw, Status status) noexcept;
     std::uint16_t fault_reset_with_rearm(Status status) noexcept;
     void publish_state(Status status, std::int32_t actual, std::int32_t velocity) noexcept;
+    // Abort the in-flight move: set BOTH tiers -- latched_ctrl_error_ (+rt_error_
+    // for last_error) AND failed_generation+notify (to wake the go_to waiter
+    // PROMPTLY). The invariant: every FSM path that fails the active move calls this.
+    void abort_active_move(RtError reason) noexcept;
 
     // commands_ BY VALUE -> never reset until dtor (no stop-time push-vs-destroy
     // UAF). master_ unique_ptr -> rebuilt by reconfigure() AFTER join (RT thread
