@@ -123,8 +123,10 @@ void Master::process() noexcept {
     if (wkc < 0 || wkc < expected_wkc_) {
         ++consecutive_wkc_errors_;
         if (consecutive_wkc_errors_ >= config_.max_consecutive_wkc_errors) {
+            // Store the payload (fault_wkc_) first, then publish the flag with a
+            // release store so a reader that acquires fault_==true sees the wkc.
             fault_wkc_.store(wkc, std::memory_order_relaxed);
-            fault_.store(true, std::memory_order_relaxed);
+            fault_.store(true, std::memory_order_release);
             operational_.store(false, std::memory_order_relaxed);
         }
     } else {
@@ -204,7 +206,9 @@ FieldLocation Master::tx_field(std::uint16_t slave, std::uint16_t index, std::ui
 }
 
 std::string Master::last_error() const {
-    if (!fault_.load(std::memory_order_relaxed)) {
+    // Acquire pairs with process()'s release store of fault_, so fault_wkc_ below
+    // is the value that was current when the fault latched (never stale).
+    if (!fault_.load(std::memory_order_acquire)) {
         return {};
     }
     return "EtherCAT working-counter fault on '" + config_.ifname + "': got " + std::to_string(fault_wkc_.load(std::memory_order_relaxed)) +

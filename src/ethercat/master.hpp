@@ -80,7 +80,9 @@ class Master {
         return operational_.load(std::memory_order_relaxed);
     }
     bool fault() const noexcept {
-        return fault_.load(std::memory_order_relaxed);
+        // Acquire pairs with the release store in process(), so a reader that
+        // sees fault()==true also sees the fault_wkc_ payload last_error() reads.
+        return fault_.load(std::memory_order_acquire);
     }
     int working_counter() const noexcept {
         return working_counter_.load(std::memory_order_relaxed);

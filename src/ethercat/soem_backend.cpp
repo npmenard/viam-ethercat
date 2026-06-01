@@ -44,6 +44,29 @@ EcatState from_soem_state(std::uint16_t soem) noexcept {
     }
 }
 
+std::string hex32(std::uint32_t v) {
+    static constexpr char kDigits[] = "0123456789ABCDEF";
+    std::string out = "0x00000000";
+    for (int i = 0; i < 8; ++i) {
+        out[static_cast<std::size_t>(9 - i)] = kDigits[(v >> (4U * static_cast<unsigned>(i))) & 0xFU];
+    }
+    return out;
+}
+
+// Drain SOEM's error stack and, if a CoE abort is present, return its detail.
+// SOEM reports an SDO abort by pushing an ec_errort (with .AbortCode) even when
+// the mailbox working counter is non-zero, so checking the WKC alone can miss it.
+std::string pop_coe_abort(ecx_contextt* ctx) {
+    std::string detail;
+    ec_errort err{};
+    while (ecx_poperror(ctx, &err)) {
+        if (err.Etype == EC_ERR_TYPE_SDO_ERROR) {
+            detail = ", CoE abort " + hex32(static_cast<std::uint32_t>(err.AbortCode));
+        }
+    }
+    return detail;
+}
+
 }  // namespace
 
 // All SOEM-touching state lives here, behind the pimpl. The reentrant API wants
@@ -145,18 +168,21 @@ void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8
     // SOEM's psize is an int; PDO/SDO payloads are tiny, so the cast is safe.
     const int size = static_cast<int>(data.size());
     const int wkc = ecx_SDOwrite(&impl_->ctx, slave, index, sub, FALSE, size, const_cast<std::byte*>(data.data()), EC_TIMEOUTRXM);
-    if (wkc <= 0) {
+    // A CoE abort can return wkc > 0 but push an error, so check both.
+    if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {
+        const std::string abort = pop_coe_abort(&impl_->ctx);
         throw PdoMappingError("SDO write to slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" +
-                              std::to_string(sub) + " failed (working counter " + std::to_string(wkc) + ")");
+                              std::to_string(sub) + " failed (working counter " + std::to_string(wkc) + ")" + abort);
     }
 }
 
 std::size_t SoemBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
     int size = static_cast<int>(out.size());
     const int wkc = ecx_SDOread(&impl_->ctx, slave, index, sub, FALSE, &size, out.data(), EC_TIMEOUTRXM);
-    if (wkc <= 0) {
+    if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {
+        const std::string abort = pop_coe_abort(&impl_->ctx);
         throw BusError("SDO read from slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" + std::to_string(sub) +
-                       " failed (working counter " + std::to_string(wkc) + ")");
+                       " failed (working counter " + std::to_string(wkc) + ")" + abort);
     }
     return static_cast<std::size_t>(size < 0 ? 0 : size);
 }
