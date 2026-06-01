@@ -46,11 +46,6 @@ function(viam_apply_wall_werror target_name)
       -Wdouble-promotion
       -Wnull-dereference
       -Wunused
-      # The Viam SDK's logging header pulls boost::log -> boost::mpl, whose
-      # integral_wrapper trips clang's -Wenum-constexpr-conversion. Suppress it
-      # (it's third-party + a known boost-mpl issue; gcc ignores the unknown flag).
-      # TODO: drop after the boost upgrade (boostorg/mpl#69).
-      -Wno-enum-constexpr-conversion
     )
   elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     target_compile_options(${target_name} PRIVATE /W4 /WX)
@@ -249,6 +244,11 @@ if (ETHERCAT_BUILD_MODULE)
   )
 
   viam_apply_wall_werror(ethercat-servo)
+  # The Viam SDK's logging header (boost::log -> boost::mpl) trips clang-19's
+  # -Wenum-constexpr-conversion. Suppress it ONLY on the SDK-linked module targets,
+  # NOT in viam_apply_wall_werror -- so genuine enum-constexpr issues in our library
+  # TUs still fail. Known boost-mpl issue (boostorg/mpl#69); UR carries the same flag.
+  target_compile_options(ethercat-servo PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
 
   install(
     TARGETS
@@ -270,6 +270,7 @@ if (ETHERCAT_BUILD_MODULE)
   target_compile_definitions(servo_motor_test PRIVATE BOOST_DLL_USE_STD_FS)
   target_include_directories(servo_motor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   viam_apply_wall_werror(servo_motor_test)
+  target_compile_options(servo_motor_test PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
   add_test(NAME servo_motor_test COMMAND servo_motor_test)
 endif()
 
