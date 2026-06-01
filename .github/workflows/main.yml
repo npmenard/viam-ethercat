@@ -59,11 +59,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The arm64 leg MUST be a NATIVE arm64 runner (ubuntu-24.04-arm = GitHub's
+        # free native Ampere runner), never qemu. TSan finds data races but NOT
+        # misplaced-fence ORDERING bugs in the seqlock; x86 is TSO and hides
+        # weak-ordering mistakes, and qemu serializes to ~TSO too. So the native
+        # arm64 run is the only authoritative check of the seqlock fence
+        # placement and the TxStaging Dekker (seq_cst) ordering. If a native
+        # arm64 runner is ever unavailable, document it as a known
+        # weak-ordering-coverage gap here -- do NOT substitute an emulated leg.
         include:
           - arch: amd64
             runner: ubuntu-latest
           - arch: arm64
-            runner: ubuntu-4cpu-arm
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4

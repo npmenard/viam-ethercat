@@ -1,6 +1,7 @@
 #include "ethercat/pdo_cache.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <string>
 
@@ -19,8 +20,15 @@ RxSnapshot::RxSnapshot(std::size_t payload_size) noexcept : size_(std::min(paylo
 void RxSnapshot::publish(std::span<const std::byte> payload, std::uint16_t working_counter, std::uint64_t cycle) noexcept {
     const std::size_t n = std::min(payload.size(), size_);
 
-    const std::uint64_t s = seq_.load(std::memory_order_relaxed);
-    seq_.store(s + 1, std::memory_order_relaxed);  // -> odd: write in progress
+    // Parity-robust: derive a strictly-greater ODD value regardless of the
+    // current parity, and commit at odd+1 (even). `(v + 1) | 1` is the next odd
+    // >= v+1 for any v, so this restores the single-writer even invariant even if
+    // a test seam left seq at an odd value.
+    const std::uint64_t odd = (seq_.load(std::memory_order_relaxed) + 1U) | 1U;
+    seq_.store(odd, std::memory_order_relaxed);  // -> odd: write in progress
+    // (F1) LOAD-BEARING: orders the odd marker before the payload writes below.
+    // Must stay a fence -- making the odd store `release` would NOT order it
+    // before the subsequent relaxed payload stores. Do not remove.
     std::atomic_thread_fence(std::memory_order_release);
 
     // All shared payload/metadata writes go through atomic_ref (relaxed) so there
@@ -33,13 +41,14 @@ void RxSnapshot::publish(std::span<const std::byte> payload, std::uint16_t worki
     std::atomic_ref<std::uint16_t>(wkc_).store(working_counter, std::memory_order_relaxed);
     std::atomic_ref<std::uint64_t>(cycle_).store(cycle, std::memory_order_relaxed);
 
+    // (F2) Redundant given the `release` even-store below, but kept as insurance:
+    // it becomes load-bearing if anyone ever weakens the even store to relaxed.
     std::atomic_thread_fence(std::memory_order_release);
-    seq_.store(s + 2, std::memory_order_release);  // -> even: stable
+    seq_.store(odd + 1U, std::memory_order_release);  // -> even: stable
 }
 
 PdoSnapshot RxSnapshot::read() const noexcept {
     PdoSnapshot out;
-    out.size = size_;
 
     for (unsigned attempt = 0; attempt < kMaxReadRetries; ++attempt) {
         const std::uint64_t s0 = seq_.load(std::memory_order_acquire);
@@ -53,9 +62,15 @@ PdoSnapshot RxSnapshot::read() const noexcept {
         const std::uint16_t wkc = std::atomic_ref<std::uint16_t>(wkc_).load(std::memory_order_relaxed);
         const std::uint64_t cyc = std::atomic_ref<std::uint64_t>(cycle_).load(std::memory_order_relaxed);
 
+        // (G2) LOAD-BEARING: orders the payload loads above before the seq
+        // re-read below. Must stay a fence -- making the re-read `acquire` would
+        // order the re-read before *later* ops, not the *prior* loads before
+        // itself (wrong direction). Do not remove. The re-read can stay relaxed
+        // precisely because this fence carries the ordering.
         std::atomic_thread_fence(std::memory_order_acquire);
         const std::uint64_t s1 = seq_.load(std::memory_order_relaxed);
         if (s0 == s1) {
+            out.size = size_;
             out.working_counter = wkc;
             out.cycle = cyc;
             out.valid = true;
@@ -64,10 +79,15 @@ PdoSnapshot RxSnapshot::read() const noexcept {
         }
     }
 
-    // Retry budget exhausted: the writer kept moving. Report not-valid; the
-    // consumer keeps its own last-good frame.
+    // Retry budget exhausted: the writer kept moving (or is wedged mid-publish,
+    // leaving seq permanently odd -> every read exhausts -> stale forever ->
+    // is_powered()=false; a correct, safe failure mode). Report not-valid with no
+    // payload; the consumer keeps its own last-good frame. The cycle is a
+    // best-effort diagnostic only.
+    out.size = 0;
     out.valid = false;
     out.stale = true;
+    out.cycle = std::atomic_ref<std::uint64_t>(cycle_).load(std::memory_order_relaxed);
     return out;
 }
 
@@ -132,11 +152,18 @@ CommandBatch CommandQueue::drain() noexcept {
 TxStaging::TxStaging(std::size_t payload_size) : size_(std::min(payload_size, kMaxPdoBytes)) {}
 
 void TxStaging::stage_outputs(std::span<const std::byte> payload) noexcept {
-    const std::uint32_t pend = pending_.load(std::memory_order_relaxed);
-    const std::uint32_t rd = reading_.load(std::memory_order_seq_cst);  // observe the RT reader's hazard
+#ifndef NDEBUG
+    // Single-writer tripwire (see TRIPWIRE in the header): catch a second
+    // concurrent stager in tests. Compiles out under NDEBUG.
+    const bool already = staging_.exchange(true, std::memory_order_acq_rel);
+    assert(!already && "TxStaging::stage_outputs is single-writer-only");
+#endif
 
-    // With three slots and at most one pending + one being-read, a free slot
-    // always exists.
+    // seq_cst on BOTH pending_ loads/stores forms the Dekker StoreLoad with the
+    // RT take's announce/validate. A free slot always exists: at most one slot
+    // is pending and one is being read, leaving a third.
+    const std::uint32_t pend = pending_.load(std::memory_order_seq_cst);
+    const std::uint32_t rd = reading_.load(std::memory_order_seq_cst);  // observe the RT reader's hazard
     std::uint32_t slot = 0;
     for (; slot < 3; ++slot) {
         if (slot != pend && slot != rd) {
@@ -146,24 +173,43 @@ void TxStaging::stage_outputs(std::span<const std::byte> payload) noexcept {
 
     std::memcpy(slots_[slot].data(), payload.data(), std::min(payload.size(), size_));
     pending_.store(slot, std::memory_order_seq_cst);  // newest-wins: overwrites any prior unsent slot
+
+#ifndef NDEBUG
+    staging_.store(false, std::memory_order_release);
+#endif
 }
 
 std::size_t TxStaging::take_outputs(std::span<std::byte> out) noexcept {
-    std::uint32_t idx = 0;
-    do {
-        idx = pending_.load(std::memory_order_acquire);
+    // Protocol: load pending -> ANNOUNCE reading -> RE-VALIDATE pending -> copy
+    // -> compare_exchange (consume iff unchanged). Never a bare exchange: that
+    // would clear pending_ before the announce, reopening the window for the
+    // stager to reuse the slot mid-copy (torn Tx). reading_==idx is held across
+    // the whole copy, and the stager's self-exclusion (slot != pend) keeps idx
+    // out of its pick set, so the copied slot is never concurrently written.
+    // All pending_/reading_ ops are seq_cst (Dekker StoreLoad).
+    std::uint32_t idx = pending_.load(std::memory_order_seq_cst);
+    for (unsigned spins = 0;; ++spins) {
         if (idx == kNone) {
             reading_.store(kNone, std::memory_order_seq_cst);
             return 0;  // nothing new pending
         }
-        reading_.store(idx, std::memory_order_seq_cst);  // ANNOUNCE first (hazard)
-    } while (pending_.load(std::memory_order_acquire) != idx);  // RE-VALIDATE the writer didn't move on
+        reading_.store(idx, std::memory_order_seq_cst);                      // ANNOUNCE
+        const std::uint32_t cur = pending_.load(std::memory_order_seq_cst);  // RE-VALIDATE
+        if (cur == idx) {
+            break;  // stable: safe to copy
+        }
+        if (spins >= kMaxTakeSpins) {
+            break;  // freshness cap: copying idx is still safe (reading_==idx held)
+        }
+        idx = cur;  // a newer frame was staged; re-announce it
+    }
 
     std::memcpy(out.data(), slots_[idx].data(), std::min(out.size(), size_));
     std::atomic_thread_fence(std::memory_order_acquire);
-    // Consume: only clear pending_ if it is still our idx (writer may have staged
-    // a newer frame, which we leave pending for the next take).
-    pending_.compare_exchange_strong(idx, kNone, std::memory_order_acq_rel, std::memory_order_relaxed);
+    // Consume: clear pending_ iff it is still our idx (a newer staged frame is
+    // left pending for the next take). Strong CAS; on failure do not reuse idx
+    // without re-reading (the CAS already wrote the observed value into idx).
+    pending_.compare_exchange_strong(idx, kNone, std::memory_order_seq_cst, std::memory_order_seq_cst);
     reading_.store(kNone, std::memory_order_seq_cst);
     return size_;
 }

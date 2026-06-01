@@ -127,10 +127,10 @@ TEST("RxSnapshot: retry-exhaustion (writer stuck) returns valid=false/stale") {
     const PdoSnapshot s = rx.read();
     CHECK(!s.valid);
     CHECK(s.stale);
+    CHECK_EQ(s.size, std::size_t{0});  // no payload on the exhausted path
 
-    // Balance the forced bump (odd -> even) to restore the seqlock invariant,
-    // then a normal publish/read is valid again.
-    rx.force_writing_for_test();
+    // publish() is parity-robust: it restores the even/stable invariant even
+    // though the seam left seq odd, so a subsequent read is valid again.
     std::array<std::byte, kPayload> frame{};
     fill_uniform(frame, 0x3C);
     rx.publish(frame, 7, 1);
@@ -252,6 +252,7 @@ TEST("RxSnapshot stress: no torn frames, cycle monotone (1 writer, 4 readers)") 
     std::atomic<bool> stop{false};
     std::atomic<int> tears{0};
     std::atomic<int> regressions{0};
+    std::atomic<std::uint64_t> valid_reads{0};
 
     auto reader = [&] {
         std::uint64_t last_cycle = 0;
@@ -260,6 +261,7 @@ TEST("RxSnapshot stress: no torn frames, cycle monotone (1 writer, 4 readers)") 
             if (!s.valid) {
                 continue;
             }
+            valid_reads.fetch_add(1, std::memory_order_relaxed);
             // Every byte of frame c is (c & 0xFF); the seqlock-protected cycle is
             // c. If the read tore (payload from one frame, cycle from another),
             // the bytes won't all equal (cycle & 0xFF).
@@ -293,6 +295,10 @@ TEST("RxSnapshot stress: no torn frames, cycle monotone (1 writer, 4 readers)") 
 
     CHECK_EQ(tears.load(), 0);
     CHECK_EQ(regressions.load(), 0);
+    // Guard against a vacuous pass: if read() always exhausted (e.g. a parity
+    // bug), tears would be 0 trivially. Require that readers actually observed
+    // many valid frames.
+    CHECK(valid_reads.load() > 1000);
 }
 
 // ---------------------------------------------------------------------------

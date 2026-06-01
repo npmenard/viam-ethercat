@@ -69,7 +69,10 @@ class RxSnapshot {
 
     // Test-only seam: force the "write in progress" (odd seq) state so a test can
     // exercise the reader's bounded-retry -> valid=false path. Not used in
-    // production code. publish() restores the even (stable) state.
+    // production. Safe even though it can leave seq at an arbitrary parity:
+    // publish() is parity-ROBUST (it computes an explicitly-even final seq
+    // regardless of entry parity), so a subsequent publish always restores the
+    // stable/even invariant.
     void force_writing_for_test() noexcept {
         seq_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -110,6 +113,9 @@ struct SetZero {};
 
 using Command = std::variant<SetTarget, SetVelocity, Enable, Disable, Halt, QuickStop, FaultReset, SetZero>;
 static_assert(std::is_trivially_copyable_v<Command>, "Command must be trivially copyable for the lock-free queue");
+// boost::lockfree::queue additionally requires a trivial destructor; assert it
+// so a future non-trivial Command alternative fails at compile, not at link.
+static_assert(std::is_trivially_destructible_v<Command>, "Command must be trivially destructible for the lock-free queue");
 
 // Coalesced result of draining the queue for one RT cycle. Setpoints are
 // latest-wins; discrete commands are sticky booleans (any occurrence latches).
@@ -164,7 +170,19 @@ class CommandQueue {
 // read. The announce-FIRST / re-validate protocol (mirrors the seqlock reader)
 // is the correctness crux against a torn Tx.
 //
-// Single non-RT writer (the advanced/raw staging path) and the single RT reader.
+// TRIPWIRE: this hazard scheme is married to exactly ONE non-RT writer (the
+// advanced/raw staging path) and ONE RT reader. Two concurrent stagers would
+// break the 3-slot/hazard invariant. There is no way to static_assert this, so
+// stage_outputs has a debug-only reentrancy guard. If an advanced path ever
+// needs multiple stagers, wrap stage_outputs in a producer-side mutex the RT
+// thread never touches.
+//
+// All pending_/reading_ accesses are seq_cst on BOTH sides: the announce/
+// validate handshake is a Dekker StoreLoad, and release/acquire is insufficient
+// for StoreLoad ordering (it reorders on arm64). Slot payload bytes do NOT need
+// atomic_ref -- the pending_ release/acquire edge plus the mutual-exclusion
+// invariant give a clean happens-before, so a plain memcpy of the slot is
+// race-free.
 class TxStaging {
    public:
     explicit TxStaging(std::size_t payload_size);
@@ -177,7 +195,12 @@ class TxStaging {
     std::size_t take_outputs(std::span<std::byte> out) noexcept;
 
    private:
-    static constexpr std::uint32_t kNone = 0xFFFFFFFFU;
+    static constexpr std::uint32_t kNone = 0xFFFFFFFFU;  // distinct 4th sentinel (slots are 0/1/2)
+    // Cap on the re-validate loop. This is a FRESHNESS bound, not a safety bound:
+    // copying a slightly-stale idx is still safe (reading_==idx is held), so the
+    // cap just stops a pathological concurrent stager from livelocking the RT
+    // thread.
+    static constexpr unsigned kMaxTakeSpins = 8;
 
     // Atomics first (the alignas(64) anchor) so the large slots_ array does not
     // wedge padding between fields.
@@ -185,6 +208,9 @@ class TxStaging {
     std::atomic<std::uint32_t> reading_{kNone};              // slot the RT reader is copying (hazard cell)
     std::size_t size_;
     std::array<std::array<std::byte, kMaxPdoBytes>, 3> slots_{};
+    // Debug-only single-writer tripwire (see TRIPWIRE above). [[maybe_unused]]
+    // because the guard compiles out under NDEBUG.
+    [[maybe_unused]] std::atomic<bool> staging_{false};
 };
 
 // ----------------------------------------------------------------------------
