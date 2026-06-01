@@ -96,7 +96,14 @@ class ServoController {
     void go_for(double rpm, double revs);     // PP: relative move; PV: timed run
     void go_to(double rpm, double position);  // PP only (rejects in PV)
     void halt() noexcept;
-    void set_zero() noexcept;
+    // Set the software zero so the CURRENT actual reads `offset_revs` (default 0).
+    // offset_revs != 0 reads config_ -> takes the shared lock; offset 0 is the
+    // common stop/zero case.
+    void set_zero(double offset_revs = 0.0) noexcept;
+    // Operator recovery / power control (surfaced via the module's do_command).
+    void request_fault_reset() noexcept;  // edge the CiA402 fault-reset + clear the controller-error latch
+    void enable() noexcept;               // re-enable from Disabled
+    void disable() noexcept;              // disable voltage (coast)
 
     // --- non-RT accessors (master_-FREE: ControllerState atomics + stopping_) ---
     double position_revs() const noexcept;

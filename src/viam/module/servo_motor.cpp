@@ -1,0 +1,369 @@
+#include "viam/module/servo_motor.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <optional>
+#include <stdexcept>
+#include <utility>
+
+#include <viam/sdk/common/proto_value.hpp>
+
+#include "ethercat/backend.hpp"
+#include "ethercat/cia402.hpp"
+#include "ethercat/errors.hpp"
+#include "ethercat/pdo_mapping.hpp"
+#include "ethercat/sim_backend.hpp"
+#include "viam/lib/servo_config.hpp"
+
+namespace ethercat::servo {
+
+namespace {
+
+// --- attribute helpers (numbers arrive as double; int is upcast by the SDK) ---
+
+const ProtoValue* find_attr(const ResourceConfig& cfg, const std::string& key) {
+    const auto& attrs = cfg.attributes();
+    const auto it = attrs.find(key);
+    return it == attrs.end() ? nullptr : &it->second;
+}
+
+template <class T>
+std::optional<T> opt_attr(const ResourceConfig& cfg, const std::string& key) {
+    const ProtoValue* const v = find_attr(cfg, key);
+    if (v == nullptr) {
+        return std::nullopt;
+    }
+    const T* const p = v->get<T>();
+    if (p == nullptr) {
+        throw ConfigError("config attribute '" + key + "' has the wrong type");
+    }
+    return *p;
+}
+
+double req_num(const ResourceConfig& cfg, const std::string& key) {
+    const auto v = opt_attr<double>(cfg, key);
+    if (!v) {
+        throw ConfigError("required config attribute '" + key + "' is missing");
+    }
+    return *v;
+}
+
+double opt_num(const ResourceConfig& cfg, const std::string& key, double dflt) {
+    return opt_attr<double>(cfg, key).value_or(dflt);
+}
+
+std::string req_str(const ResourceConfig& cfg, const std::string& key) {
+    const auto v = opt_attr<std::string>(cfg, key);
+    if (!v) {
+        throw ConfigError("required config attribute '" + key + "' is missing");
+    }
+    return *v;
+}
+
+// Read a numeric member out of a nested ProtoStruct (PDO map parsing).
+double struct_num(const ProtoStruct& obj, const std::string& key, const std::string& ctx) {
+    const auto it = obj.find(key);
+    if (it == obj.end()) {
+        throw ConfigError(ctx + ": missing '" + key + "'");
+    }
+    const double* const p = it->second.get<double>();
+    if (p == nullptr) {
+        throw ConfigError(ctx + ": '" + key + "' must be a number");
+    }
+    return *p;
+}
+
+double struct_num_or(const ProtoStruct& obj, const std::string& key, double dflt) {
+    const auto it = obj.find(key);
+    if (it == obj.end()) {
+        return dflt;
+    }
+    const double* const p = it->second.get<double>();
+    return p != nullptr ? *p : dflt;
+}
+
+// Parse one PDO map ({assign_index, pdos:[{index, entries:[{index,subindex,bit_length}]}]}).
+// The A6 (or any drive) map is CONFIG DATA -- never hardcoded here.
+PdoMap parse_pdo_map(const ProtoValue& val, const std::string& what) {
+    const ProtoStruct* const obj = val.get<ProtoStruct>();
+    if (obj == nullptr) {
+        throw ConfigError(what + " must be an object");
+    }
+    PdoMap map;
+    map.assign_index = static_cast<std::uint16_t>(struct_num(*obj, "assign_index", what));
+
+    const auto pdos_it = obj->find("pdos");
+    if (pdos_it == obj->end()) {
+        throw ConfigError(what + ": missing 'pdos' list");
+    }
+    const ProtoList* const pdos = pdos_it->second.get<ProtoList>();
+    if (pdos == nullptr) {
+        throw ConfigError(what + ": 'pdos' must be a list");
+    }
+    for (const ProtoValue& pv : *pdos) {
+        const ProtoStruct* const pobj = pv.get<ProtoStruct>();
+        if (pobj == nullptr) {
+            throw ConfigError(what + ": each pdo must be an object");
+        }
+        const auto pidx = static_cast<std::uint16_t>(struct_num(*pobj, "index", what + " pdo"));
+        map.pdo_indices.push_back(pidx);
+
+        const auto entries_it = pobj->find("entries");
+        if (entries_it == pobj->end()) {
+            throw ConfigError(what + " pdo: missing 'entries' list");
+        }
+        const ProtoList* const entries = entries_it->second.get<ProtoList>();
+        if (entries == nullptr) {
+            throw ConfigError(what + " pdo: 'entries' must be a list");
+        }
+        std::vector<PdoEntry> parsed;
+        parsed.reserve(entries->size());
+        for (const ProtoValue& ev : *entries) {
+            const ProtoStruct* const eobj = ev.get<ProtoStruct>();
+            if (eobj == nullptr) {
+                throw ConfigError(what + " entry: must be an object");
+            }
+            PdoEntry e;
+            e.index = static_cast<std::uint16_t>(struct_num(*eobj, "index", what + " entry"));
+            e.subindex = static_cast<std::uint8_t>(struct_num_or(*eobj, "subindex", 0.0));
+            e.bit_length = static_cast<std::uint8_t>(struct_num(*eobj, "bit_length", what + " entry"));
+            parsed.push_back(e);
+        }
+        map.entries[pidx] = std::move(parsed);
+    }
+    return map;
+}
+
+ServoConfig servo_config_from_viam(const ResourceConfig& cfg) {
+    ServoConfig c;
+    c.ifname = req_str(cfg, "interface");
+    c.slave_id = static_cast<std::uint16_t>(opt_num(cfg, "slave", 1.0));
+    c.mode = parse_control_mode(req_str(cfg, "control_mode"));
+
+    c.max_motor_speed_rpm = req_num(cfg, "max_rpm");
+    c.counts_per_rev = req_num(cfg, "counts_per_rev");
+    c.motor_rated_current_amps = req_num(cfg, "motor_rated_current_amps");
+    c.gear_ratio = opt_num(cfg, "gear_ratio", 1.0);
+    c.peak_current_limit_amps = opt_num(cfg, "peak_current_amps", 0.0);
+
+    c.position_tolerance_counts = static_cast<std::int32_t>(opt_num(cfg, "position_tolerance_counts", 0.0));
+    c.velocity_threshold = static_cast<std::int32_t>(opt_num(cfg, "velocity_threshold", 0.0));
+
+    c.target_loop_rate_hz = static_cast<std::uint32_t>(opt_num(cfg, "loop_rate_hz", 1000.0));
+    c.require_realtime = opt_attr<bool>(cfg, "require_realtime").value_or(true);
+    c.rt_priority = static_cast<int>(opt_num(cfg, "rt_priority", 80.0));
+
+    c.max_consecutive_wkc_errors = static_cast<int>(opt_num(cfg, "max_consecutive_wkc_errors", 5.0));
+    c.stall_threshold_cycles = static_cast<std::uint64_t>(opt_num(cfg, "stall_threshold_cycles", 10.0));
+    c.command_queue_capacity = static_cast<std::size_t>(opt_num(cfg, "command_queue_capacity", 64.0));
+    c.handshake_timeout_cycles = static_cast<std::uint32_t>(opt_num(cfg, "handshake_timeout_cycles", 100.0));
+    c.move_timeout_ms = static_cast<std::uint32_t>(opt_num(cfg, "move_timeout_ms", 0.0));
+
+    const ProtoValue* const rx = find_attr(cfg, "rxpdo");
+    const ProtoValue* const tx = find_attr(cfg, "txpdo");
+    if (rx == nullptr || tx == nullptr) {
+        throw ConfigError("both 'rxpdo' and 'txpdo' PDO maps are required (the drive's object map is config data)");
+    }
+    c.rxpdo = parse_pdo_map(*rx, "rxpdo");
+    c.txpdo = parse_pdo_map(*tx, "txpdo");
+
+    c.validate();  // throws ConfigError (clear text) on any invalid field
+    return c;
+}
+
+bool wants_simulation(const ResourceConfig& cfg, const ServoConfig& sc) {
+    if (opt_attr<bool>(cfg, "simulate").value_or(false)) {
+        return true;
+    }
+    return sc.ifname == "sim";
+}
+
+// Derive an in-memory SimSlaveModel from the configured PDO offsets, so the module
+// can load + run in a Viam robot config with no hardware (DoD: loads in sim).
+SimSlaveModel sim_model_from_config(const ServoConfig& sc) {
+    SimSlaveModel m;
+    m.mode = sc.mode == ControlMode::ProfileVelocity ? Cia402Mode::ProfileVelocity : Cia402Mode::ProfilePosition;
+
+    std::size_t off = 0;
+    for (const std::uint16_t pidx : sc.rxpdo.pdo_indices) {
+        for (const PdoEntry& e : sc.rxpdo.entries.at(pidx)) {
+            if (e.index == 0x6040) {
+                m.ctrlword_off = off;
+            } else if (e.index == 0x607A) {
+                m.target_off = off;
+            } else if (e.index == 0x60FF) {
+                m.velocity_off = static_cast<std::int32_t>(off);
+            }
+            off += e.bit_length / 8U;
+        }
+    }
+    m.output_bytes = off;
+
+    off = 0;
+    for (const std::uint16_t pidx : sc.txpdo.pdo_indices) {
+        for (const PdoEntry& e : sc.txpdo.entries.at(pidx)) {
+            if (e.index == 0x6041) {
+                m.statusword_off = off;
+            } else if (e.index == 0x6064) {
+                m.actual_off = off;
+            }
+            off += e.bit_length / 8U;
+        }
+    }
+    m.input_bytes = off;
+
+    // Counts advanced per cycle at max speed, so a simulated move actually converges.
+    const double per_cycle =
+        sc.counts_per_rev * std::abs(sc.gear_ratio) * (sc.max_motor_speed_rpm / 60.0) / static_cast<double>(sc.target_loop_rate_hz);
+    m.counts_per_step = std::max<std::int32_t>(1, static_cast<std::int32_t>(per_cycle));
+    return m;
+}
+
+ServoController::BackendFactory sim_factory_from_config(const ServoConfig& sc) {
+    const SimSlaveModel model = sim_model_from_config(sc);
+    return [model] { return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{model})); };
+}
+
+std::unique_ptr<ServoController> build_controller(const ResourceConfig& cfg) {
+    ServoConfig sc = servo_config_from_viam(cfg);
+    if (wants_simulation(cfg, sc)) {
+        return std::make_unique<ServoController>(std::move(sc), sim_factory_from_config(sc));
+    }
+    return std::make_unique<ServoController>(std::move(sc));  // SoemBackend (real hardware)
+}
+
+bool command_flag(const ProtoStruct& command, const char* key) {
+    const auto it = command.find(key);
+    if (it == command.end()) {
+        return false;
+    }
+    const bool* const b = it->second.get<bool>();
+    return b != nullptr && *b;
+}
+
+}  // namespace
+
+const ModelFamily& ServoMotor::model_family() {
+    static const auto family = ModelFamily{"viam", "ethercat"};
+    return family;
+}
+
+Model ServoMotor::model() {
+    return {model_family(), "servo"};
+}
+
+std::vector<std::shared_ptr<ModelRegistration>> ServoMotor::create_model_registrations() {
+    return {std::make_shared<ModelRegistration>(
+        API::get<Motor>(),
+        model(),
+        [](const auto& deps, const auto& cfg) { return std::make_shared<ServoMotor>(deps, cfg); },
+        [](const auto& cfg) { return ServoMotor::validate(cfg); })};
+}
+
+std::vector<std::string> ServoMotor::validate(const ResourceConfig& cfg) {
+    (void)servo_config_from_viam(cfg);  // throws ConfigError on any problem
+    return {};                          // a motor has no dependencies
+}
+
+ServoMotor::ServoMotor(const Dependencies& /*deps*/, const ResourceConfig& cfg) : Motor(cfg.name()), controller_(build_controller(cfg)) {
+    controller_->start();
+}
+
+ServoMotor::ServoMotor(std::string name, std::unique_ptr<ServoController> controller)
+    : Motor(std::move(name)), controller_(std::move(controller)) {
+    if (!controller_) {
+        throw ConfigError("ServoMotor: null controller");
+    }
+    controller_->start();
+}
+
+ServoMotor::~ServoMotor() {
+    if (controller_) {
+        controller_->stop();  // idempotent; joins the RT thread
+    }
+}
+
+void ServoMotor::reconfigure(const Dependencies& /*deps*/, const ResourceConfig& cfg) {
+    // Validate-before-mutate: parse + validate the new config (throws) BEFORE any
+    // teardown. The controller owns the stop->join->rebuild->restart lifecycle.
+    ServoConfig sc = servo_config_from_viam(cfg);
+    controller_->reconfigure(std::move(sc));
+}
+
+void ServoMotor::set_power(double /*power_pct*/, const ProtoStruct& /*extra*/) {
+    throw std::runtime_error(
+        "set_power is unsupported: this servo has no open-loop torque/power mode; use go_to/go_for (PP) or set_rpm (PV)");
+}
+
+void ServoMotor::set_rpm(double rpm, const ProtoStruct& /*extra*/) {
+    controller_->set_rpm(rpm);  // PV only; the controller throws a clear error in PP
+}
+
+void ServoMotor::go_for(double rpm, double revolutions, const ProtoStruct& /*extra*/) {
+    controller_->go_for(rpm, revolutions);  // PP relative move / PV timed run
+}
+
+void ServoMotor::go_to(double rpm, double position_revolutions, const ProtoStruct& /*extra*/) {
+    controller_->go_to(rpm, position_revolutions);  // PP only; the controller throws in PV / on stall / on timeout
+}
+
+void ServoMotor::reset_zero_position(double offset, const ProtoStruct& /*extra*/) {
+    controller_->set_zero(offset);  // make the current position read `offset` revs
+}
+
+Motor::position ServoMotor::get_position(const ProtoStruct& /*extra*/) {
+    return controller_->position_revs();
+}
+
+Motor::properties ServoMotor::get_properties(const ProtoStruct& /*extra*/) {
+    return properties{/*position_reporting=*/true};
+}
+
+Motor::power_status ServoMotor::get_power_status(const ProtoStruct& /*extra*/) {
+    const bool on = controller_->is_powered();
+    return power_status{/*is_on=*/on, /*power_pct=*/on ? 1.0 : 0.0};  // no torque feedback in MVP -> 1.0/0.0
+}
+
+bool ServoMotor::is_moving() {
+    return controller_->is_moving();  // fail-safe: stale/disconnected -> false
+}
+
+void ServoMotor::stop(const ProtoStruct& /*extra*/) {
+    controller_->halt();  // Stop == Halt (sticky); the drive stays enabled
+}
+
+ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
+    ProtoStruct result;
+    if (command_flag(command, "fault_reset")) {
+        controller_->request_fault_reset();
+        result.emplace("fault_reset", ProtoValue(true));
+    }
+    if (command_flag(command, "enable")) {
+        controller_->enable();
+        result.emplace("enable", ProtoValue(true));
+    }
+    if (command_flag(command, "disable")) {
+        controller_->disable();
+        result.emplace("disable", ProtoValue(true));
+    }
+    if (command_flag(command, "status")) {
+        ProtoStruct status;
+        status.emplace("is_powered", ProtoValue(controller_->is_powered()));
+        status.emplace("is_moving", ProtoValue(controller_->is_moving()));
+        status.emplace("position", ProtoValue(controller_->position_revs()));
+        status.emplace("is_disconnected", ProtoValue(controller_->is_disconnected()));
+        status.emplace("last_error", ProtoValue(controller_->last_error()));
+        result.emplace("status", ProtoValue(std::move(status)));
+    }
+    if (result.empty()) {
+        throw std::runtime_error("unknown do_command; supported keys: fault_reset, enable, disable, status (each a bool)");
+    }
+    return result;
+}
+
+std::vector<GeometryConfig> ServoMotor::get_geometries(const ProtoStruct& /*extra*/) {
+    return {};  // a bare motor has no geometry
+}
+
+}  // namespace ethercat::servo

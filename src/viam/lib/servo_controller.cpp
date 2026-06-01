@@ -589,9 +589,33 @@ void ServoController::halt() noexcept {
     (void)commands_.push(Command{Halt{}});
 }
 
-void ServoController::set_zero() noexcept {
-    // Pure state_ atomics (master_-free, config_-free) -> no lifecycle lock needed.
-    state_.zero_offset_counts.store(state_.position_counts.load(std::memory_order_acquire), std::memory_order_release);
+void ServoController::request_fault_reset() noexcept {
+    const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    (void)commands_.push(Command{FaultReset{}});
+}
+
+void ServoController::enable() noexcept {
+    const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    (void)commands_.push(Command{Enable{}});
+}
+
+void ServoController::disable() noexcept {
+    const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    (void)commands_.push(Command{Disable{}});
+}
+
+void ServoController::set_zero(double offset_revs) noexcept {
+    const std::int32_t cur = state_.position_counts.load(std::memory_order_acquire);
+    if (offset_revs == 0.0) {
+        // Common case: make the current actual read 0. Pure atomics, no lock.
+        state_.zero_offset_counts.store(cur, std::memory_order_release);
+        return;
+    }
+    // Make the current actual read offset_revs: zero = current - offset_in_counts.
+    // Reads config_ conversion params -> shared lock (vs reconfigure's swap).
+    const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    const std::int32_t offset_counts = revs_to_counts(offset_revs, config_.counts_per_rev, config_.gear_ratio);
+    state_.zero_offset_counts.store(static_cast<std::int32_t>(cur - offset_counts), std::memory_order_release);
 }
 
 double ServoController::position_revs() const noexcept {

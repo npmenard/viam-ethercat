@@ -1,0 +1,61 @@
+{
+  "_comment": [
+    "Example Viam component config for the viam:ethercat:servo motor model.",
+    "The drive's object dictionary (PDO map, counts/rev, gear) is CONFIG DATA --",
+    "this file is the A6-EC profile; the module code stays generic. Index/subindex",
+    "are decimal (JSON has no hex): 0x6040=24640 (controlword), 0x607A=24698",
+    "(target position), 0x60FF=24831 (target velocity), 0x6041=24641 (statusword),",
+    "0x6064=24676 (actual position); RxPDO 0x1600=5632 on SM 0x1C12=7186, TxPDO",
+    "0x1A00=6656 on SM 0x1C13=7187. Set \"simulate\": true (or interface \"sim\") to",
+    "run against the in-memory SimBackend with no NIC/hardware."
+  ],
+  "name": "servo",
+  "api": "rdk:component:motor",
+  "model": "viam:ethercat:servo",
+  "attributes": {
+    "interface": "eth0",
+    "simulate": true,
+    "slave": 1,
+    "control_mode": "PP",
+    "max_rpm": 3000.0,
+    "counts_per_rev": 131072.0,
+    "gear_ratio": 1.0,
+    "motor_rated_current_amps": 2.5,
+    "peak_current_amps": 7.5,
+    "loop_rate_hz": 1000,
+    "require_realtime": false,
+    "rt_priority": 80,
+    "position_tolerance_counts": 200,
+    "velocity_threshold": 50000,
+    "move_timeout_ms": 10000,
+    "handshake_timeout_cycles": 1000,
+    "stall_threshold_cycles": 2000,
+    "command_queue_capacity": 64,
+    "max_consecutive_wkc_errors": 5,
+    "rxpdo": {
+      "assign_index": 7186,
+      "pdos": [
+        {
+          "index": 5632,
+          "entries": [
+            { "index": 24640, "subindex": 0, "bit_length": 16 },
+            { "index": 24698, "subindex": 0, "bit_length": 32 },
+            { "index": 24831, "subindex": 0, "bit_length": 32 }
+          ]
+        }
+      ]
+    },
+    "txpdo": {
+      "assign_index": 7187,
+      "pdos": [
+        {
+          "index": 6656,
+          "entries": [
+            { "index": 24641, "subindex": 0, "bit_length": 16 },
+            { "index": 24676, "subindex": 0, "bit_length": 32 }
+          ]
+        }
+      ]
+    }
+  }
+}

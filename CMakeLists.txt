@@ -227,6 +227,7 @@ if (ETHERCAT_BUILD_MODULE)
   target_sources(ethercat-servo
     PRIVATE
       src/viam/module/main.cpp
+      src/viam/module/servo_motor.cpp
   )
 
   # Tell boost::dll to use std::filesystem rather than boost::filesystem.
@@ -248,6 +249,23 @@ if (ETHERCAT_BUILD_MODULE)
     TARGETS
       ethercat-servo
   )
+
+  # Module smoke test: drives a ServoMotor over a SimBackend-backed controller.
+  # Lives here (not viam_add_test) because it needs the Viam SDK link.
+  add_executable(servo_motor_test
+    tests/servo_motor_test.cpp
+    src/viam/module/servo_motor.cpp
+  )
+  target_link_libraries(servo_motor_test
+    PRIVATE
+      ethercat
+      viam-cpp-sdk::viamapi
+      viam-cpp-sdk::viamsdk
+  )
+  target_compile_definitions(servo_motor_test PRIVATE BOOST_DLL_USE_STD_FS)
+  target_include_directories(servo_motor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  viam_apply_wall_werror(servo_motor_test)
+  add_test(NAME servo_motor_test COMMAND servo_motor_test)
 endif()
 
 
