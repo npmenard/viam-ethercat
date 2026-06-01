@@ -26,17 +26,19 @@ std::int32_t revs_to_counts(double revs, double counts_per_rev, double gear_rati
     return clamp_to_i32(revs * counts_per_rev * gear_ratio);
 }
 
-double counts_to_revs(double counts, double counts_per_rev, double gear_ratio) noexcept {
+double counts_to_revs(std::int32_t counts, double counts_per_rev, double gear_ratio) noexcept {
     const double denom = counts_per_rev * gear_ratio;
-    return denom != 0.0 ? counts / denom : 0.0;
+    return denom != 0.0 ? static_cast<double>(counts) / denom : 0.0;
 }
 
-std::int32_t rpm_to_device_velocity(double rpm, double velocity_scale) noexcept {
-    return clamp_to_i32(rpm * velocity_scale);
+std::int32_t rpm_to_device_velocity(double rpm, double counts_per_rev, double gear_ratio) noexcept {
+    // rpm -> rev/s (/60) -> counts/s (* counts_per_rev * gear_ratio).
+    return clamp_to_i32(rpm / 60.0 * counts_per_rev * gear_ratio);
 }
 
-double device_velocity_to_rpm(double device_velocity, double velocity_scale) noexcept {
-    return velocity_scale != 0.0 ? device_velocity / velocity_scale : 0.0;
+double device_velocity_to_rpm(std::int32_t dev, double counts_per_rev, double gear_ratio) noexcept {
+    const double denom = counts_per_rev * gear_ratio;
+    return denom != 0.0 ? static_cast<double>(dev) / denom * 60.0 : 0.0;
 }
 
 double clamp_rpm(double rpm, double max_rpm) noexcept {
