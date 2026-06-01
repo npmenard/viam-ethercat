@@ -108,6 +108,15 @@ std::size_t SimBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::
 void SimBackend::map_process_data() {
     expected_wkc_ = 0;
     for (auto& s : slaves_) {
+        // Validate model offsets fit the image sizes at SETUP time. step_device()
+        // is noexcept and uses subspan(), so a bad offset there would throw and
+        // std::terminate -- fail loudly here instead.
+        const SimSlaveModel& m = s.model;
+        if (m.ctrlword_off + 2 > m.output_bytes || (m.target_off + 4 > m.output_bytes && m.mode == Cia402Mode::ProfilePosition) ||
+            m.statusword_off + 2 > m.input_bytes || m.actual_off + 4 > m.input_bytes) {
+            throw ConfigError("SimSlaveModel offsets exceed the image sizes (out=" + std::to_string(m.output_bytes) +
+                              ", in=" + std::to_string(m.input_bytes) + ")");
+        }
         s.output_image.assign(s.model.output_bytes, std::byte{0});
         s.input_image.assign(s.model.input_bytes, std::byte{0});
         // Each slave with both a command and feedback image contributes 3 to the
@@ -132,6 +141,8 @@ void SimBackend::request_state(std::uint16_t slave, EcatState target) {
 
 EcatState SimBackend::slave_state(std::uint16_t slave) const {
     if (slave == 0) {
+        // Relies on EcatState being ordered least->most progressed
+        // (None<Init<PreOp<SafeOp<Op)); do not reorder the enum.
         EcatState worst = EcatState::Op;
         for (const auto& s : slaves_) {
             worst = std::min(worst, s.state);
@@ -216,6 +227,9 @@ void SimBackend::step_device(Slave& s) noexcept {
             }
             break;
         case St::FaultReactionActive:
+            // The sim doesn't model the transient fault-reaction state
+            // (inject_fault jumps straight to Fault); kept for completeness. The
+            // master's Cia402Fsm::step handles it either way.
             s.device_state = St::Fault;
             break;
         case St::Fault:
