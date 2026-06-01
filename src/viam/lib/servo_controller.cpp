@@ -501,25 +501,11 @@ void ServoController::set_rpm(double rpm) {
     (void)commands_.push(Command{SetVelocity{dev}});
 }
 
-void ServoController::go_to(double rpm, double position) {
-    std::uint32_t g = 0;
-    std::chrono::milliseconds move_timeout{0};
-    {
-        const std::shared_lock<std::shared_mutex> lk(api_mutex_);
-        if (config_.mode != ControlMode::ProfilePosition) {
-            throw ConfigError("go_to requires Profile Position (PP) mode; this servo is configured PV -- use set_rpm");
-        }
-        const std::int32_t counts = revs_to_counts(position, config_.counts_per_rev, config_.gear_ratio);
-        const double clamped_rpm = clamp_rpm(rpm, config_.max_motor_speed_rpm);
-        const std::int32_t prof = rpm_to_device_velocity(clamped_rpm, config_.counts_per_rev, config_.gear_ratio);
-        g = next_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
-        move_timeout = config_.move_timeout_ms != 0 ? std::chrono::milliseconds(config_.move_timeout_ms) : std::chrono::milliseconds(30000);
-        (void)commands_.push(Command{SetTarget{counts, static_cast<std::uint32_t>(std::abs(prof)), false, g}});
-    }  // release the shared lock BEFORE parking (so reconfigure isn't blocked for the whole move)
-
+void ServoController::await_move(std::uint32_t generation, std::chrono::milliseconds timeout) {
+    const std::uint32_t g = generation;
     // Bounded wait_for re-check loop (lost-wakeup-immune; RT never locks the CV).
     // Predicate is master_-FREE (state_ atomics + stopping_ + watchdog).
-    const auto deadline = std::chrono::steady_clock::now() + move_timeout;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     constexpr auto slice = std::chrono::milliseconds(2);
     std::unique_lock<std::mutex> lk(completion_mutex_);
     auto done = [&] {
@@ -538,30 +524,61 @@ void ServoController::go_to(double rpm, double position) {
     // faulted, so check it BEFORE the generic drive-fault branch; last_error()
     // carries the precise reason enum; then a real drive/bus fault; then success).
     if (stopping_.load(std::memory_order_acquire) || watchdog_expired()) {
-        throw BusError("go_to: controller stopped / RT loop not alive");
+        throw BusError("move: controller stopped / RT loop not alive");
     }
     if (state_.failed_generation.load(std::memory_order_acquire) >= g && state_.completed_generation.load(std::memory_order_acquire) < g) {
-        throw BusError("go_to: move aborted (" + last_error() + ")");
+        throw BusError("move aborted (" + last_error() + ")");
     }
     if (state_.faulted.load(std::memory_order_acquire)) {
-        throw BusError("go_to: drive faulted during the move");
+        throw BusError("move: drive faulted during the move");
     }
     if (state_.completed_generation.load(std::memory_order_acquire) >= g || state_.active_generation.load(std::memory_order_acquire) > g) {
         return;  // completed (or superseded by a newer move -- benign)
     }
-    throw BusError("go_to: move timed out");
+    throw BusError("move timed out");
+}
+
+void ServoController::go_to(double rpm, double position) {
+    std::uint32_t g = 0;
+    std::chrono::milliseconds move_timeout{0};
+    {
+        const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+        if (config_.mode != ControlMode::ProfilePosition) {
+            throw ConfigError("go_to requires Profile Position (PP) mode; this servo is configured PV -- use set_rpm");
+        }
+        // ABSOLUTE target in the ZEROED frame: add zero_offset_counts to map the
+        // user's zeroed position to the raw encoder frame, so go_to(X) lands where
+        // position_revs()==X after reset_zero (get_position is zeroed too).
+        const std::int32_t counts = static_cast<std::int32_t>(revs_to_counts(position, config_.counts_per_rev, config_.gear_ratio) +
+                                                              state_.zero_offset_counts.load(std::memory_order_acquire));
+        const double clamped_rpm = clamp_rpm(rpm, config_.max_motor_speed_rpm);
+        const std::int32_t prof = rpm_to_device_velocity(clamped_rpm, config_.counts_per_rev, config_.gear_ratio);
+        g = next_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+        move_timeout = config_.move_timeout_ms != 0 ? std::chrono::milliseconds(config_.move_timeout_ms) : std::chrono::milliseconds(30000);
+        (void)commands_.push(Command{SetTarget{counts, static_cast<std::uint32_t>(std::abs(prof)), false, g}});
+    }  // release the shared lock BEFORE parking (so reconfigure isn't blocked for the whole move)
+
+    await_move(g, move_timeout);
 }
 
 void ServoController::go_for(double rpm, double revs) {
     if (config_.mode == ControlMode::ProfilePosition) {
-        double rev_pos = 0.0;
+        std::uint32_t g = 0;
+        std::chrono::milliseconds move_timeout{0};
         {
             const std::shared_lock<std::shared_mutex> lk(api_mutex_);
-            const std::int32_t cur = state_.position_counts.load(std::memory_order_acquire);
+            // RELATIVE move (frame-agnostic): push SetTarget{relative=true} so the FSM
+            // computes target = actual + delta. Do NOT route through go_to -- go_to now
+            // adds zero_offset (absolute frame), which would double-shift a relative move.
             const std::int32_t delta = revs_to_counts(revs, config_.counts_per_rev, config_.gear_ratio);
-            rev_pos = counts_to_revs(static_cast<std::int32_t>(cur + delta), config_.counts_per_rev, config_.gear_ratio);
-        }  // release before delegating (shared_mutex is not recursive)
-        go_to(rpm, rev_pos);
+            const double clamped_rpm = clamp_rpm(rpm, config_.max_motor_speed_rpm);
+            const std::int32_t prof = rpm_to_device_velocity(clamped_rpm, config_.counts_per_rev, config_.gear_ratio);
+            g = next_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+            move_timeout =
+                config_.move_timeout_ms != 0 ? std::chrono::milliseconds(config_.move_timeout_ms) : std::chrono::milliseconds(30000);
+            (void)commands_.push(Command{SetTarget{delta, static_cast<std::uint32_t>(std::abs(prof)), true, g}});
+        }
+        await_move(g, move_timeout);
         return;
     }
     // PV: run at rpm for the time to cover `revs`, then halt.

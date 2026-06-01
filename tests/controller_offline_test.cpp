@@ -150,6 +150,35 @@ TEST("ServoController: reset_zero offsets the reported position") {
     CHECK(std::abs(ctrl.position_revs()) < 0.01);  // now reads ~0 at the current actual
 }
 
+TEST("ServoController(PP): go_to is absolute in the ZEROED frame after reset_zero") {
+    // Frame contract: get_position()/position_revs() report the zeroed frame, so
+    // go_to must too -- go_to(X) after reset_zero must land at position_revs()==X.
+    // (Regression: go_to used to target the raw frame, ignoring zero_offset.)
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, nullptr)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    ctrl.go_to(1000.0, 3.0);  // move to a NONZERO raw position
+    ctrl.set_zero();          // zero HERE -> position_revs()==0 at raw 3 revs
+    CHECK(std::abs(ctrl.position_revs()) < 0.01);
+
+    ctrl.go_to(1000.0, 1.0);  // absolute +1 rev in the zeroed frame
+    CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);  // lands at zeroed 1.0 (raw 4 revs)
+}
+
+TEST("ServoController(PP): go_for stays relative regardless of the zero") {
+    // go_for is a RELATIVE move -- frame-agnostic. Guards against go_for routing
+    // through the (now zero-offset-aware) go_to and double-shifting.
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, nullptr)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    ctrl.go_to(1000.0, 2.0);  // raw 2 revs
+    ctrl.set_zero();          // zeroed 0 at raw 2 revs
+    ctrl.go_for(1000.0, 1.0);  // relative +1 rev
+    CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);  // 0 + 1 = 1 (NOT double-shifted to 3)
+}
+
 TEST("ServoController: after stop() the fail-safe reports not-powered/disconnected") {
     ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, nullptr)};
     ctrl.start();

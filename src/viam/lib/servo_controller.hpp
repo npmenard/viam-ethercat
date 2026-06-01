@@ -27,6 +27,7 @@
 //    block reconfigure.
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -50,14 +51,14 @@ namespace ethercat::servo {
 // loop is the SOLE writer. The non-RT side derives all of is_powered/is_moving/
 // position/completion from THESE -- never from master_.
 struct ControllerState {
-    std::atomic<std::int32_t> position_counts{0};        // 0x6064 actual, before zero-offset
-    std::atomic<std::int32_t> velocity{0};               // device velocity units
-    std::atomic<bool> powered{false};                    // OperationEnabled this cycle
-    std::atomic<bool> moving{false};                     // !move-complete
-    std::atomic<bool> faulted{false};                    // master_->fault() || status.fault() || rt_error_!=None (RT-side master_ deref)
-    std::atomic<std::int32_t> fault_wkc{0};              // WKC at a live bus fault (payload; published by rt_error_ release)
-    std::atomic<std::int32_t> expected_wkc{0};           // constant after start(); for last_error() (lock-free, master_-free)
-    std::atomic<std::uint64_t> loop_cycle{0};            // heartbeat counter
+    std::atomic<std::int32_t> position_counts{0};  // 0x6064 actual, before zero-offset
+    std::atomic<std::int32_t> velocity{0};         // device velocity units
+    std::atomic<bool> powered{false};              // OperationEnabled this cycle
+    std::atomic<bool> moving{false};               // !move-complete
+    std::atomic<bool> faulted{false};              // DRIVE/BUS only: master_->fault() || status.fault() (move-errors are Tier-2, NOT here)
+    std::atomic<std::int32_t> fault_wkc{0};        // WKC at a live bus fault (payload; published by rt_error_ release)
+    std::atomic<std::int32_t> expected_wkc{0};     // constant after start(); for last_error() (lock-free, master_-free)
+    std::atomic<std::uint64_t> loop_cycle{0};      // heartbeat counter
     std::atomic<std::uint64_t> last_cycle_time_ns{0};    // CLOCK_MONOTONIC ns at last iteration (watchdog; 0 = never published)
     std::atomic<std::int32_t> zero_offset_counts{0};     // SetZero software offset
     std::atomic<std::uint32_t> active_generation{0};     // gen RT adopted from the applied SetTarget (post-coalescing)
@@ -192,6 +193,10 @@ class ServoController {
     // for last_error) AND failed_generation+notify (to wake the go_to waiter
     // PROMPTLY). The invariant: every FSM path that fails the active move calls this.
     void abort_active_move(RtError reason) noexcept;
+    // Park on generation `g`'s completion (bounded wait_for, lost-wakeup-immune)
+    // then classify the wake and THROW on stop/abort/fault/timeout. Shared by
+    // go_to (absolute) and go_for (relative) so both get identical semantics.
+    void await_move(std::uint32_t generation, std::chrono::milliseconds timeout);
 
     // commands_ BY VALUE -> never reset until dtor (no stop-time push-vs-destroy
     // UAF). master_ unique_ptr -> rebuilt by reconfigure() AFTER join (RT thread

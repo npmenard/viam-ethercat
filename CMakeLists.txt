@@ -46,6 +46,11 @@ function(viam_apply_wall_werror target_name)
       -Wdouble-promotion
       -Wnull-dereference
       -Wunused
+      # The Viam SDK's logging header pulls boost::log -> boost::mpl, whose
+      # integral_wrapper trips clang's -Wenum-constexpr-conversion. Suppress it
+      # (it's third-party + a known boost-mpl issue; gcc ignores the unknown flag).
+      # TODO: drop after the boost upgrade (boostorg/mpl#69).
+      -Wno-enum-constexpr-conversion
     )
   elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     target_compile_options(${target_name} PRIVATE /W4 /WX)
