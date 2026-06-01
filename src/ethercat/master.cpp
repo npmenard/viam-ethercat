@@ -80,6 +80,21 @@ void Master::configure() {
     slaves_.clear();
     for (const SlaveConfig& sc : config_.slaves) {
         const SlaveInfo info = backend_->slave_info(sc.slave_id);
+
+        // Validate the APPLIED (wire) image against the CONFIGURED map. If a real
+        // drive silently rejected part of the remap, map_process_data lays out the
+        // drive's default image while the field table (built from config below)
+        // carries offsets for the expected map -- a store_le into outputs at a
+        // config-derived offset could then run past the wire-sized span (OOB in
+        // the noexcept RT loop). Fail loudly here instead.
+        const std::size_t rx_bytes = sc.rxpdo.byte_size();
+        const std::size_t tx_bytes = sc.txpdo.byte_size();
+        if (info.output_bytes != rx_bytes || info.input_bytes != tx_bytes) {
+            throw PdoMappingError("slave " + std::to_string(sc.slave_id) + ": applied RxPDO " + std::to_string(info.output_bytes) +
+                                  " B / TxPDO " + std::to_string(info.input_bytes) + " B != configured " + std::to_string(rx_bytes) +
+                                  " / " + std::to_string(tx_bytes) + " B (remap did not take)");
+        }
+
         // PdoCache(rx = FEEDBACK size (TxPDO/inputs), tx = COMMAND size (RxPDO/outputs)).
         slaves_.emplace_back(sc.slave_id, info.input_bytes, info.output_bytes);
         SlaveRuntime& rt = slaves_.back();

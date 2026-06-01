@@ -99,7 +99,7 @@ TEST("Master+SimBackend: full RT loop reaches OperationEnabled, WKC + bit10 hold
     for (int cycle = 0; cycle < 50; ++cycle) {
         const PdoSnapshot snap = master.read_inputs(1);
         const Status st = status_of(snap);
-        if (snap.cycle > 0) {
+        if (snap.is_live()) {
             CHECK(st.target_reached());  // A6 bit10 held =1 on every real published frame
         }
         write_ctrl(master, Cia402Fsm{}.step(st, Cia402State::OperationEnabled));

@@ -8,7 +8,8 @@
 //                      slot-claim bookkeeping. TSan-clean because every shared
 //                      byte/word is touched through std::atomic_ref.
 //   2. CommandQueue -- non-RT enqueues commands; RT drains + coalesces them.
-//                      boost::lockfree::queue (MPMC), fixed capacity, pimpl'd.
+//                      boost::lockfree::spsc_queue + producer-mutex (MPSC),
+//                      fixed capacity, pimpl'd.
 //   3. TxStaging    -- non-RT stages an output image; RT takes it. LOCK-FREE
 //                      3-slot announce/re-validate handoff (no RT mutex). This
 //                      is the advanced/raw path -- the common path has the RT
@@ -47,10 +48,18 @@ struct PdoSnapshot {
     std::uint16_t working_counter = 0;  // EtherCAT WKC at publish time
     std::uint64_t cycle = 0;            // RT cycle counter at publish time
     bool valid = false;                 // this read succeeded (was not retry-exhausted)
-    bool stale = false;                 // == !valid: the read retry-exhausted. NOTE: the
-                                        // cross-cycle "RT loop is dead" staleness that drives
-                                        // is_powered()/is_moving()=false is computed by
-                                        // ServoController (Phase 5), not here.
+    // == !valid: the read retry-exhausted. The cross-cycle "RT loop is dead"
+    // staleness that drives is_powered()/is_moving()=false is computed by
+    // ServoController (Phase 5), not here.
+    bool stale = false;
+
+    // A real frame has been published at least once. `cycle == 0` is the
+    // pre-publish stable-all-zero frame (which still reads valid=true, since
+    // `valid` means "clean read", not "has data"). Consumers should treat a
+    // non-live snapshot as the fail-safe bucket (is_powered/is_moving = false).
+    bool is_live() const noexcept {
+        return cycle > 0;
+    }
 };
 
 // Single-writer (RT) / multi-reader (non-RT) seqlock.
