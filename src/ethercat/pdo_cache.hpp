@@ -141,9 +141,15 @@ struct CommandBatch {
 // lock-free and NEVER takes the mutex -> zero priority inversion. Move-only;
 // boost is hidden behind the pimpl.
 //
-// THREADING CONTRACT: push() is non-RT (gRPC handlers) and takes the mutex;
-// drain() is the RT consumer and is lock-free. The RT thread must never call
-// push().
+// THREADING CONTRACT (load-bearing for the SPSC correctness):
+//  - push() is non-RT (gRPC handlers) and holds the producer mutex across its
+//    ENTIRE body, so two producers never interleave inside the single-producer
+//    ring. The RT thread must NEVER call push().
+//  - drain() has EXACTLY ONE caller, ever: the single RT consumer. spsc_queue
+//    permits only one popper. No non-RT path may drain/pop concurrently with the
+//    RT consumer -- any queue drain on reconfigure/shutdown must happen only
+//    AFTER the RT thread is joined (or be performed by the RT thread itself). A
+//    stray non-RT drain silently violates the SPSC contract.
 class CommandQueue {
    public:
     explicit CommandQueue(std::size_t capacity);

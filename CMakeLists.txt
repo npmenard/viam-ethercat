@@ -159,6 +159,8 @@ target_sources(ethercat
     src/ethercat/version.cpp
     src/ethercat/cia402.cpp
     src/ethercat/pdo_cache.cpp
+    src/ethercat/backend.cpp
+    src/ethercat/sim_backend.cpp
 )
 
 target_include_directories(ethercat
@@ -260,6 +262,7 @@ endfunction()
 viam_add_test(pdo_buffer_test tests/pdo_buffer_test.cpp)
 viam_add_test(cia402_test tests/cia402_test.cpp)
 viam_add_test(pdo_cache_test tests/pdo_cache_test.cpp)
+viam_add_test(sim_backend_test tests/sim_backend_test.cpp)
 
 # ThreadSanitizer build of the RT-boundary test. Compiles the pdo_cache TU
 # directly (with -fsanitize=thread) so the seqlock / lock-free handoff code is
