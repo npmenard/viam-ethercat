@@ -71,8 +71,11 @@ class SimBackend final : public EcatBackend {
     // Force the next send_receive() to report a short WKC (one cycle), to test
     // the master's WKC-fault latch.
     void force_short_wkc_once() noexcept;
-    // Read back a recorded SDO value (for asserting the configure() remap order).
+    // Read back a recorded SDO value (latest write to that object).
     std::vector<std::byte> recorded_sdo(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const;
+    // Ordered log of SDO write keys ((index<<8)|sub) for asserting the remap
+    // sub-protocol ordering (configure() test).
+    std::vector<std::uint32_t> sdo_log(std::uint16_t slave) const;
 
    private:
     struct Slave {

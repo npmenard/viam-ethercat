@@ -323,4 +323,11 @@ std::vector<std::byte> SimBackend::recorded_sdo(std::uint16_t slave, std::uint16
     return it == dict.end() ? std::vector<std::byte>{} : it->second;
 }
 
+std::vector<std::uint32_t> SimBackend::sdo_log(std::uint16_t slave) const {
+    if (slave < 1 || slave > slaves_.size()) {
+        return {};
+    }
+    return slaves_[slave - 1].sdo_write_order;
+}
+
 }  // namespace ethercat
