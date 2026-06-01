@@ -122,6 +122,30 @@ TEST("writing past the end throws PdoAccessError") {
     CHECK_THROWS(w.write<std::uint8_t>(0), PdoAccessError);  // full
 }
 
+TEST("load_le/store_le free functions round-trip and stay little-endian") {
+    Buf<4> b{};
+    ethercat::store_le<std::uint32_t>(b, 0x0A0B0C0D);
+    CHECK_EQ(std::to_integer<int>(b[0]), 0x0D);  // LSB first
+    CHECK_EQ(std::to_integer<int>(b[1]), 0x0C);
+    CHECK_EQ(std::to_integer<int>(b[2]), 0x0B);
+    CHECK_EQ(std::to_integer<int>(b[3]), 0x0A);
+    CHECK_EQ(ethercat::load_le<std::uint32_t>(b), std::uint32_t{0x0A0B0C0D});
+
+    Buf<8> d{};
+    ethercat::store_le<double>(d, -987.625);
+    CHECK_EQ(ethercat::load_le<double>(d), -987.625);
+
+    Buf<2> s{};
+    ethercat::store_le<std::int16_t>(s, std::int16_t{-2});
+    CHECK_EQ(ethercat::load_le<std::int16_t>(s), std::int16_t{-2});
+
+    // The throwing cursor and the free helpers must agree byte-for-byte.
+    Buf<4> viaCursor{};
+    PdoWriter w{viaCursor};
+    w.write<std::int32_t>(-2000000000);
+    CHECK_EQ(ethercat::load_le<std::int32_t>(viaCursor), std::int32_t{-2000000000});
+}
+
 TEST("skip and seek past the end throw PdoAccessError") {
     Buf<4> buf{};
     PdoReader r{buf};

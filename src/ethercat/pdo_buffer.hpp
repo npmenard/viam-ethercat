@@ -48,6 +48,36 @@ using uint_of_t = typename uint_of<N>::type;
 
 }  // namespace detail
 
+// ---------------------------------------------------------------------------
+// RT hot-path little-endian helpers (free functions, noexcept, NO bounds check)
+// ---------------------------------------------------------------------------
+// The RT loop calls these on pre-resolved {offset,width} field spans (Phase 4
+// builds that flat table at configure()), so they must not throw and must not
+// bounds-check. PRECONDITION: field.size() == sizeof(T). The throwing
+// PdoReader/PdoWriter cursors below bounds-check and then delegate here, so
+// there is exactly one little-endian implementation.
+
+template <PdoScalar T>
+T load_le(std::span<const std::byte> field) noexcept {
+    using U = detail::uint_of_t<sizeof(T)>;
+    U raw = 0;
+    for (std::size_t i = 0; i < sizeof(T); ++i) {
+        const auto octet = std::to_integer<std::uint8_t>(field[i]);
+        raw = static_cast<U>(raw | static_cast<U>(static_cast<U>(octet) << (8 * i)));
+    }
+    return std::bit_cast<T>(raw);
+}
+
+template <PdoScalar T>
+void store_le(std::span<std::byte> field, T value) noexcept {
+    using U = detail::uint_of_t<sizeof(T)>;
+    const U raw = std::bit_cast<U>(value);
+    for (std::size_t i = 0; i < sizeof(T); ++i) {
+        const U octet = static_cast<U>((raw >> (8 * i)) & static_cast<U>(0xFF));
+        field[i] = static_cast<std::byte>(static_cast<std::uint8_t>(octet));
+    }
+}
+
 // Cursor over a read-only PDO byte span. All multi-byte scalars are decoded as
 // explicit little-endian (EtherCAT wire order), independent of host endianness.
 // Any access that would read past the end throws PdoAccessError naming the
@@ -68,13 +98,7 @@ class PdoReader {
     template <PdoScalar T>
     T peek() const {
         require(sizeof(T));
-        using U = detail::uint_of_t<sizeof(T)>;
-        U raw = 0;
-        for (std::size_t i = 0; i < sizeof(T); ++i) {
-            const auto octet = std::to_integer<std::uint8_t>(data_[pos_ + i]);
-            raw = static_cast<U>(raw | static_cast<U>(static_cast<U>(octet) << (8 * i)));
-        }
-        return std::bit_cast<T>(raw);
+        return load_le<T>(data_.subspan(pos_, sizeof(T)));
     }
 
     // Advance the cursor by n bytes (must stay within bounds).
@@ -124,12 +148,7 @@ class PdoWriter {
     template <PdoScalar T>
     void write(T value) {
         require(sizeof(T));
-        using U = detail::uint_of_t<sizeof(T)>;
-        const U raw = std::bit_cast<U>(value);
-        for (std::size_t i = 0; i < sizeof(T); ++i) {
-            const U octet = static_cast<U>((raw >> (8 * i)) & static_cast<U>(0xFF));
-            data_[pos_ + i] = static_cast<std::byte>(static_cast<std::uint8_t>(octet));
-        }
+        store_le<T>(data_.subspan(pos_, sizeof(T)), value);
         pos_ += sizeof(T);
     }
 
