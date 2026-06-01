@@ -1,10 +1,5 @@
 #pragma once
 
-// ============================================================================
-// DRAFT skeleton (converged after architect + devils-advocate review rounds).
-// The RT-loop body + lifecycle FSM step()s live in the .cpp and get the joint
-// line-by-line before finalizing. Not yet wired into CMake.
-// ============================================================================
 //
 // ServoController owns the real-time loop for ONE servo. SDK-free (src/viam/lib)
 // so it is unit-testable on a SimBackend with no Viam SDK and no hardware. It
