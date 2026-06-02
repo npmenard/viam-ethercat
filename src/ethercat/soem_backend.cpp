@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <iostream>
 #include <string>
 
 #include <soem/ethercat.h>
@@ -276,6 +277,10 @@ void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns) {
         }
         // SYNC0 on, `cycle_ns` period, 0 shift. SOEM writes ESC 0x0981/0x0990/...
         ecx_dcsync0(&impl_->ctx, static_cast<std::uint16_t>(i), TRUE, cycle_ns, 0);
+        // Bring-up diagnostic: confirm DC actually activated (vs a silent no-op) so
+        // the bench can distinguish "SYNC0 on but drive still refuses OP" from "DC
+        // never set up". DC-only path; runs once per configure() on a real drive.
+        std::cerr << "[dc] slave " << i << " hasdc=1, SYNC0 enabled @ " << cycle_ns << " ns\n";
     }
     impl_->dc_cycle_ns = cycle_ns;  // pace the upcoming OP-transition PD pump at this period
 }

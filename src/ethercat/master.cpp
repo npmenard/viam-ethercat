@@ -127,6 +127,11 @@ void Master::configure() {
         // Pace `dc_lock_cycles` exchanges at the DC period so the slaves' SYNC0/DC
         // PLL locks before we request OP. An unpaced burst leaves DC unlocked and
         // the drive refuses OP / faults. dc_lock_cycles = 0 skips the warmup (sim).
+        // PROVISIONAL (architect, runbook §5.2): this warmup currently runs on the
+        // caller's (non-RT) thread. start() locks memory first (no page-fault
+        // spikes); SCHED_OTHER scheduling jitter remains. If the bench shows the A6
+        // PLL doesn't lock cleanly under that jitter, restructure to do the DC
+        // warmup + OP transition in the RT thread prelude (design "(b)").
         timespec next{};
         (void)clock_gettime(CLOCK_MONOTONIC, &next);
         for (std::uint32_t i = 0; i < config_.dc_lock_cycles; ++i) {

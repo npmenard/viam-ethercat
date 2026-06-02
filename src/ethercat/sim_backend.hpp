@@ -85,6 +85,8 @@ class SimBackend final : public EcatBackend {
     void suppress_setpoint_ack(std::uint16_t slave, bool on = true) noexcept;
     // SYNC0 cycle (ns) the master requested via configure_dc_sync, or 0 if it never
     // did. Lets an offline test assert DC is configured when use_distributed_clocks.
+    // TEST-ONLY: call only after the controller is stopped/joined (set during
+    // configure(), which runs on the lifecycle thread before the RT thread spawns).
     std::uint32_t configured_dc_cycle_ns() const noexcept;
     // Read back a recorded SDO value (latest write to that object).
     std::vector<std::byte> recorded_sdo(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const;
