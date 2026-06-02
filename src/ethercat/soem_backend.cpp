@@ -388,6 +388,20 @@ void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_s
     // pulses are firing); 0x0980 b0 = SYNC-unit control source (1 = PDI/uC owns it, so
     // ECAT's activation is ignored -> would explain a stuck 0). 0x0134 = 0x2D => the
     // start was mis-scheduled (clock not settled before dcsync0).
+    //
+    // DECISIVE A-vs-B DISAMBIGUATION (architect + team-lead): the question is whether
+    // SYNC0-won't-arm is (A) the DC CLOCK being dead/unlocked upstream, or (B) the
+    // SYNC-out unit refusing despite a correct, running, properly-started clock. Three
+    // reads settle it, all on the SAME pump as the 0x098E double-read:
+    //   * 0x0910 read TWICE around one pump -> is the 64-bit system time ADVANCING? Not
+    //     advancing => clock DEAD (branch A, upstream ecx_configdc). Advancing => alive.
+    //   * 0x092C System Time Difference (the REAL lock signal -- NOT 0x0930, which is the
+    //     Speed-Counter-Start CONFIG reg whose default 0x1000=4096 is a red herring).
+    //     b31 = sign, b0..30 = |ns|. ~0 => the reference clock is locked/disciplined.
+    //   * (0x0910 sampleB - 0x0990 start) signed -> PROVES we are past the scheduled
+    //     start when we read, so a stuck 0x0984 is not a "read too early" artifact.
+    // Verdict: clock advancing + 0x092C~0 + past start + 0x0984=0 & 0x098E static + 0x0980
+    // b0=0 (ECAT owns) => BRANCH B, silicon refusal -> next move is a pcap-diff capture.
     for (int i = 1; i <= impl_->slavecount; ++i) {
         const std::uint16_t adp = impl_->slavelist[i].configadr;
         std::uint8_t cyc_ctrl = 0;      // 0x0980 cyclic unit control (b0: 0=ECAT, 1=PDI owns SYNC unit)
@@ -395,20 +409,46 @@ void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_s
         std::uint8_t sync0_stat_a = 0;  // 0x098E SYNC0 status, sample A
         std::uint8_t sync0_stat_b = 0;  // 0x098E SYNC0 status, sample B (after a pump)
         std::uint16_t al_status = 0;    // 0x0134 AL status code
+        std::uint64_t sys_a = 0;        // 0x0910 system time, sample A (clock-advance check)
+        std::uint64_t sys_b = 0;        // 0x0910 system time, sample B (after the pump)
+        std::uint32_t time_diff = 0;    // 0x092C System Time Difference (the real lock signal)
+        std::uint64_t start_990 = 0;    // 0x0990 SYNC0 start time (prove we are past it)
         (void)ecx_FPRD(&impl_->port, adp, 0x0980, sizeof(cyc_ctrl), &cyc_ctrl, EC_TIMEOUTRET);
         (void)ecx_FPRD(&impl_->port, adp, 0x0984, sizeof(act_status), &act_status, EC_TIMEOUTRET);
         (void)ecx_FPRD(&impl_->port, adp, 0x098E, sizeof(sync0_stat_a), &sync0_stat_a, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->port, adp, 0x0910, sizeof(sys_a), &sys_a, EC_TIMEOUTRET);
         ecx_send_processdata(&impl_->ctx);
         (void)ecx_receive_processdata(&impl_->ctx, EC_TIMEOUTRET);
         const timespec ts{.tv_sec = 0, .tv_nsec = static_cast<long>(cycle_ns)};
         (void)nanosleep(&ts, nullptr);
         (void)ecx_FPRD(&impl_->port, adp, 0x098E, sizeof(sync0_stat_b), &sync0_stat_b, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->port, adp, 0x0910, sizeof(sys_b), &sys_b, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->port, adp, 0x092C, sizeof(time_diff), &time_diff, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->port, adp, 0x0990, sizeof(start_990), &start_990, EC_TIMEOUTRET);
         (void)ecx_FPRD(&impl_->port, adp, 0x0134, sizeof(al_status), &al_status, EC_TIMEOUTRET);
         const bool pulsing = act_status != 0 || sync0_stat_a != sync0_stat_b;
+        const bool clock_advancing = sys_b > sys_a;
+        const std::int64_t clock_step = static_cast<std::int64_t>(sys_b) - static_cast<std::int64_t>(sys_a);
+        const std::int64_t past_start = static_cast<std::int64_t>(sys_b) - static_cast<std::int64_t>(start_990);
+        // 0x092C: b31 sign (1 => local ahead of reference), b0..30 magnitude in ns.
+        const bool diff_sign = (time_diff & 0x80000000U) != 0;
+        const std::uint32_t diff_mag = time_diff & 0x7FFFFFFFU;
         std::cerr << "[dc]   slave " << i << " SYNC0-GEN (post-start): 0x0984 actStatus=0x" << std::hex << static_cast<unsigned>(act_status)
                   << " 0x098E sync0Status=0x" << static_cast<unsigned>(sync0_stat_a) << "->0x" << static_cast<unsigned>(sync0_stat_b)
                   << " 0x0980 unitCtrl=0x" << static_cast<unsigned>(cyc_ctrl) << " 0x0134 AL=0x" << al_status << std::dec
                   << (pulsing ? "  -> SYNC0 GENERATING" : "  -> *** SYNC0 NOT generating (0x0984=0 & 0x098E static) ***") << '\n';
+        std::cerr << "[dc]   slave " << i << " DC-CLOCK: 0x0910 " << sys_a << "->" << sys_b << " (step=" << clock_step << "ns "
+                  << (clock_advancing ? "ADVANCING" : "*** DEAD ***") << ")"
+                  << " 0x092C sysTimeDiff=" << (diff_sign ? "-" : "+") << diff_mag << "ns"
+                  << (diff_mag < 1000 ? " (LOCKED~0)" : " (*** UNLOCKED ***)")
+                  << " | 0x0910-0x0990 startDelta=" << past_start << "ns " << (past_start >= 0 ? "(PAST start)" : "(*** before start ***)")
+                  << "\n[dc]   slave " << i << " VERDICT: "
+                  << (clock_advancing && diff_mag < 1000 && past_start >= 0 && !pulsing
+                          ? "BRANCH B -- clock alive+locked+past-start yet SYNC0 refuses -> SILICON, needs pcap-diff"
+                      : !clock_advancing ? "BRANCH A -- DC clock DEAD, dig ecx_configdc reference setup"
+                      : pulsing          ? "SYNC0 OK -- arming succeeded"
+                                         : "INCONCLUSIVE -- see flags above")
+                  << '\n';
         if ((cyc_ctrl & 0x01U) != 0) {
             std::cerr << "[dc]   *** 0x0980 b0=1: the SYNC unit is PDI/uC-controlled -- ECAT activation is IGNORED ***\n";
         }
