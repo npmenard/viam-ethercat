@@ -63,7 +63,23 @@ constexpr std::uint16_t kTorqueActual = 0x6077;
 constexpr std::uint16_t kFaultCode = 0x603F;
 constexpr std::uint16_t kIdentity = 0x1018;
 
+// A6 manufacturer sync-tolerance group C13. The A6 faults out of OP (Er C1.0
+// "sync period error too large", 0x603F=0x8700) when our Linux-RT master's sync
+// jitter exceeds the DEFAULT 3 us window -- the manual's remedy is to loosen this
+// group. CoE index INFERRED from the documented Cxx.yy -> 0x20xx:(yy+1) pattern
+// (C01->0x2001, C10->0x2010); VERIFY against the drive dictionary -- a wrong
+// index/width surfaces as a CoE abort (PdoMappingError) at configure().
+constexpr std::uint16_t kSyncToleranceGroup = 0x2013;  // C13
+constexpr std::uint8_t kC13_02_SyncLoss = 0x03;        // C13.02 sync-loss threshold (default 8)
+constexpr std::uint8_t kC13_05_SyncMode = 0x06;        // C13.05 EtherCAT sync mode (default 1)
+constexpr std::uint8_t kC13_06_JitterNs = 0x07;        // C13.06 sync jitter threshold ns (default 3000)
+
 constexpr double kCountsPerRev = 131072.0;  // A6 single-turn encoder = 2^17
+
+// Little-endian 2-byte (U16) object value for an SDO write.
+std::vector<std::byte> le16(std::uint16_t v) {
+    return {static_cast<std::byte>(v & 0xFFU), static_cast<std::byte>((v >> 8U) & 0xFFU)};
+}
 
 std::atomic<bool> g_stop{false};
 extern "C" void on_sigint(int) {
@@ -87,6 +103,16 @@ MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_targe
     SlaveConfig a6;
     a6.slave_id = 1;
     a6.default_mode = Cia402Mode::ProfilePosition;
+
+    // Loosen the A6 sync-jitter tolerance (PRE-OP, before remap) so a Linux-RT
+    // master holds OP. Default C13.06=3000 ns is too strict; C13.05=2 is the
+    // "host jitter > 1 us" mode. Widths assumed U16 -- if the drive aborts on a
+    // length mismatch, the abort code tells us the real width / index.
+    a6.preop_sdo_writes = {
+        {kSyncToleranceGroup, kC13_05_SyncMode, le16(2)},     // C13.05 = 2 (host jitter > 1 us mode)
+        {kSyncToleranceGroup, kC13_06_JitterNs, le16(6000)},  // C13.06 = 6000 ns (max; default 3000)
+        {kSyncToleranceGroup, kC13_02_SyncLoss, le16(20)},    // C13.02 = 20 (default 8; ride OP-entry transient)
+    };
 
     a6.rxpdo.assign_index = 0x1C12;
     a6.rxpdo.pdo_indices = {0x1600};

@@ -83,6 +83,14 @@ void Master::configure(bool reach_op) {
     backend_->request_state(0, EcatState::PreOp);
 
     for (const SlaveConfig& sc : config_.slaves) {
+        // Driver-supplied PRE-OP SDO writes FIRST, before the remap: drive-tuning
+        // params (e.g. the A6 C13 sync-jitter-tolerance group) that must land while
+        // the drive is quiescent and the SM mapping is still default. Config DATA --
+        // no drive specifics here. A bad object/length surfaces as the backend's
+        // PdoMappingError carrying the CoE abort code.
+        for (const SdoWrite& w : sc.preop_sdo_writes) {
+            backend_->sdo_write(sc.slave_id, w.index, w.subindex, w.data);
+        }
         apply_pdo_map(*backend_, sc.slave_id, sc.rxpdo);
         apply_pdo_map(*backend_, sc.slave_id, sc.txpdo);
         // Set modes-of-operation (0x6060, U8) via SDO -- NOT mapped cyclically. A real

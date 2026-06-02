@@ -162,6 +162,32 @@ TEST("Master: configure() sets modes-of-operation 0x6060 from default_mode (SDO)
     CHECK_EQ(static_cast<int>(std::to_integer<std::uint8_t>(mode[0])), 1);  // PP = 1
 }
 
+TEST("Master: configure() applies preop_sdo_writes (drive tuning) before the remap") {
+    MasterConfig cfg = make_config();
+    // Two driver-supplied PRE-OP writes (mirrors the A6 C13 sync-tolerance tune).
+    cfg.slaves[0].preop_sdo_writes = {
+        {0x2013, 0x06, {std::byte{0x02}, std::byte{0x00}}},  // U16 = 2
+        {0x2013, 0x07, {std::byte{0x70}, std::byte{0x17}}},  // U16 = 6000
+    };
+    auto sim = std::make_unique<SimBackend>(make_models());
+    SimBackend* sim_ptr = sim.get();
+    Master master{cfg, std::move(sim)};
+    master.init();
+    master.configure();
+
+    // The raw values were written verbatim.
+    const std::vector<std::byte> a = sim_ptr->recorded_sdo(1, 0x2013, 0x06);
+    const std::vector<std::byte> b = sim_ptr->recorded_sdo(1, 0x2013, 0x07);
+    CHECK_EQ(a.size(), std::size_t{2});
+    CHECK_EQ(static_cast<int>(std::to_integer<std::uint8_t>(a[0])), 0x02);
+    CHECK_EQ(static_cast<int>(std::to_integer<std::uint8_t>(b[1])), 0x17);
+
+    // ...and they landed BEFORE the remap: their keys lead the SDO log.
+    const std::vector<std::uint32_t> log = sim_ptr->sdo_log(1);
+    const auto first = log.front();
+    CHECK_EQ(first, (std::uint32_t{0x2013} << 8U) | 0x06U);
+}
+
 TEST("Master+SimBackend: dc_time() advances across process() (DC phase-lock input)") {
     Master master{make_config(), std::make_unique<SimBackend>(make_models())};
     master.init();

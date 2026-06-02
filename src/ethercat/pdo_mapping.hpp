@@ -39,6 +39,18 @@ struct PdoMap {
     std::size_t byte_size() const;
 };
 
+// A one-shot SDO write the driver wants applied at configure() time, in PRE-OP,
+// BEFORE the PDO remap. This is how drive-specific TUNING params stay config DATA
+// (not hardcoded): e.g. the A6's C13 sync-jitter-tolerance group, which must be
+// written while the drive is quiescent (several C13 params are "at-stop only").
+// `data` is the raw little-endian object value; its length MUST match the object's
+// CoE data type or the drive aborts (the abort code surfaces via PdoMappingError).
+struct SdoWrite {
+    std::uint16_t index = 0;
+    std::uint8_t subindex = 0;
+    std::vector<std::byte> data;
+};
+
 // Per-slave configuration (config DATA; the A6 specifics live here, never in
 // generic code).
 struct SlaveConfig {
@@ -46,6 +58,9 @@ struct SlaveConfig {
     PdoMap rxpdo;                // assign_index 0x1C12
     PdoMap txpdo;                // assign_index 0x1C13
     Cia402Mode default_mode = Cia402Mode::ProfilePosition;
+    // Driver-supplied SDO writes applied in PRE-OP before the remap (drive tuning,
+    // e.g. A6 C13 sync tolerance). Empty for slaves that need none.
+    std::vector<SdoWrite> preop_sdo_writes;
 };
 
 // Master-level configuration.
