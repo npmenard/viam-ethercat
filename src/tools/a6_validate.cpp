@@ -114,16 +114,14 @@ MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_targe
     // so the C13 sync-tolerance writes were dropped -- the generic preop_sdo_writes
     // mechanism stays for exactly this kind of drive-config write.)
     if (sm_dc_sync) {
-        // POST-REMAP: the sync-type write must follow the PDO assignment or the drive
-        // re-defaults 0x1C32 back to SM-sync (=1). optional=true: 0x1C33:01 (input SM)
-        // reads a non-standard value and may be read-only -- a rejection there must NOT
-        // abort the run before we learn whether 0x1C32:01 (output SM, the one consuming
-        // our RxPDO) took =2.
-        // NOTE: we do NOT write 0x1C32:02/0x1C33:02 (cycle time) -- the A6 confirmed it
-        // READ-ONLY (CoE abort 0x06010002) and auto-DERIVES the cycle from the observed
-        // SYNC0 pulses. That derivation is exactly why configure_dc_sync waits for SYNC0
-        // to start pulsing before requesting SAFE-OP (see soem_backend).
-        a6.postremap_sdo_writes = {
+        // POST-DC (not post-remap): switch SM2/SM3 to DC SYNC0 mode AFTER
+        // configure_dc_sync has set the ESC SYNC0 cycle (0x09A0=1ms) and SYNC0 is
+        // pulsing. The A6's read-only SM cycle 0x1C32:02 is SNAPSHOTTED from the live
+        // 0x09A0 at DC-mode entry -- switching before dcsync0 (0x09A0 still 0) latches
+        // :02=0 -> AL 0x0030. optional=true: 0x1C33:01 (input SM) reads a non-standard
+        // value and may be read-only; a rejection there must not abort the run.
+        // We do NOT write 0x1C32:02 (read-only, CoE abort 0x06010002 -- auto-derived).
+        a6.postdc_sdo_writes = {
             {kSm2SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0), /*optional=*/true},  // SM2 outputs -> DC SYNC0
             {kSm3SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0), /*optional=*/true},  // SM3 inputs  -> DC SYNC0
         };

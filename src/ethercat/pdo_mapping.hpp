@@ -73,6 +73,13 @@ struct SlaveConfig {
     // RE-DEFAULT 0x1C32 when the PDO assignment changes -- so a sync-type write done
     // before the assignment gets clobbered back to its default. Empty for most slaves.
     std::vector<SdoWrite> postremap_sdo_writes;
+    // SDO writes applied in PRE-OP AFTER configure_dc_sync (SYNC0 configured + the ESC
+    // cycle register 0x09A0 set + SYNC0 pulsing), immediately before the SAFE-OP
+    // request. The SM sync-type switch to DC (0x1C32:01 = 2) belongs here for drives
+    // that SNAPSHOT the read-only SM cycle time 0x1C32:02 from the live 0x09A0 at the
+    // moment they enter DC mode -- switching earlier (while 0x09A0 is still 0) latches
+    // 0x1C32:02 = 0 -> AL 0x0030 "Invalid DC SYNC config". Empty for most slaves.
+    std::vector<SdoWrite> postdc_sdo_writes;
 };
 
 // Master-level configuration.

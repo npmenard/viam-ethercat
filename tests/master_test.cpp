@@ -211,6 +211,28 @@ TEST("Master: configure() applies postremap_sdo_writes AFTER the PDO assignment"
     CHECK(assign_pos < sync_pos);                                                  // ...and the assignment came FIRST
 }
 
+TEST("Master: configure() applies postdc_sdo_writes AFTER the per-slave config (post-DC)") {
+    MasterConfig cfg = make_config();
+    cfg.use_distributed_clocks = true;
+    // SM sync-type to DC, deferred until after configure_dc_sync set the SYNC0 cycle.
+    cfg.slaves[0].postdc_sdo_writes = {
+        {0x1C32, 0x01, {std::byte{0x02}, std::byte{0x00}}},  // sync type = DC SYNC0
+    };
+    auto sim = std::make_unique<SimBackend>(make_models());
+    SimBackend* sim_ptr = sim.get();
+    Master master{cfg, std::move(sim)};
+    master.init();
+    master.configure();
+
+    const std::vector<std::uint32_t> log = sim_ptr->sdo_log(1);
+    const auto key = [](std::uint16_t idx, std::uint8_t sub) { return (static_cast<std::uint32_t>(idx) << 8U) | sub; };
+    const auto postdc_pos = std::find(log.begin(), log.end(), key(0x1C32, 0x01));
+    const auto mode_pos = std::find(log.begin(), log.end(), key(0x6060, 0x00));  // last per-slave config write
+    CHECK(postdc_pos != log.end());                                              // the post-DC write happened
+    CHECK(mode_pos != log.end());                                                // the 0x6060 mode write happened
+    CHECK(mode_pos < postdc_pos);  // ...and post-DC writes come AFTER the per-slave config phase
+}
+
 TEST("Master+SimBackend: dc_time() advances across process() (DC phase-lock input)") {
     Master master{make_config(), std::make_unique<SimBackend>(make_models())};
     master.init();

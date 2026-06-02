@@ -168,6 +168,15 @@ void Master::configure(bool reach_op) {
         backend_->configure_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);
     }
 
+    // POST-DC SDO writes, applied here -- after SYNC0 is configured + pulsing (the ESC
+    // cycle register 0x09A0 is now live) and BEFORE the SAFE-OP request. The SM
+    // sync-type switch to DC (0x1C32:01 = 2) goes here: some drives snapshot the
+    // read-only SM cycle 0x1C32:02 from 0x09A0 at DC-mode entry, so switching earlier
+    // (0x09A0 still 0) latches :02 = 0 -> AL 0x0030 at the SafeOp validation.
+    for (const SlaveConfig& sc : config_.slaves) {
+        apply_sdo_writes(sc.slave_id, sc.postdc_sdo_writes);
+    }
+
     backend_->request_state(0, EcatState::SafeOp);
 
     if (config_.use_distributed_clocks) {
