@@ -63,25 +63,38 @@ constexpr std::uint16_t kTorqueActual = 0x6077;
 constexpr std::uint16_t kFaultCode = 0x603F;
 constexpr std::uint16_t kIdentity = 0x1018;
 
-// SM synchronization-TYPE objects (ETG std). 0x1C32:01 = SM2/output (RxPDO) sync
-// type, 0x1C33:01 = SM3/input (TxPDO) sync type. Value 2 = "DC SYNC0". These tell
-// the drive's APPLICATION layer to synchronize to the SYNC0 pulse. The bench panel
-// shows Er74.1 "no sync signal" even with the ESC SYNC0 active (configdc TRUE,
-// hasdc=1, DCtime advancing) -- the classic cause is the drive still running
-// free-run/SM-sync because 0x1C32:01 was never set to 2. Opt-in via --sm-dc-sync
-// (a read-only-object abort here would otherwise block the timing-sweep runs).
+// SM synchronization objects 0x1C32 (SM2/outputs) / 0x1C33 (SM3/inputs), per
+// ETG.1020. Confirmed against the A6's REAL object dictionary (slaveinfo -sdo):
+//   :01 Sync Type      R/W  -- 2 = DC SYNC0 (default 1 = SM-synchron). Writable ONLY
+//                              before DC activation; post-configdc it 0x08000022-rejects.
+//   :02 Cycle Time     RO   -- the value SafeOp validates; the A6 does NOT auto-derive
+//                              it from the ESC 0x09A0. Must be populated via :0a + :08.
+//   :04 Supported      RO   -- 0x0004 = DC SYNC0 only (confirms SYNC1 N/A).
+//   :05 Min Cycle      RO   -- 250000 ns.
+//   :08 Get Cycle Time R/W  -- 1 = measure/calc the cycle time (ETG.1020 handshake).
+//   :0a Sync0 Cycle T. R/W  -- the master TELLS the drive the SYNC0 cycle (ns) here;
+//                              the drive then fills the RO :02 -> valid DC config.
 constexpr std::uint16_t kSm2SyncType = 0x1C32;     // SM2 (outputs/RxPDO)
 constexpr std::uint16_t kSm3SyncType = 0x1C33;     // SM3 (inputs/TxPDO)
-constexpr std::uint8_t kSyncTypeSub = 0x01;        // :01 sync type
-constexpr std::uint8_t kSyncCycleSub = 0x02;       // :02 cycle time (ns, U32)
+constexpr std::uint8_t kSyncTypeSub = 0x01;        // :01 sync type (R/W, pre-DC)
+constexpr std::uint8_t kSyncCycleSub = 0x02;       // :02 cycle time (U32 ns, RO -- SafeOp validates this)
+constexpr std::uint8_t kGetCycleSub = 0x08;        // :08 Get Cycle Time (U16, R/W): 1 = measure
+constexpr std::uint8_t kSync0CycleSub = 0x0A;      // :0a Sync0 Cycle Time (U32 ns, R/W)
 constexpr std::uint16_t kSyncTypeDcSync0 = 2;      // ETG sync type 2 = DC SYNC0
+constexpr std::uint16_t kGetCycleMeasure = 1;      // :08 = 1 -> drive measures + populates :02
 constexpr std::uint32_t kSyncCycleNs = 1'000'000;  // SYNC0/SM cycle = loop period (1 ms); must match ESC 0x09A0
 
 constexpr double kCountsPerRev = 131072.0;  // A6 single-turn encoder = 2^17
 
-// Little-endian 2-byte (U16) object value for an SDO write.
+// Little-endian object values for an SDO write.
 std::vector<std::byte> le16(std::uint16_t v) {
     return {static_cast<std::byte>(v & 0xFFU), static_cast<std::byte>((v >> 8U) & 0xFFU)};
+}
+std::vector<std::byte> le32(std::uint32_t v) {
+    return {static_cast<std::byte>(v & 0xFFU),
+            static_cast<std::byte>((v >> 8U) & 0xFFU),
+            static_cast<std::byte>((v >> 16U) & 0xFFU),
+            static_cast<std::byte>((v >> 24U) & 0xFFU)};
 }
 
 std::atomic<bool> g_stop{false};
@@ -114,21 +127,29 @@ MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_targe
     // so the C13 sync-tolerance writes were dropped -- the generic preop_sdo_writes
     // mechanism stays for exactly this kind of drive-config write.)
     if (sm_dc_sync) {
-        // POST-DC (not post-remap): switch SM2/SM3 to DC SYNC0 mode AFTER
-        // configure_dc_sync has set the ESC SYNC0 cycle (0x09A0=1ms) and SYNC0 is
-        // pulsing. The A6's read-only SM cycle 0x1C32:02 is SNAPSHOTTED from the live
-        // 0x09A0 at DC-mode entry -- switching before dcsync0 (0x09A0 still 0) latches
-        // :02=0 -> AL 0x0030. optional=true: 0x1C33:01 (input SM) reads a non-standard
-        // value and may be read-only; a rejection there must not abort the run.
-        // We do NOT write 0x1C32:02 (read-only, CoE abort 0x06010002 -- auto-derived).
-        a6.postdc_sdo_writes = {
+        // PRE-DC (postremap = post-assign, before configdc): switch SM2/SM3 to DC SYNC0.
+        // 0x1C32:01 is R/W only BEFORE DC activation -- written post-configdc the A6
+        // rejects it 0x08000022 (wrong state). optional=true: 0x1C33:01 reads a
+        // non-standard 0x22 and may reject; must not abort the run.
+        a6.postremap_sdo_writes = {
             {kSm2SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0), /*optional=*/true},  // SM2 outputs -> DC SYNC0
             {kSm3SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0), /*optional=*/true},  // SM3 inputs  -> DC SYNC0
         };
-        // After the DC-mode switch, pump up to 250 cycles so the drive copies the live
-        // SYNC0 cycle (0x09A0) into the read-only 0x1C32:02; break early the moment :02
-        // reads non-zero. Without this settle the drive validates 0x1C32:02=0 at SafeOp
-        // -> AL 0x0030.
+        // POST-DC (after dcsync0 set 0x09A0=1ms + SYNC0 pulsing): the ETG.1020
+        // cycle-time handshake. The A6's OD shows 0x1C32:02 (Cycle Time) is READ-ONLY
+        // and is NOT auto-derived -- so we TELL the drive the SYNC0 cycle via the R/W
+        // :0a (Sync0 Cycle Time = 1ms) and trigger a measurement via :08 (Get Cycle
+        // Time = 1). The drive then fills the RO :02 -> SafeOp validates a non-zero
+        // cycle. :0a first (provides the value), then :08 (triggers). All optional.
+        a6.postdc_sdo_writes = {
+            {kSm2SyncType, kSync0CycleSub, le32(kSyncCycleNs), /*optional=*/true},    // SM2 Sync0 Cycle Time = 1 ms
+            {kSm3SyncType, kSync0CycleSub, le32(kSyncCycleNs), /*optional=*/true},    // SM3 Sync0 Cycle Time = 1 ms
+            {kSm2SyncType, kGetCycleSub, le16(kGetCycleMeasure), /*optional=*/true},  // SM2 Get Cycle Time = measure
+            {kSm3SyncType, kGetCycleSub, le16(kGetCycleMeasure), /*optional=*/true},  // SM3 Get Cycle Time = measure
+        };
+        // After the handshake, pump up to 250 cycles so the drive measures + populates
+        // the RO 0x1C32:02; break early the moment :02 reads non-zero. Without this
+        // settle the drive validates :02=0 at SafeOp -> AL 0x0030.
         cfg.dc_postwrite_settle_cycles = 250;
         cfg.dc_settle_poll_index = kSm2SyncType;  // poll 0x1C32...
         cfg.dc_settle_poll_sub = kSyncCycleSub;   // ...:02 (SM cycle time) until non-zero
@@ -334,23 +355,24 @@ int main(int argc, char** argv) {
         } catch (const Error& e) {
             std::cerr << "[dc] SM sync-type read failed (object absent?): " << e.what() << '\n';
         }
-        // Cycle time 0x1C32:02/0x1C33:02 -- READ-ONLY on the A6 (write aborts
-        // 0x06010002); the drive AUTO-DERIVES it from observed SYNC0 pulses. So 0 here
-        // just means SYNC0 hasn't pulsed enough yet; it should read the SYNC0 cycle
-        // (1000000) once pulsing. configure_dc_sync waits for SYNC0 to start before
-        // SAFE-OP precisely so this derivation completes.
+        // Cycle-time handshake state: :02 (RO Cycle Time -- the value SafeOp validates),
+        // :0a (Sync0 Cycle Time -- what we told the drive), :08 (Get Cycle Time -- the
+        // measure trigger; auto-resets to 0 when done). :02 flipping 0 -> 1000000 after
+        // the :0a/:08 writes is the smoking gun that the DC config is now valid.
         try {
             const auto cyc2 = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, kSyncCycleSub);
-            const auto cyc3 = master.sdo_read<std::uint32_t>(slave, kSm3SyncType, kSyncCycleSub);
+            const auto cyc0a = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, kSync0CycleSub);
+            const auto get08 = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kGetCycleSub);
             const char* note = "  (non-1ms -- unexpected)";
             if (cyc2 == 0) {
-                note = "  (RO/auto: 0 = drive not yet derived it from SYNC0 pulses)";
+                note = "  *** :02=0 -> drive hasn't populated Cycle Time -> AL 0x0030 ***";
             } else if (cyc2 == kSyncCycleNs) {
-                note = "  (auto-derived = SYNC0 cycle, good)";
+                note = "  -> Cycle Time populated, DC config VALID";
             }
-            std::cout << "[dc]   0x1C32:02 SM2cycle=" << cyc2 << "ns 0x1C33:02 SM3cycle=" << cyc3 << "ns" << note << '\n';
+            std::cout << "[dc]   0x1C32:02 CycleTime(RO)=" << cyc2 << "ns 0x1C32:0a Sync0CycleTime=" << cyc0a
+                      << "ns 0x1C32:08 GetCycleTime=" << get08 << note << '\n';
         } catch (const Error& e) {
-            std::cerr << "[dc]   0x1C32:02 SM cycle-time read failed (sub-index absent -> auto-derived): " << e.what() << '\n';
+            std::cerr << "[dc]   0x1C32 cycle-time readback failed: " << e.what() << '\n';
         }
     };
 
