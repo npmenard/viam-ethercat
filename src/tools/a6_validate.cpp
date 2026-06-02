@@ -81,8 +81,14 @@ constexpr std::uint8_t kSyncCycleSub = 0x02;       // :02 cycle time (U32 ns, RO
 constexpr std::uint8_t kGetCycleSub = 0x08;        // :08 Get Cycle Time (U16, R/W): 1 = measure
 constexpr std::uint8_t kSync0CycleSub = 0x0A;      // :0a Sync0 Cycle Time (U32 ns, R/W)
 constexpr std::uint16_t kSyncTypeDcSync0 = 2;      // ETG sync type 2 = DC SYNC0
-constexpr std::uint16_t kGetCycleMeasure = 1;      // :08 = 1 -> drive measures + populates :02
+constexpr std::uint16_t kGetCycleMeasure = 1;      // :08 = 1 -> measure ONCE, populates :02 (needs SYNC0 live)
+constexpr std::uint16_t kGetCycleReset = 0;        // :08 = 0 -> reset any stale measurement before triggering
 constexpr std::uint32_t kSyncCycleNs = 1'000'000;  // SYNC0/SM cycle = loop period (1 ms); must match ESC 0x09A0
+// ETG.1020 measurement diagnostic counters (sub-indices per the A6's REAL OD dump --
+// note SyncError is :13 on this drive, not the ETG-standard :20). Populated by :08=1.
+constexpr std::uint8_t kSmMissedSub = 0x0B;       // :0b SM-event missed counter (U16)
+constexpr std::uint8_t kCycleTooSmallSub = 0x0C;  // :0c Cycle Time Too Small counter (U16)
+constexpr std::uint8_t kSyncErrorSub = 0x13;      // :13 Sync Error (BOOL)
 
 constexpr double kCountsPerRev = 131072.0;  // A6 single-turn encoder = 2^17
 
@@ -142,10 +148,12 @@ MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_targe
         // Time = 1). The drive then fills the RO :02 -> SafeOp validates a non-zero
         // cycle. :0a first (provides the value), then :08 (triggers). All optional.
         a6.postdc_sdo_writes = {
+            {kSm2SyncType, kGetCycleSub, le16(kGetCycleReset), /*optional=*/true},    // reset any stale measurement first
+            {kSm3SyncType, kGetCycleSub, le16(kGetCycleReset), /*optional=*/true},    //
             {kSm2SyncType, kSync0CycleSub, le32(kSyncCycleNs), /*optional=*/true},    // SM2 Sync0 Cycle Time = 1 ms
             {kSm3SyncType, kSync0CycleSub, le32(kSyncCycleNs), /*optional=*/true},    // SM3 Sync0 Cycle Time = 1 ms
-            {kSm2SyncType, kGetCycleSub, le16(kGetCycleMeasure), /*optional=*/true},  // SM2 Get Cycle Time = measure
-            {kSm3SyncType, kGetCycleSub, le16(kGetCycleMeasure), /*optional=*/true},  // SM3 Get Cycle Time = measure
+            {kSm2SyncType, kGetCycleSub, le16(kGetCycleMeasure), /*optional=*/true},  // SM2 Get Cycle Time = measure once
+            {kSm3SyncType, kGetCycleSub, le16(kGetCycleMeasure), /*optional=*/true},  // SM3 Get Cycle Time = measure once
         };
         // After the handshake, pump up to 250 cycles so the drive measures + populates
         // the RO 0x1C32:02; break early the moment :02 reads non-zero. Without this
@@ -373,6 +381,17 @@ int main(int argc, char** argv) {
                       << "ns 0x1C32:08 GetCycleTime=" << get08 << note << '\n';
         } catch (const Error& e) {
             std::cerr << "[dc]   0x1C32 cycle-time readback failed: " << e.what() << '\n';
+        }
+        // ETG.1020 measurement diagnostics: if :02 populates but 0x0030 persists, these
+        // say why -- SM-event-missed / cycle-too-small / SyncError (updated by :08=1).
+        try {
+            const auto missed = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kSmMissedSub);
+            const auto too_small = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kCycleTooSmallSub);
+            const auto sync_err = master.sdo_read<std::uint8_t>(slave, kSm2SyncType, kSyncErrorSub);
+            std::cout << "[dc]   0x1C32 diag: :0b SMmissed=" << missed << " :0c cycleTooSmall=" << too_small
+                      << " :13 syncError=" << static_cast<int>(sync_err) << '\n';
+        } catch (const Error& e) {
+            std::cerr << "[dc]   0x1C32 diag-counter readback failed: " << e.what() << '\n';
         }
     };
 
