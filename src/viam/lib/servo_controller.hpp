@@ -35,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <variant>
@@ -56,9 +57,16 @@ struct ControllerState {
     std::atomic<bool> powered{false};              // OperationEnabled this cycle
     std::atomic<bool> moving{false};               // !move-complete
     std::atomic<bool> faulted{false};              // DRIVE/BUS only: master_->fault() || status.fault() (move-errors are Tier-2, NOT here)
-    std::atomic<std::int32_t> fault_wkc{0};        // WKC at a live bus fault (payload; published by rt_error_ release)
+    std::atomic<std::int32_t> fault_wkc{0};        // WKC at a live bus fault (payload; published BEFORE wkc_faulted release)
     std::atomic<std::int32_t> expected_wkc{0};     // constant after start(); for last_error() (lock-free, master_-free)
-    std::atomic<std::uint64_t> loop_cycle{0};      // heartbeat counter
+    // Per-tier fault liveness (spec #16): last_error() composes EVERY active tier so
+    // a both-true Er74 (drive 0x603F + bus WKC->0) reports root cause AND symptom,
+    // never masking one. Each (flag, payload) pair: payload relaxed-stored BEFORE the
+    // flag release-stored (RT, sole writer); cross-tier skew is benign (quasi-static).
+    std::atomic<bool> wkc_faulted{false};                // BUS tier = master_->fault(); pairs with fault_wkc
+    std::atomic<bool> drive_faulted{false};              // DRIVE tier = status.fault() (bit3); pairs with drive_fault_code
+    std::atomic<std::uint16_t> drive_fault_code{0};      // 0x603F live-read every faulted cycle; relaxed before drive_faulted release
+    std::atomic<std::uint64_t> loop_cycle{0};            // heartbeat counter
     std::atomic<std::uint64_t> last_cycle_time_ns{0};    // CLOCK_MONOTONIC ns at last iteration (watchdog; 0 = never published)
     std::atomic<std::int32_t> zero_offset_counts{0};     // SetZero software offset
     std::atomic<std::uint32_t> active_generation{0};     // gen RT adopted from the applied SetTarget (post-coalescing)
@@ -112,6 +120,11 @@ class ServoController {
     bool is_powered() const noexcept;  // powered && rt_alive() && !stopping_
     bool is_disconnected() const noexcept;
     std::string last_error() const;
+    // Last published device velocity (0x606C from the wire when mapped, else the
+    // instantaneous estimate). RAW device units -- the module layer converts to
+    // Viam units (the 0x606C scaling is a drive-unit question, applied there, not
+    // here). master_-free + lock-free, symmetric with position_revs().
+    std::int32_t velocity_counts() const noexcept;
 
    private:
     // --- lifecycle FSM (std::variant; each state's step() in the .cpp) ---
@@ -125,9 +138,10 @@ class ServoController {
     // PP new-set-point handshake sub-FSM (cycle-stepped, with a timeout).
     enum class Handshake : std::uint8_t { Idle, WriteTarget, AwaitAck, ClearBit4, AwaitAckClear };
 
-    // RT-loop fault reasons. The RT thread only STORES the enum (no string alloc,
-    // no mutex on the hot path); last_error() composes the human text non-RT.
-    enum class RtError : std::uint8_t { None, WkcFault, HandshakeTimeout, MoveStalled, NotOperational };
+    // CONTROLLER-tier fault reasons (the CTRL tier only -- spec #16 moved the BUS
+    // WkcFault out to state_.wkc_faulted). The RT thread only STORES the enum (no
+    // string alloc, no mutex on the hot path); last_error() composes the text non-RT.
+    enum class RtError : std::uint8_t { None, HandshakeTimeout, MoveStalled, NotOperational };
 
     // The RT thread body (loop while !st.stop_requested()). `started` is fulfilled
     // after a clean prelude (or set to an InitError exception on RT-sched failure
@@ -138,6 +152,8 @@ class ServoController {
     bool setup_realtime() const noexcept;                // mlockall + mallopt + SCHED_FIFO; false on RT-sched failure
     void resolve_fields();                               // cache controlword/status/target/actual/velocity FieldLocations
     bool rxpdo_has(std::uint16_t index) const noexcept;  // is `index` mapped in the RxPDO? (optional-field probe)
+    bool txpdo_has(std::uint16_t index) const noexcept;  // is `index` mapped in the TxPDO? (optional feedback probe)
+    std::string fault_gloss(std::uint16_t code) const;   // 0x603F code -> config label (empty if unknown); cold path
     bool rt_alive() const noexcept;                      // !watchdog_expired() && !state_.faulted  (master_-FREE)
     bool watchdog_expired() const noexcept;              // (now - last_cycle_time_ns) > watchdog_ns
 
@@ -157,6 +173,9 @@ class ServoController {
     FieldLocation f_actual_;
     FieldLocation f_velocity_;
     FieldLocation f_profile_velocity_;  // 0x6081 PP move speed; byte_width==0 if not mapped (optional)
+    // TxPDO feedback fields (spec #16). Both OPTIONAL (byte_width==0 => unmapped):
+    FieldLocation f_fault_code_;       // 0x603F U16 drive error code (last_error gloss)
+    FieldLocation f_velocity_actual_;  // 0x606C S32 velocity-actual (wire velocity; else estimate)
 
     Cia402Fsm fsm_;
     ControllerState state_;
@@ -196,7 +215,10 @@ class ServoController {
     std::uint16_t step_lifecycle(Status status, const CommandBatch& batch, std::int32_t actual) noexcept;
     std::uint16_t step_handshake(std::uint16_t base_cw, Status status) noexcept;
     std::uint16_t fault_reset_with_rearm(Status status) noexcept;
-    void publish_state(Status status, std::int32_t actual, std::int32_t velocity) noexcept;
+    // `in` is THIS cycle's single input-image snapshot (spec #16 §10): 0x603F is
+    // sliced from the SAME span as statusword/actual, so the code matches the fault
+    // state it is reported with -- structurally, not by timing luck.
+    void publish_state(Status status, std::int32_t actual, std::int32_t velocity, std::span<const std::byte> in) noexcept;
     // Abort the in-flight move: set BOTH tiers -- latched_ctrl_error_ (+rt_error_
     // for last_error) AND failed_generation+notify (to wake the go_to waiter
     // PROMPTLY). The invariant: every FSM path that fails the active move calls this.

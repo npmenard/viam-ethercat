@@ -412,6 +412,40 @@ if (ETHERCAT_SANITIZE_THREAD)
   viam_apply_wall_werror(teardown_under_load_test_tsan)
   add_test(NAME teardown_under_load_test_tsan COMMAND teardown_under_load_test_tsan)
   set_tests_properties(teardown_under_load_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
+
+  # ThreadSanitizer build of the offline controller tests. The #16 fault tests toggle
+  # SimBackend hooks (inject_fault / set_fault_code / force_short_wkc) from the test
+  # thread WHILE the RT loop reads them -- TSan proves those hook fields are race-free
+  # (they are atomic) and that the whole RT/non-RT fault-publish path is clean.
+  add_executable(controller_offline_test_tsan
+    tests/controller_offline_test.cpp
+    src/ethercat/cia402.cpp
+    src/ethercat/pdo_cache.cpp
+    src/ethercat/pdo_mapping.cpp
+    src/ethercat/backend.cpp
+    src/ethercat/sim_backend.cpp
+    src/ethercat/soem_backend.cpp
+    src/ethercat/master.cpp
+    src/viam/lib/motion_profile.cpp
+    src/viam/lib/servo_config.cpp
+    src/viam/lib/servo_controller.cpp
+  )
+  target_include_directories(controller_offline_test_tsan
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  )
+  target_link_libraries(controller_offline_test_tsan
+    PRIVATE
+      soem
+      Threads::Threads
+      Boost::headers
+  )
+  target_compile_options(controller_offline_test_tsan PRIVATE -fsanitize=thread -O1 -g)
+  target_link_options(controller_offline_test_tsan PRIVATE -fsanitize=thread)
+  viam_apply_wall_werror(controller_offline_test_tsan)
+  add_test(NAME controller_offline_test_tsan COMMAND controller_offline_test_tsan)
+  set_tests_properties(controller_offline_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
 endif()
 
 

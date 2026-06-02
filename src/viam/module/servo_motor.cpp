@@ -5,7 +5,9 @@
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include <viam/sdk/common/proto_value.hpp>
 
@@ -134,6 +136,38 @@ PdoMap parse_pdo_map(const ProtoValue& val, const std::string& what) {
     return map;
 }
 
+// OPTIONAL 0x603F gloss (spec #16): "fault_code_labels": [{ "code": <U16>, "label":
+// "<text>" }, ...]. Drive error code -> human label for last_error(). Absent -> empty
+// (last_error shows bare hex). CONFIG DATA -- the A6-specific codes live in the JSON.
+std::vector<std::pair<std::uint16_t, std::string>> parse_fault_code_labels(const ProtoStruct& attrs) {
+    std::vector<std::pair<std::uint16_t, std::string>> out;
+    const ProtoValue* const v = find_attr(attrs, "fault_code_labels");
+    if (v == nullptr) {
+        return out;  // optional
+    }
+    const ProtoList* const list = v->get<ProtoList>();
+    if (list == nullptr) {
+        throw ConfigError("fault_code_labels must be a list of {code, label}");
+    }
+    for (const ProtoValue& ev : *list) {
+        const ProtoStruct* const eobj = ev.get<ProtoStruct>();
+        if (eobj == nullptr) {
+            throw ConfigError("fault_code_labels: each entry must be an object");
+        }
+        const auto code = static_cast<std::uint16_t>(struct_num(*eobj, "code", "fault_code_labels entry"));
+        const auto lit = eobj->find("label");
+        if (lit == eobj->end()) {
+            throw ConfigError("fault_code_labels entry: missing 'label'");
+        }
+        const std::string* const label = lit->second.get<std::string>();
+        if (label == nullptr) {
+            throw ConfigError("fault_code_labels entry: 'label' must be a string");
+        }
+        out.emplace_back(code, *label);
+    }
+    return out;
+}
+
 ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     ServoConfig c;
     c.ifname = req_str(attrs, "interface");
@@ -167,6 +201,7 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     }
     c.rxpdo = parse_pdo_map(*rx, "rxpdo");
     c.txpdo = parse_pdo_map(*tx, "txpdo");
+    c.fault_code_labels = parse_fault_code_labels(attrs);  // optional 0x603F gloss
 
     c.validate();  // throws ConfigError (clear text) on any invalid field
     return c;

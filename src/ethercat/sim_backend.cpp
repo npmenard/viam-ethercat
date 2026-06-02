@@ -41,11 +41,11 @@ std::uint32_t sdo_key(std::uint16_t index, std::uint8_t sub) noexcept {
 }  // namespace
 
 SimBackend::SimBackend(std::vector<SimSlaveModel> slaves) {
-    slaves_.reserve(slaves.size());
+    // emplace in place: Slave holds atomics (cross-thread test-hook fields) so it is
+    // non-movable; std::deque back-insertion constructs directly without moving.
     for (auto& model : slaves) {
-        Slave slave;
-        slave.model = std::move(model);
-        slaves_.push_back(std::move(slave));
+        slaves_.emplace_back();
+        slaves_.back().model = std::move(model);
     }
 }
 
@@ -117,8 +117,10 @@ void SimBackend::map_process_data() {
         // is noexcept and uses subspan(), so a bad offset there would throw and
         // std::terminate -- fail loudly here instead.
         const SimSlaveModel& m = s.model;
+        const bool fault_oob = m.fault_code_off >= 0 && static_cast<std::size_t>(m.fault_code_off) + 2 > m.input_bytes;
+        const bool vel_oob = m.velocity_actual_off >= 0 && static_cast<std::size_t>(m.velocity_actual_off) + 4 > m.input_bytes;
         if (m.ctrlword_off + 2 > m.output_bytes || (m.target_off + 4 > m.output_bytes && m.mode == Cia402Mode::ProfilePosition) ||
-            m.statusword_off + 2 > m.input_bytes || m.actual_off + 4 > m.input_bytes) {
+            m.statusword_off + 2 > m.input_bytes || m.actual_off + 4 > m.input_bytes || fault_oob || vel_oob) {
             throw ConfigError("SimSlaveModel offsets exceed the image sizes (out=" + std::to_string(m.output_bytes) +
                               ", in=" + std::to_string(m.input_bytes) + ")");
         }
@@ -182,7 +184,7 @@ void SimBackend::step_device(Slave& s) noexcept {
     const bool fault_reset_rising = ((cw & 0x80U) != 0U) && ((prev & 0x80U) == 0U);
 
     using St = Cia402State;
-    if (s.faulted && s.device_state != St::Fault) {
+    if (s.faulted.load(std::memory_order_relaxed) && s.device_state != St::Fault) {
         s.device_state = St::Fault;
     }
 
@@ -239,7 +241,7 @@ void SimBackend::step_device(Slave& s) noexcept {
             break;
         case St::Fault:
             if (fault_reset_rising) {
-                s.faulted = false;
+                s.faulted.store(false, std::memory_order_relaxed);
                 s.device_state = St::SwitchOnDisabled;
             }
             break;
@@ -263,6 +265,7 @@ void SimBackend::step_device(Slave& s) noexcept {
     // Motion: chase the target (PP) or integrate velocity (PV). Driven by the
     // SDO-set effective_mode -- in mode 0 (0x6060 never written) the motor does NOT
     // move, even when OperationEnabled, so a missing mode set fails offline.
+    const std::int32_t actual_before_motion = s.actual;
     if (s.device_state == St::OperationEnabled) {
         // Record the commanded profile velocity (0x6081) the master wrote -- test
         // visibility for "did the RT loop actually send the move speed?".
@@ -288,6 +291,7 @@ void SimBackend::step_device(Slave& s) noexcept {
             s.actual = static_cast<std::int32_t>(s.actual + vel);
         }
     }
+    s.velocity = static_cast<std::int32_t>(s.actual - actual_before_motion);  // per-cycle delta -> 0x606C feedback
 
     // Compose the statusword.
     unsigned sw = statusword_base(s.device_state);
@@ -303,6 +307,23 @@ void SimBackend::step_device(Slave& s) noexcept {
     const auto in = std::span<std::byte>(s.input_image);
     store_le<std::uint16_t>(in.subspan(s.model.statusword_off, 2), static_cast<std::uint16_t>(sw));
     store_le<std::int32_t>(in.subspan(s.model.actual_off, 4), s.actual);
+    // #16 TxPDO feedback de-mask (only when the field is mapped): velocity-actual
+    // (0x606C) every cycle from the wire-driven motion; drive error code (0x603F) =
+    // the configured code WHILE in Fault, else 0 (so the flag gates the payload).
+    if (s.model.velocity_actual_off >= 0) {
+        store_le<std::int32_t>(in.subspan(static_cast<std::size_t>(s.model.velocity_actual_off), 4), s.velocity);
+    }
+    if (s.model.fault_code_off >= 0) {
+        // A forced stale code (test hook) overrides the gating -> 0x603F is nonzero
+        // even with bit3 clear; otherwise the code is the configured value WHILE in
+        // Fault, else 0 (the flag gates the payload on the wire).
+        const std::uint16_t stale = s.stale_fault_code.load(std::memory_order_relaxed);
+        std::uint16_t code = stale;  // forced stale code overrides the gating
+        if (stale == 0 && s.device_state == St::Fault) {
+            code = s.fault_code.load(std::memory_order_relaxed);  // gated: code only while faulted
+        }
+        store_le<std::uint16_t>(in.subspan(static_cast<std::size_t>(s.model.fault_code_off), 2), code);
+    }
 
     s.prev_ctrlword = cw;
 }
@@ -319,7 +340,7 @@ int SimBackend::exchange() noexcept {
             step_device(s);
         }
     }
-    if (short_wkc_once_) {
+    if (short_wkc_once_ || short_wkc_sticky_.load(std::memory_order_relaxed)) {
         short_wkc_once_ = false;
         return expected_wkc_ - 1;
     }
@@ -339,12 +360,28 @@ void SimBackend::close() noexcept {
 
 void SimBackend::inject_fault(std::uint16_t slave) noexcept {
     if (slave >= 1 && slave <= slaves_.size()) {
-        slaves_[slave - 1].faulted = true;
+        slaves_[slave - 1].faulted.store(true, std::memory_order_relaxed);
+    }
+}
+
+void SimBackend::set_fault_code(std::uint16_t slave, std::uint16_t code) noexcept {
+    if (slave >= 1 && slave <= slaves_.size()) {
+        slaves_[slave - 1].fault_code.store(code, std::memory_order_relaxed);
+    }
+}
+
+void SimBackend::set_stale_fault_code(std::uint16_t slave, std::uint16_t code) noexcept {
+    if (slave >= 1 && slave <= slaves_.size()) {
+        slaves_[slave - 1].stale_fault_code.store(code, std::memory_order_relaxed);
     }
 }
 
 void SimBackend::force_short_wkc_once() noexcept {
     short_wkc_once_ = true;
+}
+
+void SimBackend::force_short_wkc(bool on) noexcept {
+    short_wkc_sticky_.store(on, std::memory_order_relaxed);
 }
 
 void SimBackend::suppress_setpoint_ack(std::uint16_t slave, bool on) noexcept {

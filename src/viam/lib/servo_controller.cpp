@@ -27,7 +27,20 @@ constexpr std::uint16_t kTargetPos = 0x607A;
 constexpr std::uint16_t kActualPos = 0x6064;
 constexpr std::uint16_t kTargetVel = 0x60FF;
 constexpr std::uint16_t kProfileVel = 0x6081;  // PP move speed (carries the GoTo/GoFor rpm); optional in the map
+constexpr std::uint16_t kFaultCode = 0x603F;   // drive error code (TxPDO, optional feedback)
+constexpr std::uint16_t kVelActual = 0x606C;   // velocity actual value (TxPDO, optional feedback)
 constexpr std::uint64_t kNsPerSec = 1'000'000'000ULL;
+
+// 4-digit uppercase hex of a U16 (e.g. 0x8700 -> "8700"); for last_error()'s
+// "drive fault 0x...." line. Cold path; no iostream/locale.
+std::string to_hex16(std::uint16_t v) {
+    static constexpr char kDigits[] = "0123456789ABCDEF";
+    std::string s(4, '0');
+    for (int i = 0; i < 4; ++i) {
+        s[static_cast<std::size_t>(3 - i)] = kDigits[(v >> (4U * static_cast<unsigned>(i))) & 0xFU];
+    }
+    return s;
+}
 
 std::uint64_t monotonic_ns() noexcept {
     timespec ts{};
@@ -215,10 +228,25 @@ void ServoController::resolve_fields() {
     } else {
         f_velocity_ = master_->rx_field(s, kTargetVel, 0);
     }
+    // OPTIONAL TxPDO feedback (spec #16) -- both modes. byte_width==0 => unmapped, so
+    // the RT loop falls back (velocity estimate) / omits the tier (fault code).
+    f_fault_code_ = txpdo_has(kFaultCode) ? master_->tx_field(s, kFaultCode, 0) : FieldLocation{};
+    f_velocity_actual_ = txpdo_has(kVelActual) ? master_->tx_field(s, kVelActual, 0) : FieldLocation{};
 }
 
 bool ServoController::rxpdo_has(std::uint16_t index) const noexcept {
     for (const auto& [pdo, entries] : config_.rxpdo.entries) {
+        for (const PdoEntry& e : entries) {
+            if (e.index == index) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool ServoController::txpdo_has(std::uint16_t index) const noexcept {
+    for (const auto& [pdo, entries] : config_.txpdo.entries) {
         for (const PdoEntry& e : entries) {
             if (e.index == index) {
                 return true;
@@ -411,7 +439,7 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
     return ControlWord::disable_voltage();
 }
 
-void ServoController::publish_state(Status status, std::int32_t actual, std::int32_t velocity) noexcept {
+void ServoController::publish_state(Status status, std::int32_t actual, std::int32_t velocity, std::span<const std::byte> in) noexcept {
     state_.position_counts.store(actual, std::memory_order_relaxed);
     state_.velocity.store(velocity, std::memory_order_relaxed);
 
@@ -456,21 +484,30 @@ void ServoController::publish_state(Status status, std::int32_t actual, std::int
         }
     }
 
-    // Two-tier fault publish (AFTER the watchdog, so a stall set this cycle shows
-    // now). Bus WkcFault is LIVE (mirrors master_->fault(), sticky-til-reconfigure)
-    // and WINS precedence; controller errors latch until fault_reset. Publish the
-    // fault_wkc payload (relaxed) BEFORE the rt_error_ flag (release) so last_error()
-    // never reads a stale WKC.
-    const RtError eff = master_->fault() ? RtError::WkcFault : latched_ctrl_error_;
-    if (eff == RtError::WkcFault) {
-        state_.fault_wkc.store(master_->working_counter(), std::memory_order_relaxed);
-    }
-    rt_error_.store(eff, std::memory_order_release);
-    // state_.faulted is the DRIVE/BUS fault tier ONLY (de-powers the motor + wakes
-    // the waiter's fault branch). Controller move-errors (HandshakeTimeout/
-    // MoveStalled) deliberately stay OUT: they fail the in-flight move (via
-    // failed_generation) but must NOT de-power an otherwise-healthy drive.
-    state_.faulted.store(master_->fault() || status.fault(), std::memory_order_release);
+    // Per-tier fault publish (spec #16; AFTER the watchdog so a stall set this cycle
+    // shows now). last_error() COMPOSES every active tier -- never picks one -- so a
+    // both-true Er74 (drive 0x603F + bus WKC->0) reports root cause AND symptom. In
+    // each tier the payload is relaxed-stored BEFORE the flag is release-stored, so a
+    // master_-free reader never sees a true flag with a stale payload (cross-tier skew
+    // is benign: fault state is quasi-static once latched).
+    const bool bus_fault = master_->fault();
+    // BUS tier: payload (the raw last-exchange WKC -- the actual bad value at fault)
+    // then flag.
+    state_.fault_wkc.store(master_->last_wkc(), std::memory_order_relaxed);
+    state_.wkc_faulted.store(bus_fault, std::memory_order_release);
+    // DRIVE tier: live-read 0x603F from THIS cycle's snapshot EVERY faulted cycle (not
+    // edge-captured) so a code the drive latches a frame or two after it sets bit3 is
+    // still picked up ("code pending" collapses to the rare hard-drop race only).
+    const std::uint16_t drive_code = f_fault_code_.byte_width != 0 ? load_le<std::uint16_t>(in.subspan(f_fault_code_.byte_offset, 2)) : 0;
+    state_.drive_fault_code.store(drive_code, std::memory_order_relaxed);
+    state_.drive_faulted.store(status.fault(), std::memory_order_release);
+    // CTRL tier: the published mirror of the latch (tracks abort, clears on fault_reset).
+    rt_error_.store(latched_ctrl_error_, std::memory_order_release);
+    // state_.faulted is the DRIVE/BUS gate ONLY (de-powers the motor + wakes the
+    // waiter's fault branch). Controller move-errors (HandshakeTimeout/MoveStalled)
+    // deliberately stay OUT: they fail the in-flight move (via failed_generation) but
+    // must NOT de-power an otherwise-healthy drive.
+    state_.faulted.store(bus_fault || status.fault(), std::memory_order_release);
 
     state_.last_cycle_time_ns.store(monotonic_ns(), std::memory_order_release);
     state_.loop_cycle.fetch_add(1, std::memory_order_relaxed);
@@ -492,6 +529,9 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
     while (!st.stop_requested()) {
         const CommandBatch batch = commands_.drain();
 
+        // ONE input-image snapshot per cycle (spec #16 §10): statusword/bit3, actual,
+        // 0x603F, 0x606C all slice from THIS span -- never a second input_image() call
+        // -- so the fault code matches the fault state it is reported with structurally.
         const std::span<const std::byte> in = master_->input_image(slave);
         const Status status{load_le<std::uint16_t>(in.subspan(f_statusword_.byte_offset, 2))};
         const std::int32_t actual = load_le<std::int32_t>(in.subspan(f_actual_.byte_offset, 4));
@@ -499,8 +539,12 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
             prev_actual_ = actual;  // avoid a spurious huge velocity on cycle 0
             first_cycle_ = false;
         }
+        // Velocity from the wire (0x606C) when mapped, else the instantaneous estimate
+        // (actual-delta * loop rate). One branch; identical fallback when unmapped.
         const std::int32_t velocity =
-            static_cast<std::int32_t>(static_cast<std::int64_t>(actual - prev_actual_) * config_.target_loop_rate_hz);
+            f_velocity_actual_.byte_width != 0
+                ? load_le<std::int32_t>(in.subspan(f_velocity_actual_.byte_offset, 4))
+                : static_cast<std::int32_t>(static_cast<std::int64_t>(actual - prev_actual_) * config_.target_loop_rate_hz);
         prev_actual_ = actual;
 
         const std::uint16_t cw = step_lifecycle(status, batch, actual);
@@ -508,7 +552,7 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
         last_cw_ = cw;
 
         master_->process();
-        publish_state(status, actual, velocity);
+        publish_state(status, actual, velocity, in);
 
         next += period_ns;
         timespec deadline{};
@@ -687,25 +731,64 @@ bool ServoController::is_disconnected() const noexcept {
     return stopping_.load(std::memory_order_acquire) || watchdog_expired();
 }
 
-std::string ServoController::last_error() const {
-    // Cold-but-LOCK-FREE and master_-FREE (symmetric with is_powered/is_moving):
-    // compose from rt_error_ (acquire) + the published fault_wkc payload + the
-    // constant expected_wkc atom. No api_mutex_ (it would block for the full
-    // ~2s reconfigure), no master_ deref.
-    switch (rt_error_.load(std::memory_order_acquire)) {  // pairs with the RT release store; reads fault_wkc after
-        case RtError::WkcFault:
-            return "EtherCAT working-counter fault: got " + std::to_string(state_.fault_wkc.load(std::memory_order_relaxed)) +
-                   ", expected " + std::to_string(state_.expected_wkc.load(std::memory_order_relaxed));
-        case RtError::HandshakeTimeout:
-            return "Profile-Position set-point acknowledge timed out";
-        case RtError::MoveStalled:
-            return "move stalled (no progress)";
-        case RtError::NotOperational:
-            return "drive not operational";
-        case RtError::None:
-            return {};
+std::int32_t ServoController::velocity_counts() const noexcept {
+    return state_.velocity.load(std::memory_order_relaxed);
+}
+
+std::string ServoController::fault_gloss(std::uint16_t code) const {
+    // Config-data lookup (NOT a hardcoded A6 table): 0x603F code -> human label.
+    // Unknown code -> empty, so last_error() shows just the bare hex. Cold path.
+    for (const auto& [c, label] : config_.fault_code_labels) {
+        if (c == code) {
+            return label;
+        }
     }
     return {};
+}
+
+std::string ServoController::last_error() const {
+    // Cold-but-LOCK-FREE and master_-FREE (symmetric with is_powered/is_moving): read
+    // the three published tier flags (acquire) + their payloads. COMPOSE every active
+    // tier -- never pick one -- so a both-true Er74 reports root cause AND symptom.
+    // (fault_gloss reads config_, taking the shared lock -- fine, this is non-RT.)
+    std::string out;
+    const auto append = [&out](const std::string& s) {
+        if (!out.empty()) {
+            out += "; ";
+        }
+        out += s;
+    };
+
+    // DRIVE (root cause) -- pair read: flag acquire, then code relaxed.
+    if (state_.drive_faulted.load(std::memory_order_acquire)) {
+        const std::uint16_t code = state_.drive_fault_code.load(std::memory_order_relaxed);
+        if (code != 0) {
+            const std::string gloss = fault_gloss(code);
+            append("drive fault 0x" + to_hex16(code) + (gloss.empty() ? "" : " (" + gloss + ")"));
+        } else {
+            append("drive fault (code pending)");
+        }
+    }
+    // BUS (symptom + recovery).
+    if (state_.wkc_faulted.load(std::memory_order_acquire)) {
+        append("EtherCAT working-counter fault: got " + std::to_string(state_.fault_wkc.load(std::memory_order_relaxed)) + ", expected " +
+               std::to_string(state_.expected_wkc.load(std::memory_order_relaxed)) + " -- bus re-init required");
+    }
+    // CTRL (latched controller error).
+    switch (rt_error_.load(std::memory_order_acquire)) {
+        case RtError::HandshakeTimeout:
+            append("Profile-Position set-point acknowledge timed out");
+            break;
+        case RtError::MoveStalled:
+            append("move stalled (no progress)");
+            break;
+        case RtError::NotOperational:
+            append("drive not operational");
+            break;
+        case RtError::None:
+            break;
+    }
+    return out;
 }
 
 }  // namespace ethercat::servo

@@ -31,7 +31,7 @@ namespace {
 
 constexpr double kCountsPerRev = 131072.0;
 
-ServoConfig make_config(ControlMode mode) {
+ServoConfig make_config(ControlMode mode, bool feedback = false) {
     ServoConfig c;
     c.ifname = "sim0";
     c.slave_id = 1;
@@ -47,7 +47,14 @@ ServoConfig make_config(ControlMode mode) {
     }
     c.txpdo.assign_index = 0x1C13;
     c.txpdo.pdo_indices = {0x1A00};
-    c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}};
+    // #16 feedback variant: add 0x603F (fault code) + 0x606C (velocity actual) to the
+    // TxPDO so the controller resolves + reads them. status@0, actual@2, 603F@6, 606C@8.
+    if (feedback) {
+        c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16}, PdoEntry{0x606C, 0, 32}};
+        c.fault_code_labels = {{0x8700, "Er74.1 / no SYNC0"}};
+    } else {
+        c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}};
+    }
     c.max_motor_speed_rpm = 3000.0;
     c.motor_rated_current_amps = 2.5;
     c.gear_ratio = 1.0;
@@ -61,13 +68,20 @@ ServoConfig make_config(ControlMode mode) {
     return c;
 }
 
-SimSlaveModel make_model(ControlMode mode) {
+SimSlaveModel make_model(ControlMode mode, bool feedback = false) {
     SimSlaveModel m;
     m.input_bytes = 6;  // status@0, actual@2
     m.ctrlword_off = 0;
     m.statusword_off = 0;
     m.actual_off = 2;
     m.counts_per_step = 50'000;  // PP fallback speed (only used if 0x6081 is NOT mapped)
+    // #16 feedback de-mask: drive the 0x603F/0x606C TxPDO offsets so the read path is
+    // exercised offline (mirrors make_config(feedback): 603F@6, 606C@8, input 12 B).
+    if (feedback) {
+        m.input_bytes = 12;
+        m.fault_code_off = 6;
+        m.velocity_actual_off = 8;
+    }
     if (mode == ControlMode::ProfileVelocity) {
         m.mode = ethercat::Cia402Mode::ProfileVelocity;
         m.output_bytes = 6;  // ctrl@0, target velocity@2
@@ -81,9 +95,9 @@ SimSlaveModel make_model(ControlMode mode) {
     return m;
 }
 
-ServoController::BackendFactory sim_factory(ControlMode mode, SimBackend** out_ptr) {
-    return [mode, out_ptr] {
-        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model(mode)});
+ServoController::BackendFactory sim_factory(ControlMode mode, SimBackend** out_ptr, bool feedback = false) {
+    return [mode, out_ptr, feedback] {
+        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model(mode, feedback)});
         if (out_ptr != nullptr) {
             *out_ptr = be.get();
         }
@@ -174,7 +188,7 @@ TEST("ServoController(PP): go_to is absolute in the ZEROED frame after reset_zer
     ctrl.set_zero();          // zero HERE -> position_revs()==0 at raw 3 revs
     CHECK(std::abs(ctrl.position_revs()) < 0.01);
 
-    ctrl.go_to(1000.0, 1.0);  // absolute +1 rev in the zeroed frame
+    ctrl.go_to(1000.0, 1.0);                             // absolute +1 rev in the zeroed frame
     CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);  // lands at zeroed 1.0 (raw 4 revs)
 }
 
@@ -200,9 +214,9 @@ TEST("ServoController(PP): go_for stays relative regardless of the zero") {
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
 
-    ctrl.go_to(1000.0, 2.0);  // raw 2 revs
-    ctrl.set_zero();          // zeroed 0 at raw 2 revs
-    ctrl.go_for(1000.0, 1.0);  // relative +1 rev
+    ctrl.go_to(1000.0, 2.0);                             // raw 2 revs
+    ctrl.set_zero();                                     // zeroed 0 at raw 2 revs
+    ctrl.go_for(1000.0, 1.0);                            // relative +1 rev
     CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);  // 0 + 1 = 1 (NOT double-shifted to 3)
 }
 
@@ -301,6 +315,103 @@ TEST("ServoController: fault inject -> not powered; fault_reset recovers") {
 
     sim->inject_fault(1);
     CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+}
+
+// ---- #16: TxPDO feedback (fault legibility + velocity) ----
+
+TEST("ServoController(#16): a drive fault is legible -- last_error shows 0x603F + config gloss") {
+    SimBackend* sim = nullptr;
+    ServoController ctrl{make_config(ControlMode::ProfilePosition, /*feedback=*/true),
+                         sim_factory(ControlMode::ProfilePosition, &sim, /*feedback=*/true)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    CHECK(sim != nullptr);
+
+    sim->set_fault_code(1, 0x8700);  // Er74.1 (the missed-SYNC0 code this work illuminates)
+    sim->inject_fault(1);
+    CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    const std::string e = ctrl.last_error();
+    CHECK(e.find("drive fault 0x8700") != std::string::npos);  // the raw code
+    CHECK(e.find("Er74.1 / no SYNC0") != std::string::npos);   // the config-data gloss
+}
+
+TEST("ServoController(#16): compose-both -- a drive fault AND a WKC fault BOTH surface (Er74)") {
+    // The regression test: a missed SYNC0 faults the drive (0x603F) AND drops WKC->0;
+    // last_error() must report BOTH (root cause + symptom), never mask one.
+    SimBackend* sim = nullptr;
+    ServoController ctrl{make_config(ControlMode::ProfilePosition, true), sim_factory(ControlMode::ProfilePosition, &sim, true)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    sim->set_fault_code(1, 0x8700);
+    sim->inject_fault(1);        // DRIVE tier (status bit3 + 0x603F)
+    sim->force_short_wkc(true);  // BUS tier (sustained short WKC -> master latches fault)
+    CHECK(wait_until(
+        [&] {
+            const std::string e = ctrl.last_error();
+            return e.find("drive fault 0x8700") != std::string::npos && e.find("working-counter fault") != std::string::npos;
+        },
+        std::chrono::milliseconds(1000)));
+}
+
+TEST("ServoController(#16): 0x603F is live-read -- a code latched AFTER bit3 is still picked up") {
+    SimBackend* sim = nullptr;
+    ServoController ctrl{make_config(ControlMode::ProfilePosition, true), sim_factory(ControlMode::ProfilePosition, &sim, true)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    sim->inject_fault(1);  // bit3 set; fault_code defaults 0 -> "code pending"
+    CHECK(wait_until([&] { return ctrl.last_error().find("code pending") != std::string::npos; }, std::chrono::milliseconds(500)));
+    sim->set_fault_code(1, 0x8700);  // code latched a few cycles later -> live-read picks it up
+    CHECK(wait_until([&] { return ctrl.last_error().find("0x8700") != std::string::npos; }, std::chrono::milliseconds(500)));
+}
+
+TEST("ServoController(#16): the drive-fault FLAG gates a stale 0x603F -- no phantom fault") {
+    // The literal flag-gating test (inverse of the masking bug): a nonzero 0x603F on
+    // the wire while bit3 is CLEAR (a stale code lingering after the fault cleared)
+    // must NOT produce a drive tier -- last_error() reads drive_faulted (the flag)
+    // before drive_fault_code (the payload), so a stale code is never reported as a
+    // live fault. set_stale_fault_code forces 0x603F nonzero WITHOUT setting bit3.
+    SimBackend* sim = nullptr;
+    ServoController ctrl{make_config(ControlMode::ProfilePosition, true), sim_factory(ControlMode::ProfilePosition, &sim, true)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    sim->set_stale_fault_code(1, 0x8700);  // 0x603F = 0x8700 on the wire, but the drive is NOT faulted (bit3 = 0)
+    // Give the controller several cycles to publish; the drive must stay powered (no
+    // fault) and last_error() must NOT mention a drive fault despite the nonzero code.
+    CHECK(!wait_until([&] { return ctrl.last_error().find("drive fault") != std::string::npos; }, std::chrono::milliseconds(200)));
+    CHECK(ctrl.is_powered());
+    CHECK(ctrl.last_error().find("drive fault") == std::string::npos);
+}
+
+TEST("ServoController(#16): velocity comes from the 0x606C wire value, not the estimate") {
+    SimBackend* sim = nullptr;
+    ServoController ctrl{make_config(ControlMode::ProfileVelocity, true), sim_factory(ControlMode::ProfileVelocity, &sim, true)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    // PV: the sim integrates s.actual += (0x60FF value) per cycle, so the per-cycle
+    // delta it writes to 0x606C == the commanded device velocity. The estimate path
+    // would instead report delta * loop_rate (1000x). Assert the WIRE value.
+    const std::int32_t dev = ethercat::servo::rpm_to_device_velocity(60.0, kCountsPerRev, 1.0);
+    ctrl.set_rpm(60.0);
+    CHECK(wait_until([&] { return ctrl.velocity_counts() == dev; }, std::chrono::milliseconds(500)));
+    CHECK(ctrl.velocity_counts() != dev * 1000);  // NOT the estimate (delta * rate)
+}
+
+TEST("ServoController(#16): unmapped 0x603F/0x606C -> no OOB; velocity falls back to the estimate") {
+    SimBackend* sim = nullptr;
+    // Default config: NO 0x603F/0x606C in the TxPDO -> the optional guards must hold.
+    ServoController ctrl{make_config(ControlMode::ProfileVelocity), sim_factory(ControlMode::ProfileVelocity, &sim, false)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    CHECK(ctrl.last_error().empty());  // healthy, no drive tier, no OOB
+
+    // Velocity falls back to the instantaneous estimate (actual-delta * rate).
+    ctrl.set_rpm(60.0);
+    CHECK(wait_until([&] { return ctrl.velocity_counts() != 0; }, std::chrono::milliseconds(500)));
 }
 
 TEST_MAIN()

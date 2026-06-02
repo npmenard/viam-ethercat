@@ -12,8 +12,10 @@
 // exercises the full RT loop + CiA402 enable ladder + setpoint propagation +
 // snapshot readback with no hardware.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <span>
 #include <string>
@@ -41,6 +43,10 @@ struct SimSlaveModel {
     std::int32_t counts_per_step = 1000;     // PP: how fast actual chases target per cycle
     std::int32_t velocity_off = -1;          // optional: 0x60FF target velocity offset in outputs (i32); <0 = none
     std::int32_t profile_velocity_off = -1;  // optional: 0x6081 PP profile-velocity offset in outputs (u32); <0 = none
+    // De-mask of the #16 TxPDO FEEDBACK fields (offsets into the INPUT image; <0 = not
+    // mapped, so the controller's read path falls back -- exercises the optional guard).
+    std::int32_t fault_code_off = -1;       // 0x603F drive error code (u16) in inputs
+    std::int32_t velocity_actual_off = -1;  // 0x606C velocity-actual (i32) in inputs
 
     std::uint32_t vendor_id = 0;
     std::uint32_t product_code = 0;
@@ -71,9 +77,25 @@ class SimBackend final : public EcatBackend {
     // --- test hooks (not part of EcatBackend) ---
     // Inject a fault on a slave (next exchange decodes to Fault).
     void inject_fault(std::uint16_t slave) noexcept;
+    // Set the drive error code (0x603F) the slave reports WHILE faulted (0 = none).
+    // Written to the 0x603F TxPDO offset each cycle the device is in Fault, else 0.
+    // Lets a test exercise the #16 drive-fault tier + the code-pending race (set the
+    // fault first with code 0, then set the code a cycle later).
+    void set_fault_code(std::uint16_t slave, std::uint16_t code) noexcept;
+    // Force a STALE 0x603F: write `code` to the 0x603F offset UNCONDITIONALLY (even
+    // when the device is NOT in Fault / bit3 clear), modelling a drive that leaves a
+    // nonzero error code lingering after the fault clears. 0 = off (normal gated
+    // behaviour). Lets the #16 flag-gating test assert that a nonzero stale code with
+    // status.fault()==false produces NO drive tier in last_error() -- the literal
+    // "flag gates the payload", not a zero-code coincidence.
+    void set_stale_fault_code(std::uint16_t slave, std::uint16_t code) noexcept;
     // Force the next send_receive() to report a short WKC (one cycle), to test
     // the master's WKC-fault latch.
     void force_short_wkc_once() noexcept;
+    // STICKY short WKC: every exchange reports a short WKC while on, so an async RT
+    // loop reliably accumulates enough consecutive bad cycles to latch a BUS fault
+    // (the #16 compose-both test needs a live master_->fault() without driving cycles).
+    void force_short_wkc(bool on) noexcept;
     // Last profile velocity (0x6081) the device saw in its command image (0 if the
     // master never wrote it / it isn't mapped). Lets offline tests assert the RT loop
     // actually writes the commanded move speed.
@@ -108,9 +130,15 @@ class SimBackend final : public EcatBackend {
         std::int32_t target = 0;
         std::int32_t actual = 0;
         bool setpoint_ack = false;  // PP bit12 latch
-        bool faulted = false;
-        std::int32_t profile_velocity = 0;  // last 0x6081 seen in the command image (test visibility)
-        bool suppress_ack = false;          // test hook: never assert bit12 (force handshake timeout)
+        // ATOMIC: written by a non-RT test hook (inject_fault/set_fault_code/
+        // set_stale_fault_code) while the RT loop reads them in step_device -- the only
+        // cross-thread Slave fields. Relaxed is sufficient (independent test signals).
+        std::atomic<bool> faulted{false};
+        std::atomic<std::uint16_t> fault_code{0};        // 0x603F code reported while faulted (set_fault_code)
+        std::atomic<std::uint16_t> stale_fault_code{0};  // forces 0x603F = this REGARDLESS of fault state (flag-gating test)
+        std::int32_t profile_velocity = 0;               // last 0x6081 seen in the command image (test visibility; RT-only)
+        std::int32_t velocity = 0;                       // per-cycle actual delta (0x606C de-mask; RT-only)
+        bool suppress_ack = false;                       // test hook: never assert bit12 (force handshake timeout)
         // RUNTIME mode of operation -- set ONLY by the master's 0x6060 SDO write (de-masked
         // from model.mode), so a missing/wrong mode set leaves it None and the motor never
         // moves (mode-0 guard), catching the "forgot to set 0x6060" bug offline.
@@ -119,12 +147,18 @@ class SimBackend final : public EcatBackend {
 
     static void step_device(Slave& s) noexcept;
 
-    std::vector<Slave> slaves_;
+    // deque, not vector: Slave holds atomics (cross-thread test-hook fields) so it is
+    // non-movable, and vector back-insertion compile-time-requires move-insertable
+    // (for its reallocation path) even with reserve(). deque grows without moving
+    // existing elements, so it stores non-movable Slaves directly. Per-Slave access is
+    // still O(1); the inner output_image/input_image vectors stay contiguous.
+    std::deque<Slave> slaves_;
     int expected_wkc_ = 0;
     std::uint32_t dc_cycle_ns_ = 0;     // last configure_dc_sync() cycle (0 = never requested)
     std::int64_t synthetic_dc_ns_ = 0;  // synthetic DC clock, advanced each exchange() (dc_time())
     bool open_ = false;
-    bool short_wkc_once_ = false;
+    bool short_wkc_once_ = false;                // one-shot (master_test drives it synchronously; RT-only)
+    std::atomic<bool> short_wkc_sticky_{false};  // toggled non-RT while the RT loop reads it in exchange() -> atomic
 };
 
 }  // namespace ethercat

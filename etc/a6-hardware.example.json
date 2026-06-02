@@ -102,6 +102,11 @@
       ]
     },
 
+    "_comment_fault_labels": "OPTIONAL gloss for the 0x603F (24639) drive error code, surfaced by last_error(). CONFIG DATA -- A6 codes live here, never hardcoded. code is the U16 value of 0x603F; 34560 = 0x8700 = DS402 sync error (Er74.1 / no SYNC0). Extend per the A6 manual as the bench surfaces other codes; an unlisted code shows as bare hex.",
+    "fault_code_labels": [
+      { "code": 34560, "label": "Er74.1 / no SYNC0" }
+    ],
+
     "_pv_variant": {
       "_comment": "PROFILE VELOCITY drive: apply these two changes to the attributes above. control_mode=PV -> modes-of-operation 0x6060 = 3. The RxPDO swaps target position 0x607A (24698) for target velocity 0x60FF (24831); the TxPDO is unchanged (statusword + position actual). set_rpm drives a signed velocity; go_to is rejected in PV.",
       "control_mode": "PV",

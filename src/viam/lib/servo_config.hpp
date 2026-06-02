@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #include "ethercat/pdo_mapping.hpp"
 
@@ -61,6 +63,14 @@ struct ServoConfig {
     std::size_t command_queue_capacity = 64;       // > 0
     std::uint32_t handshake_timeout_cycles = 100;  // PP bit12 ack timeout
     std::uint32_t move_timeout_ms = 0;             // 0 = no-progress watchdog only
+
+    // --- diagnostics ---
+    // OPTIONAL gloss for the 0x603F drive error code -> human label, surfaced by
+    // last_error() (e.g. 0x8700 -> "Er74.1 / no SYNC0"). CONFIG DATA, never a
+    // hardcoded A6 table: populated from the hardware JSON. A code not in this list
+    // glosses to bare hex, so the line is never wrong, just less descriptive. Small
+    // (a handful of codes); looked up on the cold last_error() path only.
+    std::vector<std::pair<std::uint16_t, std::string>> fault_code_labels;
 
     // Throws ethercat::ConfigError (clear text) on any invalid field. Pure --
     // no I/O.
