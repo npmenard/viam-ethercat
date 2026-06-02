@@ -38,8 +38,13 @@ ServoConfig make_config(ControlMode mode) {
     c.mode = mode;
     c.rxpdo.assign_index = 0x1C12;
     c.rxpdo.pdo_indices = {0x1600};
-    // ctrl(0x6040,16) + target(0x607A,32) + velocity(0x60FF,32) = 10 bytes.
-    c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x60FF, 0, 32}};
+    // Authoritative A6 maps per mode: PP = ctrl + target position + profile velocity
+    // (10 B); PV = ctrl + target velocity (6 B).
+    if (mode == ControlMode::ProfileVelocity) {
+        c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x60FF, 0, 32}};
+    } else {
+        c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6081, 0, 32}};
+    }
     c.txpdo.assign_index = 0x1C13;
     c.txpdo.pdo_indices = {0x1A00};
     c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}};
@@ -58,15 +63,21 @@ ServoConfig make_config(ControlMode mode) {
 
 SimSlaveModel make_model(ControlMode mode) {
     SimSlaveModel m;
-    m.output_bytes = 10;  // ctrl@0, target@2, velocity@6
-    m.input_bytes = 6;    // status@0, actual@2
+    m.input_bytes = 6;  // status@0, actual@2
     m.ctrlword_off = 0;
-    m.target_off = 2;
-    m.velocity_off = 6;
     m.statusword_off = 0;
     m.actual_off = 2;
-    m.mode = (mode == ControlMode::ProfileVelocity) ? ethercat::Cia402Mode::ProfileVelocity : ethercat::Cia402Mode::ProfilePosition;
-    m.counts_per_step = 50'000;  // ~2.6 revs/cycle: a 1-rev move converges in a few cycles
+    m.counts_per_step = 50'000;  // PP fallback speed (only used if 0x6081 is NOT mapped)
+    if (mode == ControlMode::ProfileVelocity) {
+        m.mode = ethercat::Cia402Mode::ProfileVelocity;
+        m.output_bytes = 6;  // ctrl@0, target velocity@2
+        m.velocity_off = 2;
+    } else {
+        m.mode = ethercat::Cia402Mode::ProfilePosition;
+        m.output_bytes = 10;  // ctrl@0, target@2, profile velocity@6
+        m.target_off = 2;
+        m.profile_velocity_off = 6;  // de-masked: PP chases at the 0x6081 the RT loop writes
+    }
     return m;
 }
 
@@ -170,26 +181,9 @@ TEST("ServoController(PP): go_to is absolute in the ZEROED frame after reset_zer
 TEST("ServoController(PP): the commanded rpm is written to profile velocity (0x6081)") {
     // Hardware gap (same class as 0x6060): if 0x6081 is mapped but the RT loop never
     // writes it, the move runs at the drive's DEFAULT speed and the rpm is ignored.
-    // Map 0x6081 and assert the device actually received the commanded velocity.
-    ServoConfig cfg = make_config(ControlMode::ProfilePosition);
-    cfg.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6081, 0, 32}};
+    // The shared PP map carries 0x6081; assert the device received the commanded value.
     SimBackend* sim = nullptr;
-    auto factory = [&sim] {
-        SimSlaveModel m;
-        m.output_bytes = 10;  // ctrl@0, target@2, profile-velocity@6
-        m.input_bytes = 6;    // status@0, actual@2
-        m.ctrlword_off = 0;
-        m.target_off = 2;
-        m.profile_velocity_off = 6;
-        m.statusword_off = 0;
-        m.actual_off = 2;
-        m.mode = ethercat::Cia402Mode::ProfilePosition;
-        m.counts_per_step = 50'000;
-        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m});
-        sim = be.get();
-        return std::unique_ptr<EcatBackend>(std::move(be));
-    };
-    ServoController ctrl{cfg, factory};
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
 
@@ -287,7 +281,8 @@ TEST("ServoController(PP): a no-progress move trips the stall watchdog; drive st
     // via go_to throwing, WITHOUT de-powering the healthy drive.
     auto factory = [] {
         SimSlaveModel m = make_model(ControlMode::ProfilePosition);
-        m.counts_per_step = 0;  // commanded but frozen
+        m.profile_velocity_off = -1;  // don't track 0x6081 -> use the fixed fallback speed...
+        m.counts_per_step = 0;        // ...of 0 => physically frozen (drive enabled, no progress)
         return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m}));
     };
     ServoController ctrl{make_config(ControlMode::ProfilePosition), factory};

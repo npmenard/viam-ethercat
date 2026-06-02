@@ -145,6 +145,12 @@ class ServoController {
     BackendFactory backend_factory_;
 
     // Resolved once at start(); indexed by the RT loop without a map find.
+    // INVARIANT (learned from the 0x6060 + 0x6081 gaps): every RxPDO field the drive
+    // CONSUMES must be written by the RT loop each cycle (or SDO-set at configure) --
+    // controlword + target position/velocity + profile velocity here. A mapped-but-
+    // unwritten command field makes the drive use its default (silent wrong behavior
+    // on hardware). The SimBackend consumes each field's WIRE value (not a config
+    // shortcut) so a missing write FAILS an offline test, not just the bench.
     FieldLocation f_ctrlword_;
     FieldLocation f_statusword_;
     FieldLocation f_target_;

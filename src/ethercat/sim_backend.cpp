@@ -270,7 +270,12 @@ void SimBackend::step_device(Slave& s) noexcept {
             s.profile_velocity = load_le<std::int32_t>(out.subspan(static_cast<std::size_t>(s.model.profile_velocity_off), 4));
         }
         if (s.effective_mode == Cia402Mode::ProfilePosition) {
-            const std::int32_t step = s.model.counts_per_step;
+            // De-mask: chase at the 0x6081 profile-velocity WIRE value the master
+            // wrote (counts/cycle here), NOT a config shortcut -- so if the RT loop
+            // forgets to write 0x6081 the value is 0 and the move makes NO progress
+            // (caught offline). Fall back to counts_per_step only when 0x6081 isn't
+            // mapped at all (profile_velocity_off < 0).
+            const std::int32_t step = (s.model.profile_velocity_off >= 0) ? s.profile_velocity : s.model.counts_per_step;
             if (s.actual < s.target) {
                 const std::int32_t next = static_cast<std::int32_t>(s.actual + step);
                 s.actual = (next > s.target) ? s.target : next;
