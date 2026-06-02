@@ -206,11 +206,18 @@ void Master::configure(bool reach_op) {
                                kDcPreopLockStreak,
                                preop_streak >= kDcPreopLockStreak ? " -> LOCKED" : " -> NOT locked (cap hit)");
 
-            // Cross into SAFE-OP with the master ALREADY locked, then keep pumping the
-            // SAME cadence (shared `next`/`dc_integral` -> no phase break) through the
-            // drive's cycle-measurement window, so the value it latches into 0x1C32:02 is
-            // the clean locked 1 ms.
+            // Cross into SAFE-OP with the master ALREADY locked, then keep pumping
+            // through the drive's cycle-measurement window so the value it latches into
+            // 0x1C32:02 is the clean locked 1 ms.
             backend_->request_state(0, EcatState::SafeOp);
+            // RE-BASE the deadline: request_state() blocks on the AL statecheck WITHOUT
+            // pumping process data, so `next` is now several ms in the PAST. Without this
+            // the measure window's first cycles fire back-to-back catching up -> a sub-ms
+            // FIRST SM2-event period -> exactly the mis-measurement we're preventing (the
+            // A6 latches that first period into 0x1C32:02). Fresh base = the first
+            // post-SAFE-OP frame lands one clean cycle from now. The integral (phase) is
+            // preserved across the re-base, so the master is still locked.
+            (void)clock_gettime(CLOCK_MONOTONIC, &next);
             (void)phase_lock_pump(cycle_ns, dc_shift, kDcSafeopMeasureCycles, 0, next, dc_integral);
         } else {
             backend_->request_state(0, EcatState::SafeOp);
