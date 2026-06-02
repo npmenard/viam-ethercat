@@ -51,6 +51,13 @@ Status read_status(SimBackend& be) {
     return Status{ethercat::load_le<std::uint16_t>(be.slave_io(1).inputs.subspan(0, 2))};
 }
 
+// Set modes-of-operation 0x6060 (U8) via SDO -- the master does this in configure();
+// the device only moves once it's set (de-masked from model.mode).
+void set_mode(SimBackend& be, Cia402Mode mode) {
+    const std::array<std::byte, 1> data{static_cast<std::byte>(static_cast<std::uint8_t>(mode))};
+    be.sdo_write(1, 0x6060, 0, data);
+}
+
 }  // namespace
 
 TEST("SimBackend: device walks the DS402 enable ladder; bit10 always 1") {
@@ -84,6 +91,7 @@ TEST("SimBackend: device walks the DS402 enable ladder; bit10 always 1") {
 TEST("SimBackend: PP set-point-acknowledge bit12 handshake") {
     SimBackend be{std::vector<SimSlaveModel>{a6_like_model()}};
     bring_up_to_op(be);
+    set_mode(be, Cia402Mode::ProfilePosition);  // 0x6060 = PP (else no handshake)
     // Drive to OperationEnabled.
     for (std::uint16_t cw :
          {ControlWord::disable_voltage(), ControlWord::shutdown(), ControlWord::switch_on(), ControlWord::enable_operation()}) {
@@ -108,6 +116,7 @@ TEST("SimBackend: PP set-point-acknowledge bit12 handshake") {
 TEST("SimBackend: PP actual position chases the latched target") {
     SimBackend be{std::vector<SimSlaveModel>{a6_like_model()}};
     bring_up_to_op(be);
+    set_mode(be, Cia402Mode::ProfilePosition);  // 0x6060 = PP (else no motion)
     for (std::uint16_t cw :
          {ControlWord::disable_voltage(), ControlWord::shutdown(), ControlWord::switch_on(), ControlWord::enable_operation()}) {
         write_ctrl(be, cw);
@@ -121,6 +130,29 @@ TEST("SimBackend: PP actual position chases the latched target") {
     }
     const std::int32_t actual = ethercat::load_le<std::int32_t>(be.slave_io(1).inputs.subspan(2, 4));
     CHECK_EQ(actual, std::int32_t{2500});
+}
+
+TEST("SimBackend: mode-0 guard -- no 0x6060 write means no motion even when enabled") {
+    // The de-mask: without the master's 0x6060 SDO the device stays in mode 0, so a
+    // real drive (and now the sim) won't move. This is the bug that was previously
+    // masked by SimBackend reading model.mode directly.
+    SimBackend be{std::vector<SimSlaveModel>{a6_like_model()}};
+    bring_up_to_op(be);
+    // NOTE: deliberately NO set_mode() here.
+    for (std::uint16_t cw :
+         {ControlWord::disable_voltage(), ControlWord::shutdown(), ControlWord::switch_on(), ControlWord::enable_operation()}) {
+        write_ctrl(be, cw);
+        be.exchange();
+    }
+    CHECK_EQ(read_status(be).decode(), Cia402State::OperationEnabled);  // enabled...
+    ethercat::store_le<std::int32_t>(be.slave_io(1).outputs.subspan(2, 4), 2500);
+    write_ctrl(be, ControlWord::with_new_setpoint(ControlWord::enable_operation(), true));
+    for (int i = 0; i < 5; ++i) {
+        be.exchange();
+    }
+    // ...but mode 0 => actual NEVER advances (and the PP handshake never acks).
+    CHECK_EQ(ethercat::load_le<std::int32_t>(be.slave_io(1).inputs.subspan(2, 4)), std::int32_t{0});
+    CHECK(!read_status(be).setpoint_acknowledged());
 }
 
 TEST("SimBackend: fault inject decodes Fault; fault-reset edge recovers") {

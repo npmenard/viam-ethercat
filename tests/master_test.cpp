@@ -151,6 +151,17 @@ TEST("Master+SimBackend: PP SetTarget propagates; actual converges to target") {
     CHECK_EQ(actual_of(master.read_inputs(1)), target);
 }
 
+TEST("Master: configure() sets modes-of-operation 0x6060 from default_mode (SDO)") {
+    auto sim = std::make_unique<SimBackend>(make_models());
+    SimBackend* sim_ptr = sim.get();
+    Master master{make_config(), std::move(sim)};  // default_mode = ProfilePosition
+    master.init();
+    master.configure();
+    const std::vector<std::byte> mode = sim_ptr->recorded_sdo(1, 0x6060, 0);
+    CHECK_EQ(mode.size(), std::size_t{1});
+    CHECK_EQ(static_cast<int>(std::to_integer<std::uint8_t>(mode[0])), 1);  // PP = 1
+}
+
 TEST("Master: configure() re-applies the PDO map every call (power-cycle safe)") {
     auto sim = std::make_unique<SimBackend>(make_models());
     SimBackend* sim_ptr = sim.get();

@@ -61,30 +61,36 @@ ec_scan: found 1 EtherCAT slave(s) on 'enp3s0':
 
 **3.2 The A6 `SlaveConfig` is CONFIG DATA** (never hardcoded; cpp-expert's `etc/a6-hardware.example.json` (#14) encodes this same map in decimal, since JSON has no hex). Authoritative map, verified against the A6 manual §10 (object dictionary + PDO config). Mapping-word format: each entry packs as `index<<16 | subindex<<8 | length_bits` (length byte `08`=8b, `10`=16b, `20`=32b) — e.g. `6040:00`/16b → `0x60400010`; entries pack byte-aligned in map order, little-endian on the wire (our cursor handles LE).
 
-The recommended map is a **single unified RxPDO/TxPDO that serves BOTH PP and PV** (mirrors the drive's own fixed preset `0x1703`), with the active mode selected by `0x6060`:
+**Mode is set once via SDO, NOT in the cyclic map** (decision: Option A, single-mode-per-config MVP — task #15). `Master::configure()` writes `SDO 0x6060 ← 1 (PP) / 3 (PV)` in PRE-OP, so the RxPDO is **mode-specific and excludes `0x6060`**. (Per #15, the `SimBackend` reads the mode from that SDO too, so the mode-set is exercised offline — the gap that would otherwise only appear on hardware becomes a tested behavior.)
 
-**RxPDO `0x1600` (master→drive, SM `0x1C12`), 5 entries / 15 B:**
+**RxPDO `0x1600` (master→drive, SM `0x1C12`) — pick the map for your `control_mode`:**
+
+*PP — 3 entries / 10 B:*
 | Object | Hex | Type | Bits | Role |
 |---|---|---|---|---|
 | Controlword | `0x6040:00` | U16 | 16 | command |
-| Mode of operation | `0x6060:00` | I8 | 8 | **1 = PP, 3 = PV** |
-| Target position | `0x607A:00` | I32 | 32 | PP |
-| Target velocity | `0x60FF:00` | I32 | 32 | PV |
-| Profile velocity | `0x6081:00` | U32 | 32 | PP profile speed |
+| Target position | `0x607A:00` | I32 | 32 | absolute target (zeroed frame) |
+| Profile velocity | `0x6081:00` | U32 | 32 | **move speed — carries the GoTo/GoFor rpm** |
 
-**TxPDO `0x1A00` (drive→master, SM `0x1C13`), 6 entries / 15 B:**
+*PV — 2 entries / 6 B:*
 | Object | Hex | Type | Bits | Role |
 |---|---|---|---|---|
-| Fault code | `0x603F:00` | U16 | 16 | error code |
+| Controlword | `0x6040:00` | U16 | 16 | command |
+| Target velocity | `0x60FF:00` | I32 | 32 | signed = direction |
+
+**TxPDO `0x1A00` (drive→master, SM `0x1C13`) — same for both modes, 6 entries / 15 B:**
+| Object | Hex | Type | Bits | Role |
+|---|---|---|---|---|
+| Fault code | `0x603F:00` | U16 | 16 | error code (→ `last_error`) |
 | Statusword | `0x6041:00` | U16 | 16 | status |
-| Mode display | `0x6061:00` | I8 | 8 | echoes `0x6060` |
+| Mode display | `0x6061:00` | I8 | 8 | echoes `0x6060` (confirm mode took) |
 | Position actual | `0x6064:00` | I32 | 32 | feedback |
 | Velocity actual | `0x606C:00` | I32 | 32 | feedback |
 | Torque actual | `0x6077:00` | I16 | 16 | ‰ rated (current proxy) |
 
-> **⚠ `0x6060` mode-of-operation must be set** — with the unified map it's an RxPDO field, so the RT loop must **write the configured mode value (1 or 3) into it every cycle**; otherwise the drive sees mode 0 (no mode) and won't enter PP/PV. *Alternative (simpler for our single-mode-per-config MVP):* drop `0x6060` from the RxPDO and **set it once via SDO** at `configure()` (`SDO 0x6060 ← 1` or `3`). cpp-expert + I are settling which (#14 + a small controller change) — see the note at the end of this section. Whichever is chosen, **the mode must be set somewhere; the SimBackend doesn't exercise this, so it's a hardware-only failure mode if missed.**
+> **The RT loop must WRITE every RxPDO command field each cycle.** PP = controlword + target position + **profile velocity `0x6081`** (this is where the `GoTo`/`GoFor` rpm goes — if `0x6081` is mapped but the module doesn't write it, the move runs at the **drive's default speed** and the commanded rpm is ignored; see the note flagged to cpp-expert, same class as the `0x6060` gap, folded into #15). PV = controlword + target velocity. Mode `0x6060` is **SDO-set once**, not written cyclically.
 
-Limits: max 10 entries / 40 B per map. The A6 `0x1600`/`0x1A00` are the *configurable* PDOs we remap; `0x1701–0x1705`/`0x1B01–0x1B04` are **fixed presets** (no entry-write needed). **No-mapping-write fallback:** if the SDO remap ever misbehaves on the bench, select fixed preset `0x1703` (Output: 6040,607A,60FF,6060,60B8,60E0,60E1) + `0x1B03` (Input) via the SM assignment alone (`0x1C12:01 ← 0x1703`, `0x1C13:01 ← 0x1B03`) — covers PP+PV without writing any map entries.
+Limits: max 10 entries / 40 B per map. The A6 `0x1600`/`0x1A00` are the *configurable* PDOs we remap; `0x1701–0x1705`/`0x1B01–0x1B04` are **fixed presets**. **No-mapping-write fallback:** if the SDO remap ever misbehaves on the bench, select fixed preset `0x1703` (Output: 6040,607A,60FF,6060,60B8,60E0,60E1) + `0x1B03` (Input) via the SM assignment alone (`0x1C12:01 ← 0x1703`, `0x1C13:01 ← 0x1B03`) — covers PP+PV without writing entries. **Note:** `0x1703` *includes* `0x6060` as a cyclic field, so under that fallback the SDO-once mode-set still applies (the drive latches the last value), but the module would be sending 0 into the mapped `0x6060` each cycle — if you ever use the fixed preset, set the mode via SDO *and* confirm `0x6061` (mode display) reflects it, or the cyclic 0 will override. Prefer the configurable map.
 
 **3.3 Re-applied every power-on.** The A6's PDO mapping is **writable only in PRE-OP and is NOT stored in EEPROM** (manual §10) → `configure()` re-applies it on every start/power-on. The exact CoE sequence the module runs (all in PRE-OP, per slave): `0x1C12:00 ← 0` (clear RPDO assign) → `0x1600:00 ← 0` (clear entry count) → `0x1600:01..N ← ` the packed mapping words → `0x1600:00 ← N` (entry count, **5** for the unified RxPDO) → `0x1C12:01 ← 0x1600` → `0x1C12:00 ← 1`; identical for `0x1C13`/`0x1A00` (count **6**) → `map_process_data` → SAFE-OP → prime → OP. You don't do this by hand — but **confirm it ran**: a clean `configure()` (no `PdoMappingError`, drive reaches OP) means it took. The `applied-image-size == configured-byte_size` guard throws loudly if the remap was silently rejected (§7).
 
@@ -106,13 +112,24 @@ Limits: max 10 entries / 40 B per map. The A6 `0x1600`/`0x1A00` are the *configu
 
 Drive these via the SDK (motor methods) or `DoCommand`. Watch the statusword each step (read it via `DoCommand {"status": true}` → `last_error`/flags, or an SDO read of `0x6041`).
 
-**4.1 Enable ladder (automatic).** On `start()` the RT loop runs the CiA402 ladder: `0x06` (shutdown) → `0x07` (switch-on) → `0x0F` (enable-operation). The statusword should decode **SwitchOnDisabled → ReadyToSwitchOn → SwitchedOn → OperationEnabled** within a few cycles. Confirm `is_powered() == true`.
+> **What the module does internally vs. what you do:** you call SDK methods (or `DoCommand`); the module runs the cyclic controlword↔statusword sequence below in its RT loop. The low-level controlword values are given so you can correlate what an SDO/PDO monitor shows with the module's behavior. The one-time SDO config (PDO remap + `0x6060 ← mode` + optional limits) happens in `configure()` before the cyclic loop (§3.3).
+
+**Bit reference** (CiA402; decode what you see on an SDO/PDO monitor):
+
+*Controlword `0x6040`* — bit0 SwitchOn · bit1 EnableVoltage · bit2 QuickStop (**active-low**: 0 = QS) · bit3 EnableOperation · bit4 NewSetpoint (PP) · bit5 ChangeImmediately (PP) · bit6 Relative (PP) · bit7 FaultReset (**rising edge**) · bit8 Halt (valid in **both** PP and PV; re-commandable). Common words: `0x06` shutdown · `0x07` switch-on · `0x0F` enable-op · `0x1F` enable-op+new-setpoint · `0x10F` enable-op+Halt (our Stop) · `0x80` fault-reset · `0x02` quick-stop (emergency only). **In PV, bits 4–6 (and 9–10) are reserved/unsupported** — the controller holds plain `0x0F` (the new-setpoint handshake is PP-only).
+
+*Statusword `0x6041`* — bit0 ReadyToSwitchOn · bit1 SwitchedOn · bit2 OperationEnabled · bit3 **Fault** · bit4 VoltageEnabled · bit5 QuickStop (active-low) · bit6 SwitchOnDisabled · bit7 Warning · bit9 Remote · **bit10 TargetReached — A6 stuck=1, DO NOT USE** · bit11 InternalLimit · **bit12 SetpointAck (PP)** · **bit13 PositionDeviation** (vs window `0x6065`). State decode (mask the low bits): `…0` NotReady · `x1xx0000`=SwitchOnDisabled · `x01x0001`=ReadyToSwitchOn · `x01x0011`=SwitchedOn · `x01x0111`=**OperationEnabled** · `x00x0111`=QuickStopActive · `x0xx1111`=FaultReaction · `x0xx1000`=**Fault**.
+
+**4.1 Enable ladder (automatic).** On `start()` the RT loop runs the CiA402 ladder, one transition/cycle: `0x06` (shutdown) → `0x07` (switch-on) → `0x0F` (enable-operation) — manual shorthand **"x→6→7→15"**. The statusword should decode **SwitchOnDisabled → ReadyToSwitchOn → SwitchedOn → OperationEnabled** (bits 0→1→2) within a few cycles. If it starts in Fault (bit 3), the loop emits `0x80` (bit 7 rising edge) once to clear, then re-ladders. Confirm `is_powered() == true`.
 - ⚠️ At OperationEnabled the drive is **energized and holding** — shaft is now live.
+- Optional limits the module may set via SDO at `configure()` (manual §4): `0x607F` max-speed = `(max_rpm/60)×counts_per_rev`, `0x6083` accel / `0x6084` decel; torque limits `0x6072`/`0x60E0`/`0x60E1` stay at the default **3000 ‰** until the motor rated current is known (flag c).
 
-**4.2 PV jog (if `control_mode: "PV"`).** `SetRPM(small rpm)` — e.g. 60 rpm. Confirm the shaft turns at ~the commanded speed and the **sign/direction** matches expectation (flip via `0x607E` polarity in config if reversed). `is_moving() == true` while turning. `SetRPM(0)` / `Stop()` → halts and **stays stopped** (Stop = Halt, bit 8, sticky; the drive stays enabled/re-commandable). Verify reported velocity (`0x606C`) tracks.
+**4.2 PV jog (if `control_mode: "PV"`).** `SetRPM(small rpm)` — e.g. 60 rpm. Internally the loop holds controlword `0x0F` and writes RxPDO `0x60FF ← (rpm/60)×counts_per_rev` each cycle (signed; sign = direction); the drive runs at that speed immediately, accel/decel governed by `0x6083`/`0x6084`. Confirm the shaft turns at ~the commanded speed and the **sign/direction** matches expectation (flip via `0x607E` polarity in config if reversed). `is_moving() == true` while turning (PV `is_moving` is **velocity-based**: `|vel| > velocity_threshold`). `SetRPM(0)` / `Stop()` → halts and **stays stopped**.
+- **Stop semantics — our design uses Halt, not QuickStop.** `Stop()` = **Halt (controlword bit 8, `0x0F|0x100`), sticky** — the drive stays enabled/holding and **re-commandable**. The drive *also* supports **QuickStop** (controlword `0x02` → `QuickStopActive`, decelerate + needs re-enable) — we reserve that for an **emergency** path, not the normal Stop. So on an SDO monitor a `Stop()` shows bit 8 set, **not** `0x02`. Verify reported velocity (`0x606C`) goes to 0 and stays.
 
-**4.3 PP move (if `control_mode: "PP"`).** `GoTo(rpm, target_revs)` or `GoFor(rpm, revs)`. Watch the **new-setpoint handshake**: controlword `0x0F → 0x1F` (bit 4 rising) → **statusword bit 12 (set-point acknowledge) goes 1** → controlword drops bit 4 → bit 12 clears. The module's handshake sub-FSM does this with a timeout; if the drive never acks within `handshake_timeout_cycles`, `GoTo` throws "set-point acknowledge timed out" (§7).
-- **Move-complete is by the position predicate**, `|target − actual| ≤ position_tolerance_counts && |vel| ≤ velocity_threshold` — **NOT statusword bit 10**. On the A6, **bit 10 ("target reached") is hard-wired to 1 and unusable**; the module never reads it. Confirm `GoTo(X)` lands at `Position() ≈ X` (within tolerance) and `is_moving()` goes false at completion.
+**4.3 PP move (if `control_mode: "PP"`).** `GoTo(rpm, target_revs)` (absolute) or `GoFor(rpm, revs)` (relative). Internally: write RxPDO `0x607A ← target counts` + `0x6081 ← profile velocity (counts/s)`, then the **new-setpoint handshake** — controlword `0x0F → 0x1F` (bit 4 rising = latch setpoint) → **statusword bit 12 (set-point acknowledge) goes 1** (drive accepted) → controlword drops bit 4 (`0x1F → 0x0F`) → bit 12 returns 0 (re-armed for the next move). Manual shorthand **"6→7→15→31"** (abs, wait-for-current-to-finish); `GoFor` uses the **relative** variant (bit 6, "6→7→79→95"). The module's handshake sub-FSM does this with a timeout; if the drive never acks within `handshake_timeout_cycles`, `GoTo` throws "set-point acknowledge timed out" (§7).
+- **Move-complete is the module's RT predicate**, `|target − actual| ≤ position_tolerance_counts && |vel| ≤ velocity_threshold` — **NOT statusword bit 10**. On the A6, **bit 10 ("target reached") is hard-wired to 1 and unusable**; the module never reads it. Confirm `GoTo(X)` lands at `Position() ≈ X` (within tolerance) and `is_moving()` goes false at completion.
+- **Bench cross-check (drive-side):** the A6 also exposes **statusword bit 13 (position-deviation)** against the position window `0x6065` (default 3145728 ref-units): bit 13 = 0 means within range. You can watch bit 13 / `|0x607A − 0x6064|` on an SDO monitor as an independent confirmation that the move physically completed, but the module's authoritative signal is the RT predicate above.
 - After `ResetZeroPosition(0)`, `Position()` reads ~0 at the current shaft position, and a subsequent `GoTo(X)` lands at `Position()==X` (absolute, zeroed frame).
 
 **4.4 Scaling — two distinct gears, don't conflate them.**

@@ -96,6 +96,10 @@ class SimBackend final : public EcatBackend {
         bool setpoint_ack = false;  // PP bit12 latch
         bool faulted = false;
         bool suppress_ack = false;  // test hook: never assert bit12 (force handshake timeout)
+        // RUNTIME mode of operation -- set ONLY by the master's 0x6060 SDO write (de-masked
+        // from model.mode), so a missing/wrong mode set leaves it None and the motor never
+        // moves (mode-0 guard), catching the "forgot to set 0x6060" bug offline.
+        Cia402Mode effective_mode = Cia402Mode::None;
     };
 
     static void step_device(Slave& s) noexcept;

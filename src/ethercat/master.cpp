@@ -1,13 +1,19 @@
 #include "ethercat/master.hpp"
 
+#include <array>
+#include <cstdint>
+#include <span>
 #include <string>
 #include <utility>
+
+#include "ethercat/cia402.hpp"
 
 namespace ethercat {
 
 namespace {
 
-constexpr int kPrimeCycles = 3;  // exchanges in SAFE-OP so slaves have valid outputs before OP
+constexpr int kPrimeCycles = 3;               // exchanges in SAFE-OP so slaves have valid outputs before OP
+constexpr std::uint16_t kModesOfOp = 0x6060;  // CiA402 modes-of-operation (U8): PP=1, PV=3; SDO-set in PRE-OP
 
 std::uint32_t field_key(std::uint16_t index, std::uint8_t sub) noexcept {
     return (static_cast<std::uint32_t>(index) << 8U) | sub;
@@ -72,6 +78,11 @@ void Master::configure() {
     for (const SlaveConfig& sc : config_.slaves) {
         apply_pdo_map(*backend_, sc.slave_id, sc.rxpdo);
         apply_pdo_map(*backend_, sc.slave_id, sc.txpdo);
+        // Set modes-of-operation (0x6060, U8) via SDO -- NOT mapped cyclically. A real
+        // drive left in mode 0 never moves; this is the one drive-mode write per
+        // configure(). PP=1 / PV=3 from the configured default_mode.
+        const std::array<std::byte, 1> mode{static_cast<std::byte>(static_cast<std::uint8_t>(sc.default_mode))};
+        backend_->sdo_write(sc.slave_id, kModesOfOp, 0, mode);
     }
 
     backend_->map_process_data();

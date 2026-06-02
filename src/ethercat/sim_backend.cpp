@@ -87,6 +87,11 @@ void SimBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_
     Slave& s = slaves_[slave - 1];
     s.dictionary[sdo_key(index, sub)] = std::vector<std::byte>(data.begin(), data.end());
     s.sdo_write_order.push_back(sdo_key(index, sub));
+    // De-mask: the runtime mode of operation comes from the 0x6060 SDO (U8), NOT
+    // model.mode -- so a master that forgets to set it leaves the device in mode 0.
+    if (index == 0x6060 && sub == 0 && !data.empty()) {
+        s.effective_mode = static_cast<Cia402Mode>(static_cast<std::int8_t>(data[0]));
+    }
 }
 
 std::size_t SimBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
@@ -240,8 +245,9 @@ void SimBackend::step_device(Slave& s) noexcept {
             break;
     }
 
-    // Profile-Position set-point-acknowledge handshake (bit4 / bit12).
-    if (s.model.mode == Cia402Mode::ProfilePosition && s.device_state == St::OperationEnabled) {
+    // Profile-Position set-point-acknowledge handshake (bit4 / bit12). Mode comes
+    // from the 0x6060 SDO (effective_mode), NOT model.mode -- mode 0 => no handshake.
+    if (s.effective_mode == Cia402Mode::ProfilePosition && s.device_state == St::OperationEnabled) {
         const bool bit4 = (cw & 0x10U) != 0U;
         const bool prev_bit4 = (prev & 0x10U) != 0U;
         if (bit4 && !prev_bit4) {
@@ -254,9 +260,11 @@ void SimBackend::step_device(Slave& s) noexcept {
         s.setpoint_ack = false;
     }
 
-    // Motion: chase the target (PP) or integrate velocity (PV).
+    // Motion: chase the target (PP) or integrate velocity (PV). Driven by the
+    // SDO-set effective_mode -- in mode 0 (0x6060 never written) the motor does NOT
+    // move, even when OperationEnabled, so a missing mode set fails offline.
     if (s.device_state == St::OperationEnabled) {
-        if (s.model.mode == Cia402Mode::ProfilePosition) {
+        if (s.effective_mode == Cia402Mode::ProfilePosition) {
             const std::int32_t step = s.model.counts_per_step;
             if (s.actual < s.target) {
                 const std::int32_t next = static_cast<std::int32_t>(s.actual + step);
@@ -265,7 +273,7 @@ void SimBackend::step_device(Slave& s) noexcept {
                 const std::int32_t next = static_cast<std::int32_t>(s.actual - step);
                 s.actual = (next < s.target) ? s.target : next;
             }
-        } else if (s.model.mode == Cia402Mode::ProfileVelocity && s.model.velocity_off >= 0) {
+        } else if (s.effective_mode == Cia402Mode::ProfileVelocity && s.model.velocity_off >= 0) {
             const std::int32_t vel = load_le<std::int32_t>(out.subspan(static_cast<std::size_t>(s.model.velocity_off), 4));
             s.actual = static_cast<std::int32_t>(s.actual + vel);
         }
