@@ -22,15 +22,14 @@ namespace {
 
 // --- attribute helpers (numbers arrive as double; int is upcast by the SDK) ---
 
-const ProtoValue* find_attr(const ResourceConfig& cfg, const std::string& key) {
-    const auto& attrs = cfg.attributes();
+const ProtoValue* find_attr(const ProtoStruct& attrs, const std::string& key) {
     const auto it = attrs.find(key);
     return it == attrs.end() ? nullptr : &it->second;
 }
 
 template <class T>
-std::optional<T> opt_attr(const ResourceConfig& cfg, const std::string& key) {
-    const ProtoValue* const v = find_attr(cfg, key);
+std::optional<T> opt_attr(const ProtoStruct& attrs, const std::string& key) {
+    const ProtoValue* const v = find_attr(attrs, key);
     if (v == nullptr) {
         return std::nullopt;
     }
@@ -41,20 +40,20 @@ std::optional<T> opt_attr(const ResourceConfig& cfg, const std::string& key) {
     return *p;
 }
 
-double req_num(const ResourceConfig& cfg, const std::string& key) {
-    const auto v = opt_attr<double>(cfg, key);
+double req_num(const ProtoStruct& attrs, const std::string& key) {
+    const auto v = opt_attr<double>(attrs, key);
     if (!v) {
         throw ConfigError("required config attribute '" + key + "' is missing");
     }
     return *v;
 }
 
-double opt_num(const ResourceConfig& cfg, const std::string& key, double dflt) {
-    return opt_attr<double>(cfg, key).value_or(dflt);
+double opt_num(const ProtoStruct& attrs, const std::string& key, double dflt) {
+    return opt_attr<double>(attrs, key).value_or(dflt);
 }
 
-std::string req_str(const ResourceConfig& cfg, const std::string& key) {
-    const auto v = opt_attr<std::string>(cfg, key);
+std::string req_str(const ProtoStruct& attrs, const std::string& key) {
+    const auto v = opt_attr<std::string>(attrs, key);
     if (!v) {
         throw ConfigError("required config attribute '" + key + "' is missing");
     }
@@ -135,33 +134,33 @@ PdoMap parse_pdo_map(const ProtoValue& val, const std::string& what) {
     return map;
 }
 
-ServoConfig servo_config_from_viam(const ResourceConfig& cfg) {
+ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     ServoConfig c;
-    c.ifname = req_str(cfg, "interface");
-    c.slave_id = static_cast<std::uint16_t>(opt_num(cfg, "slave", 1.0));
-    c.mode = parse_control_mode(req_str(cfg, "control_mode"));
+    c.ifname = req_str(attrs, "interface");
+    c.slave_id = static_cast<std::uint16_t>(opt_num(attrs, "slave", 1.0));
+    c.mode = parse_control_mode(req_str(attrs, "control_mode"));
 
-    c.max_motor_speed_rpm = req_num(cfg, "max_rpm");
-    c.counts_per_rev = req_num(cfg, "counts_per_rev");
-    c.motor_rated_current_amps = req_num(cfg, "motor_rated_current_amps");
-    c.gear_ratio = opt_num(cfg, "gear_ratio", 1.0);
-    c.peak_current_limit_amps = opt_num(cfg, "peak_current_amps", 0.0);
+    c.max_motor_speed_rpm = req_num(attrs, "max_rpm");
+    c.counts_per_rev = req_num(attrs, "counts_per_rev");
+    c.motor_rated_current_amps = req_num(attrs, "motor_rated_current_amps");
+    c.gear_ratio = opt_num(attrs, "gear_ratio", 1.0);
+    c.peak_current_limit_amps = opt_num(attrs, "peak_current_amps", 0.0);
 
-    c.position_tolerance_counts = static_cast<std::int32_t>(opt_num(cfg, "position_tolerance_counts", 0.0));
-    c.velocity_threshold = static_cast<std::int32_t>(opt_num(cfg, "velocity_threshold", 0.0));
+    c.position_tolerance_counts = static_cast<std::int32_t>(opt_num(attrs, "position_tolerance_counts", 0.0));
+    c.velocity_threshold = static_cast<std::int32_t>(opt_num(attrs, "velocity_threshold", 0.0));
 
-    c.target_loop_rate_hz = static_cast<std::uint32_t>(opt_num(cfg, "loop_rate_hz", 1000.0));
-    c.require_realtime = opt_attr<bool>(cfg, "require_realtime").value_or(true);
-    c.rt_priority = static_cast<int>(opt_num(cfg, "rt_priority", 80.0));
+    c.target_loop_rate_hz = static_cast<std::uint32_t>(opt_num(attrs, "loop_rate_hz", 1000.0));
+    c.require_realtime = opt_attr<bool>(attrs, "require_realtime").value_or(true);
+    c.rt_priority = static_cast<int>(opt_num(attrs, "rt_priority", 80.0));
 
-    c.max_consecutive_wkc_errors = static_cast<int>(opt_num(cfg, "max_consecutive_wkc_errors", 5.0));
-    c.stall_threshold_cycles = static_cast<std::uint64_t>(opt_num(cfg, "stall_threshold_cycles", 10.0));
-    c.command_queue_capacity = static_cast<std::size_t>(opt_num(cfg, "command_queue_capacity", 64.0));
-    c.handshake_timeout_cycles = static_cast<std::uint32_t>(opt_num(cfg, "handshake_timeout_cycles", 100.0));
-    c.move_timeout_ms = static_cast<std::uint32_t>(opt_num(cfg, "move_timeout_ms", 0.0));
+    c.max_consecutive_wkc_errors = static_cast<int>(opt_num(attrs, "max_consecutive_wkc_errors", 5.0));
+    c.stall_threshold_cycles = static_cast<std::uint64_t>(opt_num(attrs, "stall_threshold_cycles", 10.0));
+    c.command_queue_capacity = static_cast<std::size_t>(opt_num(attrs, "command_queue_capacity", 64.0));
+    c.handshake_timeout_cycles = static_cast<std::uint32_t>(opt_num(attrs, "handshake_timeout_cycles", 100.0));
+    c.move_timeout_ms = static_cast<std::uint32_t>(opt_num(attrs, "move_timeout_ms", 0.0));
 
-    const ProtoValue* const rx = find_attr(cfg, "rxpdo");
-    const ProtoValue* const tx = find_attr(cfg, "txpdo");
+    const ProtoValue* const rx = find_attr(attrs, "rxpdo");
+    const ProtoValue* const tx = find_attr(attrs, "txpdo");
     if (rx == nullptr || tx == nullptr) {
         throw ConfigError("both 'rxpdo' and 'txpdo' PDO maps are required (the drive's object map is config data)");
     }
@@ -172,8 +171,8 @@ ServoConfig servo_config_from_viam(const ResourceConfig& cfg) {
     return c;
 }
 
-bool wants_simulation(const ResourceConfig& cfg, const ServoConfig& sc) {
-    if (opt_attr<bool>(cfg, "simulate").value_or(false)) {
+bool wants_simulation(const ProtoStruct& attrs, const ServoConfig& sc) {
+    if (opt_attr<bool>(attrs, "simulate").value_or(false)) {
         return true;
     }
     return sc.ifname == "sim";
@@ -226,8 +225,9 @@ ServoController::BackendFactory sim_factory_from_config(const ServoConfig& sc) {
 }
 
 std::unique_ptr<ServoController> build_controller(const ResourceConfig& cfg) {
-    ServoConfig sc = servo_config_from_viam(cfg);
-    if (wants_simulation(cfg, sc)) {
+    const ProtoStruct& attrs = cfg.attributes();
+    ServoConfig sc = config_from_attrs(attrs);
+    if (wants_simulation(attrs, sc)) {
         return std::make_unique<ServoController>(std::move(sc), sim_factory_from_config(sc));
     }
     return std::make_unique<ServoController>(std::move(sc));  // SoemBackend (real hardware)
@@ -243,6 +243,10 @@ bool command_flag(const ProtoStruct& command, const char* key) {
 }
 
 }  // namespace
+
+ServoConfig parse_servo_config(const ProtoStruct& attributes) {
+    return config_from_attrs(attributes);
+}
 
 const ModelFamily& ServoMotor::model_family() {
     static const auto family = ModelFamily{"viam", "ethercat"};
@@ -262,8 +266,8 @@ std::vector<std::shared_ptr<ModelRegistration>> ServoMotor::create_model_registr
 }
 
 std::vector<std::string> ServoMotor::validate(const ResourceConfig& cfg) {
-    (void)servo_config_from_viam(cfg);  // throws ConfigError on any problem
-    return {};                          // a motor has no dependencies
+    (void)parse_servo_config(cfg.attributes());  // throws ConfigError on any problem
+    return {};                                   // a motor has no dependencies
 }
 
 ServoMotor::ServoMotor(const Dependencies& /*deps*/, const ResourceConfig& cfg) : Motor(cfg.name()), controller_(build_controller(cfg)) {
@@ -287,7 +291,7 @@ ServoMotor::~ServoMotor() {
 void ServoMotor::reconfigure(const Dependencies& /*deps*/, const ResourceConfig& cfg) {
     // Validate-before-mutate: parse + validate the new config (throws) BEFORE any
     // teardown. The controller owns the stop->join->rebuild->restart lifecycle.
-    ServoConfig sc = servo_config_from_viam(cfg);
+    ServoConfig sc = parse_servo_config(cfg.attributes());
     controller_->reconfigure(std::move(sc));
 }
 

@@ -272,6 +272,28 @@ if (ETHERCAT_BUILD_MODULE)
   viam_apply_wall_werror(servo_motor_test)
   target_compile_options(servo_motor_test PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
   add_test(NAME servo_motor_test COMMAND servo_motor_test)
+
+  # Offline validation of the shipped example configs through the real parser +
+  # ServoConfig::validate() (JSON -> protobuf::Struct -> ProtoStruct -> parse).
+  add_executable(a6_config_parse_test
+    tests/a6_config_parse_test.cpp
+    src/viam/module/servo_motor.cpp
+  )
+  target_link_libraries(a6_config_parse_test
+    PRIVATE
+      ethercat
+      viam-cpp-sdk::viamapi
+      viam-cpp-sdk::viamsdk
+  )
+  target_compile_definitions(a6_config_parse_test PRIVATE
+    BOOST_DLL_USE_STD_FS
+    "A6_HW_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-hardware.example.json\""
+    "A6_SIM_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-servo.example.json\""
+  )
+  target_include_directories(a6_config_parse_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  viam_apply_wall_werror(a6_config_parse_test)
+  target_compile_options(a6_config_parse_test PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
+  add_test(NAME a6_config_parse_test COMMAND a6_config_parse_test)
 endif()
 
 

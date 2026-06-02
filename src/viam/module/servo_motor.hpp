@@ -25,6 +25,11 @@ namespace ethercat::servo {
 
 using namespace viam::sdk;
 
+// Parse a Viam resource config's attributes (the ProtoStruct from cfg.attributes())
+// into a validated ServoConfig. Throws ethercat::ConfigError (clear text) on any
+// missing/wrong-typed/invalid field. Exposed for offline config-file validation.
+ServoConfig parse_servo_config(const ProtoStruct& attributes);
+
 class ServoMotor final : public Motor, public Reconfigurable {
    public:
     // Model identity: viam:ethercat:servo (generic -- A6 is config data, not a model).
