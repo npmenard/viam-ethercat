@@ -380,6 +380,40 @@ void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_s
                                                       : "  -> *** start not reached (cap hit) -- SafeOp may still 0x0030 ***")
               << '\n';
 
+    // POST-WAIT silicon check: NOW that the ~100 ms SyncDelay start has elapsed, read
+    // the SYNC-out-unit GENERATION status -- this is the "is SYNC0 actually pulsing?"
+    // evidence (vs the pre-wait readback above, which is always 0 because the start is
+    // ~100 ms in the future). 0x0984 = activation status (b0 = SYNC0 cyclic op active);
+    // 0x098E = SYNC0 status/event (read twice with PD pumped between -- if it CHANGES,
+    // pulses are firing); 0x0980 b0 = SYNC-unit control source (1 = PDI/uC owns it, so
+    // ECAT's activation is ignored -> would explain a stuck 0). 0x0134 = 0x2D => the
+    // start was mis-scheduled (clock not settled before dcsync0).
+    for (int i = 1; i <= impl_->slavecount; ++i) {
+        const std::uint16_t adp = impl_->slavelist[i].configadr;
+        std::uint8_t cyc_ctrl = 0;      // 0x0980 cyclic unit control (b0: 0=ECAT, 1=PDI owns SYNC unit)
+        std::uint8_t act_status = 0;    // 0x0984 activation status (b0 SYNC0 active, b1 SYNC1 active)
+        std::uint8_t sync0_stat_a = 0;  // 0x098E SYNC0 status, sample A
+        std::uint8_t sync0_stat_b = 0;  // 0x098E SYNC0 status, sample B (after a pump)
+        std::uint16_t al_status = 0;    // 0x0134 AL status code
+        (void)ecx_FPRD(&impl_->port, adp, 0x0980, sizeof(cyc_ctrl), &cyc_ctrl, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->port, adp, 0x0984, sizeof(act_status), &act_status, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->port, adp, 0x098E, sizeof(sync0_stat_a), &sync0_stat_a, EC_TIMEOUTRET);
+        ecx_send_processdata(&impl_->ctx);
+        (void)ecx_receive_processdata(&impl_->ctx, EC_TIMEOUTRET);
+        const timespec ts{.tv_sec = 0, .tv_nsec = static_cast<long>(cycle_ns)};
+        (void)nanosleep(&ts, nullptr);
+        (void)ecx_FPRD(&impl_->port, adp, 0x098E, sizeof(sync0_stat_b), &sync0_stat_b, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->port, adp, 0x0134, sizeof(al_status), &al_status, EC_TIMEOUTRET);
+        const bool pulsing = act_status != 0 || sync0_stat_a != sync0_stat_b;
+        std::cerr << "[dc]   slave " << i << " SYNC0-GEN (post-start): 0x0984 actStatus=0x" << std::hex << static_cast<unsigned>(act_status)
+                  << " 0x098E sync0Status=0x" << static_cast<unsigned>(sync0_stat_a) << "->0x" << static_cast<unsigned>(sync0_stat_b)
+                  << " 0x0980 unitCtrl=0x" << static_cast<unsigned>(cyc_ctrl) << " 0x0134 AL=0x" << al_status << std::dec
+                  << (pulsing ? "  -> SYNC0 GENERATING" : "  -> *** SYNC0 NOT generating (0x0984=0 & 0x098E static) ***") << '\n';
+        if ((cyc_ctrl & 0x01U) != 0) {
+            std::cerr << "[dc]   *** 0x0980 b0=1: the SYNC unit is PDI/uC-controlled -- ECAT activation is IGNORED ***\n";
+        }
+    }
+
     impl_->dc_cycle_ns = cycle_ns;  // pace the upcoming OP-transition PD pump at this period
 }
 
