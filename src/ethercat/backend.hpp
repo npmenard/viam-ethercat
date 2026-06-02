@@ -136,16 +136,26 @@ class EcatBackend {
     // phase-locked PD -> OP. Default no-op (sim / free-run drives).
     virtual void configure_dc_configdc() {}
 
-    // DC step 2, AFTER SAFE-OP is reached: ecx_dcsync0 on a FRESH live 0x0910 -> arm
-    // the ESC SYNC-out unit at `cycle_ns`. Called only when MasterConfig requests DC.
-    // Default no-op (sim / free-run drives). Drives that support ONLY DC sync (e.g.
-    // the A6-EC) fault out of OP -- WKC -> 0, statusword Fault, Er74.1 "no sync
-    // signal" -- unless SYNC0 is armed AND the drive has observed phase-locked PD.
-    // `cycle_ns` must be a valid multiple for the drive (A6: multiple of 250000 ns).
-    // `sync0_shift_ns` is the SYNC0 pulse phase offset (ecx_dcsync0 CyclShift): the
-    // SYNC0 edge fires `sync0_shift_ns` after the DC base time. Tune it (with the
-    // master's send phase) so the drive latches a FRESH output frame at SYNC0.
+    // DC step 2, AFTER SAFE-OP is reached: arm the ESC SYNC-out unit (ecx_dcsync0 on a
+    // FRESH live 0x0910). Self-contained variant -- PRIMES a few exchanges itself so
+    // 0x0910 is live, then arms. Used by the OWN-the-bring-up path configure(reach_op=
+    // true). Default no-op (sim / free-run drives). `cycle_ns` must be a valid multiple
+    // for the drive (A6: multiple of 250000 ns). `sync0_shift_ns` is the SYNC0 pulse
+    // phase offset (ecx_dcsync0 CyclShift): the SYNC0 edge fires `sync0_shift_ns` after
+    // the DC base time. Tune it (with the master's send phase) so the drive latches a
+    // FRESH output frame at SYNC0.
     virtual void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
+        (void)cycle_ns;
+        (void)sync0_shift_ns;
+    }
+
+    // DC step 2, IN-LOOP variant for the caller-driven path: ecx_dcsync0 ONLY, no prime
+    // pump (the caller's RT loop is ALREADY pumping phase-locked PD). Call a few cycles
+    // into the SAFE-OP loop, once synchronized PD is flowing AND the master is phase-
+    // locking, so the drive arms SYNC0 against a live, disciplined clock it has just
+    // proven in sync -- which is what a DC drive (the A6) requires before it will
+    // generate SYNC0 / permit OP. Default no-op (sim / free-run drives).
+    virtual void arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
         (void)cycle_ns;
         (void)sync0_shift_ns;
     }

@@ -64,6 +64,13 @@ class Master {
     // which faults out of OP on a single missed SYNC0 frame).
     void configure(bool reach_op = true);
 
+    // Caller-driven in-loop SYNC0 arm (only after configure(reach_op=false)): arm the
+    // ESC SYNC-out unit from the RT loop, AFTER SAFE-OP, once synchronized PD is
+    // flowing and the master is phase-locking -- a DC drive (the A6) generates SYNC0 /
+    // permits OP only once it has proven sync from that traffic. Call ONCE; then keep
+    // pumping + poll dc_sync_status until ready, then request_op(). Never throws.
+    void arm_dc_sync() noexcept;
+
     // Caller-driven OP request (only after configure(reach_op=false)): writes the
     // OP state request; the caller's cyclic loop pumps the transition. Never throws.
     void request_op() noexcept;

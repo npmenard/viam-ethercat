@@ -293,21 +293,26 @@ void SoemBackend::configure_dc_configdc() {
 }
 
 void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
-    impl_->dc_cycle_ns = cycle_ns;  // pace the upcoming OP-transition PD pump at this period
-
-    // DC step 2 (AFTER SAFE-OP): arm SYNC0. ecx_dcsync0 computes the SYNC0 start time
-    // from the slave's LIVE local DC system time (FPRD of 0x0910 at call time). We are
-    // post-SAFE-OP so PD has begun flowing, but pace a few more exchanges to be sure
-    // 0x0910 is live + forward-moving before dcsync0 reads it. The CALLER then pumps a
-    // phase-locked PD loop in SAFE-OP (carrying the FRMW DC datagram) until the slave
-    // reports clock-locked + SYNC0-armed (dc_sync_status), and only THEN requests OP.
+    // Self-contained arm (configure(reach_op=true) path): PRIME a few exchanges so the
+    // slave's DC clock (0x0910) is live + forward-moving, THEN arm. The caller-driven
+    // path uses arm_dc_sync() directly -- its RT loop is already pumping.
     for (std::uint32_t p = 0; p < kDcStartPrimeCycles; ++p) {
         ecx_send_processdata(&impl_->ctx);
         (void)ecx_receive_processdata(&impl_->ctx, EC_TIMEOUTRET);  // refreshes the DC clocks
         const timespec ts{.tv_sec = 0, .tv_nsec = static_cast<long>(cycle_ns)};
         (void)nanosleep(&ts, nullptr);
     }
+    arm_dc_sync(cycle_ns, sync0_shift_ns);
+}
 
+void SoemBackend::arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
+    impl_->dc_cycle_ns = cycle_ns;  // pace the upcoming OP-transition PD pump at this period
+
+    // DC step 2 (AFTER SAFE-OP, no prime -- the caller's loop is pumping): arm SYNC0.
+    // ecx_dcsync0 computes the SYNC0 start time from the slave's LIVE local DC system
+    // time (FPRD of 0x0910 at call time), so it MUST be called on a forward-moving
+    // clock. The caller keeps pumping phase-locked PD (carrying the FRMW DC datagram)
+    // and polls dc_sync_status until clock-locked + SYNC0-armed, THEN requests OP.
     for (int i = 1; i <= impl_->slavecount; ++i) {
         if (impl_->slavelist[i].hasdc == FALSE) {
             throw InitError("slave " + std::to_string(i) + " is not DC-capable (hasdc=0) -- cannot enable SYNC0");

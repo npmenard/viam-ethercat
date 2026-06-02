@@ -184,8 +184,15 @@ void Master::configure(bool reach_op) {
                                "CAP_IPC_LOCK / RLIMIT_MEMLOCK=infinity; the SYNC0 PLL lock may be unreliable.\n",
                                errno);
         }
-        // DC step 2 (post-SAFE-OP): arm SYNC0 on a fresh live 0x0910.
-        backend_->configure_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);
+        // DC step 2 (post-SAFE-OP): arm SYNC0 on a fresh live 0x0910 -- ONLY on the
+        // self-contained path (reach_op=true, e.g. the module). On the caller-driven
+        // path (reach_op=false, e.g. a6_validate) the arm is DEFERRED to the caller's RT
+        // loop via Master::arm_dc_sync(), so SYNC0 arms a few cycles in WHILE
+        // synchronized PD is flowing and the master is phase-locking -- which is what a
+        // DC drive (the A6) needs to observe before it will generate SYNC0 / permit OP.
+        if (reach_op) {
+            backend_->configure_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);
+        }
     }
 
     // POST-DC SDO writes, applied here -- AFTER the SYNC0 arm, so the ESC cycle
@@ -300,6 +307,15 @@ void Master::configure(bool reach_op) {
         // grace covers the expected short WKC across that whole window.
         settle_remaining_ = config_.dc_lock_cycles + config_.dc_settle_cycles + static_cast<std::uint32_t>(kPrimeCycles);
         operational_.store(true, std::memory_order_relaxed);
+    }
+}
+
+void Master::arm_dc_sync() noexcept {
+    const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
+    try {
+        backend_->arm_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);  // ecx_dcsync0, no prime (the caller pumps)
+    } catch (const std::exception& e) {
+        (void)std::fprintf(stderr, "[ethercat] arm_dc_sync failed: %s\n", e.what());
     }
 }
 

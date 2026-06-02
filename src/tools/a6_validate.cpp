@@ -461,16 +461,23 @@ int main(int argc, char** argv) {
     int locked_streak = 0;
     std::int64_t dc_integral = 0;
     long dc_off = 0;
-    // SAFE-OP DC-sync gate (Arthur Ketels' flow): hold in SAFE-OP pumping phase-locked
-    // PD until BOTH the master is send-phase locked AND the slave's DC clock is stable +
-    // SYNC0 has actually armed (dc_sync_status().ready), THEN request OP. Poll the ESC
-    // DC regs at ~20 Hz (acyclic FPRD off the hot 1 kHz path). A cap still requests OP
-    // after ~4 s so a never-arms run still surfaces the drive's reaction on the bench.
+    // The SOEM-author (Arthur Ketels) flow, in ONE gapless loop:
+    //   (1) pump phase-locked PD in SAFE-OP until the MASTER is send-phase locked;
+    //   (2) THEN arm SYNC0 IN-LOOP (master.arm_dc_sync) -- on a live clock the drive is
+    //       already seeing synchronized LRW on, which is what makes it generate SYNC0;
+    //   (3) keep pumping + poll the slave DC-sync health (0x0984 arm + 0x092C lock);
+    //   (4) request OP only once dc_sync_status().ready (Arthur's "proven in sync").
+    // Poll the ESC DC regs at ~20 Hz (acyclic FPRD ADDITIVE to the per-cycle PD send,
+    // never substitutive) only after arming. A cap (relative to the arm) still requests
+    // OP so a never-arms run loudly surfaces the drive's Er74 reaction.
     DcSyncStatus dcs{};
     bool dc_ready = false;
     bool dc_sync_announced = false;
-    constexpr std::uint64_t kDcPollEvery = 50;           // poll dc_sync_status every 50 cycles (~20 Hz)
-    constexpr std::uint64_t kOpRequestCapCycles = 4000;  // ~4 s: request OP even if never `ready` (to see the result)
+    bool dc_armed = false;                               // SYNC0 armed in-loop yet?
+    std::uint64_t arm_tick = 0;                          // tick at which we armed (cap is relative to this)
+    constexpr int kArmAfterLockStreak = 200;             // arm SYNC0 once the master holds phase-lock this long (~200 ms)
+    constexpr std::uint64_t kDcPollEvery = 50;           // poll dc_sync_status every 50 cycles (~20 Hz), ADDITIVE to PD
+    constexpr std::uint64_t kOpRequestCapCycles = 4000;  // ~4 s AFTER arming: request OP even if never ready (failure path)
 
     while (!g_stop.load()) {
         // DEADLINE-FIRST: advance the phase-corrected deadline and sleep to it BEFORE
@@ -494,29 +501,52 @@ int main(int argc, char** argv) {
         dc_off = dc_phase_correction(dct, static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
         locked_streak = dc_phase_locked(dct, static_cast<std::int64_t>(period_ns), dc_shift) ? locked_streak + 1 : 0;
 
-        // SAFE-OP DC-sync gate: while not yet in ->OP, poll the slave DC-sync health at
-        // ~20 Hz. SYNC0 (0x0984) only ARMS once the drive has observed synchronized PD,
-        // so this transitions false -> true mid-loop; that edge is the real go-signal.
-        if (!op_requested && (tick % kDcPollEvery == 0)) {
+        // STEP 2 -- ARM SYNC0 IN-LOOP, once the master holds phase-lock, while
+        // synchronized PD is already flowing. This is the crux of the SOEM-author flow:
+        // dcsync0 runs HERE (post-SAFE-OP, PD live, master disciplined), NOT in
+        // configure(). My bet (and the team-lead's): the A6 generates SYNC0 only when it
+        // arms against a clock it is already observing in sync.
+        if (!dc_armed && locked_streak >= kArmAfterLockStreak) {
+            master.arm_dc_sync();
+            dc_armed = true;
+            arm_tick = tick;
+            std::cout << "[B] master phase-locked (lockStreak=" << locked_streak << ", dcPhase~"
+                      << (dct % static_cast<std::int64_t>(period_ns)) << "ns) -> ARMING SYNC0 in-loop (post-SAFE-OP, PD flowing)\n";
+        }
+
+        // STEP 3 -- after arming, poll the slave DC-sync health at ~20 Hz. 0x0984 (SYNC0
+        // armed) is the load-bearing signal (on a single-slave bus the A6 IS the DC
+        // reference, so 0x092C ~ 0 trivially). The decisive artifact is the 0->1 edge of
+        // 0x0984 under synchronized PD -> print the per-poll trace until ready.
+        if (dc_armed && !op_requested && (tick % kDcPollEvery == 0)) {
             dcs = master.dc_sync_status();
             dc_ready = dcs.ready;
+            if (!dc_ready) {  // per-poll trace through the proving window (stops at ready)
+                std::cout << "[B]   poll t=" << tick << " 0x0984=" << (dcs.sync0_active ? "ARMED" : "0")
+                          << " 0x092C=" << dcs.sys_time_diff_ns << "ns lockStreak=" << locked_streak << " AL=0x" << std::hex
+                          << dcs.al_status << std::dec << '\n';
+            }
             if (dcs.sync0_active && !dc_sync_announced) {
-                std::cout << "[B] DC-sync: SYNC0 ARMED (0x0984 b0=1), clock " << (dcs.clock_locked ? "LOCKED" : "unlocked")
+                std::cout << "[B] *** SYNC0 ARMED *** (0x0984 b0=1), clock " << (dcs.clock_locked ? "LOCKED" : "unlocked")
                           << " (0x092C=" << dcs.sys_time_diff_ns << "ns)\n";
                 dc_sync_announced = true;
             }
         }
 
-        // Request OP only once the master is send-phase locked AND the slave DC clock is
-        // stable + SYNC0 armed (Arthur's two criteria) -- or after the cap, to surface a
-        // never-arms result. The loop keeps cycling through the transition (no frame gap).
-        if (!op_requested && locked_streak >= 50 && (dc_ready || tick >= kOpRequestCapCycles)) {
+        // STEP 4 -- request OP only once armed AND ready (master locked + slave SYNC0
+        // armed + clock locked). The cap (relative to the arm) still fires OP so a
+        // never-arms run surfaces the drive's Er74 -- but it is LOUD: a capped run is the
+        // FAILURE path, never to be mistaken for success.
+        const bool cap_hit = dc_armed && tick >= arm_tick + kOpRequestCapCycles;
+        if (!op_requested && dc_armed && (dc_ready || cap_hit)) {
             master.request_op();
             op_requested = true;
-            std::cout << "[B] phase locked (dcPhase~" << (dct % static_cast<std::int64_t>(period_ns)) << "ns), DC-sync "
-                      << (dc_ready ? "READY (clock locked + SYNC0 armed)"
-                                   : "NOT ready (cap hit -- requesting OP anyway to see drive reaction)")
-                      << " -> requesting OP\n";
+            if (dc_ready) {
+                std::cout << "[B] DC-sync READY (master locked + SYNC0 armed + clock locked) -> requesting OP\n";
+            } else {
+                std::cout << "[B] !!! FAILURE PATH: SYNC0 never armed (0x0984=0 through " << kOpRequestCapCycles
+                          << " cycles after arm) -- requesting OP to surface the drive fault (expect Er74) !!!\n";
+            }
         }
         // Full WKC == outputs processing == in OP with live command flow.
         const bool op = op_requested && raw_wkc == master.expected_wkc();
