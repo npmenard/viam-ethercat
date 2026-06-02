@@ -477,6 +477,8 @@ int main(int argc, char** argv) {
     DcSyncStatus dcs{};
     bool dc_ready = false;
     bool dc_sync_announced = false;
+    int op_fault_streak = 0;                             // consecutive cycles faulted-in-OP (persistent-cause give-up)
+    constexpr int kPersistentFaultGiveUp = 2000;         // ~2 s faulted in OP despite reset -> STOP (protect the drive)
     bool dc_armed = false;                               // SYNC0 armed in-loop yet?
     bool cycle_ready = false;                            // 0x1C32:02 re-derived clean (== 1 ms) from the firing SYNC0?
     std::int64_t sm_cycle = -1;                          // latest 0x1C32:02 read (ns), -1 = not yet read
@@ -628,6 +630,26 @@ int main(int argc, char** argv) {
             std::cout << "[B] *** FAULT CLEARED *** -> " << to_string(status.decode()) << '\n';
         }
         was_faulted = faulted;
+
+        // BOUNDED GIVE-UP: if the drive stays faulted in OP despite the auto fault-reset
+        // -- a persistent-CAUSE fault like Er74.0 cycle-error, where the bit7 reset edge
+        // fires but the cause is still active -- STOP cleanly instead of spinning the
+        // reset for the whole --seconds. Repeated OP-entry faults are what wedged the
+        // drive (NO-CARRIER) last run, so giving up protects the (power-cycle-scarce)
+        // drive AND keeps the result legible (the live drive code is named, not masked).
+        // A transient fault that clears resets the streak and the run continues.
+        if (op_requested && faulted) {
+            ++op_fault_streak;
+            if (op_fault_streak >= kPersistentFaultGiveUp) {
+                std::cout << "[B] !!! fault-reset INEFFECTIVE: drive fault 0x" << std::hex
+                          << read_tx<std::uint16_t>(master, slave, in, kFaultCode) << std::dec << " persists " << op_fault_streak
+                          << " cycles after OP (cause not cleared) -- STOPPING to protect "
+                          << "the drive (repeated OP-entry faults wedge it). Fix the cycle cause; do not re-run blind.\n";
+                break;
+            }
+        } else if (!faulted) {
+            op_fault_streak = 0;
+        }
 
         // Decide the controlword for this cycle.
         const std::span<std::byte> out = master.outputs(slave);
