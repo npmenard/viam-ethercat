@@ -289,7 +289,11 @@ int main(int argc, char** argv) {
             opt.ifname = a;
         } else {
             std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N]\n"
-                      << "                   [--dc-target-ns NS] [--dc-shift-ns NS] [--sm-dc-sync]\n";
+                      << "                   [--dc-target-ns NS] [--dc-shift-ns NS] [--sm-dc-sync]\n"
+                      << "  --dc-target-ns: master send-phase lock target within the 1ms cycle (-1=auto mid ~500000).\n"
+                      << "                  SWEEP on Er74.0 cycle-error: try 100000 (just after SYNC0) or 900000 (just\n"
+                      << "                  before) to find where the drive accepts the frame relative to its SYNC0 edge.\n"
+                      << "  --dc-shift-ns:  SYNC0 pulse CyclShift (ecx_dcsync0) -- moves the SYNC0 edge itself.\n";
             return 2;
         }
     }
@@ -479,6 +483,20 @@ int main(int argc, char** argv) {
     constexpr std::uint64_t kDcPollEvery = 50;           // poll dc_sync_status every 50 cycles (~20 Hz), ADDITIVE to PD
     constexpr std::uint64_t kOpRequestCapCycles = 4000;  // ~4 s AFTER arming: request OP even if never ready (failure path)
 
+    // Read the RO SM2 cycle time (0x1C32:02) the drive validates at OP -- watch it
+    // re-derive toward 1000000 once a clean SYNC0 is pulsing (vs a stale cached value
+    // like 999680 a prior dirty bring-up burned in -> Er74.0 cycle error). SDO read =
+    // a mailbox round-trip that BLOCKS the loop, so only call it where a stalled cycle
+    // is harmless: pre-OP (no cycle enforcement yet) or when already faulted. -1 = not
+    // readable this cycle.
+    const auto read_sm_cycle = [&master]() -> std::int64_t {
+        try {
+            return static_cast<std::int64_t>(master.sdo_read<std::uint32_t>(slave, kSm2SyncType, kSyncCycleSub));
+        } catch (const Error&) {
+            return -1;
+        }
+    };
+
     while (!g_stop.load()) {
         // DEADLINE-FIRST: advance the phase-corrected deadline and sleep to it BEFORE
         // exchanging -- one unbroken cadence from the first frame, so the drive never
@@ -529,10 +547,10 @@ int main(int argc, char** argv) {
         if (dc_armed && !op_requested && (tick % kDcPollEvery == 0)) {
             dcs = master.dc_sync_status();
             dc_ready = dcs.ready;
-            if (!dc_ready) {  // per-poll trace through the proving window (stops at ready)
+            if (!dc_ready) {  // per-poll trace through the proving window (stops at ready); pre-OP so the SDO read is safe
                 std::cout << "[B]   poll t=" << tick << " 0x0984=" << (dcs.sync0_active ? "ARMED" : "0")
                           << " 0x092C=" << dcs.sys_time_diff_ns << "ns lockStreak=" << locked_streak << " AL=0x" << std::hex
-                          << dcs.al_status << std::dec << '\n';
+                          << dcs.al_status << std::dec << " 0x1C32:02=" << read_sm_cycle() << "ns\n";
             }
             if (dcs.sync0_active && !dc_sync_announced) {
                 std::cout << "[B] *** SYNC0 ARMED *** (0x0984 b0=1), clock " << (dcs.clock_locked ? "LOCKED" : "unlocked")
@@ -582,9 +600,12 @@ int main(int argc, char** argv) {
         const bool faulted = status.decode() == Cia402State::Fault;
         if (faulted && !was_faulted) {
             const auto fault_code = read_tx<std::uint16_t>(master, slave, in, kFaultCode);
+            // Read 0x1C32:02 on the fault edge (drive already faulted -> a stalled cycle
+            // from the SDO read is harmless): a 0x6320 Er74.0 "cycle error" with :02 !=
+            // 1000000 (e.g. a stale 999680) is the smoking gun for the cached-cycle theory.
             std::cout << "[B] !!! DRIVE FAULT @ " << phase_label(op, op_requested) << " t=" << tick / kLoopHz << "s: 0x603F=0x" << std::hex
                       << fault_code << " sw=0x" << status.raw << std::dec << " dcPhase=" << (dct % static_cast<std::int64_t>(period_ns))
-                      << "ns";
+                      << "ns 0x1C32:02=" << read_sm_cycle() << "ns";
             if (opt.reset_fault) {
                 std::cout << " -- running CiA402 fault-reset (no energize)...";
             }
