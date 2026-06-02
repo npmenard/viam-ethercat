@@ -128,12 +128,20 @@ class EcatBackend {
         }
     }
 
-    // Configure Distributed-Clock SYNC0 on every DC-capable slave at `cycle_ns`,
-    // called at SAFE-OP before requesting OP, only when MasterConfig requests DC.
-    // Default no-op (sim / free-run drives). Drives that support ONLY DC sync
-    // (e.g. the A6-EC) fault out of OP immediately -- WKC -> 0, statusword Fault,
-    // Er74.1 "no sync signal" -- unless SYNC0 is running. `cycle_ns` must be a
-    // valid multiple for the drive (A6: integer multiple of 250000 ns).
+    // DC step 1, in PRE-OP: ecx_configdc -- detect DC-capable slaves, designate the
+    // reference clock, write each slave's system-time offset (0x0920) + propagation
+    // delay (0x0928). Offsets only; SYNC0 is NOT armed here. Per the SOEM author
+    // (Arthur Ketels), a DC drive proves sync from synchronized PDO traffic in
+    // SAFE-OP, so the canonical order is configdc(PRE-OP) -> SAFE-OP -> dcsync0 ->
+    // phase-locked PD -> OP. Default no-op (sim / free-run drives).
+    virtual void configure_dc_configdc() {}
+
+    // DC step 2, AFTER SAFE-OP is reached: ecx_dcsync0 on a FRESH live 0x0910 -> arm
+    // the ESC SYNC-out unit at `cycle_ns`. Called only when MasterConfig requests DC.
+    // Default no-op (sim / free-run drives). Drives that support ONLY DC sync (e.g.
+    // the A6-EC) fault out of OP -- WKC -> 0, statusword Fault, Er74.1 "no sync
+    // signal" -- unless SYNC0 is armed AND the drive has observed phase-locked PD.
+    // `cycle_ns` must be a valid multiple for the drive (A6: multiple of 250000 ns).
     // `sync0_shift_ns` is the SYNC0 pulse phase offset (ecx_dcsync0 CyclShift): the
     // SYNC0 edge fires `sync0_shift_ns` after the DC base time. Tune it (with the
     // master's send phase) so the drive latches a FRESH output frame at SYNC0.

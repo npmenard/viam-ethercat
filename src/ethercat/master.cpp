@@ -153,35 +153,53 @@ void Master::configure(bool reach_op) {
         rt.tx_fields = build_field_table(sc.slave_id, sc.txpdo);
     }
 
-    // Distributed Clocks: configure SYNC0 in PRE-OP, BEFORE requesting SAFE-OP. A
-    // drive in DC-SYNC mode (SM sync type 0x1C32:01 = 2) VALIDATES its DC SYNC
-    // configuration at the PRE-OP -> SAFE-OP transition and AL-rejects with 0x0030
-    // "Invalid DC SYNC configuration" if SYNC0 isn't set up yet. So configdc + the
-    // live-DCtime prime + dcsync0 must all complete HERE, in PRE-OP, before the
-    // SafeOp request. (ecx_send/receive_processdata still distributes the DC datagram
-    // in PRE-OP: the process-data SMs aren't active but the ARMW on register 0x0910
-    // isn't SM-gated, so ec_DCtime goes live for the start-time computation.) Required
-    // by drives that support only DC sync (the A6-EC). cycle = loop period; the A6
-    // needs an integer multiple of 250 us (1 kHz -> 1 ms is valid).
+    // Distributed Clocks: the SOEM-author (Arthur Ketels) canonical order. A DC drive
+    // proves it is in sync from synchronized, DC-phase-locked PDO TRAFFIC observed in
+    // SAFE-OP; only then will it permit OP. So the sequence is:
+    //   configdc (PRE-OP, offsets only) -> request SAFE-OP -> dcsync0 (arm SYNC0 on a
+    //   fresh live clock) -> pump a phase-locked PD loop in SAFE-OP -> request OP.
+    // Arming SYNC0 in PRE-OP (the old order) schedules it off a not-yet-disciplined
+    // clock and the drive never sees the synchronized transfer it requires -> Er74 /
+    // AL 0x0030. cycle = loop period; the A6 needs a multiple of 250 us (1 ms valid).
     const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
+
+    // DC step 1 (PRE-OP): configdc -- reference clock + system-time offset + delay.
     if (config_.use_distributed_clocks) {
+        backend_->configure_dc_configdc();
+    }
+
+    // Reach SAFE-OP BEFORE arming SYNC0 (the canonical order above).
+    backend_->request_state(0, EcatState::SafeOp);
+
+    if (config_.use_distributed_clocks) {
+        // Lock CURRENT memory (the IOmap + SOEM context are resident after
+        // map_process_data) before any RT-paced pumping (the arm prime + the warmup),
+        // so a page fault never spikes the SYNC0 phase. NOT MCL_FUTURE: this can run on
+        // a non-RT thread that later spawns the RT jthread, and MCL_FUTURE would make
+        // that thread's stack alloc hit RLIMIT_MEMLOCK -> EAGAIN. Best-effort but NEVER
+        // silent (a silent fail re-introduces the spike it prevents).
+        if (mlockall(MCL_CURRENT) != 0) {
+            (void)std::fprintf(stderr,
+                               "[ethercat] mlockall(MCL_CURRENT) failed (errno=%d) before the DC warmup: grant "
+                               "CAP_IPC_LOCK / RLIMIT_MEMLOCK=infinity; the SYNC0 PLL lock may be unreliable.\n",
+                               errno);
+        }
+        // DC step 2 (post-SAFE-OP): arm SYNC0 on a fresh live 0x0910.
         backend_->configure_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);
     }
 
-    // POST-DC SDO writes, applied here -- after SYNC0 is configured + pulsing (the ESC
-    // cycle register 0x09A0 is now live) and BEFORE the SAFE-OP request. The SM
-    // sync-type switch to DC (0x1C32:01 = 2) goes here: some drives snapshot the
-    // read-only SM cycle 0x1C32:02 from 0x09A0 at DC-mode entry, so switching earlier
-    // (0x09A0 still 0) latches :02 = 0 -> AL 0x0030 at the SafeOp validation.
+    // POST-DC SDO writes, applied here -- AFTER the SYNC0 arm, so the ESC cycle
+    // register 0x09A0 is live. The ETG.1020 cycle-time handshake (0x1C32:0a Sync0
+    // cycle + :08 Get-Cycle) populates the read-only 0x1C32:02 the drive validates;
+    // it needs 0x09A0 non-zero to measure a real cycle. (0x1C32:01 = DC-mode switch
+    // stays in postremap, PRE-OP -- it is writable only before configdc.)
     for (const SlaveConfig& sc : config_.slaves) {
         apply_sdo_writes(sc.slave_id, sc.postdc_sdo_writes);
     }
 
-    // POST-DC SETTLE: after the DC-mode switch, pump paced PD so the drive APPLIES the
-    // DC config -- copies the live ESC SYNC0 cycle (0x09A0) into the read-only CoE
-    // 0x1C32:02 -- BEFORE we request SAFE-OP. Otherwise it validates an incomplete DC
-    // config (:02 still 0) at the PS transition -> AL 0x0030. Optionally poll a CoE
-    // object each cycle and break early once it reads non-zero (config applied).
+    // POST-DC SETTLE: pump paced PD so the drive APPLIES the DC config -- copies the
+    // live ESC SYNC0 cycle (0x09A0) into the read-only CoE 0x1C32:02. Optionally poll a
+    // CoE object each cycle and break early once it reads non-zero (config applied).
     if (config_.use_distributed_clocks && config_.dc_postwrite_settle_cycles > 0) {
         const std::uint16_t poll_slave = config_.slaves.front().slave_id;
         timespec next{};
@@ -220,35 +238,19 @@ void Master::configure(bool reach_op) {
         }
     }
 
-    backend_->request_state(0, EcatState::SafeOp);
-
     if (config_.use_distributed_clocks) {
-        // Lock CURRENT memory (the IOmap + SOEM context are already resident after
-        // map_process_data) right before the warmup. The warmup is alloc-free
-        // (send/receive over the pre-allocated context), so MCL_CURRENT covers its
-        // whole working set -- a page fault mid-warmup is a ms spike that spoils the
-        // SYNC0 PLL lock. We deliberately do NOT use MCL_FUTURE here: this can run on
-        // a non-RT thread that later spawns the RT jthread, and MCL_FUTURE would make
-        // that thread's stack alloc hit RLIMIT_MEMLOCK -> EAGAIN. Best-effort but
-        // NEVER silent (a silent fail re-introduces the spike it prevents).
-        if (mlockall(MCL_CURRENT) != 0) {
-            (void)std::fprintf(stderr,
-                               "[ethercat] mlockall(MCL_CURRENT) failed (errno=%d) before the DC warmup: grant "
-                               "CAP_IPC_LOCK / RLIMIT_MEMLOCK=infinity; the SYNC0 PLL lock may be unreliable.\n",
-                               errno);
-        }
-        // Run a PHASE-LOCKING warmup before OP: pace exchanges at the SYNC0 cycle
-        // AND run the DC phase-lock PI each cycle, so we don't just prime the PLL but
-        // converge our send phase into the SYNC0 window BEFORE requesting OP -- then
-        // the bus enters OP already aligned (WKC 3/3 from cycle 0) instead of dropping
-        // WKC while the post-OP loop is still pulling the phase in. Break early once
-        // locked for a few consecutive cycles. dc_lock_cycles = 0 skips it (sim).
-        // PROVISIONAL (architect, runbook §5.2): this runs on the caller's (possibly
-        // non-RT) thread; memory is locked above so no page-fault spikes, but
-        // SCHED_OTHER jitter remains -- if the bench shows it can't hold lock, move
-        // the warmup + OP transition into the RT thread prelude (design "(b)").
-        // Lock the phase at this DC-time offset. -1 = auto = mid-cycle (cycle/2):
-        // off the SYNC0 edge so jitter never crosses the pulse.
+        // Run a PHASE-LOCKING warmup before OP (post-SAFE-OP, SYNC0 already armed): pace
+        // exchanges at the SYNC0 cycle AND run the DC phase-lock PI each cycle, so we
+        // converge our send phase into the SYNC0 window BEFORE requesting OP -- the bus
+        // then enters OP already aligned (WKC 3/3 from cycle 0) instead of dropping WKC
+        // while the post-OP loop is still pulling the phase in. Break early once locked
+        // for a few consecutive cycles. dc_lock_cycles = 0 skips it (sim). Memory was
+        // locked above (before the arm) so no page-fault spikes; SCHED_OTHER jitter
+        // remains -- if the bench shows it can't hold lock, move the warmup + OP
+        // transition into the RT thread prelude (design "(b)"). a6_validate already does
+        // exactly that via reach_op=false + its own phase-locked, SYNC0-gated loop.
+        // Lock the phase at this DC-time offset. -1 = auto = mid-cycle (cycle/2): off the
+        // SYNC0 edge so jitter never crosses the pulse.
         const std::int64_t shift = config_.dc_sync_shift_ns < 0 ? static_cast<std::int64_t>(cycle_ns) / 2 : config_.dc_sync_shift_ns;
         timespec next{};
         (void)clock_gettime(CLOCK_MONOTONIC, &next);

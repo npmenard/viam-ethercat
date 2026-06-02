@@ -200,6 +200,14 @@ void write_rx(const Master& m, std::uint16_t slave, std::span<std::byte> img, st
     store_le<T>(img.subspan(loc.byte_offset, loc.byte_width), value);
 }
 
+// Read a scalar back out of a slave's COMMAND image (RxPDO) for logging -- shows what
+// the master is actually sending the drive this cycle, decoded from the live image.
+template <PdoScalar T>
+T read_rx(const Master& m, std::uint16_t slave, std::span<const std::byte> img, std::uint16_t index, std::uint8_t sub = 0) {
+    const FieldLocation loc = m.rx_field(slave, index, sub);
+    return load_le<T>(img.subspan(loc.byte_offset, loc.byte_width));
+}
+
 // Lock memory + go SCHED_FIFO so the cyclic loop's jitter stays inside the DC
 // SYNC0 window. WITHOUT this, best-effort scheduling jitter makes the A6 miss the
 // sync window -> WKC drops to 0 and the drive faults out of OP. Best-effort: warns
@@ -461,7 +469,7 @@ int main(int argc, char** argv) {
     DcSyncStatus dcs{};
     bool dc_ready = false;
     bool dc_sync_announced = false;
-    constexpr std::uint64_t kDcPollEvery = 50;       // poll dc_sync_status every 50 cycles (~20 Hz)
+    constexpr std::uint64_t kDcPollEvery = 50;           // poll dc_sync_status every 50 cycles (~20 Hz)
     constexpr std::uint64_t kOpRequestCapCycles = 4000;  // ~4 s: request OP even if never `ready` (to see the result)
 
     while (!g_stop.load()) {
@@ -506,7 +514,8 @@ int main(int argc, char** argv) {
             master.request_op();
             op_requested = true;
             std::cout << "[B] phase locked (dcPhase~" << (dct % static_cast<std::int64_t>(period_ns)) << "ns), DC-sync "
-                      << (dc_ready ? "READY (clock locked + SYNC0 armed)" : "NOT ready (cap hit -- requesting OP anyway to see drive reaction)")
+                      << (dc_ready ? "READY (clock locked + SYNC0 armed)"
+                                   : "NOT ready (cap hit -- requesting OP anyway to see drive reaction)")
                       << " -> requesting OP\n";
         }
         // Full WKC == outputs processing == in OP with live command flow.
@@ -594,24 +603,35 @@ int main(int argc, char** argv) {
         write_rx<std::uint16_t>(master, slave, out, kControlword, cw);
         last_cw = cw;
 
-        if (tick % 200 == 0) {  // ~5 Hz status print
+        if (tick % 200 == 0) {  // ~5 Hz decoded-PDO print, through SAFE-OP AND OP (red_test-style)
             const std::int64_t dc_phase = period_ns != 0 ? dct % static_cast<std::int64_t>(period_ns) : 0;
-            std::cout << "    t=" << tick / kLoopHz << "s " << phase_label(op, op_requested) << " " << to_string(status.decode())
-                      << " sw=0x" << std::hex << status.raw << std::dec;
-            if (faulted) {  // surface the CiA402 error code alongside the state on every faulted print
-                std::cout << " 0x603F=0x" << std::hex << read_tx<std::uint16_t>(master, slave, in, kFaultCode) << std::dec;
-            }
-            // mode display 0x6061 (in TxPDO): confirm the drive is in PP(1)/PV(3),
-            // NOT CSP(8) -- a stuck CSP default is itself a candidate "no sync" cause.
+            // Decode BOTH directions from the live process image (one snapshot/cycle, per
+            // #16): RxPDO = what we command the drive; TxPDO = what it feeds back.
+            const std::span<const std::byte> outimg = master.outputs(slave);
+            const auto rx_cw = read_rx<std::uint16_t>(master, slave, outimg, kControlword);
+            const auto rx_tpos = read_rx<std::int32_t>(master, slave, outimg, kTargetPosition);
+            const auto rx_pvel = read_rx<std::uint32_t>(master, slave, outimg, kProfileVelocity);
+            const auto fc = read_tx<std::uint16_t>(master, slave, in, kFaultCode);
             const auto mode_now = read_tx<std::int8_t>(master, slave, in, kModeDisplay);
-            std::cout << " mode=" << static_cast<int>(mode_now) << " pos=" << pos << " vel=" << vel << " wkc=" << raw_wkc << "/"
-                      << master.expected_wkc() << " badWKC=" << wkc_bad << "(maxRun=" << wkc_bad_max_streak << ") dcPhase=" << dc_phase
-                      << "ns(off=" << dc_off << ")" << (master.fault() ? " [BUS FAULT]" : "") << '\n';
-            if (!op) {  // SAFE-OP / ->OP: show the DC-sync gate progression (SYNC0 arm + clock lock)
-                std::cout << "      DC-sync: SYNC0=" << (dcs.sync0_active ? "ARMED" : "off") << " clock=" << (dcs.clock_locked ? "LOCKED" : "unlocked")
-                          << " 0x092C=" << dcs.sys_time_diff_ns << "ns lockStreak=" << locked_streak
-                          << " AL=0x" << std::hex << dcs.al_status << std::dec << (dc_ready ? " -> READY for OP" : "") << '\n';
+            const auto torque = read_tx<std::int16_t>(master, slave, in, kTorqueActual);
+            std::cout << "    t=" << tick / kLoopHz << "s " << phase_label(op, op_requested) << '\n';
+            std::cout << "      Rx(cmd) : cw=0x" << std::hex << rx_cw << std::dec << " targetPos=" << rx_tpos << " profVel=" << rx_pvel
+                      << '\n';
+            std::cout << "      Tx(fb)  : " << to_string(status.decode()) << " sw=0x" << std::hex << status.raw << " 0x603F=0x" << fc
+                      << std::dec << " mode=" << static_cast<int>(mode_now) << " pos=" << pos << " vel=" << vel << " torq=" << torque
+                      << '\n';
+            std::cout << "      bus/DC  : wkc=" << raw_wkc << "/" << master.expected_wkc() << " badWKC=" << wkc_bad
+                      << "(maxRun=" << wkc_bad_max_streak << ") DCtime=" << dct << " dcPhase=" << dc_phase << "ns(off=" << dc_off << ")"
+                      << " lockStreak=" << locked_streak << (master.fault() ? " [BUS FAULT]" : "") << '\n';
+            const char* dc_sync_note = " (proving sync...)";
+            if (dc_ready) {
+                dc_sync_note = " -> READY for OP";
+            } else if (op) {
+                dc_sync_note = "";
             }
+            std::cout << "      DC-sync : SYNC0=" << (dcs.sync0_active ? "ARMED" : "off")
+                      << " clock=" << (dcs.clock_locked ? "LOCKED" : "unlocked") << " 0x092C=" << dcs.sys_time_diff_ns << "ns AL=0x"
+                      << std::hex << dcs.al_status << std::dec << dc_sync_note << '\n';
         }
 
         if (master.fault()) {
