@@ -14,6 +14,7 @@
 #include "ethercat/errors.hpp"
 #include "ethercat/sim_backend.hpp"
 #include "test_harness.hpp"
+#include "viam/lib/motion_profile.hpp"
 #include "viam/lib/servo_config.hpp"
 #include "viam/lib/servo_controller.hpp"
 
@@ -164,6 +165,38 @@ TEST("ServoController(PP): go_to is absolute in the ZEROED frame after reset_zer
 
     ctrl.go_to(1000.0, 1.0);  // absolute +1 rev in the zeroed frame
     CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);  // lands at zeroed 1.0 (raw 4 revs)
+}
+
+TEST("ServoController(PP): the commanded rpm is written to profile velocity (0x6081)") {
+    // Hardware gap (same class as 0x6060): if 0x6081 is mapped but the RT loop never
+    // writes it, the move runs at the drive's DEFAULT speed and the rpm is ignored.
+    // Map 0x6081 and assert the device actually received the commanded velocity.
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition);
+    cfg.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6081, 0, 32}};
+    SimBackend* sim = nullptr;
+    auto factory = [&sim] {
+        SimSlaveModel m;
+        m.output_bytes = 10;  // ctrl@0, target@2, profile-velocity@6
+        m.input_bytes = 6;    // status@0, actual@2
+        m.ctrlword_off = 0;
+        m.target_off = 2;
+        m.profile_velocity_off = 6;
+        m.statusword_off = 0;
+        m.actual_off = 2;
+        m.mode = ethercat::Cia402Mode::ProfilePosition;
+        m.counts_per_step = 50'000;
+        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m});
+        sim = be.get();
+        return std::unique_ptr<EcatBackend>(std::move(be));
+    };
+    ServoController ctrl{cfg, factory};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    ctrl.go_to(600.0, 1.0);  // 600 rpm
+    CHECK(sim != nullptr);
+    const std::int32_t expected = ethercat::servo::rpm_to_device_velocity(600.0, kCountsPerRev, 1.0);
+    CHECK_EQ(sim->received_profile_velocity(1), std::abs(expected));  // rpm reached the drive, not 0
 }
 
 TEST("ServoController(PP): go_for stays relative regardless of the zero") {

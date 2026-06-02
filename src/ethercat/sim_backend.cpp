@@ -264,6 +264,11 @@ void SimBackend::step_device(Slave& s) noexcept {
     // SDO-set effective_mode -- in mode 0 (0x6060 never written) the motor does NOT
     // move, even when OperationEnabled, so a missing mode set fails offline.
     if (s.device_state == St::OperationEnabled) {
+        // Record the commanded profile velocity (0x6081) the master wrote -- test
+        // visibility for "did the RT loop actually send the move speed?".
+        if (s.model.profile_velocity_off >= 0) {
+            s.profile_velocity = load_le<std::int32_t>(out.subspan(static_cast<std::size_t>(s.model.profile_velocity_off), 4));
+        }
         if (s.effective_mode == Cia402Mode::ProfilePosition) {
             const std::int32_t step = s.model.counts_per_step;
             if (s.actual < s.target) {
@@ -340,6 +345,13 @@ void SimBackend::suppress_setpoint_ack(std::uint16_t slave, bool on) noexcept {
     if (slave >= 1 && slave <= slaves_.size()) {
         slaves_[slave - 1].suppress_ack = on;
     }
+}
+
+std::int32_t SimBackend::received_profile_velocity(std::uint16_t slave) const noexcept {
+    if (slave >= 1 && slave <= slaves_.size()) {
+        return slaves_[slave - 1].profile_velocity;
+    }
+    return 0;
 }
 
 std::vector<std::byte> SimBackend::recorded_sdo(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const {

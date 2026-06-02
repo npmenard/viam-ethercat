@@ -38,8 +38,9 @@ struct SimSlaveModel {
     std::size_t actual_off = 0;      // 0x6064 actual position in inputs (i32)
 
     Cia402Mode mode = Cia402Mode::ProfilePosition;
-    std::int32_t counts_per_step = 1000;  // PP: how fast actual chases target per cycle
-    std::int32_t velocity_off = -1;       // optional: 0x60FF target velocity offset in outputs (i32); <0 = none
+    std::int32_t counts_per_step = 1000;     // PP: how fast actual chases target per cycle
+    std::int32_t velocity_off = -1;          // optional: 0x60FF target velocity offset in outputs (i32); <0 = none
+    std::int32_t profile_velocity_off = -1;  // optional: 0x6081 PP profile-velocity offset in outputs (u32); <0 = none
 
     std::uint32_t vendor_id = 0;
     std::uint32_t product_code = 0;
@@ -71,6 +72,10 @@ class SimBackend final : public EcatBackend {
     // Force the next send_receive() to report a short WKC (one cycle), to test
     // the master's WKC-fault latch.
     void force_short_wkc_once() noexcept;
+    // Last profile velocity (0x6081) the device saw in its command image (0 if the
+    // master never wrote it / it isn't mapped). Lets offline tests assert the RT loop
+    // actually writes the commanded move speed.
+    std::int32_t received_profile_velocity(std::uint16_t slave) const noexcept;
     // Toggle whether a slave asserts the PP set-point-acknowledge (bit12). When
     // suppressed, the controller's new-set-point handshake times out; re-enabling
     // lets a subsequent move complete (handshake-timeout-then-recovery test).
@@ -95,7 +100,8 @@ class SimBackend final : public EcatBackend {
         std::int32_t actual = 0;
         bool setpoint_ack = false;  // PP bit12 latch
         bool faulted = false;
-        bool suppress_ack = false;  // test hook: never assert bit12 (force handshake timeout)
+        std::int32_t profile_velocity = 0;  // last 0x6081 seen in the command image (test visibility)
+        bool suppress_ack = false;          // test hook: never assert bit12 (force handshake timeout)
         // RUNTIME mode of operation -- set ONLY by the master's 0x6060 SDO write (de-masked
         // from model.mode), so a missing/wrong mode set leaves it None and the motor never
         // moves (mode-0 guard), catching the "forgot to set 0x6060" bug offline.

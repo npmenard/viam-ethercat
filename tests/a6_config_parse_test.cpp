@@ -57,8 +57,8 @@ TEST("a6-hardware.example.json: PP config parses through the real parser + valid
     CHECK(c.mode == ControlMode::ProfilePosition);
     CHECK(c.counts_per_rev == 131072.0);  // 2^17
     CHECK(c.require_realtime);
-    CHECK(c.rxpdo.entries.at(0x1600).size() == 2);  // controlword + target position
-    CHECK(c.txpdo.entries.at(0x1A00).size() == 2);  // statusword + position actual
+    CHECK(c.rxpdo.entries.at(0x1600).size() == 3);  // controlword + target position + profile velocity
+    CHECK(c.txpdo.entries.at(0x1A00).size() == 6);  // fault, status, mode-display, pos, vel, torque
 }
 
 TEST("a6-hardware.example.json: PV variant parses + validates") {

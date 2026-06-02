@@ -26,6 +26,7 @@ constexpr std::uint16_t kStatusword = 0x6041;
 constexpr std::uint16_t kTargetPos = 0x607A;
 constexpr std::uint16_t kActualPos = 0x6064;
 constexpr std::uint16_t kTargetVel = 0x60FF;
+constexpr std::uint16_t kProfileVel = 0x6081;  // PP move speed (carries the GoTo/GoFor rpm); optional in the map
 constexpr std::uint64_t kNsPerSec = 1'000'000'000ULL;
 
 std::uint64_t monotonic_ns() noexcept {
@@ -196,9 +197,24 @@ void ServoController::resolve_fields() {
     f_actual_ = master_->tx_field(s, kActualPos, 0);
     if (config_.mode == ControlMode::ProfilePosition) {
         f_target_ = master_->rx_field(s, kTargetPos, 0);
+        // Profile velocity (0x6081) is OPTIONAL in the map. If the drive maps it
+        // (the A6 does), the RT loop must write the commanded speed there every
+        // cycle -- else the move runs at the drive's default speed (rpm ignored).
+        f_profile_velocity_ = rxpdo_has(kProfileVel) ? master_->rx_field(s, kProfileVel, 0) : FieldLocation{};
     } else {
         f_velocity_ = master_->rx_field(s, kTargetVel, 0);
     }
+}
+
+bool ServoController::rxpdo_has(std::uint16_t index) const noexcept {
+    for (const auto& [pdo, entries] : config_.rxpdo.entries) {
+        for (const PdoEntry& e : entries) {
+            if (e.index == index) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool ServoController::setup_realtime() const noexcept {
@@ -352,6 +368,12 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
         std::uint16_t cw = ControlWord::enable_operation();
         if (config_.mode == ControlMode::ProfilePosition) {
             cw = step_handshake(cw, status);
+            // Write the commanded move speed to profile velocity (0x6081) every cycle
+            // when it's mapped -- else the drive uses its default speed and the rpm
+            // passed to go_to/go_for is silently ignored on hardware.
+            if (f_profile_velocity_.byte_width != 0) {
+                store_le<std::uint32_t>(master_->outputs(config_.slave_id).subspan(f_profile_velocity_.byte_offset, 4), profile_vel_);
+            }
         } else if (f_velocity_.byte_width != 0) {
             store_le<std::int32_t>(master_->outputs(config_.slave_id).subspan(f_velocity_.byte_offset, 4), pv_velocity_);
         }

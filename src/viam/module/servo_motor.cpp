@@ -193,6 +193,8 @@ SimSlaveModel sim_model_from_config(const ServoConfig& sc) {
                 m.target_off = off;
             } else if (e.index == 0x60FF) {
                 m.velocity_off = static_cast<std::int32_t>(off);
+            } else if (e.index == 0x6081) {
+                m.profile_velocity_off = static_cast<std::int32_t>(off);
             }
             off += e.bit_length / 8U;
         }

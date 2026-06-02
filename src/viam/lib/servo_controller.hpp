@@ -135,10 +135,11 @@ class ServoController {
     // thread (reconfigure-safe). On exit: leave outputs safe (Halt/disable) + a
     // final process(), then return so join() completes.
     void run_rt_loop(const std::stop_token& st, std::promise<void> started) noexcept;
-    bool setup_realtime() const noexcept;    // mlockall + mallopt + SCHED_FIFO; false on RT-sched failure
-    void resolve_fields();                   // cache controlword/status/target/actual/velocity FieldLocations
-    bool rt_alive() const noexcept;          // !watchdog_expired() && !state_.faulted  (master_-FREE)
-    bool watchdog_expired() const noexcept;  // (now - last_cycle_time_ns) > watchdog_ns
+    bool setup_realtime() const noexcept;                // mlockall + mallopt + SCHED_FIFO; false on RT-sched failure
+    void resolve_fields();                               // cache controlword/status/target/actual/velocity FieldLocations
+    bool rxpdo_has(std::uint16_t index) const noexcept;  // is `index` mapped in the RxPDO? (optional-field probe)
+    bool rt_alive() const noexcept;                      // !watchdog_expired() && !state_.faulted  (master_-FREE)
+    bool watchdog_expired() const noexcept;              // (now - last_cycle_time_ns) > watchdog_ns
 
     ServoConfig config_;
     BackendFactory backend_factory_;
@@ -149,6 +150,7 @@ class ServoController {
     FieldLocation f_target_;
     FieldLocation f_actual_;
     FieldLocation f_velocity_;
+    FieldLocation f_profile_velocity_;  // 0x6081 PP move speed; byte_width==0 if not mapped (optional)
 
     Cia402Fsm fsm_;
     ControllerState state_;
