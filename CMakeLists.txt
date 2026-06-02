@@ -216,6 +216,20 @@ install(
     ec_scan
 )
 
+# slaveinfo: SOEM's own bundled bus-inspection tool, built from the FetchContent
+# source (SOEM's CMake samples are disabled, so we add the target ourselves). It
+# dumps each slave's identity, SM/FMMU config, DC info, and -- with -sdo -- the
+# full CoE object dictionary (e.g. the whole 0x1C32/0x1C33 sync-manager sub-tree:
+# sync type, cycle time, supported types). Authoritative drive-side DC/SM config
+# for A6 bring-up, straight off the hardware. NOT our code, so NO -Wall -Werror.
+#   sudo ./slaveinfo <ifname>          # identity + SM + DC summary
+#   sudo ./slaveinfo <ifname> -map     # PDO mapping (per CoE + per SII) + SM sizes
+#   sudo ./slaveinfo <ifname> -sdo     # full CoE OD incl 0x1C32/0x1C33 sub-tree
+if(DEFINED soem_SOURCE_DIR AND EXISTS "${soem_SOURCE_DIR}/test/linux/slaveinfo/slaveinfo.c")
+  add_executable(slaveinfo "${soem_SOURCE_DIR}/test/linux/slaveinfo/slaveinfo.c")
+  target_link_libraries(slaveinfo PRIVATE soem)
+endif()
+
 # a6_validate: TEMPORARY hardware bring-up validation against a real A6 drive.
 # Links the ethercat library (Master + SoemBackend); SOEM is bundled inside it.
 add_executable(a6_validate)
