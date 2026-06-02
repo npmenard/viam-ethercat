@@ -270,26 +270,58 @@ SlaveIo SoemBackend::slave_io(std::uint16_t slave) noexcept {
     return SlaveIo{std::span<std::byte>(out, out != nullptr ? s.Obytes : 0), std::span<const std::byte>(in, in != nullptr ? s.Ibytes : 0)};
 }
 
-void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
+void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns, bool enable_sync1) {
     // ecx_configdc detects DC-capable slaves + syncs the DC reference clock (ESC
     // 0x0910). It MUST run, set each slave's hasdc, and return TRUE before
     // ecx_dcsync0 -- otherwise dcsync0 is a silent no-op and a DC-only drive (the
     // A6) refuses OP with AL 0x0027 "Freerun not supported". Verify both so a DC
     // misconfig names itself instead of surfacing as an opaque OP refusal.
-    if (ecx_configdc(&impl_->ctx) == FALSE) {
+    const boolean dc_found = ecx_configdc(&impl_->ctx);
+    std::cerr << "[dc] ecx_configdc() returned " << (dc_found == TRUE ? "TRUE (DC slaves found)" : "FALSE (NO DC slaves)") << '\n';
+    if (dc_found == FALSE) {
         throw InitError("use_distributed_clocks is set but ecx_configdc() found NO DC-capable slave on the bus");
     }
     for (int i = 1; i <= impl_->slavecount; ++i) {
         if (impl_->slavelist[i].hasdc == FALSE) {
             throw InitError("slave " + std::to_string(i) + " is not DC-capable (hasdc=0) -- cannot enable SYNC0");
         }
-        // SYNC0 on, `cycle_ns` period, `sync0_shift_ns` CyclShift. SOEM writes ESC
-        // 0x0981/0x0990/... so the SYNC0 edge fires shift after the DC base time.
-        ecx_dcsync0(&impl_->ctx, static_cast<std::uint16_t>(i), TRUE, cycle_ns, sync0_shift_ns);
-        // Bring-up diagnostic: confirm DC actually activated (vs a silent no-op) so
-        // the bench can distinguish "SYNC0 on but drive still refuses OP" from "DC
-        // never set up". DC-only path; runs once per configure() on a real drive.
-        std::cerr << "[dc] slave " << i << " hasdc=1, SYNC0 @ " << cycle_ns << " ns, shift " << sync0_shift_ns << " ns\n";
+        const auto si = static_cast<std::uint16_t>(i);
+        // SYNC0 (and optionally SYNC1) on, `cycle_ns` period, `sync0_shift_ns`
+        // CyclShift. SOEM writes ESC 0x0980/0x0981/0x0990/0x09A0... activating the
+        // cyclic pulse so it fires `shift` after the DC base time. --sync1 routes to
+        // ecx_dcsync01 (SYNC0+SYNC1 same cycle) for CSP servos that need both.
+        if (enable_sync1) {
+            ecx_dcsync01(&impl_->ctx, si, TRUE, cycle_ns, cycle_ns, sync0_shift_ns);
+        } else {
+            ecx_dcsync0(&impl_->ctx, si, TRUE, cycle_ns, sync0_shift_ns);
+        }
+
+        // SILICON-LEVEL PROOF: read the ESC DC registers straight back via FPRD so
+        // the bench can see whether SYNC0 is ACTUALLY activated (vs ecx_dcsync0
+        // silently not sticking). The drive reporting Er74.1 "no sync signal" while
+        // 0x0981 shows SYNC0 enabled => it's a drive-side requirement (SYNC1 / mode),
+        // not our activation. If 0x0981 bit1 is clear => the activation didn't take.
+        const std::uint16_t adp = impl_->slavelist[i].configadr;
+        std::uint8_t cyclic_ctrl = 0;  // 0x0980 cyclic unit control
+        std::uint8_t activation = 0;   // 0x0981 activation: b0 cyclic, b1 SYNC0, b2 SYNC1
+        std::uint32_t sync0_cyc = 0;   // 0x09A0 SYNC0 cycle time (ns)
+        std::uint32_t sync1_cyc = 0;   // 0x09A4 SYNC1 cycle time (ns)
+        std::uint64_t start_time = 0;  // 0x0990 start time / next SYNC0 system time
+        (void)ecx_FPRD(&impl_->port, adp, 0x0980, sizeof(cyclic_ctrl), &cyclic_ctrl, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->port, adp, 0x0981, sizeof(activation), &activation, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->port, adp, 0x09A0, sizeof(sync0_cyc), &sync0_cyc, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->port, adp, 0x09A4, sizeof(sync1_cyc), &sync1_cyc, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->port, adp, 0x0990, sizeof(start_time), &start_time, EC_TIMEOUTRET);
+        std::cerr << "[dc] slave " << i << " hasdc=1, requested SYNC0 @ " << cycle_ns << " ns shift " << sync0_shift_ns << " ns"
+                  << (enable_sync1 ? " +SYNC1" : "") << "\n"
+                  << "[dc]   ESC 0x0980 cyclicCtrl=0x" << std::hex << static_cast<unsigned>(cyclic_ctrl) << " 0x0981 activation=0x"
+                  << static_cast<unsigned>(activation) << std::dec << " [cyclicEn=" << ((activation & 0x01U) != 0)
+                  << " SYNC0en=" << ((activation & 0x02U) != 0) << " SYNC1en=" << ((activation & 0x04U) != 0) << "]\n"
+                  << "[dc]   ESC 0x09A0 SYNC0cyc=" << sync0_cyc << "ns 0x09A4 SYNC1cyc=" << sync1_cyc
+                  << "ns 0x0990 startTime=" << start_time << "\n";
+        if ((activation & 0x02U) == 0) {
+            std::cerr << "[dc]   *** WARNING: ESC SYNC0 enable bit (0x0981 b1) is CLEAR -- SYNC0 pulse NOT activated at silicon ***\n";
+        }
     }
     impl_->dc_cycle_ns = cycle_ns;  // pace the upcoming OP-transition PD pump at this period
 }

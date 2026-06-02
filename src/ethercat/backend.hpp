@@ -125,9 +125,12 @@ class EcatBackend {
     // `sync0_shift_ns` is the SYNC0 pulse phase offset (ecx_dcsync0 CyclShift): the
     // SYNC0 edge fires `sync0_shift_ns` after the DC base time. Tune it (with the
     // master's send phase) so the drive latches a FRESH output frame at SYNC0.
-    virtual void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
+    // `enable_sync1` additionally activates SYNC1 (ecx_dcsync01) at the same cycle --
+    // some CSP servos need both SYNC0 and SYNC1 or they report Er74.1 "no sync".
+    virtual void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns, bool enable_sync1) {
         (void)cycle_ns;
         (void)sync0_shift_ns;
+        (void)enable_sync1;
     }
 
     // Distributed-Clock system time (ns) latched at the last exchange(), for

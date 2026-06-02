@@ -33,7 +33,7 @@ class SoemBackend final : public EcatBackend {
     void request_state(std::uint16_t slave, EcatState target) override;
     void set_state(std::uint16_t slave, EcatState target) noexcept override;
     EcatState slave_state(std::uint16_t slave) const override;
-    void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) override;
+    void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns, bool enable_sync1) override;
     std::int64_t dc_time() const noexcept override;
 
     SlaveIo slave_io(std::uint16_t slave) noexcept override;

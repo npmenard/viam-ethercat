@@ -90,7 +90,8 @@ extern "C" void on_sigint(int) {
 // Build the PROFILE POSITION MasterConfig for one A6, mirroring
 // etc/a6-hardware.example.json (RxPDO 0x1600 = ctrl + target-pos + profile-vel;
 // TxPDO 0x1A00 = fault + status + mode-display + pos + vel + torque).
-MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_target_ns, std::int32_t dc_sync0_shift_ns, bool sm_dc_sync) {
+MasterConfig build_a6_pp_config(
+    const std::string& ifname, std::int32_t dc_target_ns, std::int32_t dc_sync0_shift_ns, bool sm_dc_sync, bool enable_sync1) {
     MasterConfig cfg;
     cfg.ifname = ifname;
     cfg.target_loop_rate_hz = 1000;             // 1 ms SYNC0 = 4 x 250 us (A6-legal)
@@ -99,6 +100,7 @@ MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_targe
     cfg.dc_settle_cycles = 1000;                // ~1 s post-OP grace while the phase finishes locking
     cfg.dc_sync_shift_ns = dc_target_ns;        // send-phase target (-1 = auto mid-cycle); --dc-target-ns sweep
     cfg.dc_sync0_shift_ns = dc_sync0_shift_ns;  // SYNC0 CyclShift; --dc-shift-ns sweep
+    cfg.dc_enable_sync1 = enable_sync1;         // --sync1: activate SYNC0+SYNC1 (ecx_dcsync01)
     cfg.max_consecutive_wkc_errors = 5;
 
     SlaveConfig a6;
@@ -204,6 +206,7 @@ struct Options {
     std::int32_t dc_target_ns = -1;      // send-phase lock target (-1 = auto mid-cycle); sweep with --dc-target-ns
     std::int32_t dc_sync0_shift_ns = 0;  // SYNC0 CyclShift; sweep with --dc-shift-ns
     bool sm_dc_sync = false;             // --sm-dc-sync: write SM2/SM3 sync type = DC SYNC0 (Er74.1 fix)
+    bool sync1 = false;                  // --sync1: activate SYNC0+SYNC1 (ecx_dcsync01)
 };
 
 }  // namespace
@@ -232,11 +235,13 @@ int main(int argc, char** argv) {
             opt.dc_sync0_shift_ns = std::stoi(args[++i]);  // SYNC0 CyclShift passed to ecx_dcsync0
         } else if (a == "--sm-dc-sync") {
             opt.sm_dc_sync = true;  // write SM2/SM3 sync type = DC SYNC0 (targeted Er74.1 fix)
+        } else if (a == "--sync1") {
+            opt.sync1 = true;  // activate SYNC0+SYNC1 (ecx_dcsync01)
         } else if (a.rfind("--", 0) != 0) {
             opt.ifname = a;
         } else {
             std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N]\n"
-                      << "                   [--dc-target-ns NS] [--dc-shift-ns NS] [--sm-dc-sync]\n";
+                      << "                   [--dc-target-ns NS] [--dc-shift-ns NS] [--sm-dc-sync] [--sync1]\n";
             return 2;
         }
     }
@@ -263,9 +268,11 @@ int main(int argc, char** argv) {
 
     std::cout << "[dc] send-phase target = " << (opt.dc_target_ns < 0 ? "auto(mid-cycle)" : std::to_string(opt.dc_target_ns) + "ns")
               << " | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns"
-              << " | SM DC-sync write = " << (opt.sm_dc_sync ? "ON (0x1C32/33:01=2)" : "off") << "\n\n";
+              << " | SM DC-sync write = " << (opt.sm_dc_sync ? "ON (0x1C32/33:01=2)" : "off")
+              << " | SYNC1 = " << (opt.sync1 ? "ON (dcsync01)" : "off") << "\n\n";
 
-    Master master(build_a6_pp_config(opt.ifname, opt.dc_target_ns, opt.dc_sync0_shift_ns, opt.sm_dc_sync), std::make_unique<SoemBackend>());
+    Master master(build_a6_pp_config(opt.ifname, opt.dc_target_ns, opt.dc_sync0_shift_ns, opt.sm_dc_sync, opt.sync1),
+                  std::make_unique<SoemBackend>());
 
     // --- Stage A: open + enumerate + read-only SDO identity (PRE-OP) ---
     try {
