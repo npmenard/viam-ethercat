@@ -336,6 +336,24 @@ int main(int argc, char** argv) {
     } catch (const Error& e) {
         std::cerr << "[dc] SM sync-type read failed (object absent?): " << e.what() << '\n';
     }
+    // SM cycle-time 0x1C32:02/0x1C33:02 -- SEPARATE try so a missing :02 sub-index
+    // can't suppress the critical :01 print above. If the drive cross-checks the SM
+    // cycle against the ESC SYNC0 cycle (0x09A0=1000000) for a valid DC config, a 0
+    // or mismatched :02 is a candidate for AL 0x0030 "Invalid DC SYNC config".
+    // GATED: read-only here; only write =1000000 (post-assign) if it reads 0.
+    try {
+        const auto cyc2 = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, 0x02);
+        const auto cyc3 = master.sdo_read<std::uint32_t>(slave, kSm3SyncType, 0x02);
+        const char* note = "  *** mismatch vs 1000000 SYNC0 ***";
+        if (cyc2 == 0) {
+            note = "  *** :02=0 -> may need =1000000 for valid DC config ***";
+        } else if (cyc2 == 1'000'000) {
+            note = "  (matches SYNC0 cycle)";
+        }
+        std::cout << "[dc]   0x1C32:02 SM2cycle=" << cyc2 << "ns 0x1C33:02 SM3cycle=" << cyc3 << "ns" << note << '\n';
+    } catch (const Error& e) {
+        std::cerr << "[dc]   0x1C32:02 SM cycle-time read failed (sub-index absent -> drive auto-derives): " << e.what() << '\n';
+    }
     const auto profile_vel = static_cast<std::uint32_t>(opt.move_rpm / 60.0 * kCountsPerRev);
     const Cia402Fsm fsm;
     const Cia402State goal = opt.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
