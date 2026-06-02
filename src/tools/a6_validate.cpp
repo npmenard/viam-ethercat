@@ -70,16 +70,24 @@ constexpr std::uint16_t kIdentity = 0x1018;
 // hasdc=1, DCtime advancing) -- the classic cause is the drive still running
 // free-run/SM-sync because 0x1C32:01 was never set to 2. Opt-in via --sm-dc-sync
 // (a read-only-object abort here would otherwise block the timing-sweep runs).
-constexpr std::uint16_t kSm2SyncType = 0x1C32;  // SM2 (outputs/RxPDO)
-constexpr std::uint16_t kSm3SyncType = 0x1C33;  // SM3 (inputs/TxPDO)
-constexpr std::uint8_t kSyncTypeSub = 0x01;
-constexpr std::uint16_t kSyncTypeDcSync0 = 2;  // ETG sync type 2 = DC SYNC0
+constexpr std::uint16_t kSm2SyncType = 0x1C32;     // SM2 (outputs/RxPDO)
+constexpr std::uint16_t kSm3SyncType = 0x1C33;     // SM3 (inputs/TxPDO)
+constexpr std::uint8_t kSyncTypeSub = 0x01;        // :01 sync type
+constexpr std::uint8_t kSyncCycleSub = 0x02;       // :02 cycle time (ns, U32)
+constexpr std::uint16_t kSyncTypeDcSync0 = 2;      // ETG sync type 2 = DC SYNC0
+constexpr std::uint32_t kSyncCycleNs = 1'000'000;  // SYNC0/SM cycle = loop period (1 ms); must match ESC 0x09A0
 
 constexpr double kCountsPerRev = 131072.0;  // A6 single-turn encoder = 2^17
 
-// Little-endian 2-byte (U16) object value for an SDO write.
+// Little-endian object values for an SDO write.
 std::vector<std::byte> le16(std::uint16_t v) {
     return {static_cast<std::byte>(v & 0xFFU), static_cast<std::byte>((v >> 8U) & 0xFFU)};
+}
+std::vector<std::byte> le32(std::uint32_t v) {
+    return {static_cast<std::byte>(v & 0xFFU),
+            static_cast<std::byte>((v >> 8U) & 0xFFU),
+            static_cast<std::byte>((v >> 16U) & 0xFFU),
+            static_cast<std::byte>((v >> 24U) & 0xFFU)};
 }
 
 std::atomic<bool> g_stop{false};
@@ -120,6 +128,8 @@ MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_targe
         a6.postremap_sdo_writes = {
             {kSm2SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0), /*optional=*/true},  // SM2 outputs -> DC SYNC0
             {kSm3SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0), /*optional=*/true},  // SM3 inputs  -> DC SYNC0
+            {kSm2SyncType, kSyncCycleSub, le32(kSyncCycleNs), /*optional=*/true},     // SM2 cycle time = SYNC0 cycle (1 ms)
+            {kSm3SyncType, kSyncCycleSub, le32(kSyncCycleNs), /*optional=*/true},     // SM3 cycle time = SYNC0 cycle
         };
     }
 
@@ -300,60 +310,65 @@ int main(int argc, char** argv) {
     }
     std::cout << "[A] OK -- EtherCAT comms + CoE SDO confirmed.\n\n";
 
+    const std::uint16_t slave = 1;
+
+    // Dump the drive's SM sync configuration (type :01, cycle :02, supported :04, min
+    // :05). Defined here so we can call it on BOTH the success path AND the
+    // configure-FAILED path: a SafeOp AL-reject (0x0030 "invalid DC SYNC config")
+    // makes configure() throw, but the bus stays open in PRE-OP with the post-assign
+    // writes already applied -- so these SDO reads still work and show exactly what
+    // the drive validated. Each group is its own try so a missing sub-index can't
+    // suppress the others.
+    const auto dump_sm_config = [&master, &opt]() {
+        try {
+            const auto sm2 = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kSyncTypeSub);
+            const auto sm3 = master.sdo_read<std::uint16_t>(slave, kSm3SyncType, kSyncTypeSub);
+            const auto supported = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, 0x04);
+            const auto min_cycle = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, 0x05);
+            const bool dc = sm2 == kSyncTypeDcSync0 && sm3 == kSyncTypeDcSync0;
+            std::cout << "[dc] SM sync-type: 0x1C32:01(SM2)=" << sm2 << " 0x1C33:01(SM3)=" << sm3
+                      << (dc ? "  -> DC SYNC0 active" : "  -> NOT DC SYNC0 (0=FreeRun,1=SM,2=DC)") << "\n"
+                      << "[dc]   0x1C32:04 supportedTypes=0x" << std::hex << supported << std::dec << " 0x1C32:05 minCycle=" << min_cycle
+                      << "ns" << (opt.sm_dc_sync ? "  [--sm-dc-sync wrote :01=2 :02=1ms]" : "") << '\n';
+        } catch (const Error& e) {
+            std::cerr << "[dc] SM sync-type read failed (object absent?): " << e.what() << '\n';
+        }
+        // Cycle time 0x1C32:02/0x1C33:02 -- in DC mode the drive cross-checks the SM
+        // cycle against the ESC SYNC0 cycle (0x09A0=1000000); a 0/mismatched :02 is the
+        // prime candidate for AL 0x0030.
+        try {
+            const auto cyc2 = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, kSyncCycleSub);
+            const auto cyc3 = master.sdo_read<std::uint32_t>(slave, kSm3SyncType, kSyncCycleSub);
+            const char* note = "  *** mismatch vs 1000000 SYNC0 ***";
+            if (cyc2 == 0) {
+                note = "  *** :02=0 -> needs =1000000 for valid DC config ***";
+            } else if (cyc2 == kSyncCycleNs) {
+                note = "  (matches SYNC0 cycle)";
+            }
+            std::cout << "[dc]   0x1C32:02 SM2cycle=" << cyc2 << "ns 0x1C33:02 SM3cycle=" << cyc3 << "ns" << note << '\n';
+        } catch (const Error& e) {
+            std::cerr << "[dc]   0x1C32:02 SM cycle-time read failed (sub-index absent -> auto-derived): " << e.what() << '\n';
+        }
+    };
+
     // --- Stage B: configure to SAFE-OP + DC, then ONE continuous loop that
     // phase-locks, requests OP, and runs the CiA402 sequence -- all on an unbroken
-    // cadence. The A6 faults out of OP on a SINGLE missed SYNC0 frame, so we must
-    // NOT have a gap between bring-up and the steady loop (configure() reaching OP
-    // then handing off to a fresh loop dropped a frame -> Er74). reach_op=false
-    // stops configure at SAFE-OP + DC; the loop below owns every frame from there.
+    // cadence. The A6 faults out of OP on a SINGLE missed SYNC0 frame, so we must NOT
+    // have a gap between bring-up and the steady loop. reach_op=false stops configure
+    // at SAFE-OP + DC; the loop below owns every frame from there.
     try {
         master.configure(false);
     } catch (const Error& e) {
         std::cerr << "[B] configure failed: " << e.what() << "\n"
-                  << "    (a PdoMappingError here means the A6 rejected our assumed PDO map -- check the ESI.)\n";
+                  << "    (a SafeOp AL-reject 0x0030 'invalid DC SYNC config' lands here; SM config below shows what the drive saw.)\n";
+        dump_sm_config();  // bus still open in PRE-OP -> reads work; capture the SM config even on failure
         return 1;
     }
     std::cout << "[B] configured to SAFE-OP, DC enabled (expected WKC=" << master.expected_wkc()
               << "); phase-locking, then requesting OP with NO frame gap...\n";
 
-    const std::uint16_t slave = 1;
+    dump_sm_config();
 
-    // SM sync-type diagnostic (ALWAYS -- these are risk-free SDO reads). Tells us the
-    // drive's ACTUAL application sync mode (2 = DC SYNC0) vs FreeRun(0)/SM(1): if it's
-    // not 2 while we're driving SYNC0, that's the Er74.1 cause. 0x1C32:04 is the
-    // SUPPORTED-types bitmask (does the A6 even offer DC?), 0x1C32:05 the min cycle.
-    // With --sm-dc-sync the values reflect our PRE-OP write; without, the drive default.
-    try {
-        const auto sm2 = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kSyncTypeSub);
-        const auto sm3 = master.sdo_read<std::uint16_t>(slave, kSm3SyncType, kSyncTypeSub);
-        const auto supported = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, 0x04);
-        const auto min_cycle = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, 0x05);
-        const bool dc = sm2 == kSyncTypeDcSync0 && sm3 == kSyncTypeDcSync0;
-        std::cout << "[dc] SM sync-type: 0x1C32:01(SM2)=" << sm2 << " 0x1C33:01(SM3)=" << sm3
-                  << (dc ? "  -> DC SYNC0 active" : "  -> NOT DC SYNC0 (0=FreeRun,1=SM,2=DC) -- candidate Er74.1 cause") << "\n"
-                  << "[dc]   0x1C32:04 supportedTypes=0x" << std::hex << supported << std::dec << " 0x1C32:05 minCycle=" << min_cycle
-                  << "ns" << (opt.sm_dc_sync ? "  [--sm-dc-sync wrote :01=2]" : "") << '\n';
-    } catch (const Error& e) {
-        std::cerr << "[dc] SM sync-type read failed (object absent?): " << e.what() << '\n';
-    }
-    // SM cycle-time 0x1C32:02/0x1C33:02 -- SEPARATE try so a missing :02 sub-index
-    // can't suppress the critical :01 print above. If the drive cross-checks the SM
-    // cycle against the ESC SYNC0 cycle (0x09A0=1000000) for a valid DC config, a 0
-    // or mismatched :02 is a candidate for AL 0x0030 "Invalid DC SYNC config".
-    // GATED: read-only here; only write =1000000 (post-assign) if it reads 0.
-    try {
-        const auto cyc2 = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, 0x02);
-        const auto cyc3 = master.sdo_read<std::uint32_t>(slave, kSm3SyncType, 0x02);
-        const char* note = "  *** mismatch vs 1000000 SYNC0 ***";
-        if (cyc2 == 0) {
-            note = "  *** :02=0 -> may need =1000000 for valid DC config ***";
-        } else if (cyc2 == 1'000'000) {
-            note = "  (matches SYNC0 cycle)";
-        }
-        std::cout << "[dc]   0x1C32:02 SM2cycle=" << cyc2 << "ns 0x1C33:02 SM3cycle=" << cyc3 << "ns" << note << '\n';
-    } catch (const Error& e) {
-        std::cerr << "[dc]   0x1C32:02 SM cycle-time read failed (sub-index absent -> drive auto-derives): " << e.what() << '\n';
-    }
     const auto profile_vel = static_cast<std::uint32_t>(opt.move_rpm / 60.0 * kCountsPerRev);
     const Cia402Fsm fsm;
     const Cia402State goal = opt.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
