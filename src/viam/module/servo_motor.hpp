@@ -7,6 +7,15 @@
 // Profile-Position / Profile-Velocity. ServoMotor adds NO locking of its own --
 // all API-vs-Reconfigure serialization lives in the controller's api_mutex_.
 //
+// CONCURRENCY-COVERAGE INVARIANT (load-bearing, DA): ServoMotor MUST stay a thin
+// pass-through -- `controller_` is NEVER reassigned (reconfigure() forwards in-place
+// to controller_->reconfigure()) and the wrapper holds no lock/state of its own. So
+// the module layer's entire concurrency surface IS the controller's api_mutex_, which
+// teardown_under_load_test already proves race-free under TSan. That is WHY there is
+// no module-level concurrency/TSan test. If a future change reassigns controller_ or
+// adds a wrapper lock, this invariant breaks and module-level concurrency testing
+// becomes required -- treat such a change as the trigger to add it.
+//
 // A6 specifics never appear here: the PDO map, counts/rev, gear ratio, etc. are
 // parsed from the Viam resource config into a ServoConfig (config data, not code).
 
