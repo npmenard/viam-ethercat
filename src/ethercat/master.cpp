@@ -153,14 +153,24 @@ void Master::configure(bool reach_op) {
         rt.tx_fields = build_field_table(sc.slave_id, sc.txpdo);
     }
 
-    backend_->request_state(0, EcatState::SafeOp);
-    // Distributed Clocks: configure SYNC0 at SAFE-OP before OP. Required by
-    // drives that support only DC sync (the A6-EC faults out of OP -- Er74.1 "no
-    // sync signal", WKC->0 -- without it). cycle = loop period; the A6 needs an
-    // integer multiple of 250 us (1 kHz -> 1 ms is valid).
+    // Distributed Clocks: configure SYNC0 in PRE-OP, BEFORE requesting SAFE-OP. A
+    // drive in DC-SYNC mode (SM sync type 0x1C32:01 = 2) VALIDATES its DC SYNC
+    // configuration at the PRE-OP -> SAFE-OP transition and AL-rejects with 0x0030
+    // "Invalid DC SYNC configuration" if SYNC0 isn't set up yet. So configdc + the
+    // live-DCtime prime + dcsync0 must all complete HERE, in PRE-OP, before the
+    // SafeOp request. (ecx_send/receive_processdata still distributes the DC datagram
+    // in PRE-OP: the process-data SMs aren't active but the ARMW on register 0x0910
+    // isn't SM-gated, so ec_DCtime goes live for the start-time computation.) Required
+    // by drives that support only DC sync (the A6-EC). cycle = loop period; the A6
+    // needs an integer multiple of 250 us (1 kHz -> 1 ms is valid).
+    const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
     if (config_.use_distributed_clocks) {
-        const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
         backend_->configure_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);
+    }
+
+    backend_->request_state(0, EcatState::SafeOp);
+
+    if (config_.use_distributed_clocks) {
         // Lock CURRENT memory (the IOmap + SOEM context are already resident after
         // map_process_data) right before the warmup. The warmup is alloc-free
         // (send/receive over the pre-allocated context), so MCL_CURRENT covers its
