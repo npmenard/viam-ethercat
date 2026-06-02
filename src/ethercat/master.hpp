@@ -116,6 +116,11 @@ class Master {
     std::int64_t dc_time() const noexcept {
         return backend_->dc_time();
     }
+    // Live DC-sync health for the SAFE-OP -> OP gate: poll while pumping phase-locked
+    // PD in SAFE-OP, request OP only once `.ready` (slave clock locked + SYNC0 armed).
+    DcSyncStatus dc_sync_status() const noexcept {
+        return backend_->dc_sync_status();
+    }
     std::string last_error() const;
 
     // Latest feedback snapshot for a slave (1-based).

@@ -453,6 +453,16 @@ int main(int argc, char** argv) {
     int locked_streak = 0;
     std::int64_t dc_integral = 0;
     long dc_off = 0;
+    // SAFE-OP DC-sync gate (Arthur Ketels' flow): hold in SAFE-OP pumping phase-locked
+    // PD until BOTH the master is send-phase locked AND the slave's DC clock is stable +
+    // SYNC0 has actually armed (dc_sync_status().ready), THEN request OP. Poll the ESC
+    // DC regs at ~20 Hz (acyclic FPRD off the hot 1 kHz path). A cap still requests OP
+    // after ~4 s so a never-arms run still surfaces the drive's reaction on the bench.
+    DcSyncStatus dcs{};
+    bool dc_ready = false;
+    bool dc_sync_announced = false;
+    constexpr std::uint64_t kDcPollEvery = 50;       // poll dc_sync_status every 50 cycles (~20 Hz)
+    constexpr std::uint64_t kOpRequestCapCycles = 4000;  // ~4 s: request OP even if never `ready` (to see the result)
 
     while (!g_stop.load()) {
         // DEADLINE-FIRST: advance the phase-corrected deadline and sleep to it BEFORE
@@ -476,12 +486,28 @@ int main(int argc, char** argv) {
         dc_off = dc_phase_correction(dct, static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
         locked_streak = dc_phase_locked(dct, static_cast<std::int64_t>(period_ns), dc_shift) ? locked_streak + 1 : 0;
 
-        // Once locked in SAFE-OP, request OP -- the loop keeps cycling through the
-        // transition, so the drive sees no gap.
-        if (!op_requested && locked_streak >= 50) {
+        // SAFE-OP DC-sync gate: while not yet in ->OP, poll the slave DC-sync health at
+        // ~20 Hz. SYNC0 (0x0984) only ARMS once the drive has observed synchronized PD,
+        // so this transitions false -> true mid-loop; that edge is the real go-signal.
+        if (!op_requested && (tick % kDcPollEvery == 0)) {
+            dcs = master.dc_sync_status();
+            dc_ready = dcs.ready;
+            if (dcs.sync0_active && !dc_sync_announced) {
+                std::cout << "[B] DC-sync: SYNC0 ARMED (0x0984 b0=1), clock " << (dcs.clock_locked ? "LOCKED" : "unlocked")
+                          << " (0x092C=" << dcs.sys_time_diff_ns << "ns)\n";
+                dc_sync_announced = true;
+            }
+        }
+
+        // Request OP only once the master is send-phase locked AND the slave DC clock is
+        // stable + SYNC0 armed (Arthur's two criteria) -- or after the cap, to surface a
+        // never-arms result. The loop keeps cycling through the transition (no frame gap).
+        if (!op_requested && locked_streak >= 50 && (dc_ready || tick >= kOpRequestCapCycles)) {
             master.request_op();
             op_requested = true;
-            std::cout << "[B] phase locked (dcPhase~" << (dct % static_cast<std::int64_t>(period_ns)) << "ns) -> requesting OP\n";
+            std::cout << "[B] phase locked (dcPhase~" << (dct % static_cast<std::int64_t>(period_ns)) << "ns), DC-sync "
+                      << (dc_ready ? "READY (clock locked + SYNC0 armed)" : "NOT ready (cap hit -- requesting OP anyway to see drive reaction)")
+                      << " -> requesting OP\n";
         }
         // Full WKC == outputs processing == in OP with live command flow.
         const bool op = op_requested && raw_wkc == master.expected_wkc();
@@ -581,6 +607,11 @@ int main(int argc, char** argv) {
             std::cout << " mode=" << static_cast<int>(mode_now) << " pos=" << pos << " vel=" << vel << " wkc=" << raw_wkc << "/"
                       << master.expected_wkc() << " badWKC=" << wkc_bad << "(maxRun=" << wkc_bad_max_streak << ") dcPhase=" << dc_phase
                       << "ns(off=" << dc_off << ")" << (master.fault() ? " [BUS FAULT]" : "") << '\n';
+            if (!op) {  // SAFE-OP / ->OP: show the DC-sync gate progression (SYNC0 arm + clock lock)
+                std::cout << "      DC-sync: SYNC0=" << (dcs.sync0_active ? "ARMED" : "off") << " clock=" << (dcs.clock_locked ? "LOCKED" : "unlocked")
+                          << " 0x092C=" << dcs.sys_time_diff_ns << "ns lockStreak=" << locked_streak
+                          << " AL=0x" << std::hex << dcs.al_status << std::dec << (dc_ready ? " -> READY for OP" : "") << '\n';
+            }
         }
 
         if (master.fault()) {

@@ -64,6 +64,18 @@ struct SlaveIo {
     std::span<const std::byte> inputs;  // TxPDO feedback (master reads)
 };
 
+// Live DC-sync health of the bus, sampled from the ESC DC registers for the
+// SAFE-OP -> OP gate (see EcatBackend::dc_sync_status). All fields are AND-reduced
+// across every DC slave (the bus is ready only if every slave is).
+struct DcSyncStatus {
+    std::int32_t sys_time_diff_ns = 0;  // worst |0x092C| seen (signed sample, the real lock signal -- NOT 0x0930)
+    bool clock_locked = false;          // every slave's |0x092C| within the lock band
+    bool sync0_active = false;          // every slave's 0x0984 b0 set (SYNC-out unit ARMED)
+    bool sync0_pulsing = false;         // every slave's 0x098E toggled across the two samples (edges firing)
+    std::uint16_t al_status = 0;        // worst 0x0134 AL status code (0x2D = DC start invalid)
+    bool ready = false;                 // clock_locked && sync0_active on ALL slaves -> safe to request OP
+};
+
 // Abstract EtherCAT bus backend. One instance per master/NIC. Setup methods run
 // non-RT at init/configure and MAY throw (InitError/PdoMappingError/BusError
 // with clear text). The cyclic methods are on the RT hot path: noexcept, no
@@ -135,6 +147,17 @@ class EcatBackend {
     // offset to drive to 0 with a PI controller). 0 = no DC (phase-lock no-op).
     virtual std::int64_t dc_time() const noexcept {
         return 0;
+    }
+
+    // Live DC-sync health, read straight from the ESC DC registers (acyclic FPRD)
+    // for the SAFE-OP -> OP gate. Per the SOEM author (Arthur Ketels): a DC drive
+    // will NOT permit OP until it has OBSERVED synchronized, DC-phase-locked PDO
+    // traffic in SAFE-OP -- the SYNC-out unit only ARMS (0x0984) once such traffic
+    // proves the slave clock is in sync. So the caller must pump phase-locked PD in
+    // SAFE-OP and poll this until `ready`, THEN request OP. Default = ready (non-DC
+    // / sim never blocks). See SoemBackend for the per-slave register reads.
+    virtual DcSyncStatus dc_sync_status() noexcept {
+        return DcSyncStatus{.clock_locked = true, .sync0_active = true, .ready = true};
     }
 
     // --- cyclic (RT hot path; noexcept, no alloc, no block) -----------------
