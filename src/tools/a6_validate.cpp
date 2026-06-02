@@ -63,16 +63,17 @@ constexpr std::uint16_t kTorqueActual = 0x6077;
 constexpr std::uint16_t kFaultCode = 0x603F;
 constexpr std::uint16_t kIdentity = 0x1018;
 
-// A6 manufacturer sync-tolerance group C13. The A6 faults out of OP (Er C1.0
-// "sync period error too large", 0x603F=0x8700) when our Linux-RT master's sync
-// jitter exceeds the DEFAULT 3 us window -- the manual's remedy is to loosen this
-// group. CoE index INFERRED from the documented Cxx.yy -> 0x20xx:(yy+1) pattern
-// (C01->0x2001, C10->0x2010); VERIFY against the drive dictionary -- a wrong
-// index/width surfaces as a CoE abort (PdoMappingError) at configure().
-constexpr std::uint16_t kSyncToleranceGroup = 0x2013;  // C13
-constexpr std::uint8_t kC13_02_SyncLoss = 0x03;        // C13.02 sync-loss threshold (default 8)
-constexpr std::uint8_t kC13_05_SyncMode = 0x06;        // C13.05 EtherCAT sync mode (default 1)
-constexpr std::uint8_t kC13_06_JitterNs = 0x07;        // C13.06 sync jitter threshold ns (default 3000)
+// SM synchronization-TYPE objects (ETG std). 0x1C32:01 = SM2/output (RxPDO) sync
+// type, 0x1C33:01 = SM3/input (TxPDO) sync type. Value 2 = "DC SYNC0". These tell
+// the drive's APPLICATION layer to synchronize to the SYNC0 pulse. The bench panel
+// shows Er74.1 "no sync signal" even with the ESC SYNC0 active (configdc TRUE,
+// hasdc=1, DCtime advancing) -- the classic cause is the drive still running
+// free-run/SM-sync because 0x1C32:01 was never set to 2. Opt-in via --sm-dc-sync
+// (a read-only-object abort here would otherwise block the timing-sweep runs).
+constexpr std::uint16_t kSm2SyncType = 0x1C32;  // SM2 (outputs/RxPDO)
+constexpr std::uint16_t kSm3SyncType = 0x1C33;  // SM3 (inputs/TxPDO)
+constexpr std::uint8_t kSyncTypeSub = 0x01;
+constexpr std::uint16_t kSyncTypeDcSync0 = 2;  // ETG sync type 2 = DC SYNC0
 
 constexpr double kCountsPerRev = 131072.0;  // A6 single-turn encoder = 2^17
 
@@ -89,7 +90,7 @@ extern "C" void on_sigint(int) {
 // Build the PROFILE POSITION MasterConfig for one A6, mirroring
 // etc/a6-hardware.example.json (RxPDO 0x1600 = ctrl + target-pos + profile-vel;
 // TxPDO 0x1A00 = fault + status + mode-display + pos + vel + torque).
-MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_target_ns, std::int32_t dc_sync0_shift_ns) {
+MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_target_ns, std::int32_t dc_sync0_shift_ns, bool sm_dc_sync) {
     MasterConfig cfg;
     cfg.ifname = ifname;
     cfg.target_loop_rate_hz = 1000;             // 1 ms SYNC0 = 4 x 250 us (A6-legal)
@@ -104,15 +105,18 @@ MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_targe
     a6.slave_id = 1;
     a6.default_mode = Cia402Mode::ProfilePosition;
 
-    // Loosen the A6 sync-jitter tolerance (PRE-OP, before remap) so a Linux-RT
-    // master holds OP. Default C13.06=3000 ns is too strict; C13.05=2 is the
-    // "host jitter > 1 us" mode. Widths assumed U16 -- if the drive aborts on a
-    // length mismatch, the abort code tells us the real width / index.
-    a6.preop_sdo_writes = {
-        {kSyncToleranceGroup, kC13_05_SyncMode, le16(2)},     // C13.05 = 2 (host jitter > 1 us mode)
-        {kSyncToleranceGroup, kC13_06_JitterNs, le16(6000)},  // C13.06 = 6000 ns (max; default 3000)
-        {kSyncToleranceGroup, kC13_02_SyncLoss, le16(20)},    // C13.02 = 20 (default 8; ride OP-entry transient)
-    };
+    // --sm-dc-sync: put the SM2/SM3 application sync into DC SYNC0 mode (PRE-OP).
+    // Targeted Er74.1 "no sync signal" fix -- the ESC SYNC0 is active but the drive
+    // app may still be free-run. Opt-in: a read-only-object abort would otherwise
+    // block the plain timing-sweep runs. (Panel-confirmed jitter is NOT the issue,
+    // so the C13 sync-tolerance writes were dropped -- the generic preop_sdo_writes
+    // mechanism stays for exactly this kind of drive-config write.)
+    if (sm_dc_sync) {
+        a6.preop_sdo_writes = {
+            {kSm2SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0)},  // SM2 outputs -> DC SYNC0
+            {kSm3SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0)},  // SM3 inputs  -> DC SYNC0
+        };
+    }
 
     a6.rxpdo.assign_index = 0x1C12;
     a6.rxpdo.pdo_indices = {0x1600};
@@ -199,6 +203,7 @@ struct Options {
     int seconds = 6;
     std::int32_t dc_target_ns = -1;      // send-phase lock target (-1 = auto mid-cycle); sweep with --dc-target-ns
     std::int32_t dc_sync0_shift_ns = 0;  // SYNC0 CyclShift; sweep with --dc-shift-ns
+    bool sm_dc_sync = false;             // --sm-dc-sync: write SM2/SM3 sync type = DC SYNC0 (Er74.1 fix)
 };
 
 }  // namespace
@@ -225,11 +230,13 @@ int main(int argc, char** argv) {
             opt.dc_target_ns = std::stoi(args[++i]);  // send-phase lock target (-1 = auto mid-cycle)
         } else if (a == "--dc-shift-ns" && i + 1 < args.size()) {
             opt.dc_sync0_shift_ns = std::stoi(args[++i]);  // SYNC0 CyclShift passed to ecx_dcsync0
+        } else if (a == "--sm-dc-sync") {
+            opt.sm_dc_sync = true;  // write SM2/SM3 sync type = DC SYNC0 (targeted Er74.1 fix)
         } else if (a.rfind("--", 0) != 0) {
             opt.ifname = a;
         } else {
             std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N]\n"
-                      << "                   [--dc-target-ns NS] [--dc-shift-ns NS]\n";
+                      << "                   [--dc-target-ns NS] [--dc-shift-ns NS] [--sm-dc-sync]\n";
             return 2;
         }
     }
@@ -255,9 +262,10 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[dc] send-phase target = " << (opt.dc_target_ns < 0 ? "auto(mid-cycle)" : std::to_string(opt.dc_target_ns) + "ns")
-              << " | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns\n\n";
+              << " | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns"
+              << " | SM DC-sync write = " << (opt.sm_dc_sync ? "ON (0x1C32/33:01=2)" : "off") << "\n\n";
 
-    Master master(build_a6_pp_config(opt.ifname, opt.dc_target_ns, opt.dc_sync0_shift_ns), std::make_unique<SoemBackend>());
+    Master master(build_a6_pp_config(opt.ifname, opt.dc_target_ns, opt.dc_sync0_shift_ns, opt.sm_dc_sync), std::make_unique<SoemBackend>());
 
     // --- Stage A: open + enumerate + read-only SDO identity (PRE-OP) ---
     try {
@@ -305,20 +313,20 @@ int main(int argc, char** argv) {
 
     const std::uint16_t slave = 1;
 
-    // PROVE the C13 sync-tolerance pre-op writes actually took. 0x2013 is INFERRED;
-    // a valid-but-wrong object would accept the write silently and change nothing.
-    // Read the values back (CoE mailbox works in SAFE-OP) and compare to what we
-    // wrote -- a mismatch means the index is wrong and C13 never applied.
-    try {
-        const auto c13_05 = master.sdo_read<std::uint16_t>(slave, kSyncToleranceGroup, kC13_05_SyncMode);
-        const auto c13_06 = master.sdo_read<std::uint16_t>(slave, kSyncToleranceGroup, kC13_06_JitterNs);
-        const auto c13_02 = master.sdo_read<std::uint16_t>(slave, kSyncToleranceGroup, kC13_02_SyncLoss);
-        const bool took = c13_05 == 2 && c13_06 == 6000 && c13_02 == 20;
-        std::cout << "[dc] C13 readback @0x2013: :06(C13.05/mode)=" << c13_05 << " :07(C13.06/jitter_ns)=" << c13_06
-                  << " :03(C13.02/loss)=" << c13_02
-                  << (took ? "  -> writes TOOK" : "  -> *** MISMATCH: 0x2013 index/width WRONG, C13 NOT applied ***") << '\n';
-    } catch (const Error& e) {
-        std::cerr << "[dc] C13 readback FAILED (0x2013 not readable -> inferred index is wrong): " << e.what() << '\n';
+    // --sm-dc-sync: prove the SM sync-type writes took. 0x1C32:01 is often READ-ONLY
+    // on a drive that auto-derives the mode from the ESC SYNC0 activation; reading it
+    // back tells us the drive's actual sync mode (2 = DC SYNC0) regardless of whether
+    // our write was honored or the object even accepted it.
+    if (opt.sm_dc_sync) {
+        try {
+            const auto sm2 = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kSyncTypeSub);
+            const auto sm3 = master.sdo_read<std::uint16_t>(slave, kSm3SyncType, kSyncTypeSub);
+            const bool dc = sm2 == kSyncTypeDcSync0 && sm3 == kSyncTypeDcSync0;
+            std::cout << "[dc] SM sync-type readback: 0x1C32:01(SM2)=" << sm2 << " 0x1C33:01(SM3)=" << sm3
+                      << (dc ? "  -> DC SYNC0 mode active" : "  -> NOT DC SYNC0 (0=FreeRun,1=SM,2=DC) -- likely the Er74.1 cause") << '\n';
+        } catch (const Error& e) {
+            std::cerr << "[dc] SM sync-type readback failed: " << e.what() << '\n';
+        }
     }
     const auto profile_vel = static_cast<std::uint32_t>(opt.move_rpm / 60.0 * kCountsPerRev);
     const Cia402Fsm fsm;
