@@ -21,6 +21,9 @@ namespace {
 constexpr int kPrimeCycles = 3;               // exchanges in SAFE-OP so slaves have valid outputs before OP
 constexpr std::uint16_t kModesOfOp = 0x6060;  // CiA402 modes-of-operation (U8): PP=1, PV=3; SDO-set in PRE-OP
 constexpr long kNsPerSec = 1'000'000'000L;
+constexpr int kDcPreopLockStreak = 200;                // PRE-OP: hold phase-lock this many cycles before crossing to SAFE-OP
+constexpr std::uint32_t kDcSafeopMeasureCycles = 500;  // SAFE-OP: keep pumping (gapless) while the drive measures its cycle
+constexpr int kDcWarmupLockStreak = 50;                // post-SAFE-OP warmup: streak before requesting OP
 
 std::uint32_t field_key(std::uint16_t index, std::uint8_t sub) noexcept {
     return (static_cast<std::uint32_t>(index) << 8U) | sub;
@@ -168,31 +171,60 @@ void Master::configure(bool reach_op) {
         backend_->configure_dc_configdc();
     }
 
-    // Reach SAFE-OP BEFORE arming SYNC0 (the canonical order above).
-    backend_->request_state(0, EcatState::SafeOp);
-
+    const std::int64_t dc_shift = config_.dc_sync_shift_ns < 0 ? static_cast<std::int64_t>(cycle_ns) / 2 : config_.dc_sync_shift_ns;
     if (config_.use_distributed_clocks) {
         // Lock CURRENT memory (the IOmap + SOEM context are resident after
-        // map_process_data) before any RT-paced pumping (the arm prime + the warmup),
-        // so a page fault never spikes the SYNC0 phase. NOT MCL_FUTURE: this can run on
-        // a non-RT thread that later spawns the RT jthread, and MCL_FUTURE would make
-        // that thread's stack alloc hit RLIMIT_MEMLOCK -> EAGAIN. Best-effort but NEVER
-        // silent (a silent fail re-introduces the spike it prevents).
+        // map_process_data) before ANY RT-paced pumping (the PRE-OP lock, the measure
+        // window, the warmup), so a page fault never spikes the phase. NOT MCL_FUTURE:
+        // this can run on a non-RT thread that later spawns the RT jthread, and
+        // MCL_FUTURE would make that thread's stack alloc hit RLIMIT_MEMLOCK -> EAGAIN.
         if (mlockall(MCL_CURRENT) != 0) {
             (void)std::fprintf(stderr,
                                "[ethercat] mlockall(MCL_CURRENT) failed (errno=%d) before the DC warmup: grant "
                                "CAP_IPC_LOCK / RLIMIT_MEMLOCK=infinity; the SYNC0 PLL lock may be unreliable.\n",
                                errno);
         }
-        // DC step 2 (post-SAFE-OP): arm SYNC0 on a fresh live 0x0910 -- ONLY on the
-        // self-contained path (reach_op=true, e.g. the module). On the caller-driven
-        // path (reach_op=false, e.g. a6_validate) the arm is DEFERRED to the caller's RT
-        // loop via Master::arm_dc_sync(), so SYNC0 arms a few cycles in WHILE
-        // synchronized PD is flowing and the master is phase-locking -- which is what a
-        // DC drive (the A6) needs to observe before it will generate SYNC0 / permit OP.
+
+        // DC step 1.5 -- PHASE-LOCK THE MASTER IN PRE-OP, BEFORE crossing to SAFE-OP. The
+        // A6 latches its RO SM cycle (0x1C32:02) from the FIRST SM2-event period it sees
+        // at the PRE-OP->SAFE-OP transition, then validates THAT at OP -- it does NOT
+        // re-derive it from SYNC0. If the master is still phase-locking when SM2 turns on,
+        // that first period is the jittery ~999 us unlocked transient -> latched ->
+        // Er74.0 (0x6320) cycle error at OP. ec_DCtime updates via the FRMW datagram even
+        // in PRE-OP, so the master CAN lock here. Lock FIRST, then cross over so the
+        // drive's first measurement is the clean, locked 1 ms rate. (bench: team-lead.)
+        // dc_lock_cycles == 0 (sim / module) skips the warmup entirely -- request SAFE-OP
+        // straight away (SimBackend has no real DC clock to lock to).
+        if (config_.dc_lock_cycles > 0) {
+            timespec next{};
+            (void)clock_gettime(CLOCK_MONOTONIC, &next);
+            std::int64_t dc_integral = 0;
+            const int preop_streak = phase_lock_pump(cycle_ns, dc_shift, config_.dc_lock_cycles, kDcPreopLockStreak, next, dc_integral);
+            (void)std::fprintf(stderr,
+                               "[ethercat] PRE-OP phase-lock: streak=%d (target %d) before SAFE-OP%s\n",
+                               preop_streak,
+                               kDcPreopLockStreak,
+                               preop_streak >= kDcPreopLockStreak ? " -> LOCKED" : " -> NOT locked (cap hit)");
+
+            // Cross into SAFE-OP with the master ALREADY locked, then keep pumping the
+            // SAME cadence (shared `next`/`dc_integral` -> no phase break) through the
+            // drive's cycle-measurement window, so the value it latches into 0x1C32:02 is
+            // the clean locked 1 ms.
+            backend_->request_state(0, EcatState::SafeOp);
+            (void)phase_lock_pump(cycle_ns, dc_shift, kDcSafeopMeasureCycles, 0, next, dc_integral);
+        } else {
+            backend_->request_state(0, EcatState::SafeOp);
+        }
+
+        // DC step 2: arm SYNC0 -- ONLY on the self-contained path (reach_op=true, e.g. the
+        // module). On the caller-driven path (reach_op=false, e.g. a6_validate) the arm is
+        // DEFERRED to the caller's RT loop via Master::arm_dc_sync(), which arms a few
+        // cycles in once it has re-confirmed phase-lock.
         if (reach_op) {
             backend_->configure_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);
         }
+    } else {
+        backend_->request_state(0, EcatState::SafeOp);
     }
 
     // POST-DC SDO writes -- the ETG.1020 cycle-time handshake (0x1C32:0a Sync0 cycle +
@@ -249,43 +281,17 @@ void Master::configure(bool reach_op) {
         }
     }
 
-    if (config_.use_distributed_clocks) {
-        // Run a PHASE-LOCKING warmup before OP (post-SAFE-OP, SYNC0 already armed): pace
-        // exchanges at the SYNC0 cycle AND run the DC phase-lock PI each cycle, so we
-        // converge our send phase into the SYNC0 window BEFORE requesting OP -- the bus
-        // then enters OP already aligned (WKC 3/3 from cycle 0) instead of dropping WKC
-        // while the post-OP loop is still pulling the phase in. Break early once locked
-        // for a few consecutive cycles. dc_lock_cycles = 0 skips it (sim). Memory was
-        // locked above (before the arm) so no page-fault spikes; SCHED_OTHER jitter
-        // remains -- if the bench shows it can't hold lock, move the warmup + OP
-        // transition into the RT thread prelude (design "(b)"). a6_validate already does
-        // exactly that via reach_op=false + its own phase-locked, SYNC0-gated loop.
-        // Lock the phase at this DC-time offset. -1 = auto = mid-cycle (cycle/2): off the
-        // SYNC0 edge so jitter never crosses the pulse.
-        const std::int64_t shift = config_.dc_sync_shift_ns < 0 ? static_cast<std::int64_t>(cycle_ns) / 2 : config_.dc_sync_shift_ns;
+    if (config_.use_distributed_clocks && reach_op) {
+        // Post-SAFE-OP, SYNC0-armed warmup before OP (self-contained path): re-confirm
+        // the phase-lock (the postdc settle above may have broken the cadence), so the
+        // bus enters OP already aligned (WKC 3/3 from cycle 0). The PRE-OP lock + measure
+        // window already ran; this is the final convergence before the OP request.
+        // dc_lock_cycles = 0 skips it (sim). a6_validate (reach_op=false) instead owns the
+        // whole arm->lock->gate->OP sequence in its own continuous loop.
         timespec next{};
         (void)clock_gettime(CLOCK_MONOTONIC, &next);
         std::int64_t dc_integral = 0;
-        int locked_streak = 0;
-        for (std::uint32_t i = 0; reach_op && i < config_.dc_lock_cycles; ++i) {
-            (void)backend_->exchange();
-            const std::int64_t dct = backend_->dc_time();
-            const long corr = dc_phase_correction(dct, static_cast<std::int64_t>(cycle_ns), dc_integral, shift);
-            locked_streak = dc_phase_locked(dct, static_cast<std::int64_t>(cycle_ns), shift) ? locked_streak + 1 : 0;
-            if (locked_streak >= 50) {
-                break;  // phase held in-band for 50 cycles -> enter OP locked
-            }
-            next.tv_nsec += static_cast<long>(cycle_ns) + corr;
-            while (next.tv_nsec >= kNsPerSec) {
-                next.tv_nsec -= kNsPerSec;
-                next.tv_sec += 1;
-            }
-            while (next.tv_nsec < 0) {
-                next.tv_nsec += kNsPerSec;
-                next.tv_sec -= 1;
-            }
-            (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
-        }
+        (void)phase_lock_pump(cycle_ns, dc_shift, config_.dc_lock_cycles, kDcWarmupLockStreak, next, dc_integral);
     } else if (reach_op) {
         for (int i = 0; i < kPrimeCycles; ++i) {
             (void)backend_->exchange();
@@ -312,6 +318,35 @@ void Master::configure(bool reach_op) {
         settle_remaining_ = config_.dc_lock_cycles + config_.dc_settle_cycles + static_cast<std::uint32_t>(kPrimeCycles);
         operational_.store(true, std::memory_order_relaxed);
     }
+}
+
+int Master::phase_lock_pump(std::uint32_t cycle_ns,
+                            std::int64_t shift_ns,
+                            std::uint32_t max_cycles,
+                            int target_streak,
+                            timespec& next,
+                            std::int64_t& integral) noexcept {
+    int streak = 0;
+    for (std::uint32_t i = 0; i < max_cycles; ++i) {
+        (void)backend_->exchange();
+        const std::int64_t dct = backend_->dc_time();
+        const long corr = dc_phase_correction(dct, static_cast<std::int64_t>(cycle_ns), integral, shift_ns);
+        streak = dc_phase_locked(dct, static_cast<std::int64_t>(cycle_ns), shift_ns) ? streak + 1 : 0;
+        if (target_streak > 0 && streak >= target_streak) {
+            return streak;  // phase held in-band -> caller may advance state
+        }
+        next.tv_nsec += static_cast<long>(cycle_ns) + corr;
+        while (next.tv_nsec >= kNsPerSec) {
+            next.tv_nsec -= kNsPerSec;
+            next.tv_sec += 1;
+        }
+        while (next.tv_nsec < 0) {  // a correction can push the deadline slightly negative
+            next.tv_nsec += kNsPerSec;
+            next.tv_sec -= 1;
+        }
+        (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
+    }
+    return streak;
 }
 
 void Master::arm_dc_sync() noexcept {

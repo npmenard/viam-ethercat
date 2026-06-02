@@ -182,6 +182,18 @@ class Master {
     SlaveRuntime& runtime_for(std::uint16_t slave);
     const SlaveRuntime& runtime_for(std::uint16_t slave) const;
 
+    // Pump `max_cycles` exchanges while running the DC phase-lock PI, sharing the
+    // caller's `next` deadline + `integral` so back-to-back calls stay on ONE
+    // continuous cadence (gapless across a state change). `target_streak > 0` returns
+    // early once the phase has held in-band that many consecutive cycles; 0 = run all
+    // cycles. Returns the final consecutive-locked streak. noexcept (RT-paced setup).
+    int phase_lock_pump(std::uint32_t cycle_ns,
+                        std::int64_t shift_ns,
+                        std::uint32_t max_cycles,
+                        int target_streak,
+                        timespec& next,
+                        std::int64_t& integral) noexcept;
+
     static std::map<std::uint32_t, FieldLocation> build_field_table(std::uint16_t slave, const PdoMap& map);
 
     MasterConfig config_;
