@@ -324,6 +324,29 @@ if (ETHERCAT_BUILD_MODULE)
   viam_apply_wall_werror(a6_config_parse_test)
   target_compile_options(a6_config_parse_test PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
   add_test(NAME a6_config_parse_test COMMAND a6_config_parse_test)
+
+  # Module-LOAD smoke (#12): the full SDK boundary -- registration + validate +
+  # the config-driven production ctor (ServoMotor{deps, ResourceConfig} -> SimBackend)
+  # + the Motor API + Reconfigure + clean shutdown -- offline. Proves the module
+  # loads + runs the gRPC-resource lifecycle without a real viam-server.
+  add_executable(module_load_test
+    tests/module_load_test.cpp
+    src/viam/module/servo_motor.cpp
+  )
+  target_link_libraries(module_load_test
+    PRIVATE
+      ethercat
+      viam-cpp-sdk::viamapi
+      viam-cpp-sdk::viamsdk
+  )
+  target_compile_definitions(module_load_test PRIVATE
+    BOOST_DLL_USE_STD_FS
+    "A6_SIM_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-servo.example.json\""
+  )
+  target_include_directories(module_load_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  viam_apply_wall_werror(module_load_test)
+  target_compile_options(module_load_test PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
+  add_test(NAME module_load_test COMMAND module_load_test)
 endif()
 
 
