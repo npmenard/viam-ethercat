@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 
 #include "ethercat/cia402.hpp"
+#include "ethercat/dc_sync.hpp"
 
 namespace ethercat {
 
@@ -142,22 +143,36 @@ void Master::configure() {
                                "CAP_IPC_LOCK / RLIMIT_MEMLOCK=infinity; the SYNC0 PLL lock may be unreliable.\n",
                                errno);
         }
-        // Pace `dc_lock_cycles` exchanges at the DC period so the slaves' SYNC0/DC
-        // PLL locks before we request OP. An unpaced burst leaves DC unlocked and
-        // the drive refuses OP / faults. dc_lock_cycles = 0 skips the warmup (sim).
-        // PROVISIONAL (architect, runbook §5.2): this warmup runs on the caller's
-        // (possibly non-RT) thread; memory is locked above so no page-fault spikes,
-        // but SCHED_OTHER scheduling jitter remains. If the bench shows the A6 PLL
-        // doesn't lock cleanly under that jitter, restructure to do the DC warmup +
-        // OP transition in the RT thread prelude (design "(b)").
+        // Run a PHASE-LOCKING warmup before OP: pace exchanges at the SYNC0 cycle
+        // AND run the DC phase-lock PI each cycle, so we don't just prime the PLL but
+        // converge our send phase into the SYNC0 window BEFORE requesting OP -- then
+        // the bus enters OP already aligned (WKC 3/3 from cycle 0) instead of dropping
+        // WKC while the post-OP loop is still pulling the phase in. Break early once
+        // locked for a few consecutive cycles. dc_lock_cycles = 0 skips it (sim).
+        // PROVISIONAL (architect, runbook §5.2): this runs on the caller's (possibly
+        // non-RT) thread; memory is locked above so no page-fault spikes, but
+        // SCHED_OTHER jitter remains -- if the bench shows it can't hold lock, move
+        // the warmup + OP transition into the RT thread prelude (design "(b)").
         timespec next{};
         (void)clock_gettime(CLOCK_MONOTONIC, &next);
+        std::int64_t dc_integral = 0;
+        int locked_streak = 0;
         for (std::uint32_t i = 0; i < config_.dc_lock_cycles; ++i) {
             (void)backend_->exchange();
-            next.tv_nsec += static_cast<long>(cycle_ns);
+            const std::int64_t dct = backend_->dc_time();
+            const long corr = dc_phase_correction(dct, static_cast<std::int64_t>(cycle_ns), dc_integral);
+            locked_streak = dc_phase_locked(dct, static_cast<std::int64_t>(cycle_ns)) ? locked_streak + 1 : 0;
+            if (locked_streak >= 50) {
+                break;  // phase held in-band for 50 cycles -> enter OP locked
+            }
+            next.tv_nsec += static_cast<long>(cycle_ns) + corr;
             while (next.tv_nsec >= kNsPerSec) {
                 next.tv_nsec -= kNsPerSec;
                 next.tv_sec += 1;
+            }
+            while (next.tv_nsec < 0) {
+                next.tv_nsec += kNsPerSec;
+                next.tv_sec -= 1;
             }
             (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
         }
@@ -174,19 +189,31 @@ void Master::configure() {
 
     fault_.store(false, std::memory_order_relaxed);
     consecutive_wkc_errors_ = 0;
+    // Open the post-OP DC settle grace (no WKC latch while the phase finishes
+    // locking). Only meaningful with DC; 0 otherwise -> immediate latching.
+    settle_remaining_ = config_.use_distributed_clocks ? config_.dc_settle_cycles : 0;
     operational_.store(true, std::memory_order_relaxed);
 }
 
 void Master::process() noexcept {
     const int wkc = backend_->exchange();
+    // Post-OP DC settle grace: while it lasts, a short/abnormal WKC neither
+    // accumulates toward the latch nor faults -- the DC phase PI is still pulling
+    // into the window and a few partial-processing cycles are expected + benign.
+    const bool in_grace = settle_remaining_ > 0;
+    if (in_grace) {
+        --settle_remaining_;
+    }
     if (wkc < 0 || wkc < expected_wkc_) {
-        ++consecutive_wkc_errors_;
-        if (consecutive_wkc_errors_ >= config_.max_consecutive_wkc_errors) {
-            // Store the payload (fault_wkc_) first, then publish the flag with a
-            // release store so a reader that acquires fault_==true sees the wkc.
-            fault_wkc_.store(wkc, std::memory_order_relaxed);
-            fault_.store(true, std::memory_order_release);
-            operational_.store(false, std::memory_order_relaxed);
+        if (!in_grace) {
+            ++consecutive_wkc_errors_;
+            if (consecutive_wkc_errors_ >= config_.max_consecutive_wkc_errors) {
+                // Store the payload (fault_wkc_) first, then publish the flag with a
+                // release store so a reader that acquires fault_==true sees the wkc.
+                fault_wkc_.store(wkc, std::memory_order_relaxed);
+                fault_.store(true, std::memory_order_release);
+                operational_.store(false, std::memory_order_relaxed);
+            }
         }
     } else {
         consecutive_wkc_errors_ = 0;

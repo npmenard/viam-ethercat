@@ -301,6 +301,16 @@ int SoemBackend::expected_wkc() const noexcept {
 
 void SoemBackend::close() noexcept {
     if (impl_->open) {
+        // Turn SYNC0 OFF before closing if we enabled DC -- otherwise the drive is
+        // left expecting a sync pulse that stops coming, which sync-faults it (A6
+        // Er74) and wedges its CoE mailbox until a control-power cycle. Disabling
+        // SYNC0 first lets the drive fall back cleanly between runs.
+        if (impl_->dc_cycle_ns != 0) {
+            for (int i = 1; i <= impl_->slavecount; ++i) {
+                ecx_dcsync0(&impl_->ctx, static_cast<std::uint16_t>(i), FALSE, 0, 0);
+            }
+            impl_->dc_cycle_ns = 0;
+        }
         ecx_close(&impl_->ctx);
         impl_->open = false;
     }

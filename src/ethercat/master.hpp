@@ -155,6 +155,7 @@ class Master {
     int expected_wkc_ = 0;
     std::uint64_t cycle_ = 0;                   // RT-only
     std::uint32_t consecutive_wkc_errors_ = 0;  // RT-only
+    std::uint32_t settle_remaining_ = 0;        // RT-only: post-OP grace cycles left (DC phase settle; no WKC latch)
 
     std::atomic<int> working_counter_{0};
     std::atomic<int> fault_wkc_{0};

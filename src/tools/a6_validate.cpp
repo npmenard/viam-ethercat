@@ -39,6 +39,7 @@
 #include <sys/mman.h>
 
 #include "ethercat/cia402.hpp"
+#include "ethercat/dc_sync.hpp"
 #include "ethercat/errors.hpp"
 #include "ethercat/master.hpp"
 #include "ethercat/pdo_buffer.hpp"
@@ -76,7 +77,8 @@ MasterConfig build_a6_pp_config(const std::string& ifname) {
     cfg.ifname = ifname;
     cfg.target_loop_rate_hz = 1000;     // 1 ms SYNC0 = 4 x 250 us (A6-legal)
     cfg.use_distributed_clocks = true;  // A6 supports ONLY DC sync
-    cfg.dc_lock_cycles = 500;           // ~0.5 s paced warmup so the DC PLL locks before OP
+    cfg.dc_lock_cycles = 2000;          // up to 2 s phase-locking warmup -> enter OP aligned
+    cfg.dc_settle_cycles = 1000;        // ~1 s post-OP grace while the phase finishes locking
     cfg.max_consecutive_wkc_errors = 5;
 
     SlaveConfig a6;
@@ -156,22 +158,6 @@ void sleep_until(struct timespec& next, long delta_ns) {
         next.tv_sec -= 1;
     }
     (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
-}
-
-// PI controller that phase-locks our cyclic wakeup to the drive's SYNC0 pulse:
-// drives (DCtime mod cycle) -> 0 by nudging the next wake target by `offset` ns.
-// Without it the master's frames drift relative to SYNC0 and the slave only
-// partially processes them (WKC degrades 3->1). Mirrors SOEM's ec_sync().
-long dc_phase_offset_ns(std::int64_t dc_time, std::int64_t cycle_ns, std::int64_t& integral) {
-    if (dc_time == 0 || cycle_ns == 0) {
-        return 0;  // no DC clock -> nothing to lock to
-    }
-    std::int64_t delta = dc_time % cycle_ns;
-    if (delta > cycle_ns / 2) {
-        delta -= cycle_ns;  // shortest signed distance to the pulse
-    }
-    integral += (delta > 0) ? 1 : (delta < 0 ? -1 : 0);
-    return static_cast<long>(-(delta / 100) - (integral / 20));  // P + I terms (SOEM gains)
 }
 
 struct Options {
@@ -302,9 +288,9 @@ int main(int argc, char** argv) {
         if (master.working_counter() != master.expected_wkc()) {
             ++wkc_bad;
         }
-        // Phase-lock our wakeup to SYNC0: nudge the next sleep target so DCtime
-        // stays aligned to the pulse (keeps WKC at full instead of drifting 3->1).
-        const long dc_off = dc_phase_offset_ns(master.dc_time(), static_cast<std::int64_t>(period_ns), dc_integral);
+        // Hold the SYNC0 phase lock (the warmup already converged it before OP):
+        // nudge the next sleep target so DCtime stays aligned to the pulse.
+        const long dc_off = dc_phase_correction(master.dc_time(), static_cast<std::int64_t>(period_ns), dc_integral);
 
         const std::span<const std::byte> in = master.input_image(slave);
         const Status status{read_tx<std::uint16_t>(master, slave, in, kStatusword)};

@@ -57,9 +57,12 @@ MasterConfig build_master_config(const ServoConfig& c) {
     mc.slaves = {slave};
     mc.max_consecutive_wkc_errors = static_cast<std::uint32_t>(c.max_consecutive_wkc_errors);
     mc.use_distributed_clocks = c.use_distributed_clocks;
-    // Paced DC-PLL warmup before OP (bench-tuned default; only used when DC is on).
-    constexpr std::uint32_t kDefaultDcLockCycles = 500;
+    // DC bring-up (bench-tuned defaults; only used when DC is on): phase-locking
+    // warmup before OP + a post-OP settle grace while the phase finishes locking.
+    constexpr std::uint32_t kDefaultDcLockCycles = 2000;
+    constexpr std::uint32_t kDefaultDcSettleCycles = 1000;
     mc.dc_lock_cycles = c.use_distributed_clocks ? kDefaultDcLockCycles : 0;
+    mc.dc_settle_cycles = c.use_distributed_clocks ? kDefaultDcSettleCycles : 0;
     return mc;
 }
 
