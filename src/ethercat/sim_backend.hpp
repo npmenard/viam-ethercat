@@ -75,6 +75,8 @@ class SimBackend final : public EcatBackend {
     // Last profile velocity (0x6081) the device saw in its command image (0 if the
     // master never wrote it / it isn't mapped). Lets offline tests assert the RT loop
     // actually writes the commanded move speed.
+    // TEST-ONLY: call only AFTER the controller is stopped/joined -- it reads a
+    // non-atomic int the RT thread writes via exchange(); a live concurrent read races.
     std::int32_t received_profile_velocity(std::uint16_t slave) const noexcept;
     // Toggle whether a slave asserts the PP set-point-acknowledge (bit12). When
     // suppressed, the controller's new-set-point handshake times out; re-enabling
