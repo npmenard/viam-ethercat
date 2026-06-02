@@ -31,6 +31,7 @@ class SoemBackend final : public EcatBackend {
     std::size_t sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) override;
     void map_process_data() override;
     void request_state(std::uint16_t slave, EcatState target) override;
+    void set_state(std::uint16_t slave, EcatState target) noexcept override;
     EcatState slave_state(std::uint16_t slave) const override;
     void configure_dc_sync(std::uint32_t cycle_ns) override;
     std::int64_t dc_time() const noexcept override;

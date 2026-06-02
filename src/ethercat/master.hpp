@@ -53,10 +53,20 @@ class Master {
     void init();
 
     // PRE-OP -> apply the PDO remap per slave -> map the process image -> size
-    // the PdoCaches + build the flat field tables -> SAFE-OP -> prime -> OP.
-    // Re-applies the map every call (A6 map isn't in EEPROM). Throws
-    // InitError/PdoMappingError naming the offending slave on failure.
-    void configure();
+    // the PdoCaches + build the flat field tables -> SAFE-OP -> [DC: enable SYNC0] ->
+    // [reach_op: phase-lock warmup -> OP] . Re-applies the map every call (A6 map
+    // isn't in EEPROM). Throws InitError/PdoMappingError naming the offending slave.
+    //
+    // reach_op = false: stop at SAFE-OP with DC enabled and DON'T run the warmup or
+    // request OP -- for a CONTINUOUS bring-up where the caller's own cyclic loop runs
+    // the phase-lock warmup, calls request_op() once locked, and keeps cycling, so a
+    // DC drive sees no frame gap through SAFE-OP->OP (the only safe path on the A6,
+    // which faults out of OP on a single missed SYNC0 frame).
+    void configure(bool reach_op = true);
+
+    // Caller-driven OP request (only after configure(reach_op=false)): writes the
+    // OP state request; the caller's cyclic loop pumps the transition. Never throws.
+    void request_op() noexcept;
 
     void close() noexcept;
 

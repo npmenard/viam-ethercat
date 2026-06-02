@@ -105,6 +105,16 @@ class EcatBackend {
     // slave + target (and the state actually reached) on timeout.
     virtual void request_state(std::uint16_t slave, EcatState target) = 0;
     virtual EcatState slave_state(std::uint16_t slave) const = 0;
+    // REQUEST `slave` (0 = all) to `target` -- writes the state request only; does
+    // NOT pump process data, wait, or throw. The caller's cyclic loop drives the
+    // transition (so a DC drive sees CONTINUOUS process data through SAFE-OP->OP,
+    // no gap -> no Er74). Default: best-effort no-throw wrapper over request_state.
+    virtual void set_state(std::uint16_t slave, EcatState target) noexcept {
+        try {
+            request_state(slave, target);
+        } catch (...) {  // NOLINT(bugprone-empty-catch): caller polls slave_state()
+        }
+    }
 
     // Configure Distributed-Clock SYNC0 on every DC-capable slave at `cycle_ns`,
     // called at SAFE-OP before requesting OP, only when MasterConfig requests DC.

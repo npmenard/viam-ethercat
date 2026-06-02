@@ -77,7 +77,7 @@ std::map<std::uint32_t, FieldLocation> Master::build_field_table(std::uint16_t s
     return fields;
 }
 
-void Master::configure() {
+void Master::configure(bool reach_op) {
     // Maps are writable only in PRE-OP and are not stored in EEPROM, so this runs
     // every configure() / power-on.
     backend_->request_state(0, EcatState::PreOp);
@@ -160,7 +160,7 @@ void Master::configure() {
         (void)clock_gettime(CLOCK_MONOTONIC, &next);
         std::int64_t dc_integral = 0;
         int locked_streak = 0;
-        for (std::uint32_t i = 0; i < config_.dc_lock_cycles; ++i) {
+        for (std::uint32_t i = 0; reach_op && i < config_.dc_lock_cycles; ++i) {
             (void)backend_->exchange();
             const std::int64_t dct = backend_->dc_time();
             const long corr = dc_phase_correction(dct, static_cast<std::int64_t>(cycle_ns), dc_integral, shift);
@@ -179,23 +179,36 @@ void Master::configure() {
             }
             (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
         }
-    } else {
+    } else if (reach_op) {
         for (int i = 0; i < kPrimeCycles; ++i) {
             (void)backend_->exchange();
         }
     }
-    backend_->request_state(0, EcatState::Op);
-    if (backend_->slave_state(0) != EcatState::Op) {
-        throw InitError("EtherCAT bus on '" + config_.ifname + "': not all slaves reached OPERATIONAL (bus is " +
-                        to_string(backend_->slave_state(0)) + ")");
-    }
 
     fault_.store(false, std::memory_order_relaxed);
     consecutive_wkc_errors_ = 0;
-    // Open the post-OP DC settle grace (no WKC latch while the phase finishes
-    // locking). Only meaningful with DC; 0 otherwise -> immediate latching.
-    settle_remaining_ = config_.use_distributed_clocks ? config_.dc_settle_cycles : 0;
-    operational_.store(true, std::memory_order_relaxed);
+    if (reach_op) {
+        backend_->request_state(0, EcatState::Op);
+        if (backend_->slave_state(0) != EcatState::Op) {
+            throw InitError("EtherCAT bus on '" + config_.ifname + "': not all slaves reached OPERATIONAL (bus is " +
+                            to_string(backend_->slave_state(0)) + ")");
+        }
+        // Post-OP DC settle grace (no WKC latch while the phase finishes locking).
+        settle_remaining_ = config_.use_distributed_clocks ? config_.dc_settle_cycles : 0;
+        operational_.store(true, std::memory_order_relaxed);
+    } else {
+        // CALLER-DRIVEN bring-up: leave the bus in SAFE-OP with DC enabled; the
+        // caller's CONTINUOUS cyclic loop runs the phase-lock warmup, requests OP
+        // (request_op()) once locked, and keeps cycling -- so a DC drive sees an
+        // unbroken stream of frames through SAFE-OP->OP (no gap -> no Er74). A big
+        // grace covers the expected short WKC across that whole window.
+        settle_remaining_ = config_.dc_lock_cycles + config_.dc_settle_cycles + static_cast<std::uint32_t>(kPrimeCycles);
+        operational_.store(true, std::memory_order_relaxed);
+    }
+}
+
+void Master::request_op() noexcept {
+    backend_->set_state(0, EcatState::Op);  // writestate only; the caller's loop pumps the transition
 }
 
 void Master::process() noexcept {

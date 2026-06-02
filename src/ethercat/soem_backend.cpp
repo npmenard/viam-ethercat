@@ -244,6 +244,14 @@ void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
     }
 }
 
+void SoemBackend::set_state(std::uint16_t slave, EcatState target) noexcept {
+    // Write the state request ONLY -- no pump, no statecheck, no throw. The caller's
+    // cyclic loop pumps process data through the transition so a DC drive never sees
+    // a gap. slave_state() reports progress.
+    impl_->slavelist[slave].state = to_soem_state(target);
+    ecx_writestate(&impl_->ctx, slave);
+}
+
 EcatState SoemBackend::slave_state(std::uint16_t slave) const {
     if (slave > impl_->slave_count) {
         return EcatState::None;

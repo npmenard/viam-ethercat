@@ -249,26 +249,29 @@ int main(int argc, char** argv) {
     }
     std::cout << "[A] OK -- EtherCAT comms + CoE SDO confirmed.\n\n";
 
-    // --- Stage B: configure (remap + 0x6060 + OP) and cyclic exchange ---
+    // --- Stage B: configure to SAFE-OP + DC, then ONE continuous loop that
+    // phase-locks, requests OP, and runs the CiA402 sequence -- all on an unbroken
+    // cadence. The A6 faults out of OP on a SINGLE missed SYNC0 frame, so we must
+    // NOT have a gap between bring-up and the steady loop (configure() reaching OP
+    // then handing off to a fresh loop dropped a frame -> Er74). reach_op=false
+    // stops configure at SAFE-OP + DC; the loop below owns every frame from there.
     try {
-        master.configure();
+        master.configure(false);
     } catch (const Error& e) {
         std::cerr << "[B] configure failed: " << e.what() << "\n"
-                  << "    (a PdoMappingError here means the A6 rejected our assumed PDO map -- check the\n"
-                  << "     ESI; the drive's mappable indices/objects may differ from the assumed defaults.)\n";
+                  << "    (a PdoMappingError here means the A6 rejected our assumed PDO map -- check the ESI.)\n";
         return 1;
     }
-    std::cout << "[B] configured: PDO map applied, mode set, all_operational=" << std::boolalpha << master.all_operational()
-              << " | expected WKC=" << master.expected_wkc() << "\n";
+    std::cout << "[B] configured to SAFE-OP, DC enabled (expected WKC=" << master.expected_wkc()
+              << "); phase-locking, then requesting OP with NO frame gap...\n";
 
     const std::uint16_t slave = 1;
-    const std::int32_t hold_pos = read_tx<std::int32_t>(master, slave, master.input_image(slave), kPositionActual);
     const auto profile_vel = static_cast<std::uint32_t>(opt.move_rpm / 60.0 * kCountsPerRev);
-
     const Cia402Fsm fsm;
     const Cia402State goal = opt.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
     constexpr std::uint32_t kLoopHz = 1000;
     const std::uint32_t period_ns = 1'000'000'000U / kLoopHz;
+    const std::int64_t dc_shift = static_cast<std::int64_t>(period_ns) / 2;  // mid-cycle phase target
 
     struct timespec next{};
     (void)clock_gettime(CLOCK_MONOTONIC, &next);
@@ -276,21 +279,30 @@ int main(int argc, char** argv) {
 
     std::uint16_t last_cw = 0;
     bool announced_op = false;
+    bool op_reached_announced = false;
+    bool op_requested = false;
     bool setpoint_latched = false;
     bool move_done = false;
     bool was_faulted = false;
-    std::int32_t target = hold_pos;
+    bool hold_captured = false;
+    std::int32_t hold_pos = 0;
+    std::int32_t target = 0;
     std::uint64_t tick = 0;
     int wkc_bad = 0;
-    std::int64_t dc_integral = 0;  // PI integrator for the DC phase lock
-
     int wkc_bad_streak = 0;
     int wkc_bad_max_streak = 0;
+    int locked_streak = 0;
+    std::int64_t dc_integral = 0;
+    long dc_off = 0;
+
     while (!g_stop.load()) {
+        // DEADLINE-FIRST: advance the phase-corrected deadline and sleep to it BEFORE
+        // exchanging -- one unbroken cadence from the first frame, so the drive never
+        // sees a gap through SAFE-OP -> OP.
+        sleep_until(next, static_cast<long>(period_ns) + dc_off);
         master.process();
-        // Count the RAW per-cycle WKC, not working_counter() (which holds the last
-        // GOOD value -> blind to short cycles). Track the max consecutive bad run so
-        // we can see whether a latch was a real 5-in-a-row vs scattered transients.
+        ++tick;
+
         const int raw_wkc = master.last_wkc();
         if (raw_wkc != master.expected_wkc()) {
             ++wkc_bad;
@@ -299,16 +311,36 @@ int main(int argc, char** argv) {
         } else {
             wkc_bad_streak = 0;
         }
-        // Hold the SYNC0 phase lock (the warmup already converged it before OP):
-        // nudge the next sleep target so DCtime stays aligned MID-CYCLE (period/2,
-        // off the SYNC0 edge -- matches the warmup's auto target).
-        const std::int64_t dc_shift = static_cast<std::int64_t>(period_ns) / 2;
-        const long dc_off = dc_phase_correction(master.dc_time(), static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
+
+        // DC phase-lock correction for the NEXT cycle (mid-cycle target).
+        const std::int64_t dct = master.dc_time();
+        dc_off = dc_phase_correction(dct, static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
+        locked_streak = dc_phase_locked(dct, static_cast<std::int64_t>(period_ns), dc_shift) ? locked_streak + 1 : 0;
+
+        // Once locked in SAFE-OP, request OP -- the loop keeps cycling through the
+        // transition, so the drive sees no gap.
+        if (!op_requested && locked_streak >= 50) {
+            master.request_op();
+            op_requested = true;
+            std::cout << "[B] phase locked (dcPhase~" << (dct % static_cast<std::int64_t>(period_ns)) << "ns) -> requesting OP\n";
+        }
+        // Full WKC == outputs processing == in OP with live command flow.
+        const bool op = op_requested && raw_wkc == master.expected_wkc();
 
         const std::span<const std::byte> in = master.input_image(slave);
         const Status status{read_tx<std::uint16_t>(master, slave, in, kStatusword)};
         const std::int32_t pos = read_tx<std::int32_t>(master, slave, in, kPositionActual);
         const std::int32_t vel = read_tx<std::int32_t>(master, slave, in, kVelocityActual);
+
+        if (op && !hold_captured) {
+            hold_pos = pos;
+            target = pos;
+            hold_captured = true;
+        }
+        if (op && !op_reached_announced) {
+            std::cout << "[B] *** OPERATIONAL *** WKC=" << raw_wkc << "/" << master.expected_wkc() << ", holding at " << hold_pos << '\n';
+            op_reached_announced = true;
+        }
 
         // --reset-fault: the FSM (goal ReadyToSwitchOn) already drives the CiA402
         // fault-reset edge below; just announce the Fault -> cleared transition (the
@@ -333,7 +365,7 @@ int main(int argc, char** argv) {
         }
 
         const std::span<std::byte> out = master.outputs(slave);
-        if (opt.enable && status.operation_enabled()) {
+        if (op && opt.enable && status.operation_enabled()) {
             if (!announced_op) {
                 std::cout << "[B] *** OPERATION ENABLED *** (motor energized, holding at " << hold_pos << ")\n";
                 announced_op = true;
@@ -372,13 +404,12 @@ int main(int argc, char** argv) {
         last_cw = cw;
 
         if (tick % 200 == 0) {  // ~5 Hz status print
-            const std::int64_t dc_phase = period_ns != 0 ? master.dc_time() % static_cast<std::int64_t>(period_ns) : 0;
-            std::cout << "    t=" << tick / kLoopHz << "s state=" << to_string(status.decode()) << " sw=0x" << std::hex << status.raw
-                      << std::dec << " pos=" << pos << " vel=" << vel << " wkc=" << raw_wkc << "/" << master.expected_wkc()
-                      << " badWKC=" << wkc_bad << "(maxRun=" << wkc_bad_max_streak << ")"
-                      << " dcPhase=" << dc_phase << "ns(off=" << dc_off << ")" << (master.fault() ? " [BUS FAULT]" : "") << '\n';
+            const std::int64_t dc_phase = period_ns != 0 ? dct % static_cast<std::int64_t>(period_ns) : 0;
+            std::cout << "    t=" << tick / kLoopHz << "s " << (op ? "OP " : (op_requested ? "->OP " : "SAFEOP "))
+                      << to_string(status.decode()) << " sw=0x" << std::hex << status.raw << std::dec << " pos=" << pos << " vel=" << vel
+                      << " wkc=" << raw_wkc << "/" << master.expected_wkc() << " badWKC=" << wkc_bad << "(maxRun=" << wkc_bad_max_streak
+                      << ") dcPhase=" << dc_phase << "ns(off=" << dc_off << ")" << (master.fault() ? " [BUS FAULT]" : "") << '\n';
         }
-        ++tick;
 
         if (master.fault()) {
             std::cerr << "[B] bus fault latched: " << master.last_error() << '\n';
@@ -387,13 +418,9 @@ int main(int argc, char** argv) {
         if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(opt.seconds)) {
             break;
         }
-        if (opt.move_pp && move_done) {
-            // let it settle a moment, then finish
-            if (tick % 500 == 0) {
-                break;
-            }
+        if (opt.move_pp && move_done && tick % 500 == 0) {
+            break;  // let it settle a moment, then finish
         }
-        sleep_until(next, static_cast<long>(period_ns) + dc_off);  // phase-corrected wake
     }
 
     // --- graceful shutdown: disable the drive, flush a few cycles, close ---
