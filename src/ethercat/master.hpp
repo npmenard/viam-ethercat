@@ -71,6 +71,14 @@ class Master {
     // pumping + poll dc_sync_status until ready, then request_op(). Never throws.
     void arm_dc_sync() noexcept;
 
+    // Caller-driven post-arm SDO writes (only after configure(reach_op=false) + an
+    // in-loop arm_dc_sync()): apply each slave's postdc_sdo_writes -- the ETG.1020
+    // cycle-time handshake that needs the ESC SYNC0 cycle (0x09A0) live. configure()
+    // skips these on the caller-driven path because the arm is deferred to the loop;
+    // the caller invokes this once, just after arming. Never throws (optional+mandatory
+    // writes both logged, never propagated into the RT loop).
+    void apply_postdc_writes() noexcept;
+
     // Caller-driven OP request (only after configure(reach_op=false)): writes the
     // OP state request; the caller's cyclic loop pumps the transition. Never throws.
     void request_op() noexcept;

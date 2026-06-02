@@ -195,19 +195,23 @@ void Master::configure(bool reach_op) {
         }
     }
 
-    // POST-DC SDO writes, applied here -- AFTER the SYNC0 arm, so the ESC cycle
-    // register 0x09A0 is live. The ETG.1020 cycle-time handshake (0x1C32:0a Sync0
-    // cycle + :08 Get-Cycle) populates the read-only 0x1C32:02 the drive validates;
-    // it needs 0x09A0 non-zero to measure a real cycle. (0x1C32:01 = DC-mode switch
-    // stays in postremap, PRE-OP -- it is writable only before configdc.)
-    for (const SlaveConfig& sc : config_.slaves) {
-        apply_sdo_writes(sc.slave_id, sc.postdc_sdo_writes);
+    // POST-DC SDO writes -- the ETG.1020 cycle-time handshake (0x1C32:0a Sync0 cycle +
+    // :08 Get-Cycle) that populates the read-only 0x1C32:02 the drive validates. Needs
+    // the ESC cycle register 0x09A0 live, i.e. AFTER the SYNC0 arm. (0x1C32:01 = DC-mode
+    // switch stays in postremap, PRE-OP -- writable only before configdc.) Applied here
+    // ONLY on the self-contained path (reach_op=true): the arm has already run above. On
+    // the caller-driven path (reach_op=false) the arm is deferred to the caller's RT
+    // loop, so the caller applies these post-arm via Master::apply_postdc_writes().
+    if (reach_op) {
+        for (const SlaveConfig& sc : config_.slaves) {
+            apply_sdo_writes(sc.slave_id, sc.postdc_sdo_writes);
+        }
     }
 
     // POST-DC SETTLE: pump paced PD so the drive APPLIES the DC config -- copies the
     // live ESC SYNC0 cycle (0x09A0) into the read-only CoE 0x1C32:02. Optionally poll a
     // CoE object each cycle and break early once it reads non-zero (config applied).
-    if (config_.use_distributed_clocks && config_.dc_postwrite_settle_cycles > 0) {
+    if (reach_op && config_.use_distributed_clocks && config_.dc_postwrite_settle_cycles > 0) {
         const std::uint16_t poll_slave = config_.slaves.front().slave_id;
         timespec next{};
         (void)clock_gettime(CLOCK_MONOTONIC, &next);
@@ -316,6 +320,24 @@ void Master::arm_dc_sync() noexcept {
         backend_->arm_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);  // ecx_dcsync0, no prime (the caller pumps)
     } catch (const std::exception& e) {
         (void)std::fprintf(stderr, "[ethercat] arm_dc_sync failed: %s\n", e.what());
+    }
+}
+
+void Master::apply_postdc_writes() noexcept {
+    for (const SlaveConfig& sc : config_.slaves) {
+        for (const SdoWrite& w : sc.postdc_sdo_writes) {
+            try {
+                backend_->sdo_write(sc.slave_id, w.index, w.subindex, w.data);
+            } catch (const std::exception& e) {
+                (void)std::fprintf(stderr,
+                                   "[ethercat] post-arm SDO write to slave %u object 0x%04X:%02X %s (continuing): %s\n",
+                                   static_cast<unsigned>(sc.slave_id),
+                                   static_cast<unsigned>(w.index),
+                                   static_cast<unsigned>(w.subindex),
+                                   w.optional ? "rejected" : "FAILED",
+                                   e.what());
+            }
+        }
     }
 }
 

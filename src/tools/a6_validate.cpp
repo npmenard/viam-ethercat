@@ -512,6 +512,14 @@ int main(int argc, char** argv) {
             arm_tick = tick;
             std::cout << "[B] master phase-locked (lockStreak=" << locked_streak << ", dcPhase~"
                       << (dct % static_cast<std::int64_t>(period_ns)) << "ns) -> ARMING SYNC0 in-loop (post-SAFE-OP, PD flowing)\n";
+            // --sm-dc-sync: NOW that the arm set the ESC SYNC0 cycle (0x09A0) live, run
+            // the ETG.1020 cycle-time handshake (0x1C32:0a/:08) so the drive populates
+            // the RO 0x1C32:02 it validates at the OP transition. configure() deferred
+            // these to here (post-arm) on the caller-driven path.
+            if (opt.sm_dc_sync) {
+                master.apply_postdc_writes();
+                std::cout << "[B] applied post-arm ETG.1020 cycle handshake (0x1C32:0a/:08) -> populating 0x1C32:02\n";
+            }
         }
 
         // STEP 3 -- after arming, poll the slave DC-sync health at ~20 Hz. 0x0984 (SYNC0
@@ -587,15 +595,19 @@ int main(int argc, char** argv) {
         was_faulted = faulted;
 
         // Decide the controlword for this cycle.
-        std::uint16_t cw = fsm.step(status, goal);
-        // Fault-reset edge: step() returns the 0x80 LEVEL while faulted; create
-        // the rising edge by dropping bit7 for one cycle when it's already set.
-        if ((cw & ControlWord::kFaultResetBit) && (last_cw & ControlWord::kFaultResetBit)) {
-            cw = 0x0000;
-        }
-
         const std::span<std::byte> out = master.outputs(slave);
-        if (op && opt.enable && status.operation_enabled()) {
+        std::uint16_t cw = fsm.step(status, goal);
+
+        if (faulted) {
+            // A latched fault (Er74) takes PRECEDENCE over the CiA402 ladder and the
+            // shutdown/enable branches below: it must be cleared before the drive will
+            // engage SYNC0 / accept commands, and it must clear in SAFE-OP (DURING
+            // sync-proving) as well as OP. CiA402 fault-reset = 0x00 -> 0x80 (bit7)
+            // rising edge -> 0x06. Generate the edge by toggling bit7: 0x80 when it was
+            // low last cycle, 0x00 when it was high. The fault code was already captured
+            // + printed on the latch edge above, so auto-resetting loses no diagnostic.
+            cw = (last_cw & ControlWord::kFaultResetBit) ? 0x0000 : ControlWord::fault_reset();
+        } else if (op && opt.enable && status.operation_enabled()) {
             if (!announced_op) {
                 std::cout << "[B] *** OPERATION ENABLED *** (motor energized, holding at " << hold_pos << ")\n";
                 announced_op = true;
