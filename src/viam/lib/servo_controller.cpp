@@ -1,8 +1,10 @@
 #include "viam/lib/servo_controller.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <utility>
@@ -47,7 +49,15 @@ Cia402Mode to_cia402_mode(ControlMode mode) noexcept {
 // not fatal (require_realtime governs the hard SCHED_FIFO gate separately).
 void lock_memory_best_effort() noexcept {
     // NOLINTBEGIN(concurrency-mt-unsafe)
-    (void)mlockall(MCL_CURRENT | MCL_FUTURE);
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        // Best-effort, but NEVER silent (architect/DA): a silent mlockall fail lets
+        // the DC warmup page-fault -> the exact ms spike it exists to prevent.
+        // viam-server captures the module's stderr, so this reaches the operator.
+        (void)std::fprintf(stderr,
+                           "[ethercat] mlockall failed (errno=%d): grant CAP_IPC_LOCK / RLIMIT_MEMLOCK=infinity; "
+                           "RT determinism degraded, DC SYNC0 lock may be unreliable.\n",
+                           errno);
+    }
     (void)mallopt(M_TRIM_THRESHOLD, -1);
     (void)mallopt(M_MMAP_MAX, 0);
     // NOLINTEND(concurrency-mt-unsafe)

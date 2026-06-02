@@ -162,6 +162,16 @@ TEST("Master: configure() sets modes-of-operation 0x6060 from default_mode (SDO)
     CHECK_EQ(static_cast<int>(std::to_integer<std::uint8_t>(mode[0])), 1);  // PP = 1
 }
 
+TEST("Master+SimBackend: dc_time() advances across process() (DC phase-lock input)") {
+    Master master{make_config(), std::make_unique<SimBackend>(make_models())};
+    master.init();
+    master.configure();
+    const std::int64_t t0 = master.dc_time();
+    master.process();
+    master.process();
+    CHECK(master.dc_time() > t0);  // the phase-lock PI controller needs a monotonic DC clock
+}
+
 TEST("Master: configure() enables DC SYNC0 only when use_distributed_clocks is set") {
     {  // default: DC off -> configure_dc_sync never called
         auto sim = std::make_unique<SimBackend>(make_models());

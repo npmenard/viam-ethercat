@@ -116,6 +116,13 @@ class EcatBackend {
         (void)cycle_ns;
     }
 
+    // Distributed-Clock system time (ns) latched at the last exchange(), for
+    // phase-locking the cyclic wakeup to the SYNC0 pulse (DCtime % cycle = the
+    // offset to drive to 0 with a PI controller). 0 = no DC (phase-lock no-op).
+    virtual std::int64_t dc_time() const noexcept {
+        return 0;
+    }
+
     // --- cyclic (RT hot path; noexcept, no alloc, no block) -----------------
 
     // Process-data windows for a slave (1-based), valid after map_process_data.

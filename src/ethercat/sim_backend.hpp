@@ -60,6 +60,7 @@ class SimBackend final : public EcatBackend {
     void request_state(std::uint16_t slave, EcatState target) override;
     EcatState slave_state(std::uint16_t slave) const override;
     void configure_dc_sync(std::uint32_t cycle_ns) override;  // records the cycle (no real DC hardware to drive)
+    std::int64_t dc_time() const noexcept override;           // synthetic ramp (advances per exchange) so phase-lock math is sane offline
 
     // EcatBackend -- cyclic
     SlaveIo slave_io(std::uint16_t slave) noexcept override;
@@ -120,7 +121,8 @@ class SimBackend final : public EcatBackend {
 
     std::vector<Slave> slaves_;
     int expected_wkc_ = 0;
-    std::uint32_t dc_cycle_ns_ = 0;  // last configure_dc_sync() cycle (0 = never requested)
+    std::uint32_t dc_cycle_ns_ = 0;     // last configure_dc_sync() cycle (0 = never requested)
+    std::int64_t synthetic_dc_ns_ = 0;  // synthetic DC clock, advanced each exchange() (dc_time())
     bool open_ = false;
     bool short_wkc_once_ = false;
 };

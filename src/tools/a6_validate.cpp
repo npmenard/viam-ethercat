@@ -145,19 +145,40 @@ bool setup_realtime(int priority) {
     // NOLINTEND(concurrency-mt-unsafe)
 }
 
-void sleep_until(struct timespec& next, std::uint32_t period_ns) {
-    next.tv_nsec += static_cast<long>(period_ns);
+void sleep_until(struct timespec& next, long delta_ns) {
+    next.tv_nsec += delta_ns;
     while (next.tv_nsec >= 1'000'000'000L) {
         next.tv_nsec -= 1'000'000'000L;
         next.tv_sec += 1;
     }
+    while (next.tv_nsec < 0) {  // a DC phase correction can push the target slightly negative
+        next.tv_nsec += 1'000'000'000L;
+        next.tv_sec -= 1;
+    }
     (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
+}
+
+// PI controller that phase-locks our cyclic wakeup to the drive's SYNC0 pulse:
+// drives (DCtime mod cycle) -> 0 by nudging the next wake target by `offset` ns.
+// Without it the master's frames drift relative to SYNC0 and the slave only
+// partially processes them (WKC degrades 3->1). Mirrors SOEM's ec_sync().
+long dc_phase_offset_ns(std::int64_t dc_time, std::int64_t cycle_ns, std::int64_t& integral) {
+    if (dc_time == 0 || cycle_ns == 0) {
+        return 0;  // no DC clock -> nothing to lock to
+    }
+    std::int64_t delta = dc_time % cycle_ns;
+    if (delta > cycle_ns / 2) {
+        delta -= cycle_ns;  // shortest signed distance to the pulse
+    }
+    integral += (delta > 0) ? 1 : (delta < 0 ? -1 : 0);
+    return static_cast<long>(-(delta / 100) - (integral / 20));  // P + I terms (SOEM gains)
 }
 
 struct Options {
     std::string ifname = "enp86s0";
     bool enable = false;
     bool move_pp = false;
+    bool reset_fault = false;
     double move_revs = 0.0;
     double move_rpm = 60.0;
     int seconds = 6;
@@ -172,6 +193,8 @@ int main(int argc, char** argv) {
         const std::string& a = args[i];
         if (a == "--enable") {
             opt.enable = true;
+        } else if (a == "--reset-fault") {
+            opt.reset_fault = true;
         } else if (a == "--move-pp" && i + 1 < args.size()) {
             opt.move_pp = true;
             opt.enable = true;  // a move requires enabling
@@ -184,7 +207,7 @@ int main(int argc, char** argv) {
         } else if (a.rfind("--", 0) != 0) {
             opt.ifname = a;
         } else {
-            std::cerr << "usage: a6_validate [ifname] [--enable] [--move-pp REVS [RPM]] [--seconds N]\n";
+            std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N]\n";
             return 2;
         }
     }
@@ -268,20 +291,39 @@ int main(int argc, char** argv) {
     bool announced_op = false;
     bool setpoint_latched = false;
     bool move_done = false;
+    bool was_faulted = false;
     std::int32_t target = hold_pos;
     std::uint64_t tick = 0;
     int wkc_bad = 0;
+    std::int64_t dc_integral = 0;  // PI integrator for the DC phase lock
 
     while (!g_stop.load()) {
         master.process();
         if (master.working_counter() != master.expected_wkc()) {
             ++wkc_bad;
         }
+        // Phase-lock our wakeup to SYNC0: nudge the next sleep target so DCtime
+        // stays aligned to the pulse (keeps WKC at full instead of drifting 3->1).
+        const long dc_off = dc_phase_offset_ns(master.dc_time(), static_cast<std::int64_t>(period_ns), dc_integral);
 
         const std::span<const std::byte> in = master.input_image(slave);
         const Status status{read_tx<std::uint16_t>(master, slave, in, kStatusword)};
         const std::int32_t pos = read_tx<std::int32_t>(master, slave, in, kPositionActual);
         const std::int32_t vel = read_tx<std::int32_t>(master, slave, in, kVelocityActual);
+
+        // --reset-fault: the FSM (goal ReadyToSwitchOn) already drives the CiA402
+        // fault-reset edge below; just announce the Fault -> cleared transition (the
+        // A6's Er74.x sync faults are software-resettable -- no power cycle needed).
+        if (opt.reset_fault) {
+            const bool faulted = status.decode() == Cia402State::Fault;
+            if (faulted && !was_faulted) {
+                std::cout << "[B] drive in FAULT (0x603F=0x" << std::hex << read_tx<std::uint16_t>(master, slave, in, kFaultCode)
+                          << std::dec << ") -- running CiA402 fault-reset (no energize)...\n";
+            } else if (!faulted && was_faulted) {
+                std::cout << "[B] *** FAULT CLEARED *** -> " << to_string(status.decode()) << '\n';
+            }
+            was_faulted = faulted;
+        }
 
         // Decide the controlword for this cycle.
         std::uint16_t cw = fsm.step(status, goal);
@@ -331,9 +373,10 @@ int main(int argc, char** argv) {
         last_cw = cw;
 
         if (tick % 200 == 0) {  // ~5 Hz status print
+            const std::int64_t dc_phase = period_ns != 0 ? master.dc_time() % static_cast<std::int64_t>(period_ns) : 0;
             std::cout << "    t=" << tick / kLoopHz << "s state=" << to_string(status.decode()) << " sw=0x" << std::hex << status.raw
                       << std::dec << " pos=" << pos << " vel=" << vel << " wkc=" << master.working_counter() << "/" << master.expected_wkc()
-                      << (master.fault() ? " [BUS FAULT]" : "") << '\n';
+                      << " dcPhase=" << dc_phase << "ns(off=" << dc_off << ")" << (master.fault() ? " [BUS FAULT]" : "") << '\n';
         }
         ++tick;
 
@@ -350,7 +393,7 @@ int main(int argc, char** argv) {
                 break;
             }
         }
-        sleep_until(next, period_ns);
+        sleep_until(next, static_cast<long>(period_ns) + dc_off);  // phase-corrected wake
     }
 
     // --- graceful shutdown: disable the drive, flush a few cycles, close ---
@@ -358,7 +401,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 50; ++i) {
         master.process();
         write_rx<std::uint16_t>(master, slave, master.outputs(slave), kControlword, ControlWord::disable_voltage());
-        sleep_until(next, period_ns);
+        sleep_until(next, static_cast<long>(period_ns));
     }
     master.close();
 

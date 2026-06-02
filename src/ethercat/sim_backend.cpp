@@ -311,6 +311,7 @@ int SimBackend::exchange() noexcept {
     if (!open_) {
         return -1;
     }
+    synthetic_dc_ns_ += (dc_cycle_ns_ != 0 ? static_cast<std::int64_t>(dc_cycle_ns_) : 1'000'000);  // advance the synthetic DC clock
     for (auto& s : slaves_) {
         // Only in OP are the RxPDO outputs live, so only then does the device
         // consume the controlword and advance its CiA402 state.
@@ -358,6 +359,10 @@ void SimBackend::configure_dc_sync(std::uint32_t cycle_ns) {
 
 std::uint32_t SimBackend::configured_dc_cycle_ns() const noexcept {
     return dc_cycle_ns_;
+}
+
+std::int64_t SimBackend::dc_time() const noexcept {
+    return synthetic_dc_ns_;
 }
 
 std::int32_t SimBackend::received_profile_velocity(std::uint16_t slave) const noexcept {

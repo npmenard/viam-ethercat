@@ -95,6 +95,11 @@ class Master {
     int expected_wkc() const noexcept {
         return expected_wkc_;
     }
+    // DC system time (ns) from the last process(); for phase-locking the cyclic
+    // wakeup to SYNC0. 0 on non-DC backends.
+    std::int64_t dc_time() const noexcept {
+        return backend_->dc_time();
+    }
     std::string last_error() const;
 
     // Latest feedback snapshot for a slave (1-based).

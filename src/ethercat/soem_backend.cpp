@@ -290,6 +290,11 @@ int SoemBackend::exchange() noexcept {
     return ecx_receive_processdata(&impl_->ctx, EC_TIMEOUTRET);
 }
 
+std::int64_t SoemBackend::dc_time() const noexcept {
+    // ctx.DCtime -> &impl_->dctime, refreshed by SOEM on each receive_processdata.
+    return impl_->dctime;
+}
+
 int SoemBackend::expected_wkc() const noexcept {
     return impl_->expected_wkc;
 }
