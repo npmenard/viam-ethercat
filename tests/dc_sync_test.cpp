@@ -45,6 +45,27 @@ TEST("dc_phase_correction: converges a 685us phase offset into the lock band") {
     CHECK(lock_cycle < 500);  // ...within a few hundred cycles (the warmup budget)
 }
 
+TEST("dc_phase_correction: a mid-cycle shift target locks OFF the SYNC0 edge") {
+    // The bench fix: target cycle/2 (not 0) so jitter never crosses the pulse.
+    constexpr std::int64_t cycle = 1'000'000;
+    constexpr std::int64_t shift = cycle / 2;  // 500us mid-cycle target
+    std::int64_t integral = 0;
+    std::int64_t phase = 1'000;  // just off the SYNC0 edge (worst case for a mid-cycle target; 0 is the no-DC sentinel)
+    bool locked = false;
+    for (int i = 0; i < 5000; ++i) {
+        const long corr = dc_phase_correction(phase, cycle, integral, shift);
+        phase = ((phase + corr) % cycle + cycle) % cycle;
+        if (dc_phase_locked(phase, cycle, shift)) {
+            locked = true;
+            break;
+        }
+    }
+    CHECK(locked);
+    // The locked phase must sit near cycle/2 (off both 0 and cycle edges).
+    CHECK(phase > 400'000);
+    CHECK(phase < 600'000);
+}
+
 TEST("dc_phase_locked: in-band vs out-of-band") {
     constexpr std::int64_t cycle = 1'000'000;
     CHECK(dc_phase_locked(10'000, cycle, 0, 50'000));        // small +phase -> locked

@@ -26,7 +26,9 @@ inline long dc_phase_correction(std::int64_t dc_time,
     if (dc_time == 0 || cycle_ns == 0) {
         return 0;  // no DC clock -> nothing to lock to
     }
-    std::int64_t delta = (dc_time - shift_ns) % cycle_ns;
+    // Normalize to [0, cycle) first (defensive: shift_ns > dc_time at startup would
+    // otherwise leave a negative un-wrapped remainder), then wrap to (-cycle/2, cycle/2].
+    std::int64_t delta = (((dc_time - shift_ns) % cycle_ns) + cycle_ns) % cycle_ns;
     if (delta > cycle_ns / 2) {
         delta -= cycle_ns;  // shortest signed distance to the target phase
     }
@@ -56,7 +58,7 @@ inline bool dc_phase_locked(std::int64_t dc_time,
     if (dc_time == 0 || cycle_ns == 0) {
         return false;
     }
-    std::int64_t delta = (dc_time - shift_ns) % cycle_ns;
+    std::int64_t delta = (((dc_time - shift_ns) % cycle_ns) + cycle_ns) % cycle_ns;
     if (delta > cycle_ns / 2) {
         delta -= cycle_ns;
     }

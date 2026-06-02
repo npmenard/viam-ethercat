@@ -289,8 +289,10 @@ int main(int argc, char** argv) {
             ++wkc_bad;
         }
         // Hold the SYNC0 phase lock (the warmup already converged it before OP):
-        // nudge the next sleep target so DCtime stays aligned to the pulse.
-        const long dc_off = dc_phase_correction(master.dc_time(), static_cast<std::int64_t>(period_ns), dc_integral);
+        // nudge the next sleep target so DCtime stays aligned MID-CYCLE (period/2,
+        // off the SYNC0 edge -- matches the warmup's auto target).
+        const std::int64_t dc_shift = static_cast<std::int64_t>(period_ns) / 2;
+        const long dc_off = dc_phase_correction(master.dc_time(), static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
 
         const std::span<const std::byte> in = master.input_image(slave);
         const Status status{read_tx<std::uint16_t>(master, slave, in, kStatusword)};

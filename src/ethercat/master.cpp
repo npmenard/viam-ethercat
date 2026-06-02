@@ -153,6 +153,9 @@ void Master::configure() {
         // non-RT) thread; memory is locked above so no page-fault spikes, but
         // SCHED_OTHER jitter remains -- if the bench shows it can't hold lock, move
         // the warmup + OP transition into the RT thread prelude (design "(b)").
+        // Lock the phase at this DC-time offset. -1 = auto = mid-cycle (cycle/2):
+        // off the SYNC0 edge so jitter never crosses the pulse.
+        const std::int64_t shift = config_.dc_sync_shift_ns < 0 ? static_cast<std::int64_t>(cycle_ns) / 2 : config_.dc_sync_shift_ns;
         timespec next{};
         (void)clock_gettime(CLOCK_MONOTONIC, &next);
         std::int64_t dc_integral = 0;
@@ -160,8 +163,8 @@ void Master::configure() {
         for (std::uint32_t i = 0; i < config_.dc_lock_cycles; ++i) {
             (void)backend_->exchange();
             const std::int64_t dct = backend_->dc_time();
-            const long corr = dc_phase_correction(dct, static_cast<std::int64_t>(cycle_ns), dc_integral);
-            locked_streak = dc_phase_locked(dct, static_cast<std::int64_t>(cycle_ns)) ? locked_streak + 1 : 0;
+            const long corr = dc_phase_correction(dct, static_cast<std::int64_t>(cycle_ns), dc_integral, shift);
+            locked_streak = dc_phase_locked(dct, static_cast<std::int64_t>(cycle_ns), shift) ? locked_streak + 1 : 0;
             if (locked_streak >= 50) {
                 break;  // phase held in-band for 50 cycles -> enter OP locked
             }

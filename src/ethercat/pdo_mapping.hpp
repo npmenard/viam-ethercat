@@ -65,6 +65,11 @@ struct MasterConfig {
     // tripping a BusError (the phase PI needs ~hundreds of cycles to fully lock; the
     // latch fires in ~5). 0 = latch immediately. Bench-tunable.
     std::uint32_t dc_settle_cycles = 0;
+    // Phase-lock TARGET: lock (dc_time mod cycle) to this offset (ns) instead of 0.
+    // The default -1 = auto = cycle/2 (mid-cycle) -- locking at the SYNC0 EDGE (0)
+    // leaves no margin, so normal +/-jitter pushes a frame past the pulse -> stale
+    // latch -> intermittent WKC drop. Mid-cycle keeps the send far from both edges.
+    std::int32_t dc_sync_shift_ns = -1;
     // Latch a BusError only after this many CONSECUTIVE short/abnormal WKC
     // cycles (a single transient bad cycle should not hard-fault). Reset on any
     // good cycle.
