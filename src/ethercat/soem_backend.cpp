@@ -1,7 +1,9 @@
 #include "ethercat/soem_backend.hpp"
 
 #include <array>
+#include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <string>
 
 #include <soem/ethercat.h>
@@ -94,6 +96,7 @@ struct SoemBackend::Impl {
     std::array<std::byte, 8192> iomap{};
     int expected_wkc = 0;
     int slave_count = 0;
+    std::uint32_t dc_cycle_ns = 0;  // SYNC0 cycle once DC is enabled; paces the OP-transition PD pump
     bool open = false;
 
     Impl() {
@@ -204,13 +207,20 @@ void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
 
     std::uint16_t reached = 0;
     if (target == EcatState::Op) {
-        // Reaching OP requires pumping process data while the slaves transition.
+        // A DC-only drive rejects OP (AL 0x0027) unless it sees LIVE process data +
+        // SYNC0 events during the transition -- so pump PD while statechecking, and
+        // PACE the pump at the SYNC0 cycle so the sends align to the slave's DC
+        // pulse (an unpaced burst doesn't). ~200 cycles of settle.
         for (int chk = 0; chk < 200; ++chk) {
             ecx_send_processdata(&impl_->ctx);
             ecx_receive_processdata(&impl_->ctx, EC_TIMEOUTRET);
             reached = ecx_statecheck(&impl_->ctx, slave, want, 50000);
             if (reached == want) {
                 break;
+            }
+            if (impl_->dc_cycle_ns > 0) {
+                const timespec ts{.tv_sec = 0, .tv_nsec = static_cast<long>(impl_->dc_cycle_ns)};
+                (void)nanosleep(&ts, nullptr);
             }
         }
     } else {
@@ -252,13 +262,22 @@ SlaveIo SoemBackend::slave_io(std::uint16_t slave) noexcept {
 }
 
 void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns) {
-    // ecx_configdc detects DC-capable slaves and sets up the DC reference;
-    // ecx_dcsync0 enables the SYNC0 pulse per slave at `cycle_ns` (0 shift).
-    // SOEM drives the ESC DC registers (0x0981/0x0910/0x0990/...) internally.
-    ecx_configdc(&impl_->ctx);
+    // ecx_configdc detects DC-capable slaves + syncs the DC reference clock (ESC
+    // 0x0910). It MUST run, set each slave's hasdc, and return TRUE before
+    // ecx_dcsync0 -- otherwise dcsync0 is a silent no-op and a DC-only drive (the
+    // A6) refuses OP with AL 0x0027 "Freerun not supported". Verify both so a DC
+    // misconfig names itself instead of surfacing as an opaque OP refusal.
+    if (ecx_configdc(&impl_->ctx) == FALSE) {
+        throw InitError("use_distributed_clocks is set but ecx_configdc() found NO DC-capable slave on the bus");
+    }
     for (int i = 1; i <= impl_->slavecount; ++i) {
+        if (impl_->slavelist[i].hasdc == FALSE) {
+            throw InitError("slave " + std::to_string(i) + " is not DC-capable (hasdc=0) -- cannot enable SYNC0");
+        }
+        // SYNC0 on, `cycle_ns` period, 0 shift. SOEM writes ESC 0x0981/0x0990/...
         ecx_dcsync0(&impl_->ctx, static_cast<std::uint16_t>(i), TRUE, cycle_ns, 0);
     }
+    impl_->dc_cycle_ns = cycle_ns;  // pace the upcoming OP-transition PD pump at this period
 }
 
 int SoemBackend::exchange() noexcept {
