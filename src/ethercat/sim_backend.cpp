@@ -353,9 +353,8 @@ void SimBackend::suppress_setpoint_ack(std::uint16_t slave, bool on) noexcept {
     }
 }
 
-void SimBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns, bool enable_sync1) {
+void SimBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
     (void)sync0_shift_ns;     // no real DC hardware to phase
-    (void)enable_sync1;       // no SYNC1 to activate offline
     dc_cycle_ns_ = cycle_ns;  // just record that the master asked
 }
 

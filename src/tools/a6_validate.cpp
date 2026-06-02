@@ -90,8 +90,7 @@ extern "C" void on_sigint(int) {
 // Build the PROFILE POSITION MasterConfig for one A6, mirroring
 // etc/a6-hardware.example.json (RxPDO 0x1600 = ctrl + target-pos + profile-vel;
 // TxPDO 0x1A00 = fault + status + mode-display + pos + vel + torque).
-MasterConfig build_a6_pp_config(
-    const std::string& ifname, std::int32_t dc_target_ns, std::int32_t dc_sync0_shift_ns, bool sm_dc_sync, bool enable_sync1) {
+MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_target_ns, std::int32_t dc_sync0_shift_ns, bool sm_dc_sync) {
     MasterConfig cfg;
     cfg.ifname = ifname;
     cfg.target_loop_rate_hz = 1000;             // 1 ms SYNC0 = 4 x 250 us (A6-legal)
@@ -100,7 +99,6 @@ MasterConfig build_a6_pp_config(
     cfg.dc_settle_cycles = 1000;                // ~1 s post-OP grace while the phase finishes locking
     cfg.dc_sync_shift_ns = dc_target_ns;        // send-phase target (-1 = auto mid-cycle); --dc-target-ns sweep
     cfg.dc_sync0_shift_ns = dc_sync0_shift_ns;  // SYNC0 CyclShift; --dc-shift-ns sweep
-    cfg.dc_enable_sync1 = enable_sync1;         // --sync1: activate SYNC0+SYNC1 (ecx_dcsync01)
     cfg.max_consecutive_wkc_errors = 5;
 
     SlaveConfig a6;
@@ -206,7 +204,6 @@ struct Options {
     std::int32_t dc_target_ns = -1;      // send-phase lock target (-1 = auto mid-cycle); sweep with --dc-target-ns
     std::int32_t dc_sync0_shift_ns = 0;  // SYNC0 CyclShift; sweep with --dc-shift-ns
     bool sm_dc_sync = false;             // --sm-dc-sync: write SM2/SM3 sync type = DC SYNC0 (Er74.1 fix)
-    bool sync1 = false;                  // --sync1: activate SYNC0+SYNC1 (ecx_dcsync01)
 };
 
 }  // namespace
@@ -235,13 +232,11 @@ int main(int argc, char** argv) {
             opt.dc_sync0_shift_ns = std::stoi(args[++i]);  // SYNC0 CyclShift passed to ecx_dcsync0
         } else if (a == "--sm-dc-sync") {
             opt.sm_dc_sync = true;  // write SM2/SM3 sync type = DC SYNC0 (targeted Er74.1 fix)
-        } else if (a == "--sync1") {
-            opt.sync1 = true;  // activate SYNC0+SYNC1 (ecx_dcsync01)
         } else if (a.rfind("--", 0) != 0) {
             opt.ifname = a;
         } else {
             std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N]\n"
-                      << "                   [--dc-target-ns NS] [--dc-shift-ns NS] [--sm-dc-sync] [--sync1]\n";
+                      << "                   [--dc-target-ns NS] [--dc-shift-ns NS] [--sm-dc-sync]\n";
             return 2;
         }
     }
@@ -268,11 +263,9 @@ int main(int argc, char** argv) {
 
     std::cout << "[dc] send-phase target = " << (opt.dc_target_ns < 0 ? "auto(mid-cycle)" : std::to_string(opt.dc_target_ns) + "ns")
               << " | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns"
-              << " | SM DC-sync write = " << (opt.sm_dc_sync ? "ON (0x1C32/33:01=2)" : "off")
-              << " | SYNC1 = " << (opt.sync1 ? "ON (dcsync01)" : "off") << "\n\n";
+              << " | SM DC-sync write = " << (opt.sm_dc_sync ? "ON (0x1C32/33:01=2)" : "off") << "\n\n";
 
-    Master master(build_a6_pp_config(opt.ifname, opt.dc_target_ns, opt.dc_sync0_shift_ns, opt.sm_dc_sync, opt.sync1),
-                  std::make_unique<SoemBackend>());
+    Master master(build_a6_pp_config(opt.ifname, opt.dc_target_ns, opt.dc_sync0_shift_ns, opt.sm_dc_sync), std::make_unique<SoemBackend>());
 
     // --- Stage A: open + enumerate + read-only SDO identity (PRE-OP) ---
     try {
@@ -320,20 +313,23 @@ int main(int argc, char** argv) {
 
     const std::uint16_t slave = 1;
 
-    // --sm-dc-sync: prove the SM sync-type writes took. 0x1C32:01 is often READ-ONLY
-    // on a drive that auto-derives the mode from the ESC SYNC0 activation; reading it
-    // back tells us the drive's actual sync mode (2 = DC SYNC0) regardless of whether
-    // our write was honored or the object even accepted it.
-    if (opt.sm_dc_sync) {
-        try {
-            const auto sm2 = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kSyncTypeSub);
-            const auto sm3 = master.sdo_read<std::uint16_t>(slave, kSm3SyncType, kSyncTypeSub);
-            const bool dc = sm2 == kSyncTypeDcSync0 && sm3 == kSyncTypeDcSync0;
-            std::cout << "[dc] SM sync-type readback: 0x1C32:01(SM2)=" << sm2 << " 0x1C33:01(SM3)=" << sm3
-                      << (dc ? "  -> DC SYNC0 mode active" : "  -> NOT DC SYNC0 (0=FreeRun,1=SM,2=DC) -- likely the Er74.1 cause") << '\n';
-        } catch (const Error& e) {
-            std::cerr << "[dc] SM sync-type readback failed: " << e.what() << '\n';
-        }
+    // SM sync-type diagnostic (ALWAYS -- these are risk-free SDO reads). Tells us the
+    // drive's ACTUAL application sync mode (2 = DC SYNC0) vs FreeRun(0)/SM(1): if it's
+    // not 2 while we're driving SYNC0, that's the Er74.1 cause. 0x1C32:04 is the
+    // SUPPORTED-types bitmask (does the A6 even offer DC?), 0x1C32:05 the min cycle.
+    // With --sm-dc-sync the values reflect our PRE-OP write; without, the drive default.
+    try {
+        const auto sm2 = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kSyncTypeSub);
+        const auto sm3 = master.sdo_read<std::uint16_t>(slave, kSm3SyncType, kSyncTypeSub);
+        const auto supported = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, 0x04);
+        const auto min_cycle = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, 0x05);
+        const bool dc = sm2 == kSyncTypeDcSync0 && sm3 == kSyncTypeDcSync0;
+        std::cout << "[dc] SM sync-type: 0x1C32:01(SM2)=" << sm2 << " 0x1C33:01(SM3)=" << sm3
+                  << (dc ? "  -> DC SYNC0 active" : "  -> NOT DC SYNC0 (0=FreeRun,1=SM,2=DC) -- candidate Er74.1 cause") << "\n"
+                  << "[dc]   0x1C32:04 supportedTypes=0x" << std::hex << supported << std::dec << " 0x1C32:05 minCycle=" << min_cycle
+                  << "ns" << (opt.sm_dc_sync ? "  [--sm-dc-sync wrote :01=2]" : "") << '\n';
+    } catch (const Error& e) {
+        std::cerr << "[dc] SM sync-type read failed (object absent?): " << e.what() << '\n';
     }
     const auto profile_vel = static_cast<std::uint32_t>(opt.move_rpm / 60.0 * kCountsPerRev);
     const Cia402Fsm fsm;
@@ -497,9 +493,12 @@ int main(int argc, char** argv) {
             if (faulted) {  // surface the CiA402 error code alongside the state on every faulted print
                 std::cout << " 0x603F=0x" << std::hex << read_tx<std::uint16_t>(master, slave, in, kFaultCode) << std::dec;
             }
-            std::cout << " pos=" << pos << " vel=" << vel << " wkc=" << raw_wkc << "/" << master.expected_wkc() << " badWKC=" << wkc_bad
-                      << "(maxRun=" << wkc_bad_max_streak << ") dcPhase=" << dc_phase << "ns(off=" << dc_off << ")"
-                      << (master.fault() ? " [BUS FAULT]" : "") << '\n';
+            // mode display 0x6061 (in TxPDO): confirm the drive is in PP(1)/PV(3),
+            // NOT CSP(8) -- a stuck CSP default is itself a candidate "no sync" cause.
+            const auto mode_now = read_tx<std::int8_t>(master, slave, in, kModeDisplay);
+            std::cout << " mode=" << static_cast<int>(mode_now) << " pos=" << pos << " vel=" << vel << " wkc=" << raw_wkc << "/"
+                      << master.expected_wkc() << " badWKC=" << wkc_bad << "(maxRun=" << wkc_bad_max_streak << ") dcPhase=" << dc_phase
+                      << "ns(off=" << dc_off << ")" << (master.fault() ? " [BUS FAULT]" : "") << '\n';
         }
 
         if (master.fault()) {

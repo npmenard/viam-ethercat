@@ -90,9 +90,6 @@ struct MasterConfig {
     // WHERE in the cycle the drive latches our output relative to its SYNC0 -- the A6
     // wants a FRESH frame just before SYNC0, not a stale mid-cycle one. Bench-swept.
     std::int32_t dc_sync0_shift_ns = 0;
-    // Also activate SYNC1 (ecx_dcsync01) at the SYNC0 cycle. Some CSP servos need
-    // both SYNC0 and SYNC1 or they report Er74.1 "no sync signal". Default off.
-    bool dc_enable_sync1 = false;
     // Latch a BusError only after this many CONSECUTIVE short/abnormal WKC
     // cycles (a single transient bad cycle should not hard-fault). Reset on any
     // good cycle.

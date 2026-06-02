@@ -59,7 +59,7 @@ class SimBackend final : public EcatBackend {
     void map_process_data() override;
     void request_state(std::uint16_t slave, EcatState target) override;
     EcatState slave_state(std::uint16_t slave) const override;
-    void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns, bool enable_sync1) override;  // records the cycle
+    void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) override;  // records the cycle
     std::int64_t dc_time() const noexcept override;  // synthetic ramp (advances per exchange) so phase-lock math is sane offline
 
     // EcatBackend -- cyclic
