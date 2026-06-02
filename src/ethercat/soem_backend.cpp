@@ -1,5 +1,6 @@
 #include "ethercat/soem_backend.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -21,6 +22,14 @@ namespace {
 // (Er74.1 / ESC 0x0134 = 0x2D). ~50 ms at a 1 ms cycle is ample for the offset +
 // drift to settle without a wrong start.
 constexpr std::uint32_t kDcStartPrimeCycles = 50;
+
+// After ecx_dcsync0, SOEM schedules the FIRST SYNC0 pulse ~SyncDelay (100 ms) after
+// the DC base time (its internal constant). A DC-mode drive validates its DC config
+// at the PRE-OP->SAFE-OP transition and AL-rejects 0x0030 "Invalid DC SYNC config"
+// if SYNC0 isn't actively PULSING yet. So pump paced PD until the DC clock passes the
+// SYNC0 start before returning (the master requests SafeOp next). Cap the wait so a
+// bad start time can't hang here -- 250 ms covers the 100 ms SyncDelay + margin.
+constexpr int kSync0StartWaitCap = 250;
 
 // EcatState <-> SOEM AL-state value.
 std::uint16_t to_soem_state(EcatState state) noexcept {
@@ -305,6 +314,7 @@ void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_s
         (void)nanosleep(&ts, nullptr);
     }
 
+    std::int64_t latest_sync0_start = 0;  // newest SYNC0 start time across slaves (wait past it before SafeOp)
     for (int i = 1; i <= impl_->slavecount; ++i) {
         if (impl_->slavelist[i].hasdc == FALSE) {
             throw InitError("slave " + std::to_string(i) + " is not DC-capable (hasdc=0) -- cannot enable SYNC0");
@@ -349,7 +359,27 @@ void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_s
         if (al_status == 0x2DU) {
             std::cerr << "[dc]   *** WARNING: ESC 0x0134 = 0x2D 'DC start time invalid' -- SYNC0 start was mis-scheduled ***\n";
         }
+        latest_sync0_start = std::max(latest_sync0_start, static_cast<std::int64_t>(start_time));
     }
+
+    // WAIT for SYNC0 to actually start pulsing before returning (-> the master
+    // requests SAFE-OP next). SOEM's 100 ms SyncDelay puts the first pulse ~100 ms
+    // out; a DC-mode drive AL-rejects 0x0030 at the SafeOp transition if it validates
+    // DC config before any SYNC0 edge has fired. Pump paced PD until the DC clock is a
+    // few cycles past the start time (a handful of pulses fired), capped.
+    const std::int64_t sync0_live_target = latest_sync0_start + (3 * static_cast<std::int64_t>(cycle_ns));
+    int waited = 0;
+    for (; waited < kSync0StartWaitCap && impl_->dctime < sync0_live_target; ++waited) {
+        ecx_send_processdata(&impl_->ctx);
+        (void)ecx_receive_processdata(&impl_->ctx, EC_TIMEOUTRET);  // advances impl_->dctime
+        const timespec ts{.tv_sec = 0, .tv_nsec = static_cast<long>(cycle_ns)};
+        (void)nanosleep(&ts, nullptr);
+    }
+    std::cerr << "[dc] waited " << waited << " cycles for SYNC0 to start: DCtime=" << impl_->dctime << " vs start=" << latest_sync0_start
+              << (impl_->dctime >= latest_sync0_start ? "  -> SYNC0 PULSING (ready for SafeOp)"
+                                                      : "  -> *** start not reached (cap hit) -- SafeOp may still 0x0030 ***")
+              << '\n';
+
     impl_->dc_cycle_ns = cycle_ns;  // pace the upcoming OP-transition PD pump at this period
 }
 
