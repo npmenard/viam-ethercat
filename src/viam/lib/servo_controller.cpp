@@ -1,10 +1,8 @@
 #include "viam/lib/servo_controller.hpp"
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <utility>
@@ -39,28 +37,6 @@ std::uint64_t monotonic_ns() noexcept {
 
 Cia402Mode to_cia402_mode(ControlMode mode) noexcept {
     return mode == ControlMode::ProfileVelocity ? Cia402Mode::ProfileVelocity : Cia402Mode::ProfilePosition;
-}
-
-// Lock memory process-wide. Called in start() BEFORE configure() so the DC PLL
-// warmup that runs in configure() (for DC drives, on this non-RT lifecycle thread)
-// is fault-free -- a page fault mid-warmup is a ms spike that spoils the SYNC0
-// lock (DA). Process-global + MCL_FUTURE, so it's idempotent with the RT thread's
-// setup_realtime() mlockall. Best-effort: missing CAP_IPC_LOCK = degraded jitter,
-// not fatal (require_realtime governs the hard SCHED_FIFO gate separately).
-void lock_memory_best_effort() noexcept {
-    // NOLINTBEGIN(concurrency-mt-unsafe)
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-        // Best-effort, but NEVER silent (architect/DA): a silent mlockall fail lets
-        // the DC warmup page-fault -> the exact ms spike it exists to prevent.
-        // viam-server captures the module's stderr, so this reaches the operator.
-        (void)std::fprintf(stderr,
-                           "[ethercat] mlockall failed (errno=%d): grant CAP_IPC_LOCK / RLIMIT_MEMLOCK=infinity; "
-                           "RT determinism degraded, DC SYNC0 lock may be unreliable.\n",
-                           errno);
-    }
-    (void)mallopt(M_TRIM_THRESHOLD, -1);
-    (void)mallopt(M_MMAP_MAX, 0);
-    // NOLINTEND(concurrency-mt-unsafe)
 }
 
 ServoConfig validated(ServoConfig config) {
@@ -106,16 +82,10 @@ ServoController::~ServoController() {
 void ServoController::start() {
     const std::unique_lock<std::shared_mutex> lk(api_mutex_);
 
-    // Lock memory BEFORE configure() ONLY for DC drives -- the DC PLL warmup runs
-    // inside configure() on this (non-RT) thread, and locked memory keeps a page
-    // fault from spiking it (DA). Gated on DC because mlockall(MCL_FUTURE) makes the
-    // RT thread's stack allocation hit RLIMIT_MEMLOCK -> EAGAIN on hosts without
-    // LimitMEMLOCK=infinity (e.g. CI); a real DC bring-up runs with that limit
-    // raised (deployment doc), and non-DC/sim paths don't need the early lock.
-    if (config_.use_distributed_clocks) {
-        lock_memory_best_effort();
-    }
-
+    // NOTE: memory for the DC PLL warmup is locked inside Master::configure() (right
+    // before the warmup, MCL_CURRENT only) so it doesn't MCL_FUTURE-lock this thread
+    // before the RT jthread spawns (which would EAGAIN the thread stack). The RT
+    // thread's setup_realtime() does the full MCL_CURRENT|MCL_FUTURE for the loop.
     master_ = std::make_unique<Master>(build_master_config(config_), backend_factory_());
     master_->init();
     master_->configure();

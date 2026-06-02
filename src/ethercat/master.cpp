@@ -1,11 +1,15 @@
 #include "ethercat/master.hpp"
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <ctime>
 #include <span>
 #include <string>
 #include <utility>
+
+#include <sys/mman.h>
 
 #include "ethercat/cia402.hpp"
 
@@ -124,14 +128,28 @@ void Master::configure() {
     if (config_.use_distributed_clocks) {
         const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
         backend_->configure_dc_sync(cycle_ns);
+        // Lock CURRENT memory (the IOmap + SOEM context are already resident after
+        // map_process_data) right before the warmup. The warmup is alloc-free
+        // (send/receive over the pre-allocated context), so MCL_CURRENT covers its
+        // whole working set -- a page fault mid-warmup is a ms spike that spoils the
+        // SYNC0 PLL lock. We deliberately do NOT use MCL_FUTURE here: this can run on
+        // a non-RT thread that later spawns the RT jthread, and MCL_FUTURE would make
+        // that thread's stack alloc hit RLIMIT_MEMLOCK -> EAGAIN. Best-effort but
+        // NEVER silent (a silent fail re-introduces the spike it prevents).
+        if (mlockall(MCL_CURRENT) != 0) {
+            (void)std::fprintf(stderr,
+                               "[ethercat] mlockall(MCL_CURRENT) failed (errno=%d) before the DC warmup: grant "
+                               "CAP_IPC_LOCK / RLIMIT_MEMLOCK=infinity; the SYNC0 PLL lock may be unreliable.\n",
+                               errno);
+        }
         // Pace `dc_lock_cycles` exchanges at the DC period so the slaves' SYNC0/DC
         // PLL locks before we request OP. An unpaced burst leaves DC unlocked and
         // the drive refuses OP / faults. dc_lock_cycles = 0 skips the warmup (sim).
-        // PROVISIONAL (architect, runbook §5.2): this warmup currently runs on the
-        // caller's (non-RT) thread. start() locks memory first (no page-fault
-        // spikes); SCHED_OTHER scheduling jitter remains. If the bench shows the A6
-        // PLL doesn't lock cleanly under that jitter, restructure to do the DC
-        // warmup + OP transition in the RT thread prelude (design "(b)").
+        // PROVISIONAL (architect, runbook §5.2): this warmup runs on the caller's
+        // (possibly non-RT) thread; memory is locked above so no page-fault spikes,
+        // but SCHED_OTHER scheduling jitter remains. If the bench shows the A6 PLL
+        // doesn't lock cleanly under that jitter, restructure to do the DC warmup +
+        // OP transition in the RT thread prelude (design "(b)").
         timespec next{};
         (void)clock_gettime(CLOCK_MONOTONIC, &next);
         for (std::uint32_t i = 0; i < config_.dc_lock_cycles; ++i) {
