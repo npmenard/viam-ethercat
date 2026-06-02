@@ -304,6 +304,22 @@ int main(int argc, char** argv) {
               << "); phase-locking, then requesting OP with NO frame gap...\n";
 
     const std::uint16_t slave = 1;
+
+    // PROVE the C13 sync-tolerance pre-op writes actually took. 0x2013 is INFERRED;
+    // a valid-but-wrong object would accept the write silently and change nothing.
+    // Read the values back (CoE mailbox works in SAFE-OP) and compare to what we
+    // wrote -- a mismatch means the index is wrong and C13 never applied.
+    try {
+        const auto c13_05 = master.sdo_read<std::uint16_t>(slave, kSyncToleranceGroup, kC13_05_SyncMode);
+        const auto c13_06 = master.sdo_read<std::uint16_t>(slave, kSyncToleranceGroup, kC13_06_JitterNs);
+        const auto c13_02 = master.sdo_read<std::uint16_t>(slave, kSyncToleranceGroup, kC13_02_SyncLoss);
+        const bool took = c13_05 == 2 && c13_06 == 6000 && c13_02 == 20;
+        std::cout << "[dc] C13 readback @0x2013: :06(C13.05/mode)=" << c13_05 << " :07(C13.06/jitter_ns)=" << c13_06
+                  << " :03(C13.02/loss)=" << c13_02
+                  << (took ? "  -> writes TOOK" : "  -> *** MISMATCH: 0x2013 index/width WRONG, C13 NOT applied ***") << '\n';
+    } catch (const Error& e) {
+        std::cerr << "[dc] C13 readback FAILED (0x2013 not readable -> inferred index is wrong): " << e.what() << '\n';
+    }
     const auto profile_vel = static_cast<std::uint32_t>(opt.move_rpm / 60.0 * kCountsPerRev);
     const Cia402Fsm fsm;
     const Cia402State goal = opt.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
