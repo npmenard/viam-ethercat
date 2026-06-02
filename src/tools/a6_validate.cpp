@@ -564,31 +564,44 @@ int main(int argc, char** argv) {
                 std::cout << "[B]   poll t=" << tick << " 0x0984=" << (dcs.sync0_active ? "ARMED" : "0")
                           << " 0x092C=" << dcs.sys_time_diff_ns << "ns lockStreak=" << locked_streak << " AL=0x" << std::hex
                           << dcs.al_status << std::dec << " 0x1C32:02=" << sm_cycle << "ns"
-                          << (cycle_ready ? " (CLEAN 1ms)" : " (re-deriving...)") << '\n';
+                          << (cycle_ready ? " (CLEAN 1ms)" : " (STALE -- latched, won't change)") << '\n';
             }
             if (dcs.sync0_active && !dc_sync_announced) {
                 std::cout << "[B] *** SYNC0 ARMED *** (0x0984 b0=1), clock " << (dcs.clock_locked ? "LOCKED" : "unlocked")
-                          << " (0x092C=" << dcs.sys_time_diff_ns << "ns) -- now waiting for 0x1C32:02 to re-derive to 1ms\n";
+                          << " (0x092C=" << dcs.sys_time_diff_ns << "ns) -- now verifying the latched 0x1C32:02 is a clean 1ms\n";
                 dc_sync_announced = true;
             }
         }
 
-        // STEP 4 -- request OP only once master-locked AND SYNC0-armed AND clock-locked AND
-        // the drive has RE-DERIVED a clean 1 ms cycle (0x1C32:02 == 1ms). Requesting OP on
-        // SYNC0-armed alone (before the re-derive) validates the stale ~999 us SM cycle ->
-        // Er74.0 0x6320 cycle error. The cap (relative to arm) still fires OP so a
-        // never-converges run surfaces the drive's reaction -- LOUD, never mistaken for OK.
+        // STEP 4 -- VERIFY, not WAIT. The A6 latches 0x1C32:02 ONCE at SM2 activation
+        // (SAFE-OP entry, during configure's measure window) and NEVER re-measures, so
+        // once SYNC0 is armed (dc_ready) we just READ the latched value:
+        //   clean 1ms  -> request OP (first light).
+        //   stale ~999us -> the PRE-OP phase-lock did NOT take; this value will NOT
+        //     change, so polling is futile and requesting OP would Er74.0 0x6320 (and
+        //     wedge the drive). ABORT cleanly -- the only recovery is to re-lock in
+        //     PRE-OP (re-run), per the architect's verify-not-wait / type-(b) give-up.
         const bool cap_hit = dc_armed && tick >= arm_tick + kOpRequestCapCycles;
-        if (!op_requested && dc_armed && ((dc_ready && cycle_ready) || cap_hit)) {
-            master.request_op();
-            op_requested = true;
-            if (dc_ready && cycle_ready) {
+        if (!op_requested && dc_armed && dc_ready) {
+            if (cycle_ready) {
+                master.request_op();
+                op_requested = true;
                 std::cout << "[B] DC-sync READY (SYNC0 armed + clock locked + 0x1C32:02=" << sm_cycle << "ns CLEAN) -> requesting OP\n";
             } else {
-                std::cout << "[B] !!! FAILURE PATH: not ready [0x0984=" << (dcs.sync0_active ? "ARMED" : "0") << " 0x1C32:02=" << sm_cycle
-                          << "ns] through " << kOpRequestCapCycles
-                          << " cycles after arm -- requesting OP to surface the drive fault (expect Er74) !!!\n";
+                std::cout
+                    << "[B] !!! CYCLE-LOCK FAILED: SYNC0 armed but 0x1C32:02=" << sm_cycle
+                    << "ns (not the clean 1000000) -- the A6 latched a STALE cycle at SAFE-OP entry; the PRE-OP phase-lock did NOT "
+                    << "take. 0x1C32:02 is latched once + never re-measured, so it will NOT change. NOT requesting OP (would Er74.0 "
+                    << "+ wedge the drive). Re-run; if it persists the PRE-OP lock isn't holding -> raise the streak / widen the band.\n";
+                break;  // abort cleanly -- re-lock in PRE-OP (re-run) is the only recovery
             }
+        } else if (!op_requested && dc_armed && cap_hit) {
+            // SYNC0 never armed within the cap. Arming was solved (d5ff073), so this is
+            // unexpected -- surface it but do NOT request OP into a no-SYNC0 state (Er74.1).
+            std::cout << "[B] !!! SYNC0 NEVER ARMED: 0x0984=0 through " << kOpRequestCapCycles
+                      << " cycles after the in-loop arm -- NOT requesting OP (would Er74.1). Unexpected (arming was solved); check the "
+                      << "[dc] arm readback (0x0981 activation) above.\n";
+            break;  // abort cleanly
         }
         // Full WKC == outputs processing == in OP with live command flow.
         const bool op = op_requested && raw_wkc == master.expected_wkc();
