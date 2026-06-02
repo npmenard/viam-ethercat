@@ -67,6 +67,12 @@ struct SlaveConfig {
     // Driver-supplied SDO writes applied in PRE-OP before the remap (drive tuning,
     // e.g. A6 C13 sync tolerance). Empty for slaves that need none.
     std::vector<SdoWrite> preop_sdo_writes;
+    // SDO writes applied in PRE-OP AFTER the PDO remap/assignment. Required for the
+    // SM-synchronization objects 0x1C32:01 / 0x1C33:01 (sync type): the ETG startup
+    // order is map -> assign (0x1C12/0x1C13) -> SM-sync, because several drives
+    // RE-DEFAULT 0x1C32 when the PDO assignment changes -- so a sync-type write done
+    // before the assignment gets clobbered back to its default. Empty for most slaves.
+    std::vector<SdoWrite> postremap_sdo_writes;
 };
 
 // Master-level configuration.

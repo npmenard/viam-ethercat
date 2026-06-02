@@ -112,10 +112,12 @@ MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_targe
     // so the C13 sync-tolerance writes were dropped -- the generic preop_sdo_writes
     // mechanism stays for exactly this kind of drive-config write.)
     if (sm_dc_sync) {
-        // optional=true: 0x1C33:01 (input SM) reads a non-standard value on the A6 and
-        // may be read-only -- a rejection there must NOT abort the run before we learn
-        // whether 0x1C32:01 (output SM, the one consuming our RxPDO) took =2.
-        a6.preop_sdo_writes = {
+        // POST-REMAP: the sync-type write must follow the PDO assignment or the drive
+        // re-defaults 0x1C32 back to SM-sync (=1). optional=true: 0x1C33:01 (input SM)
+        // reads a non-standard value and may be read-only -- a rejection there must NOT
+        // abort the run before we learn whether 0x1C32:01 (output SM, the one consuming
+        // our RxPDO) took =2.
+        a6.postremap_sdo_writes = {
             {kSm2SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0), /*optional=*/true},  // SM2 outputs -> DC SYNC0
             {kSm3SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0), /*optional=*/true},  // SM3 inputs  -> DC SYNC0
         };

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
@@ -186,6 +187,28 @@ TEST("Master: configure() applies preop_sdo_writes (drive tuning) before the rem
     const std::vector<std::uint32_t> log = sim_ptr->sdo_log(1);
     const auto first = log.front();
     CHECK_EQ(first, (std::uint32_t{0x2013} << 8U) | 0x06U);
+}
+
+TEST("Master: configure() applies postremap_sdo_writes AFTER the PDO assignment") {
+    MasterConfig cfg = make_config();
+    // An SM-sync-type write (mirrors the A6 0x1C32:01 = DC SYNC0): must land after the
+    // 0x1C12/0x1C13 assignment or the drive re-defaults it.
+    cfg.slaves[0].postremap_sdo_writes = {
+        {0x1C32, 0x01, {std::byte{0x02}, std::byte{0x00}}},  // sync type = DC SYNC0
+    };
+    auto sim = std::make_unique<SimBackend>(make_models());
+    SimBackend* sim_ptr = sim.get();
+    Master master{cfg, std::move(sim)};
+    master.init();
+    master.configure();
+
+    const std::vector<std::uint32_t> log = sim_ptr->sdo_log(1);
+    const auto key = [](std::uint16_t idx, std::uint8_t sub) { return (static_cast<std::uint32_t>(idx) << 8U) | sub; };
+    const auto sync_pos = std::find(log.begin(), log.end(), key(0x1C32, 0x01));
+    const auto assign_pos = std::find(log.begin(), log.end(), key(0x1C12, 0x00));  // RxPDO SM assignment
+    CHECK(sync_pos != log.end());                                                  // the sync-type write happened
+    CHECK(assign_pos != log.end());                                                // the assignment happened
+    CHECK(assign_pos < sync_pos);                                                  // ...and the assignment came FIRST
 }
 
 TEST("Master+SimBackend: dc_time() advances across process() (DC phase-lock input)") {

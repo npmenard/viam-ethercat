@@ -82,32 +82,41 @@ void Master::configure(bool reach_op) {
     // every configure() / power-on.
     backend_->request_state(0, EcatState::PreOp);
 
-    for (const SlaveConfig& sc : config_.slaves) {
-        // Driver-supplied PRE-OP SDO writes FIRST, before the remap: drive-tuning
-        // params (e.g. the A6 C13 sync-jitter-tolerance group) that must land while
-        // the drive is quiescent and the SM mapping is still default. Config DATA --
-        // no drive specifics here. A bad object/length surfaces as the backend's
-        // PdoMappingError carrying the CoE abort code.
-        for (const SdoWrite& w : sc.preop_sdo_writes) {
+    // Apply a list of driver SDO writes. A write marked optional that the drive
+    // rejects (read-only object / CoE abort) is logged and skipped, not fatal --
+    // for diagnostic / best-effort tuning writes; a mandatory write still throws.
+    const auto apply_sdo_writes = [this](std::uint16_t slave_id, const std::vector<SdoWrite>& writes) {
+        for (const SdoWrite& w : writes) {
             if (w.optional) {
-                // Best-effort tuning write: a rejection (read-only / abort) must not
-                // abort the whole bring-up -- log and press on.
                 try {
-                    backend_->sdo_write(sc.slave_id, w.index, w.subindex, w.data);
+                    backend_->sdo_write(slave_id, w.index, w.subindex, w.data);
                 } catch (const Error& e) {
                     (void)std::fprintf(stderr,
-                                       "[ethercat] optional pre-op SDO write to slave %u object 0x%04X:%02X rejected (continuing): %s\n",
-                                       static_cast<unsigned>(sc.slave_id),
+                                       "[ethercat] optional SDO write to slave %u object 0x%04X:%02X rejected (continuing): %s\n",
+                                       static_cast<unsigned>(slave_id),
                                        static_cast<unsigned>(w.index),
                                        static_cast<unsigned>(w.subindex),
                                        e.what());
                 }
             } else {
-                backend_->sdo_write(sc.slave_id, w.index, w.subindex, w.data);
+                backend_->sdo_write(slave_id, w.index, w.subindex, w.data);
             }
         }
+    };
+
+    for (const SlaveConfig& sc : config_.slaves) {
+        // PRE-OP SDO writes BEFORE the remap: drive-tuning params that must land while
+        // the drive is quiescent and the SM mapping is still default (config DATA; no
+        // drive specifics here). A bad object/length surfaces as the backend's
+        // PdoMappingError carrying the CoE abort code.
+        apply_sdo_writes(sc.slave_id, sc.preop_sdo_writes);
         apply_pdo_map(*backend_, sc.slave_id, sc.rxpdo);
         apply_pdo_map(*backend_, sc.slave_id, sc.txpdo);
+        // AFTER the PDO assignment: SM-synchronization writes (0x1C32:01/0x1C33:01 sync
+        // type). MUST follow the 0x1C12/0x1C13 assignment -- several drives re-default
+        // 0x1C32 when the assignment changes, so a pre-assignment sync-type write is
+        // clobbered (ETG startup order: map -> assign -> SM-sync).
+        apply_sdo_writes(sc.slave_id, sc.postremap_sdo_writes);
         // Set modes-of-operation (0x6060, U8) via SDO -- NOT mapped cyclically. A real
         // drive left in mode 0 never moves; this is the one drive-mode write per
         // configure(). PP=1 / PV=3 from the configured default_mode.
