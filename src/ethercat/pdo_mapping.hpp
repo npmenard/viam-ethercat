@@ -109,6 +109,17 @@ struct MasterConfig {
     // WHERE in the cycle the drive latches our output relative to its SYNC0 -- the A6
     // wants a FRESH frame just before SYNC0, not a stale mid-cycle one. Bench-swept.
     std::int32_t dc_sync0_shift_ns = 0;
+    // After the post-DC SDO writes (SM sync-type -> DC SYNC0), pump this many paced PD
+    // cycles BEFORE requesting SAFE-OP so the drive APPLIES the DC config -- copies the
+    // live ESC SYNC0 cycle (0x09A0) into the read-only CoE 0x1C32:02. Without it the
+    // drive validates an incomplete DC config (0x1C32:02 still 0) at the PS transition
+    // -> AL 0x0030. 0 = no settle.
+    std::uint32_t dc_postwrite_settle_cycles = 0;
+    // Optional CoE object (index:sub) polled each cycle during that settle: break the
+    // settle early once it reads NON-ZERO (the drive has applied the DC config, e.g.
+    // 0x1C32:02 went 0 -> SYNC0 cycle). index 0 = no poll, just the fixed window.
+    std::uint16_t dc_settle_poll_index = 0;
+    std::uint8_t dc_settle_poll_sub = 0;
     // Latch a BusError only after this many CONSECUTIVE short/abnormal WKC
     // cycles (a single transient bad cycle should not hard-fault). Reset on any
     // good cycle.

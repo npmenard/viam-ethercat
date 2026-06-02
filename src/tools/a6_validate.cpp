@@ -125,6 +125,13 @@ MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_targe
             {kSm2SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0), /*optional=*/true},  // SM2 outputs -> DC SYNC0
             {kSm3SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0), /*optional=*/true},  // SM3 inputs  -> DC SYNC0
         };
+        // After the DC-mode switch, pump up to 250 cycles so the drive copies the live
+        // SYNC0 cycle (0x09A0) into the read-only 0x1C32:02; break early the moment :02
+        // reads non-zero. Without this settle the drive validates 0x1C32:02=0 at SafeOp
+        // -> AL 0x0030.
+        cfg.dc_postwrite_settle_cycles = 250;
+        cfg.dc_settle_poll_index = kSm2SyncType;  // poll 0x1C32...
+        cfg.dc_settle_poll_sub = kSyncCycleSub;   // ...:02 (SM cycle time) until non-zero
     }
 
     a6.rxpdo.assign_index = 0x1C12;

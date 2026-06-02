@@ -177,6 +177,49 @@ void Master::configure(bool reach_op) {
         apply_sdo_writes(sc.slave_id, sc.postdc_sdo_writes);
     }
 
+    // POST-DC SETTLE: after the DC-mode switch, pump paced PD so the drive APPLIES the
+    // DC config -- copies the live ESC SYNC0 cycle (0x09A0) into the read-only CoE
+    // 0x1C32:02 -- BEFORE we request SAFE-OP. Otherwise it validates an incomplete DC
+    // config (:02 still 0) at the PS transition -> AL 0x0030. Optionally poll a CoE
+    // object each cycle and break early once it reads non-zero (config applied).
+    if (config_.use_distributed_clocks && config_.dc_postwrite_settle_cycles > 0) {
+        const std::uint16_t poll_slave = config_.slaves.front().slave_id;
+        timespec next{};
+        (void)clock_gettime(CLOCK_MONOTONIC, &next);
+        std::array<std::byte, 4> poll_buf{};
+        bool applied = false;
+        std::uint32_t i = 0;
+        for (; i < config_.dc_postwrite_settle_cycles && !applied; ++i) {
+            (void)backend_->exchange();
+            if (config_.dc_settle_poll_index != 0) {
+                try {
+                    const std::size_t n =
+                        backend_->sdo_read(poll_slave, config_.dc_settle_poll_index, config_.dc_settle_poll_sub, poll_buf);
+                    std::uint32_t v = 0;
+                    for (std::size_t b = 0; b < n && b < poll_buf.size(); ++b) {
+                        v |= static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(poll_buf[b])) << (8U * b);
+                    }
+                    applied = (v != 0);
+                } catch (const Error&) {  // NOLINT(bugprone-empty-catch) -- object not readable yet; settle another cycle
+                }
+            }
+            next.tv_nsec += static_cast<long>(cycle_ns);
+            while (next.tv_nsec >= kNsPerSec) {
+                next.tv_nsec -= kNsPerSec;
+                next.tv_sec += 1;
+            }
+            (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
+        }
+        if (config_.dc_settle_poll_index != 0) {
+            (void)std::fprintf(stderr,
+                               "[ethercat] post-DC settle: %u cycles, poll 0x%04X:%02X %s\n",
+                               i,
+                               static_cast<unsigned>(config_.dc_settle_poll_index),
+                               static_cast<unsigned>(config_.dc_settle_poll_sub),
+                               applied ? "-> NON-ZERO (DC config applied)" : "-> still 0 after settle (NOT applied)");
+        }
+    }
+
     backend_->request_state(0, EcatState::SafeOp);
 
     if (config_.use_distributed_clocks) {
