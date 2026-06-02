@@ -128,7 +128,7 @@ void Master::configure(bool reach_op) {
     // integer multiple of 250 us (1 kHz -> 1 ms is valid).
     if (config_.use_distributed_clocks) {
         const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
-        backend_->configure_dc_sync(cycle_ns);
+        backend_->configure_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);
         // Lock CURRENT memory (the IOmap + SOEM context are already resident after
         // map_process_data) right before the warmup. The warmup is alloc-free
         // (send/receive over the pre-allocated context), so MCL_CURRENT covers its

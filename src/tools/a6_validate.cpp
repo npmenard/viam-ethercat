@@ -73,13 +73,15 @@ extern "C" void on_sigint(int) {
 // Build the PROFILE POSITION MasterConfig for one A6, mirroring
 // etc/a6-hardware.example.json (RxPDO 0x1600 = ctrl + target-pos + profile-vel;
 // TxPDO 0x1A00 = fault + status + mode-display + pos + vel + torque).
-MasterConfig build_a6_pp_config(const std::string& ifname) {
+MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_target_ns, std::int32_t dc_sync0_shift_ns) {
     MasterConfig cfg;
     cfg.ifname = ifname;
-    cfg.target_loop_rate_hz = 1000;     // 1 ms SYNC0 = 4 x 250 us (A6-legal)
-    cfg.use_distributed_clocks = true;  // A6 supports ONLY DC sync
-    cfg.dc_lock_cycles = 2000;          // up to 2 s phase-locking warmup -> enter OP aligned
-    cfg.dc_settle_cycles = 1000;        // ~1 s post-OP grace while the phase finishes locking
+    cfg.target_loop_rate_hz = 1000;             // 1 ms SYNC0 = 4 x 250 us (A6-legal)
+    cfg.use_distributed_clocks = true;          // A6 supports ONLY DC sync
+    cfg.dc_lock_cycles = 2000;                  // up to 2 s phase-locking warmup -> enter OP aligned
+    cfg.dc_settle_cycles = 1000;                // ~1 s post-OP grace while the phase finishes locking
+    cfg.dc_sync_shift_ns = dc_target_ns;        // send-phase target (-1 = auto mid-cycle); --dc-target-ns sweep
+    cfg.dc_sync0_shift_ns = dc_sync0_shift_ns;  // SYNC0 CyclShift; --dc-shift-ns sweep
     cfg.max_consecutive_wkc_errors = 5;
 
     SlaveConfig a6;
@@ -169,6 +171,8 @@ struct Options {
     double move_revs = 0.0;
     double move_rpm = 60.0;
     int seconds = 6;
+    std::int32_t dc_target_ns = -1;      // send-phase lock target (-1 = auto mid-cycle); sweep with --dc-target-ns
+    std::int32_t dc_sync0_shift_ns = 0;  // SYNC0 CyclShift; sweep with --dc-shift-ns
 };
 
 }  // namespace
@@ -191,10 +195,15 @@ int main(int argc, char** argv) {
             }
         } else if (a == "--seconds" && i + 1 < args.size()) {
             opt.seconds = std::stoi(args[++i]);
+        } else if (a == "--dc-target-ns" && i + 1 < args.size()) {
+            opt.dc_target_ns = std::stoi(args[++i]);  // send-phase lock target (-1 = auto mid-cycle)
+        } else if (a == "--dc-shift-ns" && i + 1 < args.size()) {
+            opt.dc_sync0_shift_ns = std::stoi(args[++i]);  // SYNC0 CyclShift passed to ecx_dcsync0
         } else if (a.rfind("--", 0) != 0) {
             opt.ifname = a;
         } else {
-            std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N]\n";
+            std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N]\n"
+                      << "                   [--dc-target-ns NS] [--dc-shift-ns NS]\n";
             return 2;
         }
     }
@@ -219,7 +228,10 @@ int main(int argc, char** argv) {
         std::cerr << "    [rt] continuing best-effort -- DC SYNC0 may fault under jitter; run with sudo.\n\n";
     }
 
-    Master master(build_a6_pp_config(opt.ifname), std::make_unique<SoemBackend>());
+    std::cout << "[dc] send-phase target = " << (opt.dc_target_ns < 0 ? "auto(mid-cycle)" : std::to_string(opt.dc_target_ns) + "ns")
+              << " | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns\n\n";
+
+    Master master(build_a6_pp_config(opt.ifname, opt.dc_target_ns, opt.dc_sync0_shift_ns), std::make_unique<SoemBackend>());
 
     // --- Stage A: open + enumerate + read-only SDO identity (PRE-OP) ---
     try {
@@ -271,7 +283,19 @@ int main(int argc, char** argv) {
     const Cia402State goal = opt.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
     constexpr std::uint32_t kLoopHz = 1000;
     const std::uint32_t period_ns = 1'000'000'000U / kLoopHz;
-    const std::int64_t dc_shift = static_cast<std::int64_t>(period_ns) / 2;  // mid-cycle phase target
+    // Send-phase lock target: --dc-target-ns overrides the default mid-cycle. The
+    // master phase-locks (dc_time mod cycle) to this offset; sweeping it (with the
+    // SYNC0 CyclShift) is how we find the window where the A6 latches a FRESH frame.
+    const std::int64_t dc_shift =
+        opt.dc_target_ns < 0 ? static_cast<std::int64_t>(period_ns) / 2 : static_cast<std::int64_t>(opt.dc_target_ns);
+
+    // Short label for the EtherCAT state phase (SAFE-OP -> ->OP -> OP) used in prints.
+    const auto phase_label = [](bool in_op, bool requested) -> const char* {
+        if (in_op) {
+            return "OP";
+        }
+        return requested ? "->OP" : "SAFEOP";
+    };
 
     struct timespec next{};
     (void)clock_gettime(CLOCK_MONOTONIC, &next);
@@ -342,19 +366,25 @@ int main(int argc, char** argv) {
             op_reached_announced = true;
         }
 
-        // --reset-fault: the FSM (goal ReadyToSwitchOn) already drives the CiA402
-        // fault-reset edge below; just announce the Fault -> cleared transition (the
-        // A6's Er74.x sync faults are software-resettable -- no power cycle needed).
-        if (opt.reset_fault) {
-            const bool faulted = status.decode() == Cia402State::Fault;
-            if (faulted && !was_faulted) {
-                std::cout << "[B] drive in FAULT (0x603F=0x" << std::hex << read_tx<std::uint16_t>(master, slave, in, kFaultCode)
-                          << std::dec << ") -- running CiA402 fault-reset (no energize)...\n";
-            } else if (!faulted && was_faulted) {
-                std::cout << "[B] *** FAULT CLEARED *** -> " << to_string(status.decode()) << '\n';
+        // DIAGNOSTIC: capture the CiA402 error code 0x603F on EVERY Fault entry (not
+        // just under --reset-fault). The A6 faults AT OP ENTRY on a DC timing miss --
+        // 0x8700 = Er74.1 "no SYNC0", 0x6320 = Er74.0 "cycle error" -- so the exact
+        // code at the transition tells the bench which way to sweep --dc-target-ns /
+        // --dc-shift-ns. Printed immediately so it's never lost between status prints.
+        const bool faulted = status.decode() == Cia402State::Fault;
+        if (faulted && !was_faulted) {
+            const auto fault_code = read_tx<std::uint16_t>(master, slave, in, kFaultCode);
+            std::cout << "[B] !!! DRIVE FAULT @ " << phase_label(op, op_requested) << " t=" << tick / kLoopHz << "s: 0x603F=0x" << std::hex
+                      << fault_code << " sw=0x" << status.raw << std::dec << " dcPhase=" << (dct % static_cast<std::int64_t>(period_ns))
+                      << "ns";
+            if (opt.reset_fault) {
+                std::cout << " -- running CiA402 fault-reset (no energize)...";
             }
-            was_faulted = faulted;
+            std::cout << '\n';
+        } else if (!faulted && was_faulted) {
+            std::cout << "[B] *** FAULT CLEARED *** -> " << to_string(status.decode()) << '\n';
         }
+        was_faulted = faulted;
 
         // Decide the controlword for this cycle.
         std::uint16_t cw = fsm.step(status, goal);
@@ -405,10 +435,14 @@ int main(int argc, char** argv) {
 
         if (tick % 200 == 0) {  // ~5 Hz status print
             const std::int64_t dc_phase = period_ns != 0 ? dct % static_cast<std::int64_t>(period_ns) : 0;
-            std::cout << "    t=" << tick / kLoopHz << "s " << (op ? "OP " : (op_requested ? "->OP " : "SAFEOP "))
-                      << to_string(status.decode()) << " sw=0x" << std::hex << status.raw << std::dec << " pos=" << pos << " vel=" << vel
-                      << " wkc=" << raw_wkc << "/" << master.expected_wkc() << " badWKC=" << wkc_bad << "(maxRun=" << wkc_bad_max_streak
-                      << ") dcPhase=" << dc_phase << "ns(off=" << dc_off << ")" << (master.fault() ? " [BUS FAULT]" : "") << '\n';
+            std::cout << "    t=" << tick / kLoopHz << "s " << phase_label(op, op_requested) << " " << to_string(status.decode())
+                      << " sw=0x" << std::hex << status.raw << std::dec;
+            if (faulted) {  // surface the CiA402 error code alongside the state on every faulted print
+                std::cout << " 0x603F=0x" << std::hex << read_tx<std::uint16_t>(master, slave, in, kFaultCode) << std::dec;
+            }
+            std::cout << " pos=" << pos << " vel=" << vel << " wkc=" << raw_wkc << "/" << master.expected_wkc() << " badWKC=" << wkc_bad
+                      << "(maxRun=" << wkc_bad_max_streak << ") dcPhase=" << dc_phase << "ns(off=" << dc_off << ")"
+                      << (master.fault() ? " [BUS FAULT]" : "") << '\n';
         }
 
         if (master.fault()) {

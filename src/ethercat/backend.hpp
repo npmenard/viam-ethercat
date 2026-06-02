@@ -122,8 +122,12 @@ class EcatBackend {
     // (e.g. the A6-EC) fault out of OP immediately -- WKC -> 0, statusword Fault,
     // Er74.1 "no sync signal" -- unless SYNC0 is running. `cycle_ns` must be a
     // valid multiple for the drive (A6: integer multiple of 250000 ns).
-    virtual void configure_dc_sync(std::uint32_t cycle_ns) {
+    // `sync0_shift_ns` is the SYNC0 pulse phase offset (ecx_dcsync0 CyclShift): the
+    // SYNC0 edge fires `sync0_shift_ns` after the DC base time. Tune it (with the
+    // master's send phase) so the drive latches a FRESH output frame at SYNC0.
+    virtual void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
         (void)cycle_ns;
+        (void)sync0_shift_ns;
     }
 
     // Distributed-Clock system time (ns) latched at the last exchange(), for

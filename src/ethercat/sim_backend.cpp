@@ -353,8 +353,9 @@ void SimBackend::suppress_setpoint_ack(std::uint16_t slave, bool on) noexcept {
     }
 }
 
-void SimBackend::configure_dc_sync(std::uint32_t cycle_ns) {
-    dc_cycle_ns_ = cycle_ns;  // no real DC hardware; just record that the master asked
+void SimBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
+    (void)sync0_shift_ns;     // no real DC hardware to phase
+    dc_cycle_ns_ = cycle_ns;  // just record that the master asked
 }
 
 std::uint32_t SimBackend::configured_dc_cycle_ns() const noexcept {

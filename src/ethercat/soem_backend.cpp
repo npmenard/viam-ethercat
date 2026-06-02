@@ -270,7 +270,7 @@ SlaveIo SoemBackend::slave_io(std::uint16_t slave) noexcept {
     return SlaveIo{std::span<std::byte>(out, out != nullptr ? s.Obytes : 0), std::span<const std::byte>(in, in != nullptr ? s.Ibytes : 0)};
 }
 
-void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns) {
+void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
     // ecx_configdc detects DC-capable slaves + syncs the DC reference clock (ESC
     // 0x0910). It MUST run, set each slave's hasdc, and return TRUE before
     // ecx_dcsync0 -- otherwise dcsync0 is a silent no-op and a DC-only drive (the
@@ -283,12 +283,13 @@ void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns) {
         if (impl_->slavelist[i].hasdc == FALSE) {
             throw InitError("slave " + std::to_string(i) + " is not DC-capable (hasdc=0) -- cannot enable SYNC0");
         }
-        // SYNC0 on, `cycle_ns` period, 0 shift. SOEM writes ESC 0x0981/0x0990/...
-        ecx_dcsync0(&impl_->ctx, static_cast<std::uint16_t>(i), TRUE, cycle_ns, 0);
+        // SYNC0 on, `cycle_ns` period, `sync0_shift_ns` CyclShift. SOEM writes ESC
+        // 0x0981/0x0990/... so the SYNC0 edge fires shift after the DC base time.
+        ecx_dcsync0(&impl_->ctx, static_cast<std::uint16_t>(i), TRUE, cycle_ns, sync0_shift_ns);
         // Bring-up diagnostic: confirm DC actually activated (vs a silent no-op) so
         // the bench can distinguish "SYNC0 on but drive still refuses OP" from "DC
         // never set up". DC-only path; runs once per configure() on a real drive.
-        std::cerr << "[dc] slave " << i << " hasdc=1, SYNC0 enabled @ " << cycle_ns << " ns\n";
+        std::cerr << "[dc] slave " << i << " hasdc=1, SYNC0 @ " << cycle_ns << " ns, shift " << sync0_shift_ns << " ns\n";
     }
     impl_->dc_cycle_ns = cycle_ns;  // pace the upcoming OP-transition PD pump at this period
 }

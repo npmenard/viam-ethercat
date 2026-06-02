@@ -70,6 +70,11 @@ struct MasterConfig {
     // leaves no margin, so normal +/-jitter pushes a frame past the pulse -> stale
     // latch -> intermittent WKC drop. Mid-cycle keeps the send far from both edges.
     std::int32_t dc_sync_shift_ns = -1;
+    // SYNC0 pulse CyclShift (ns) passed to ecx_dcsync0: the SYNC0 edge fires this
+    // long after the DC base time. With the send phase (dc_sync_shift_ns) this tunes
+    // WHERE in the cycle the drive latches our output relative to its SYNC0 -- the A6
+    // wants a FRESH frame just before SYNC0, not a stale mid-cycle one. Bench-swept.
+    std::int32_t dc_sync0_shift_ns = 0;
     // Latch a BusError only after this many CONSECUTIVE short/abnormal WKC
     // cycles (a single transient bad cycle should not hard-fault). Reset on any
     // good cycle.
