@@ -254,7 +254,7 @@ void SimBackend::step_device(Slave& s) noexcept {
         const bool prev_bit4 = (prev & 0x10U) != 0U;
         if (bit4 && !prev_bit4) {
             s.target = load_le<std::int32_t>(out.subspan(s.model.target_off, 4));
-            s.setpoint_ack = !s.suppress_ack;  // test hook: withhold bit12 -> handshake times out
+            s.setpoint_ack = !s.suppress_ack.load(std::memory_order_relaxed);  // test hook: withhold bit12 -> handshake times out
         } else if (!bit4 && prev_bit4) {
             s.setpoint_ack = false;
         }
@@ -386,7 +386,7 @@ void SimBackend::force_short_wkc(bool on) noexcept {
 
 void SimBackend::suppress_setpoint_ack(std::uint16_t slave, bool on) noexcept {
     if (slave >= 1 && slave <= slaves_.size()) {
-        slaves_[slave - 1].suppress_ack = on;
+        slaves_[slave - 1].suppress_ack.store(on, std::memory_order_relaxed);
     }
 }
 

@@ -138,7 +138,7 @@ class SimBackend final : public EcatBackend {
         std::atomic<std::uint16_t> stale_fault_code{0};  // forces 0x603F = this REGARDLESS of fault state (flag-gating test)
         std::int32_t profile_velocity = 0;               // last 0x6081 seen in the command image (test visibility; RT-only)
         std::int32_t velocity = 0;                       // per-cycle actual delta (0x606C de-mask; RT-only)
-        bool suppress_ack = false;                       // test hook: never assert bit12 (force handshake timeout)
+        std::atomic<bool> suppress_ack{false};           // test hook (toggled live during a handshake): never assert bit12
         // RUNTIME mode of operation -- set ONLY by the master's 0x6060 SDO write (de-masked
         // from model.mode), so a missing/wrong mode set leaves it None and the motor never
         // moves (mode-0 guard), catching the "forgot to set 0x6060" bug offline.
