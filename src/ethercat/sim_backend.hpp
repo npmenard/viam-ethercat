@@ -59,6 +59,7 @@ class SimBackend final : public EcatBackend {
     void map_process_data() override;
     void request_state(std::uint16_t slave, EcatState target) override;
     EcatState slave_state(std::uint16_t slave) const override;
+    void configure_dc_sync(std::uint32_t cycle_ns) override;  // records the cycle (no real DC hardware to drive)
 
     // EcatBackend -- cyclic
     SlaveIo slave_io(std::uint16_t slave) noexcept override;
@@ -82,6 +83,9 @@ class SimBackend final : public EcatBackend {
     // suppressed, the controller's new-set-point handshake times out; re-enabling
     // lets a subsequent move complete (handshake-timeout-then-recovery test).
     void suppress_setpoint_ack(std::uint16_t slave, bool on = true) noexcept;
+    // SYNC0 cycle (ns) the master requested via configure_dc_sync, or 0 if it never
+    // did. Lets an offline test assert DC is configured when use_distributed_clocks.
+    std::uint32_t configured_dc_cycle_ns() const noexcept;
     // Read back a recorded SDO value (latest write to that object).
     std::vector<std::byte> recorded_sdo(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const;
     // Ordered log of SDO write keys ((index<<8)|sub) for asserting the remap
@@ -114,6 +118,7 @@ class SimBackend final : public EcatBackend {
 
     std::vector<Slave> slaves_;
     int expected_wkc_ = 0;
+    std::uint32_t dc_cycle_ns_ = 0;  // last configure_dc_sync() cycle (0 = never requested)
     bool open_ = false;
     bool short_wkc_once_ = false;
 };

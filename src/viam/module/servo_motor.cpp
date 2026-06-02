@@ -152,6 +152,7 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     c.target_loop_rate_hz = static_cast<std::uint32_t>(opt_num(attrs, "loop_rate_hz", 1000.0));
     c.require_realtime = opt_attr<bool>(attrs, "require_realtime").value_or(true);
     c.rt_priority = static_cast<int>(opt_num(attrs, "rt_priority", 80.0));
+    c.use_distributed_clocks = opt_attr<bool>(attrs, "use_distributed_clocks").value_or(false);
 
     c.max_consecutive_wkc_errors = static_cast<int>(opt_num(attrs, "max_consecutive_wkc_errors", 5.0));
     c.stall_threshold_cycles = static_cast<std::uint64_t>(opt_num(attrs, "stall_threshold_cycles", 10.0));

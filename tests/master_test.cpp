@@ -162,6 +162,28 @@ TEST("Master: configure() sets modes-of-operation 0x6060 from default_mode (SDO)
     CHECK_EQ(static_cast<int>(std::to_integer<std::uint8_t>(mode[0])), 1);  // PP = 1
 }
 
+TEST("Master: configure() enables DC SYNC0 only when use_distributed_clocks is set") {
+    {  // default: DC off -> configure_dc_sync never called
+        auto sim = std::make_unique<SimBackend>(make_models());
+        SimBackend* sim_ptr = sim.get();
+        Master master{make_config(), std::move(sim)};
+        master.init();
+        master.configure();
+        CHECK_EQ(sim_ptr->configured_dc_cycle_ns(), std::uint32_t{0});
+    }
+    {  // DC on -> SYNC0 cycle = 1e9 / target_loop_rate_hz (1 kHz -> 1 ms)
+        MasterConfig cfg = make_config();
+        cfg.use_distributed_clocks = true;
+        cfg.target_loop_rate_hz = 1000;
+        auto sim = std::make_unique<SimBackend>(make_models());
+        SimBackend* sim_ptr = sim.get();
+        Master master{cfg, std::move(sim)};
+        master.init();
+        master.configure();
+        CHECK_EQ(sim_ptr->configured_dc_cycle_ns(), std::uint32_t{1'000'000});
+    }
+}
+
 TEST("Master: configure() re-applies the PDO map every call (power-cycle safe)") {
     auto sim = std::make_unique<SimBackend>(make_models());
     SimBackend* sim_ptr = sim.get();

@@ -56,6 +56,10 @@ MasterConfig build_master_config(const ServoConfig& c) {
     mc.target_loop_rate_hz = c.target_loop_rate_hz;
     mc.slaves = {slave};
     mc.max_consecutive_wkc_errors = static_cast<std::uint32_t>(c.max_consecutive_wkc_errors);
+    mc.use_distributed_clocks = c.use_distributed_clocks;
+    // Paced DC-PLL warmup before OP (bench-tuned default; only used when DC is on).
+    constexpr std::uint32_t kDefaultDcLockCycles = 500;
+    mc.dc_lock_cycles = c.use_distributed_clocks ? kDefaultDcLockCycles : 0;
     return mc;
 }
 

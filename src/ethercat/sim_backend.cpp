@@ -352,6 +352,14 @@ void SimBackend::suppress_setpoint_ack(std::uint16_t slave, bool on) noexcept {
     }
 }
 
+void SimBackend::configure_dc_sync(std::uint32_t cycle_ns) {
+    dc_cycle_ns_ = cycle_ns;  // no real DC hardware; just record that the master asked
+}
+
+std::uint32_t SimBackend::configured_dc_cycle_ns() const noexcept {
+    return dc_cycle_ns_;
+}
+
 std::int32_t SimBackend::received_profile_velocity(std::uint16_t slave) const noexcept {
     if (slave >= 1 && slave <= slaves_.size()) {
         return slaves_[slave - 1].profile_velocity;

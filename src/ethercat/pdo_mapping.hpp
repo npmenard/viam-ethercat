@@ -54,6 +54,11 @@ struct MasterConfig {
     std::uint32_t target_loop_rate_hz = 1000;
     std::vector<SlaveConfig> slaves;
     bool use_distributed_clocks = false;
+    // When DC is on: number of PACED process-data exchanges (at the SYNC0 cycle)
+    // to run after enabling SYNC0 and BEFORE requesting OP, so the slaves' DC PLL
+    // locks first (an unpaced burst gives the PLL no real-time edges -> the A6
+    // enters OP unlocked -> WKC 0 -> fault). 0 = skip the warmup. Bench-tunable.
+    std::uint32_t dc_lock_cycles = 0;
     // Latch a BusError only after this many CONSECUTIVE short/abnormal WKC
     // cycles (a single transient bad cycle should not hard-fault). Reset on any
     // good cycle.

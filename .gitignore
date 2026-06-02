@@ -14,3 +14,4 @@ logs
 # history and licensing; ~120MB). Kept on disk for the team to read, but not
 # tracked in this repo.
 reference-src/
+build-hw/

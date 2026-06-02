@@ -106,6 +106,16 @@ class EcatBackend {
     virtual void request_state(std::uint16_t slave, EcatState target) = 0;
     virtual EcatState slave_state(std::uint16_t slave) const = 0;
 
+    // Configure Distributed-Clock SYNC0 on every DC-capable slave at `cycle_ns`,
+    // called at SAFE-OP before requesting OP, only when MasterConfig requests DC.
+    // Default no-op (sim / free-run drives). Drives that support ONLY DC sync
+    // (e.g. the A6-EC) fault out of OP immediately -- WKC -> 0, statusword Fault,
+    // Er74.1 "no sync signal" -- unless SYNC0 is running. `cycle_ns` must be a
+    // valid multiple for the drive (A6: integer multiple of 250000 ns).
+    virtual void configure_dc_sync(std::uint32_t cycle_ns) {
+        (void)cycle_ns;
+    }
+
     // --- cyclic (RT hot path; noexcept, no alloc, no block) -----------------
 
     // Process-data windows for a slave (1-based), valid after map_process_data.

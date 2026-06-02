@@ -216,6 +216,22 @@ install(
     ec_scan
 )
 
+# a6_validate: TEMPORARY hardware bring-up validation against a real A6 drive.
+# Links the ethercat library (Master + SoemBackend); SOEM is bundled inside it.
+add_executable(a6_validate)
+
+target_sources(a6_validate
+  PRIVATE
+    src/tools/a6_validate.cpp
+)
+
+target_link_libraries(a6_validate
+  PRIVATE
+    ethercat
+)
+
+viam_apply_wall_werror(a6_validate)
+
 
 #
 # The Viam motor module (servo)

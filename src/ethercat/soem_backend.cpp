@@ -218,8 +218,18 @@ void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
     }
 
     if (reached != want) {
+        // Refresh every slave's AL state + AL status code so the error names WHY
+        // (e.g. "Invalid DC SYNC Configuration", "SM watchdog") -- a SAFE-OP->OP
+        // refusal is otherwise opaque on the bench.
+        std::string detail;
+        ecx_readstate(&impl_->ctx);
+        for (int i = 1; i <= impl_->slavecount; ++i) {
+            const std::uint16_t al = impl_->slavelist[i].ALstatuscode;
+            detail += " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->slavelist[i].state)) +
+                      " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
+        }
         throw InitError("slave " + std::to_string(slave) + " did not reach state " + to_string(target) + " (reached " +
-                        to_string(from_soem_state(reached)) + ")");
+                        to_string(from_soem_state(reached)) + ")" + detail);
     }
 }
 
@@ -239,6 +249,16 @@ SlaveIo SoemBackend::slave_io(std::uint16_t slave) noexcept {
     auto* out = reinterpret_cast<std::byte*>(s.outputs);
     const auto* in = reinterpret_cast<const std::byte*>(s.inputs);
     return SlaveIo{std::span<std::byte>(out, out != nullptr ? s.Obytes : 0), std::span<const std::byte>(in, in != nullptr ? s.Ibytes : 0)};
+}
+
+void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns) {
+    // ecx_configdc detects DC-capable slaves and sets up the DC reference;
+    // ecx_dcsync0 enables the SYNC0 pulse per slave at `cycle_ns` (0 shift).
+    // SOEM drives the ESC DC registers (0x0981/0x0910/0x0990/...) internally.
+    ecx_configdc(&impl_->ctx);
+    for (int i = 1; i <= impl_->slavecount; ++i) {
+        ecx_dcsync0(&impl_->ctx, static_cast<std::uint16_t>(i), TRUE, cycle_ns, 0);
+    }
 }
 
 int SoemBackend::exchange() noexcept {

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <ctime>
 #include <span>
 #include <string>
 #include <utility>
@@ -14,6 +15,7 @@ namespace {
 
 constexpr int kPrimeCycles = 3;               // exchanges in SAFE-OP so slaves have valid outputs before OP
 constexpr std::uint16_t kModesOfOp = 0x6060;  // CiA402 modes-of-operation (U8): PP=1, PV=3; SDO-set in PRE-OP
+constexpr long kNsPerSec = 1'000'000'000L;
 
 std::uint32_t field_key(std::uint16_t index, std::uint8_t sub) noexcept {
     return (static_cast<std::uint32_t>(index) << 8U) | sub;
@@ -115,8 +117,31 @@ void Master::configure() {
     }
 
     backend_->request_state(0, EcatState::SafeOp);
-    for (int i = 0; i < kPrimeCycles; ++i) {
-        (void)backend_->exchange();
+    // Distributed Clocks: configure SYNC0 at SAFE-OP before OP. Required by
+    // drives that support only DC sync (the A6-EC faults out of OP -- Er74.1 "no
+    // sync signal", WKC->0 -- without it). cycle = loop period; the A6 needs an
+    // integer multiple of 250 us (1 kHz -> 1 ms is valid).
+    if (config_.use_distributed_clocks) {
+        const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
+        backend_->configure_dc_sync(cycle_ns);
+        // Pace `dc_lock_cycles` exchanges at the DC period so the slaves' SYNC0/DC
+        // PLL locks before we request OP. An unpaced burst leaves DC unlocked and
+        // the drive refuses OP / faults. dc_lock_cycles = 0 skips the warmup (sim).
+        timespec next{};
+        (void)clock_gettime(CLOCK_MONOTONIC, &next);
+        for (std::uint32_t i = 0; i < config_.dc_lock_cycles; ++i) {
+            (void)backend_->exchange();
+            next.tv_nsec += static_cast<long>(cycle_ns);
+            while (next.tv_nsec >= kNsPerSec) {
+                next.tv_nsec -= kNsPerSec;
+                next.tv_sec += 1;
+            }
+            (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
+        }
+    } else {
+        for (int i = 0; i < kPrimeCycles; ++i) {
+            (void)backend_->exchange();
+        }
     }
     backend_->request_state(0, EcatState::Op);
     if (backend_->slave_state(0) != EcatState::Op) {
