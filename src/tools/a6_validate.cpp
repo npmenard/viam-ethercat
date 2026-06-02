@@ -478,10 +478,18 @@ int main(int argc, char** argv) {
     bool dc_ready = false;
     bool dc_sync_announced = false;
     bool dc_armed = false;                               // SYNC0 armed in-loop yet?
+    bool cycle_ready = false;                            // 0x1C32:02 re-derived clean (== 1 ms) from the firing SYNC0?
+    std::int64_t sm_cycle = -1;                          // latest 0x1C32:02 read (ns), -1 = not yet read
     std::uint64_t arm_tick = 0;                          // tick at which we armed (cap is relative to this)
     constexpr int kArmAfterLockStreak = 200;             // arm SYNC0 once the master holds phase-lock this long (~200 ms)
     constexpr std::uint64_t kDcPollEvery = 50;           // poll dc_sync_status every 50 cycles (~20 Hz), ADDITIVE to PD
-    constexpr std::uint64_t kOpRequestCapCycles = 4000;  // ~4 s AFTER arming: request OP even if never ready (failure path)
+    constexpr std::uint64_t kOpRequestCapCycles = 8000;  // ~8 s AFTER arming: request OP even if never ready (failure path)
+    // The drive measures its SM/SYNC0 cycle into the RO 0x1C32:02; pre-SYNC0 it reads
+    // the jittery SM-event period (~999 us) and validates THAT at OP -> Er74.0 cycle
+    // error. Once SYNC0 is firing it re-derives the exact 1 ms hardware period -> gate OP
+    // on 0x1C32:02 landing within a tight band of 1 ms (NOT the ~1 us-short SM value).
+    constexpr std::int64_t kTargetCycleNs = 1'000'000;
+    constexpr std::int64_t kCleanCycleBandNs = 256;  // |0x1C32:02 - 1ms| <= this => re-derived clean
 
     // Read the RO SM2 cycle time (0x1C32:02) the drive validates at OP -- watch it
     // re-derive toward 1000000 once a clean SYNC0 is pulsing (vs a stale cached value
@@ -540,38 +548,44 @@ int main(int argc, char** argv) {
             }
         }
 
-        // STEP 3 -- after arming, poll the slave DC-sync health at ~20 Hz. 0x0984 (SYNC0
-        // armed) is the load-bearing signal (on a single-slave bus the A6 IS the DC
-        // reference, so 0x092C ~ 0 trivially). The decisive artifact is the 0->1 edge of
-        // 0x0984 under synchronized PD -> print the per-poll trace until ready.
+        // STEP 3 -- after arming, poll the slave DC-sync health AND the RO cycle 0x1C32:02
+        // at ~20 Hz (pre-OP, so the SDO read is safe). 0x0984 (SYNC0 armed) is the
+        // load-bearing DC-sync bit (single-slave: 0x092C ~ 0 trivially). 0x1C32:02 starts
+        // at the jittery SM-event period (~999 us) and must RE-DERIVE to a clean 1 ms once
+        // SYNC0 is firing -- watch it converge 999xxx -> 1000000. Trace until fully ready.
         if (dc_armed && !op_requested && (tick % kDcPollEvery == 0)) {
             dcs = master.dc_sync_status();
             dc_ready = dcs.ready;
-            if (!dc_ready) {  // per-poll trace through the proving window (stops at ready); pre-OP so the SDO read is safe
+            sm_cycle = read_sm_cycle();
+            cycle_ready = sm_cycle >= 0 && std::llabs(sm_cycle - kTargetCycleNs) <= kCleanCycleBandNs;
+            if (!(dc_ready && cycle_ready)) {  // trace through the proving window (stops once ready for OP)
                 std::cout << "[B]   poll t=" << tick << " 0x0984=" << (dcs.sync0_active ? "ARMED" : "0")
                           << " 0x092C=" << dcs.sys_time_diff_ns << "ns lockStreak=" << locked_streak << " AL=0x" << std::hex
-                          << dcs.al_status << std::dec << " 0x1C32:02=" << read_sm_cycle() << "ns\n";
+                          << dcs.al_status << std::dec << " 0x1C32:02=" << sm_cycle << "ns"
+                          << (cycle_ready ? " (CLEAN 1ms)" : " (re-deriving...)") << '\n';
             }
             if (dcs.sync0_active && !dc_sync_announced) {
                 std::cout << "[B] *** SYNC0 ARMED *** (0x0984 b0=1), clock " << (dcs.clock_locked ? "LOCKED" : "unlocked")
-                          << " (0x092C=" << dcs.sys_time_diff_ns << "ns)\n";
+                          << " (0x092C=" << dcs.sys_time_diff_ns << "ns) -- now waiting for 0x1C32:02 to re-derive to 1ms\n";
                 dc_sync_announced = true;
             }
         }
 
-        // STEP 4 -- request OP only once armed AND ready (master locked + slave SYNC0
-        // armed + clock locked). The cap (relative to the arm) still fires OP so a
-        // never-arms run surfaces the drive's Er74 -- but it is LOUD: a capped run is the
-        // FAILURE path, never to be mistaken for success.
+        // STEP 4 -- request OP only once master-locked AND SYNC0-armed AND clock-locked AND
+        // the drive has RE-DERIVED a clean 1 ms cycle (0x1C32:02 == 1ms). Requesting OP on
+        // SYNC0-armed alone (before the re-derive) validates the stale ~999 us SM cycle ->
+        // Er74.0 0x6320 cycle error. The cap (relative to arm) still fires OP so a
+        // never-converges run surfaces the drive's reaction -- LOUD, never mistaken for OK.
         const bool cap_hit = dc_armed && tick >= arm_tick + kOpRequestCapCycles;
-        if (!op_requested && dc_armed && (dc_ready || cap_hit)) {
+        if (!op_requested && dc_armed && ((dc_ready && cycle_ready) || cap_hit)) {
             master.request_op();
             op_requested = true;
-            if (dc_ready) {
-                std::cout << "[B] DC-sync READY (master locked + SYNC0 armed + clock locked) -> requesting OP\n";
+            if (dc_ready && cycle_ready) {
+                std::cout << "[B] DC-sync READY (SYNC0 armed + clock locked + 0x1C32:02=" << sm_cycle << "ns CLEAN) -> requesting OP\n";
             } else {
-                std::cout << "[B] !!! FAILURE PATH: SYNC0 never armed (0x0984=0 through " << kOpRequestCapCycles
-                          << " cycles after arm) -- requesting OP to surface the drive fault (expect Er74) !!!\n";
+                std::cout << "[B] !!! FAILURE PATH: not ready [0x0984=" << (dcs.sync0_active ? "ARMED" : "0") << " 0x1C32:02=" << sm_cycle
+                          << "ns] through " << kOpRequestCapCycles
+                          << " cycles after arm -- requesting OP to surface the drive fault (expect Er74) !!!\n";
             }
         }
         // Full WKC == outputs processing == in OP with live command flow.
