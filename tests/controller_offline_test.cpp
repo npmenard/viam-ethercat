@@ -2,6 +2,7 @@
 // full RT loop -- no Viam SDK, no hardware. require_realtime=false so the RT
 // thread runs SCHED_OTHER (CI has no CAP_SYS_NICE).
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -399,6 +400,44 @@ TEST("ServoController(#16): velocity comes from the 0x606C wire value, not the e
     ctrl.set_rpm(60.0);
     CHECK(wait_until([&] { return ctrl.velocity_counts() == dev; }, std::chrono::milliseconds(500)));
     CHECK(ctrl.velocity_counts() != dev * 1000);  // NOT the estimate (delta * rate)
+}
+
+TEST("ServoController(#16): live suppress_ack toggle vs the RT handshake read is race-free (TSan gate)") {
+    // TSan regression gate for the SimBackend cross-thread test hooks. The existing
+    // handshake-timeout test sets suppress_ack BEFORE go_to, so its accesses are
+    // happens-before-ordered via the command queue -- TSan would NOT flag a plain-bool
+    // suppress_ack there. This test instead hammers the hook from a background thread
+    // with NO synchronization against the RT loop's read in step_device, so a future
+    // non-atomic sibling (or a revert) trips TSan. Atomic -> clean. The assertion IS
+    // "TSan observed no data race" (plus a clean lifecycle).
+    SimBackend* sim = nullptr;
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition);
+    cfg.handshake_timeout_cycles = 10;  // bound each handshake so go_for returns promptly
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    CHECK(sim != nullptr);
+
+    std::atomic<bool> stop{false};
+    std::thread toggler([&] {
+        bool on = false;
+        while (!stop.load(std::memory_order_relaxed)) {
+            sim->suppress_setpoint_ack(1, on);  // unsynchronized vs the RT read in step_device
+            on = !on;
+        }
+    });
+    // Drive repeated PP handshakes (each reads suppress_ack on the bit4 rising edge)
+    // while the toggler races it. Moves may complete or abort (handshake timeout) --
+    // both fine; we only care that the concurrent access is clean.
+    for (int i = 0; i < 4; ++i) {
+        try {
+            ctrl.go_for(1000.0, 0.1);
+        } catch (const ethercat::Error&) {  // NOLINT(bugprone-empty-catch): timeout/abort is expected under the toggle
+        }
+    }
+    stop.store(true, std::memory_order_relaxed);
+    toggler.join();
+    CHECK(ctrl.is_powered());  // a move-error never de-powers; the drive is healthy throughout
 }
 
 TEST("ServoController(#16): unmapped 0x603F/0x606C -> no OOB; velocity falls back to the estimate") {
