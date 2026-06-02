@@ -92,6 +92,12 @@ class Master {
     int working_counter() const noexcept {
         return working_counter_.load(std::memory_order_relaxed);
     }
+    // RAW working counter from the last exchange(), good OR bad (unlike
+    // working_counter(), which holds the last GOOD value so a transient doesn't
+    // flap the reported WKC). Use this to actually SEE per-cycle short WKC.
+    int last_wkc() const noexcept {
+        return last_wkc_.load(std::memory_order_relaxed);
+    }
     int expected_wkc() const noexcept {
         return expected_wkc_;
     }
@@ -158,6 +164,7 @@ class Master {
     std::uint32_t settle_remaining_ = 0;        // RT-only: post-OP grace cycles left (DC phase settle; no WKC latch)
 
     std::atomic<int> working_counter_{0};
+    std::atomic<int> last_wkc_{0};  // raw WKC from the last exchange (diagnostic; good or bad)
     std::atomic<int> fault_wkc_{0};
     std::atomic<bool> fault_{false};
     std::atomic<bool> operational_{false};

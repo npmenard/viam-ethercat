@@ -200,12 +200,15 @@ void Master::configure() {
 
 void Master::process() noexcept {
     const int wkc = backend_->exchange();
-    // Post-OP DC settle grace: while it lasts, a short/abnormal WKC neither
-    // accumulates toward the latch nor faults -- the DC phase PI is still pulling
-    // into the window and a few partial-processing cycles are expected + benign.
+    last_wkc_.store(wkc, std::memory_order_relaxed);  // raw, every cycle (diagnostic)
+    // Post-OP DC settle grace: while it lasts, fully clear the latch state every
+    // cycle, so NOTHING (not even a bad streak during the grace) can carry past the
+    // grace boundary and trip a spurious latch the instant it ends. The DC phase PI
+    // is still pulling into the window; a few partial-processing cycles are benign.
     const bool in_grace = settle_remaining_ > 0;
     if (in_grace) {
         --settle_remaining_;
+        consecutive_wkc_errors_ = 0;
     }
     if (wkc < 0 || wkc < expected_wkc_) {
         if (!in_grace) {

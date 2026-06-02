@@ -18,6 +18,7 @@
 // best-effort (no SCHED_FIFO) -- fine for validation. NOT a production path;
 // the real driver is the Viam module.
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -283,10 +284,20 @@ int main(int argc, char** argv) {
     int wkc_bad = 0;
     std::int64_t dc_integral = 0;  // PI integrator for the DC phase lock
 
+    int wkc_bad_streak = 0;
+    int wkc_bad_max_streak = 0;
     while (!g_stop.load()) {
         master.process();
-        if (master.working_counter() != master.expected_wkc()) {
+        // Count the RAW per-cycle WKC, not working_counter() (which holds the last
+        // GOOD value -> blind to short cycles). Track the max consecutive bad run so
+        // we can see whether a latch was a real 5-in-a-row vs scattered transients.
+        const int raw_wkc = master.last_wkc();
+        if (raw_wkc != master.expected_wkc()) {
             ++wkc_bad;
+            ++wkc_bad_streak;
+            wkc_bad_max_streak = std::max(wkc_bad_max_streak, wkc_bad_streak);
+        } else {
+            wkc_bad_streak = 0;
         }
         // Hold the SYNC0 phase lock (the warmup already converged it before OP):
         // nudge the next sleep target so DCtime stays aligned MID-CYCLE (period/2,
@@ -363,7 +374,8 @@ int main(int argc, char** argv) {
         if (tick % 200 == 0) {  // ~5 Hz status print
             const std::int64_t dc_phase = period_ns != 0 ? master.dc_time() % static_cast<std::int64_t>(period_ns) : 0;
             std::cout << "    t=" << tick / kLoopHz << "s state=" << to_string(status.decode()) << " sw=0x" << std::hex << status.raw
-                      << std::dec << " pos=" << pos << " vel=" << vel << " wkc=" << master.working_counter() << "/" << master.expected_wkc()
+                      << std::dec << " pos=" << pos << " vel=" << vel << " wkc=" << raw_wkc << "/" << master.expected_wkc()
+                      << " badWKC=" << wkc_bad << "(maxRun=" << wkc_bad_max_streak << ")"
                       << " dcPhase=" << dc_phase << "ns(off=" << dc_off << ")" << (master.fault() ? " [BUS FAULT]" : "") << '\n';
         }
         ++tick;
@@ -393,6 +405,7 @@ int main(int argc, char** argv) {
     }
     master.close();
 
-    std::cout << "=== done. bad-WKC cycles: " << wkc_bad << " / " << tick << " ===\n";
+    std::cout << "=== done. bad-WKC cycles: " << wkc_bad << " / " << tick << " (max consecutive run: " << wkc_bad_max_streak
+              << "; raw per-cycle, not the masked working_counter) ===\n";
     return 0;
 }
