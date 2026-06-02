@@ -89,7 +89,22 @@ void Master::configure(bool reach_op) {
         // no drive specifics here. A bad object/length surfaces as the backend's
         // PdoMappingError carrying the CoE abort code.
         for (const SdoWrite& w : sc.preop_sdo_writes) {
-            backend_->sdo_write(sc.slave_id, w.index, w.subindex, w.data);
+            if (w.optional) {
+                // Best-effort tuning write: a rejection (read-only / abort) must not
+                // abort the whole bring-up -- log and press on.
+                try {
+                    backend_->sdo_write(sc.slave_id, w.index, w.subindex, w.data);
+                } catch (const Error& e) {
+                    (void)std::fprintf(stderr,
+                                       "[ethercat] optional pre-op SDO write to slave %u object 0x%04X:%02X rejected (continuing): %s\n",
+                                       static_cast<unsigned>(sc.slave_id),
+                                       static_cast<unsigned>(w.index),
+                                       static_cast<unsigned>(w.subindex),
+                                       e.what());
+                }
+            } else {
+                backend_->sdo_write(sc.slave_id, w.index, w.subindex, w.data);
+            }
         }
         apply_pdo_map(*backend_, sc.slave_id, sc.rxpdo);
         apply_pdo_map(*backend_, sc.slave_id, sc.txpdo);

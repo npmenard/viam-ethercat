@@ -49,6 +49,12 @@ struct SdoWrite {
     std::uint16_t index = 0;
     std::uint8_t subindex = 0;
     std::vector<std::byte> data;
+    // Best-effort: if the drive rejects this write (read-only object, length/value
+    // abort), LOG and CONTINUE instead of failing configure(). For diagnostic /
+    // optional tuning writes where one rejected sub-index must not block the rest
+    // (e.g. the A6's 0x1C33:01 input-SM sync type may be read-only while 0x1C32:01
+    // output-SM is the one that matters). Default false = mandatory (throws).
+    bool optional = false;
 };
 
 // Per-slave configuration (config DATA; the A6 specifics live here, never in
