@@ -475,26 +475,25 @@ int main(int argc, char** argv) {
     int locked_streak = 0;
     std::int64_t dc_integral = 0;
     long dc_off = 0;
-    // The SOEM-author (Arthur Ketels) flow, in ONE gapless loop:
+    // The bring-up flow, in ONE gapless loop:
     //   (1) pump phase-locked PD in SAFE-OP until the MASTER is send-phase locked;
-    //   (2) THEN arm SYNC0 IN-LOOP (master.arm_dc_sync) -- on a live clock the drive is
-    //       already seeing synchronized LRW on, which is what makes it generate SYNC0;
-    //   (3) keep pumping + poll the slave DC-sync health (0x0984 arm + 0x092C lock);
-    //   (4) request OP only once dc_sync_status().ready (Arthur's "proven in sync").
-    // Poll the ESC DC regs at ~20 Hz (acyclic FPRD ADDITIVE to the per-cycle PD send,
-    // never substitutive) only after arming. A cap (relative to the arm) still requests
-    // OP so a never-arms run loudly surfaces the drive's Er74 reaction.
+    //   (2) THEN arm SYNC0 IN-LOOP (master.arm_dc_sync) with a short start delay so the
+    //       first edge beats the A6's ~50ms sync watchdog;
+    //   (3) keep pumping + watch the drive stay FAULT-FREE in SAFE-OP (the real proof
+    //       SYNC0 is reaching it -- 0x0984/0x098E are PDI-consumed, unusable as a gate);
+    //   (4) once fault-free + clock-locked for a healthy hold, request OP (gapless).
     DcSyncStatus dcs{};
-    bool dc_ready = false;
     bool dc_sync_announced = false;
     int op_fault_streak = 0;                             // consecutive cycles faulted-in-OP (persistent-cause give-up)
+    int healthy_hold_streak = 0;                         // consecutive cycles fault-free + clock-locked in SAFE-OP (OP gate)
     constexpr int kPersistentFaultGiveUp = 2000;         // ~2 s faulted in OP despite reset -> STOP (protect the drive)
+    constexpr int kHealthyHoldCycles = 200;              // ~200 ms fault-free + clock-locked in SAFE-OP -> safe to request OP
     bool dc_armed = false;                               // SYNC0 armed in-loop yet?
     std::int64_t sm_cycle = -1;                          // latest 0x1C32:02 read (ns), -1 = not yet read (DIAGNOSTIC only)
     std::uint64_t arm_tick = 0;                          // tick at which we armed (cap is relative to this)
     constexpr int kArmAfterLockStreak = 200;             // arm SYNC0 once the master holds phase-lock this long (~200 ms)
     constexpr std::uint64_t kDcPollEvery = 50;           // poll dc_sync_status every 50 cycles (~20 Hz), ADDITIVE to PD
-    constexpr std::uint64_t kOpRequestCapCycles = 1000;  // ~1 s AFTER arming (10x SyncDelay): SYNC0 never PULSED -> abort
+    constexpr std::uint64_t kOpRequestCapCycles = 1000;  // ~1 s AFTER arming: no healthy hold -> abort (SYNC0 not reaching drive)
     // NOTE on 0x1C32:02 (RO SM cycle): on a CLEAN drive it reads 0 in SAFE-OP and is only
     // MEASURED/populated by the drive AT the OP transition (bench: the 999120 we chased
     // earlier was a polluted-drive residual). So we do NOT gate OP on it -- a "verify
@@ -560,62 +559,25 @@ int main(int argc, char** argv) {
             }
         }
 
-        // STEP 3 -- after arming, poll the slave DC-sync health at ~20 Hz (pre-OP, SDO
-        // read safe). 0x0984 (SYNC0 armed) is the load-bearing DC-sync bit (single-slave:
-        // 0x092C ~ 0 trivially). 0x1C32:02 is read as a DIAGNOSTIC only (it is 0 in
-        // SAFE-OP on a clean drive -- the drive measures it AT OP entry -- so it is NOT a
-        // gate; see the NOTE above). Trace until SYNC0 is armed (the OP go-signal).
-        if (dc_armed && (tick % kDcPollEvery == 0)) {
+        // STEP 3 -- poll the slave DC-sync health at ~20 Hz (FPRD, additive to PD), until
+        // a clean OP is reached. DIAGNOSTIC ONLY: 0x0984 (armed) and 0x098E (pulse status)
+        // are PDI-CONSUMED on the A6 -- once the drive's MCU owns the SYNC unit it
+        // reads/acks them each pulse, so the master samples 0/static even while SYNC0 IS
+        // firing. The reliable signals are 0x092C (clock lock) and the ABSENCE of the
+        // Er74.1 no-sync fault (checked below from the statusword). The OP gate uses those.
+        if (dc_armed && !op_reached_announced && (tick % kDcPollEvery == 0)) {
             dcs = master.dc_sync_status();
-            dc_ready = dcs.ready;
             sm_cycle = read_sm_cycle();
-            if (!op_requested && !dc_ready) {  // PRE-OP proving trace (stops once SYNC0 armed -> ready for OP)
-                std::cout << "[B]   poll t=" << tick << " 0x0984=" << (dcs.sync0_active ? "ARMED" : "0")
-                          << " 0x098E=" << (dcs.sync0_pulsing ? "PULSING" : "static") << " 0x092C=" << dcs.sys_time_diff_ns
-                          << "ns lockStreak=" << locked_streak << " AL=0x" << std::hex << dcs.al_status << std::dec
-                          << " 0x1C32:02=" << sm_cycle << "ns (0 in SAFE-OP is normal; measured at OP)\n";
-            } else if (op_requested) {
-                // POST-OP DISCRIMINATOR (team-lead): is the ESC PHYSICALLY generating SYNC0?
-                // 0x098E toggling across polls => real edges firing -> any "no sync" is
-                // downstream of the ESC (MCU/routing). 0x098E STATIC despite 0x0984=1 =>
-                // the ESC reports armed but is NOT pulsing (an arm/start-time issue, still
-                // ours to fix). Many polls over the ~2 s faulted window => a reliable read.
-                std::cout << "[B]   OP-poll t=" << tick
-                          << " 0x098E=" << (dcs.sync0_pulsing ? "PULSING (SYNC0 generating)" : "STATIC (NOT generating despite 0x0984=1!)")
-                          << " 0x0984=" << (dcs.sync0_active ? "ARMED" : "0") << " 0x092C=" << dcs.sys_time_diff_ns << "ns AL=0x"
-                          << std::hex << dcs.al_status << std::dec << '\n';
-            }
-            if (dcs.sync0_active && !dc_sync_announced) {
-                std::cout << "[B] *** SYNC0 ARMED *** (0x0984 b0=1), clock " << (dcs.clock_locked ? "LOCKED" : "unlocked")
-                          << " (0x092C=" << dcs.sys_time_diff_ns
-                          << "ns) -- now waiting for the first PULSE (0x098E toggling, ~100ms out)\n";
+            std::cout << "[B]   " << (op_requested ? "OP-poll" : "poll") << " t=" << tick
+                      << " 0x0984=" << (dcs.sync0_active ? "ARMED" : "0(PDI?)")
+                      << " 0x098E=" << (dcs.sync0_pulsing ? "toggling" : "static(PDI?)") << " 0x092C=" << dcs.sys_time_diff_ns << "ns("
+                      << (dcs.clock_locked ? "LOCKED" : "unlocked") << ") lockStreak=" << locked_streak << " AL=0x" << std::hex
+                      << dcs.al_status << std::dec << " 0x1C32:02=" << sm_cycle << "ns\n";
+            if (!dc_sync_announced) {
+                std::cout << "[B] *** SYNC0 ARMED *** -- holding in SAFE-OP, watching for fault-free + clock-locked (the real sync-OK "
+                          << "proof; 0x0984/0x098E are PDI-consumed)\n";
                 dc_sync_announced = true;
             }
-        }
-
-        // STEP 4 -- request OP once dc_ready, which now means master-locked + clock-locked
-        // + SYNC0 PHYSICALLY PULSING (0x098E toggling), NOT merely armed (0x0984=1). The
-        // arm bit is set instantly by ec_dcsync0, but the first SYNC0 edge is ~100 ms out
-        // (SyncDelay); requesting OP on the arm bit lands BEFORE the first pulse -> Er74.1
-        // "no sync" -> the fault deactivates SYNC0 before it ever fires. Waiting for real
-        // edges rides out the SyncDelay (the drive is fault-free in SAFE-OP). We do NOT
-        // gate on 0x1C32:02 (0 in SAFE-OP, measured only at OP entry); the PRE-OP lock
-        // makes that OP-entry measurement clean. The give-up below is the safety net.
-        const bool cap_hit = dc_armed && tick >= arm_tick + kOpRequestCapCycles;
-        if (!op_requested && dc_armed && dc_ready) {
-            master.request_op();
-            op_requested = true;
-            std::cout << "[B] DC-sync READY (clock locked + SYNC0 PULSING [0x098E toggling] + master locked) -> requesting OP "
-                      << "(SYNC0 is live, so the drive should not fault no-sync; 0x1C32:02 measured clean at OP entry)\n";
-        } else if (!op_requested && dc_armed && cap_hit) {
-            // SYNC0 armed (0x0984=1) but never PULSED (0x098E static) within ~1 s -- well
-            // past the ~100 ms first-edge. The ESC reports armed but is not generating
-            // edges -> genuine dead-ESC / start-time refusal (vendor/Arthur territory), NOT
-            // a too-early-OP timing miss. Do NOT request OP (would Er74.1). Abort cleanly.
-            std::cout << "[B] !!! SYNC0 ARMED BUT NEVER PULSED: 0x0984=1 but 0x098E static through " << kOpRequestCapCycles
-                      << " cycles (~1 s, >> the 100 ms first-edge) after the in-loop arm -- the ESC is not generating edges. NOT "
-                      << "requesting OP (would Er74.1). This is the genuine no-pulse case (ESC start-time / silicon -> vendor).\n";
-            break;  // abort cleanly
         }
         // Full WKC == outputs processing == in OP with live command flow.
         const bool op = op_requested && raw_wkc == master.expected_wkc();
@@ -657,6 +619,29 @@ int main(int argc, char** argv) {
             std::cout << "[B] *** FAULT CLEARED *** -> " << to_string(status.decode()) << '\n';
         }
         was_faulted = faulted;
+
+        // OP GATE (healthy-hold) -- request OP once the drive has proven sync the only
+        // RELIABLE way: by sitting FAULT-FREE in SAFE-OP with SYNC0 armed + the clock
+        // locked. The A6's 0x0984/0x098E are PDI-consumed (master samples 0/static even
+        // while SYNC0 fires), so the ABSENCE of the Er74.1 no-sync fault IS the sync-OK
+        // signal. Require not-faulted + clock-locked for ~200ms (master-lock is the arm
+        // precondition), then request OP gapless. team-lead's call after the 15ms-delay
+        // fix made the drive sit healthy in SAFE-OP.
+        if (dc_armed && !op_requested) {
+            healthy_hold_streak = (!faulted && dcs.clock_locked) ? healthy_hold_streak + 1 : 0;
+            if (healthy_hold_streak >= kHealthyHoldCycles) {
+                master.request_op();
+                op_requested = true;
+                std::cout << "[B] DC-sync HEALTHY HOLD (" << kHealthyHoldCycles
+                          << " cycles fault-free + clock-locked in SAFE-OP, SYNC0 armed) -> requesting OP "
+                          << "(SYNC0 is reaching the drive -- no Er74.1)\n";
+            } else if (tick >= arm_tick + kOpRequestCapCycles) {
+                std::cout << "[B] !!! NO HEALTHY HOLD: drive did not stay fault-free + clock-locked for " << kHealthyHoldCycles
+                          << " cycles within ~1 s of arming (faulted=" << faulted << " clockLocked=" << dcs.clock_locked
+                          << ") -- NOT requesting OP. SYNC0 likely not reaching the drive; sweep --dc-start-delay-ns.\n";
+                break;  // abort cleanly -- never request OP into a no-sync state
+            }
+        }
 
         // BOUNDED GIVE-UP: if the drive stays faulted in OP despite the auto fault-reset
         // -- a persistent-CAUSE fault like Er74.0 cycle-error, where the bit7 reset edge
@@ -749,15 +734,11 @@ int main(int argc, char** argv) {
             std::cout << "      bus/DC  : wkc=" << raw_wkc << "/" << master.expected_wkc() << " badWKC=" << wkc_bad
                       << "(maxRun=" << wkc_bad_max_streak << ") DCtime=" << dct << " dcPhase=" << dc_phase << "ns(off=" << dc_off << ")"
                       << " lockStreak=" << locked_streak << (master.fault() ? " [BUS FAULT]" : "") << '\n';
-            const char* dc_sync_note = " (proving sync...)";
-            if (dc_ready) {
-                dc_sync_note = " -> READY for OP";
-            } else if (op) {
-                dc_sync_note = "";
-            }
-            std::cout << "      DC-sync : SYNC0=" << (dcs.sync0_active ? "ARMED" : "off")
-                      << " clock=" << (dcs.clock_locked ? "LOCKED" : "unlocked") << " 0x092C=" << dcs.sys_time_diff_ns << "ns AL=0x"
-                      << std::hex << dcs.al_status << std::dec << dc_sync_note << '\n';
+            const char* dc_sync_note = op ? "" : " (healthy-hold for OP)";
+            std::cout << "      DC-sync : 0x0984=" << (dcs.sync0_active ? "ARMED" : "0(PDI?)")
+                      << " 0x098E=" << (dcs.sync0_pulsing ? "tgl" : "static") << " clock=" << (dcs.clock_locked ? "LOCKED" : "unlocked")
+                      << " 0x092C=" << dcs.sys_time_diff_ns << "ns healthyHold=" << healthy_hold_streak << " AL=0x" << std::hex
+                      << dcs.al_status << std::dec << dc_sync_note << '\n';
         }
 
         if (master.fault()) {
