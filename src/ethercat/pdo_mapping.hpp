@@ -90,17 +90,14 @@ struct MasterConfig {
     std::uint32_t target_loop_rate_hz = 1000;
     std::vector<SlaveConfig> slaves;
     bool use_distributed_clocks = false;
-    // DC bring-up (the ec_sample fold, #20): the RT loop pumps phase-locked PD from
-    // cycle 0, then runs SETTLE -> ARM(stock ecx_dcsync0) -> GATE -> request OP, all
-    // while PD flows continuously (so SYNC0 is never armed into a gap). These two bound
-    // that prelude; 0 ⇒ defaults applied at the gate.
-    //   SETTLE: paced phase-locking exchanges to run AFTER the DC clock is live and
-    //   BEFORE arming SYNC0, so dcsync0 computes its start off a disciplined clock
-    //   (~tens of cycles is ample; NOT the old 200-cycle lock-proof).
-    std::uint32_t dc_arm_settle_cycles = 50;
-    //   GATE: consecutive cycles of (WKC full && no Er74.1 on any slave) required after
-    //   the arm before requesting OP -- proves the drive accepted SYNC0 and is exchanging
-    //   synchronized PD. An Er74.1 within the window aborts the bring-up (no OP request).
+    // DC bring-up (the ec_sample fold, #20): SYNC0 is armed in PRE-OP inside configure()
+    // (stock ecx_dcsync0, before config_map_group -- the drive self-selects DC sync-type
+    // from the armed SYNC0). The RT loop then pumps phase-locked PD and GATEs before OP.
+    //   GATE: consecutive cycles of (PD flowing [wkc>0] && no Er74.1 on any slave) required
+    //   before requesting OP -- proves the drive is exchanging synchronized PD. (WKC can't
+    //   be full in SAFE-OP; full WKC is the OP confirmation, not the gate.) An Er74.1 in
+    //   the window aborts the bring-up (no OP request -- repeated Er74 OP-entry wedges the
+    //   A6). 0 ⇒ 1 (request OP on the first healthy cycle).
     std::uint32_t dc_op_gate_cycles = 50;
     // Post-OP grace: suppress the consecutive-WKC-error fault latch for this many
     // cycles after reaching OP, so any residual DC phase transient settles without

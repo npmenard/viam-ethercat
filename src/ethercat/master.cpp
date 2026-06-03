@@ -122,6 +122,21 @@ void Master::configure() {
         backend_->sdo_write(sc.slave_id, kModesOfOp, 0, mode);
     }
 
+    // DC SYNC0 cycle = loop period (A6: must be a 250 us multiple, e.g. 1 ms @ 1 kHz).
+    const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
+
+    // ARM SYNC0 IN PRE-OP, BEFORE config_map_group -- ec_sample's exact order (bench /
+    // CLAUDE.md). The A6 latches its SM sync-type (SM vs DC) at the PRE-OP->SAFE-OP
+    // transition from whether SYNC0 is ALREADY armed: arm here and the drive self-selects
+    // DC (0x1C32:01 reads 2) and holds OP; arm only after SAFE-OP and it has already chosen
+    // SM-sync -> Er74.1 "no sync signal" ~1s into OP. We still NEVER write 0x1C32:01 (that
+    // force was the self-inflicted AL 0x0030); the PRE-OP arm is the whole trigger. Stock
+    // ecx_dcsync0 -- the 100 ms SyncDelay is covered by config_map+configdc + the RT loop
+    // pumping PD before the first SYNC0 edge.
+    if (config_.use_distributed_clocks) {
+        backend_->arm_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);
+    }
+
     backend_->map_process_data();
     expected_wkc_ = backend_->expected_wkc();
 
@@ -151,17 +166,11 @@ void Master::configure() {
         rt.tx_fields = build_field_table(sc.slave_id, sc.txpdo);
     }
 
-    // Distributed Clocks: the ec_sample working sequence (#20 / CLAUDE.md). v2's
-    // config_map_group lets the drive SELF-SELECT its DC sync-type (we NEVER force
-    // 0x1C32:01 -- that was the self-inflicted AL 0x0030). configure() does step 1
-    // (configdc, PRE-OP offsets only) then stops at SAFE-OP. The SYNC0 arm + OP request
-    // happen LATER, in the caller's single RT loop via bringup_step(), so process data
-    // flows continuously through SAFE-OP->OP and SYNC0 is armed on a live clock, never
-    // into a gap (the whole #17 wall was working around v1.4.0 + that force).
-    const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
-
+    // DC configdc -- AFTER config_map_group (ec_sample order: dcsync0 -> map -> configdc).
+    // Designates the reference clock + writes each slave's system-time offset (0x0920) +
+    // propagation delay (0x0928). The SYNC0 arm already happened in PRE-OP above; we NEVER
+    // write 0x1C32:01 (the drive self-selects DC from the armed SYNC0).
     if (config_.use_distributed_clocks) {
-        // DC step 1 (PRE-OP): configdc -- reference clock + system-time offset + delay.
         backend_->configure_dc_configdc();
         // Lock resident memory (IOmap + SOEM context) before the RT thread spawns and
         // starts pacing SYNC0, so a page fault never spikes the phase. MCL_CURRENT only
@@ -175,8 +184,10 @@ void Master::configure() {
         }
     }
 
-    // Stop at SAFE-OP. PRE-OP->SAFE-OP needs no process data, and no SYNC0 is armed yet,
-    // so the configure->RT-thread handoff gap is harmless (nothing is expecting pulses).
+    // Stop at SAFE-OP. SYNC0 is armed (PRE-OP) but its first edge is ~100 ms out (stock
+    // SyncDelay), so the brief PRE-OP->SAFE-OP statecheck (no PD) finishes well before it
+    // -- the RT loop is pumping phase-locked PD before the first pulse. The drive latched
+    // DC sync-type at this transition (SYNC0 already armed).
     backend_->request_state(0, EcatState::SafeOp);
 
     // Clear a latent drive fault while still the SINGLE port owner (before the RT thread
@@ -200,14 +211,11 @@ void Master::configure() {
         }
     }
 
-    // Hand off to the caller's RT loop at SAFE-OP. It runs bringup_step() (SETTLE -> ARM
-    // -> GATE -> request OP -> AWAIT_OP) until OPERATIONAL, so operational_ stays false
-    // until then. Stash the DC params + reset the bring-up FSM.
+    // Hand off to the caller's RT loop at SAFE-OP with SYNC0 already armed. It runs
+    // bringup_step() -- GATE (PD flowing + no Er74.1, K cycles) -> request OP -> AWAIT_OP
+    // -- until OPERATIONAL, so operational_ stays false until then. Reset the FSM.
     dc_enabled_ = config_.use_distributed_clocks;
-    dc_cycle_ns_ = cycle_ns;
-    dc_sync0_shift_ns_ = config_.dc_sync0_shift_ns;
-    bringup_phase_ = BringupPhase::Settle;
-    bringup_settle_count_ = 0;
+    bringup_phase_ = BringupPhase::Gate;
     bringup_gate_streak_ = 0;
     fault_.store(false, std::memory_order_relaxed);
     consecutive_wkc_errors_ = 0;
@@ -217,41 +225,13 @@ void Master::configure() {
 
 BringupStatus Master::bringup_step(bool drive_sync_faulted) noexcept {
     // The caller owns the cadence (clock_nanosleep + dc_phase_correction on dc_time());
-    // this does the one cyclic exchange + advances the FSM. PD flows EVERY step from the
-    // first, so SYNC0 (armed in the ARM phase) is never armed into a gap.
+    // this does the one cyclic exchange + advances the FSM. SYNC0 was already armed in
+    // configure() (PRE-OP, per ec_sample), so the FSM is just GATE -> request OP ->
+    // AWAIT_OP: pump PD gaplessly, prove sync (no Er74.1), then cross to OP.
     const int wkc = backend_->exchange();
     last_wkc_.store(wkc, std::memory_order_relaxed);
 
     switch (bringup_phase_) {
-        case BringupPhase::Settle: {
-            // Pump phase-locked PD until the DC clock is live (dcsync0 computes its start
-            // off the slave's live 0x0910) and a short settle has elapsed. ~tens of
-            // cycles -- NOT the old 200-cycle lock proof. Non-DC backends skip the clock
-            // wait. dc_arm_settle_cycles == 0 ⇒ arm next cycle.
-            ++bringup_settle_count_;
-            const bool clock_live = !dc_enabled_ || backend_->dc_time() != 0;
-            const std::uint32_t target = config_.dc_arm_settle_cycles == 0 ? 1U : config_.dc_arm_settle_cycles;
-            if (bringup_settle_count_ >= target && clock_live) {
-                bringup_phase_ = BringupPhase::Arm;
-            }
-            return BringupStatus::Settling;
-        }
-        case BringupPhase::Arm: {
-            // Arm SYNC0 with stock ecx_dcsync0 (no-op on non-DC backends). PD is already
-            // flowing, so the arm lands on a live, disciplined clock.
-            if (dc_enabled_) {
-                try {
-                    backend_->arm_dc_sync(dc_cycle_ns_, dc_sync0_shift_ns_);
-                } catch (const std::exception& e) {
-                    (void)std::fprintf(stderr, "[ethercat] arm_dc_sync failed: %s\n", e.what());
-                    bringup_phase_ = BringupPhase::Aborted;
-                    return BringupStatus::Aborted;
-                }
-            }
-            bringup_gate_streak_ = 0;
-            bringup_phase_ = BringupPhase::Gate;
-            return BringupStatus::Arming;
-        }
         case BringupPhase::Gate: {
             // The real "synced" signal is the ABSENCE of Er74.1 (CLAUDE.md). WKC cannot
             // be full in SAFE-OP (the output SyncManager is inactive until OP), so the

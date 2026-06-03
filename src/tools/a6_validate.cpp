@@ -401,10 +401,6 @@ int main(int argc, char** argv) {
 
     const auto bringup_label = [](BringupStatus s) -> const char* {
         switch (s) {
-            case BringupStatus::Settling:
-                return "SETTLE";
-            case BringupStatus::Arming:
-                return "ARM";
             case BringupStatus::Gating:
                 return "GATE";
             case BringupStatus::AwaitingOp:

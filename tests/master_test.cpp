@@ -75,11 +75,10 @@ void write_ctrl(Master& m, std::uint16_t cw) {
 // Run the CiA402 enable ladder until OperationEnabled (or the cycle budget).
 // Returns true if OperationEnabled was reached.
 bool drive_to_op(Master& m) {
-    // Phase 1 (#20): configure() leaves the bus at SAFE-OP; drive the bring-up FSM
-    // (SETTLE -> ARM -> GATE -> request OP -> AWAIT_OP) to EtherCAT OPERATIONAL. On the
-    // sim, drive_sync_faulted is always false and full WKC is immediate, so this passes
-    // in ~dc_arm_settle_cycles + dc_op_gate_cycles (+1) cycles. A generous budget covers
-    // the default bounds.
+    // Phase 1 (#20): configure() leaves the bus at SAFE-OP with SYNC0 armed (PRE-OP);
+    // drive the bring-up FSM (GATE -> request OP -> AWAIT_OP) to EtherCAT OPERATIONAL. On
+    // the sim, drive_sync_faulted is always false and full WKC is immediate, so this
+    // passes in ~dc_op_gate_cycles (+1) cycles. A generous budget covers the default.
     bool op = false;
     for (int cycle = 0; cycle < 500; ++cycle) {
         const BringupStatus bs = m.bringup_step(/*drive_sync_faulted=*/false);
@@ -281,37 +280,30 @@ TEST("Master(#20): bringup_step drives SAFE-OP -> OPERATIONAL through the FSM ph
     master.configure();
     CHECK(!master.all_operational());  // #20: configure() stops at SAFE-OP, never requests OP
 
-    BringupStatus bs = BringupStatus::Settling;
-    bool saw_settling = false;
-    bool saw_arming = false;
+    BringupStatus bs = BringupStatus::Gating;
     bool saw_gating = false;
     for (int cycle = 0; cycle < 500; ++cycle) {
         bs = master.bringup_step(/*drive_sync_faulted=*/false);
-        saw_settling = saw_settling || bs == BringupStatus::Settling;
-        saw_arming = saw_arming || bs == BringupStatus::Arming;
         saw_gating = saw_gating || bs == BringupStatus::Gating;
         if (bs == BringupStatus::Operational) {
             break;
         }
     }
     CHECK(bs == BringupStatus::Operational);
-    CHECK(saw_settling);                // SETTLE pumped PD before arming
-    CHECK(saw_arming);                  // passed through the ARM transient
-    CHECK(saw_gating);                  // gated on (PD flowing + no Er74.1)
-    CHECK(master.all_operational());    // OP reached only after the gate + AWAIT_OP
+    CHECK(saw_gating);                // SYNC0 armed in configure(); the loop gated on (PD flowing + no Er74.1)
+    CHECK(master.all_operational());  // OP reached only after the gate + AWAIT_OP
     CHECK(!master.fault());
 }
 
 TEST("Master(#20): bringup_step aborts on Er74.1 in the gate and does NOT retry (no hammer)") {
     MasterConfig cfg = make_config();
-    cfg.use_distributed_clocks = true;  // exercise the SYNC0 ARM path
-    cfg.dc_arm_settle_cycles = 3;       // short SETTLE for the test
+    cfg.use_distributed_clocks = true;  // SYNC0 armed in configure(); the loop GATEs
     cfg.dc_op_gate_cycles = 50;
     Master master{cfg, std::make_unique<SimBackend>(make_models())};
     master.init();
     master.configure();
 
-    // Pump through SETTLE + ARM into the GATE with no fault...
+    // Pump a few healthy GATE cycles (gate_streak < 50, still gating)...
     for (int cycle = 0; cycle < 6; ++cycle) {
         (void)master.bringup_step(/*drive_sync_faulted=*/false);
     }

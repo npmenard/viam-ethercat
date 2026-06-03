@@ -282,17 +282,17 @@ void SoemBackend::configure_dc_configdc() {
 void SoemBackend::arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
     impl_->dc_cycle_ns = cycle_ns;  // remember it so close() disables SYNC0
 
-    // DC step 2 (AFTER SAFE-OP, called from the caller's RT loop while phase-locked PD
-    // is already flowing): arm SYNC0 with stock ecx_dcsync0. v2 + ec_sample proved this
-    // is all that's needed -- config_map_group lets the drive self-select DC sync-type,
-    // and ecx_dcsync0 writes the ESC SYNC0 activation (0x0981) + cycle (0x09A0) + start
-    // off the slave's live DC clock. No hand-rolled ESC sequence, no start-delay hack:
-    // because the caller pumps PD continuously, the drive sees synchronized traffic
-    // before and after the arm, so SYNC0 is never armed into a gap (CLAUDE.md).
+    // Arm SYNC0 with stock ecx_dcsync0, per ec_sample -- called in PRE-OP, BEFORE
+    // config_map_group. The A6 latches its SM sync-type (SM vs DC) at the PRE-OP->SAFE-OP
+    // transition based on whether SYNC0 is ALREADY armed: arm here and the drive
+    // self-selects DC (0x1C32:01 reads 2) and holds OP; arm only after SAFE-OP and the
+    // drive has already chosen SM-sync -> Er74.1 "no sync signal" ~1s into OP (bench:
+    // team-lead). No hasdc guard: hasdc is not set until config_map_group/configdc, and
+    // ec_sample arms unconditionally here (ecx_dcsync0 writes the ESC SYNC0 registers
+    // directly via configadr). The ~50ms-watchdog worry (CLAUDE.md lesson 5) does not
+    // bite: the arm sits in PRE-OP with the long config_map+configdc before OP, and the
+    // RT loop is pumping PD before SYNC0's first edge (stock 100ms SyncDelay).
     for (int i = 1; i <= impl_->ctx.slavecount; ++i) {
-        if (impl_->ctx.slavelist[i].hasdc == FALSE) {
-            throw InitError("slave " + std::to_string(i) + " is not DC-capable (hasdc=0) -- cannot enable SYNC0");
-        }
         ecx_dcsync0(&impl_->ctx, static_cast<std::uint16_t>(i), TRUE, cycle_ns, sync0_shift_ns);
     }
 }

@@ -40,9 +40,7 @@ struct FieldLocation {
 // or Aborted (surface the fault; do NOT immediately re-enter bring-up -- repeated
 // Er74 OP-entry wedges the A6, CLAUDE.md).
 enum class BringupStatus : std::uint8_t {
-    Settling,     // pumping phase-locked PD; DC clock coming live, not yet armed
-    Arming,       // SYNC0 armed this step (stock ecx_dcsync0)
-    Gating,       // armed; waiting for "no Er74.1" to hold K cycles before requesting OP
+    Gating,       // SYNC0 armed in configure(); pumping PD, waiting for "no Er74.1" to hold K cycles before OP
     AwaitingOp,   // OP requested; waiting for all slaves to reach OP with full WKC
     Operational,  // all slaves OPERATIONAL -- bring-up complete
     Aborted,      // a sync fault (Er74.1) appeared during the gate -- SYNC0 did not take
@@ -188,16 +186,13 @@ class Master {
 
     static std::map<std::uint32_t, FieldLocation> build_field_table(std::uint16_t slave, const PdoMap& map);
 
-    // Internal phases of the bring-up state machine (bringup_step). Distinct from the
-    // public BringupStatus so the "armed this step" edge (Arming) is a transient the
-    // caller sees once while the internal phase is already Gate.
-    enum class BringupPhase : std::uint8_t { Settle, Arm, Gate, AwaitOp, Done, Aborted };
-    BringupPhase bringup_phase_ = BringupPhase::Settle;  // RT-only
-    std::uint32_t bringup_settle_count_ = 0;             // RT-only: SETTLE cycles elapsed
-    std::uint32_t bringup_gate_streak_ = 0;              // RT-only: consecutive no-Er74.1 cycles in GATE
-    bool dc_enabled_ = false;                            // set in configure(): is SYNC0 in play?
-    std::uint32_t dc_cycle_ns_ = 0;                      // SYNC0 cycle = 1e9 / loop rate (set in configure())
-    std::int32_t dc_sync0_shift_ns_ = 0;                 // ecx_dcsync0 CyclShift (set in configure())
+    // Internal phases of the bring-up state machine (bringup_step). SYNC0 is armed in
+    // configure() (PRE-OP, per ec_sample), so the loop only GATEs on sync health then
+    // crosses to OP -- no Settle/Arm phases.
+    enum class BringupPhase : std::uint8_t { Gate, AwaitOp, Done, Aborted };
+    BringupPhase bringup_phase_ = BringupPhase::Gate;  // RT-only
+    std::uint32_t bringup_gate_streak_ = 0;            // RT-only: consecutive no-Er74.1 cycles in GATE
+    bool dc_enabled_ = false;                          // set in configure(): is SYNC0 in play? (gates the post-OP settle grace)
 
     MasterConfig config_;
     std::unique_ptr<EcatBackend> backend_;
