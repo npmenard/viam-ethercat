@@ -428,7 +428,13 @@ DcSyncStatus SoemBackend::dc_sync_status() noexcept {
     st.clock_locked = all_locked;
     st.sync0_active = all_armed;
     st.sync0_pulsing = all_pulsing;  // 0x098E toggled across polls => SYNC0 physically generating
-    st.ready = all_locked && all_armed;
+    // READY gates on PULSING, not merely ARMED. ec_dcsync0 sets the 0x0981 activation
+    // (0x0984) INSTANTLY, but schedules the FIRST SYNC0 edge ~100 ms out (SOEM
+    // SyncDelay). Requesting OP on 0x0984 alone lands BEFORE the first pulse -> the drive
+    // faults Er74.1 "no sync" -> the fault deactivates SYNC0 before it ever fires
+    // (0x0984 1->0, 0x098E forever static). So wait for real edges (0x098E toggling),
+    // which naturally rides out the SyncDelay; the drive tolerates the wait in SAFE-OP.
+    st.ready = all_locked && all_pulsing;
     return st;
 }
 

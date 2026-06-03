@@ -73,7 +73,8 @@ struct DcSyncStatus {
     bool sync0_active = false;          // every slave's 0x0984 b0 set (SYNC-out unit ARMED)
     bool sync0_pulsing = false;         // every slave's 0x098E changed since the PREVIOUS dc_sync_status() poll (SYNC0 physically firing)
     std::uint16_t al_status = 0;        // worst 0x0134 AL status code (0x2D = DC start invalid)
-    bool ready = false;                 // clock_locked && sync0_active on ALL slaves -> safe to request OP
+    bool ready = false;                 // clock_locked && sync0_PULSING on ALL slaves -> safe to request OP (NOT just armed:
+                                        // SYNC0's first edge is ~100ms after arm, so gate on real pulses to avoid a no-sync fault)
 };
 
 // Abstract EtherCAT bus backend. One instance per master/NIC. Setup methods run

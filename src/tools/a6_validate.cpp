@@ -484,7 +484,7 @@ int main(int argc, char** argv) {
     std::uint64_t arm_tick = 0;                          // tick at which we armed (cap is relative to this)
     constexpr int kArmAfterLockStreak = 200;             // arm SYNC0 once the master holds phase-lock this long (~200 ms)
     constexpr std::uint64_t kDcPollEvery = 50;           // poll dc_sync_status every 50 cycles (~20 Hz), ADDITIVE to PD
-    constexpr std::uint64_t kOpRequestCapCycles = 8000;  // ~8 s AFTER arming: SYNC0 never armed -> abort (failure path)
+    constexpr std::uint64_t kOpRequestCapCycles = 1000;  // ~1 s AFTER arming (10x SyncDelay): SYNC0 never PULSED -> abort
     // NOTE on 0x1C32:02 (RO SM cycle): on a CLEAN drive it reads 0 in SAFE-OP and is only
     // MEASURED/populated by the drive AT the OP transition (bench: the 999120 we chased
     // earlier was a polluted-drive residual). So we do NOT gate OP on it -- a "verify
@@ -577,30 +577,34 @@ int main(int argc, char** argv) {
             }
             if (dcs.sync0_active && !dc_sync_announced) {
                 std::cout << "[B] *** SYNC0 ARMED *** (0x0984 b0=1), clock " << (dcs.clock_locked ? "LOCKED" : "unlocked")
-                          << " (0x092C=" << dcs.sys_time_diff_ns << "ns)\n";
+                          << " (0x092C=" << dcs.sys_time_diff_ns
+                          << "ns) -- now waiting for the first PULSE (0x098E toggling, ~100ms out)\n";
                 dc_sync_announced = true;
             }
         }
 
-        // STEP 4 -- request OP once master-locked + SYNC0-armed + clock-locked (dc_ready).
-        // We deliberately do NOT gate on 0x1C32:02: on a clean drive it is 0 in SAFE-OP and
-        // is only measured AT the OP transition, so a verify-before-OP gate can never pass.
-        // The PRE-OP phase-lock is the actual fix -- the master crosses into SAFE-OP already
-        // locked, so the drive's OP-entry cycle measurement should be a clean 1 ms (no
-        // Er74.0). This is the real test of that hypothesis. The bounded give-up below is
-        // the safety net if the OP-entry measurement is still off (stops at ~2 s, no wedge).
+        // STEP 4 -- request OP once dc_ready, which now means master-locked + clock-locked
+        // + SYNC0 PHYSICALLY PULSING (0x098E toggling), NOT merely armed (0x0984=1). The
+        // arm bit is set instantly by ec_dcsync0, but the first SYNC0 edge is ~100 ms out
+        // (SyncDelay); requesting OP on the arm bit lands BEFORE the first pulse -> Er74.1
+        // "no sync" -> the fault deactivates SYNC0 before it ever fires. Waiting for real
+        // edges rides out the SyncDelay (the drive is fault-free in SAFE-OP). We do NOT
+        // gate on 0x1C32:02 (0 in SAFE-OP, measured only at OP entry); the PRE-OP lock
+        // makes that OP-entry measurement clean. The give-up below is the safety net.
         const bool cap_hit = dc_armed && tick >= arm_tick + kOpRequestCapCycles;
         if (!op_requested && dc_armed && dc_ready) {
             master.request_op();
             op_requested = true;
-            std::cout << "[B] DC-sync READY (master locked + SYNC0 armed + clock locked) -> requesting OP "
-                      << "(0x1C32:02 is measured at OP entry; PRE-OP lock should make it a clean 1ms)\n";
+            std::cout << "[B] DC-sync READY (clock locked + SYNC0 PULSING [0x098E toggling] + master locked) -> requesting OP "
+                      << "(SYNC0 is live, so the drive should not fault no-sync; 0x1C32:02 measured clean at OP entry)\n";
         } else if (!op_requested && dc_armed && cap_hit) {
-            // SYNC0 never armed within the cap. Arming was solved (d5ff073), so this is
-            // unexpected -- surface it but do NOT request OP into a no-SYNC0 state (Er74.1).
-            std::cout << "[B] !!! SYNC0 NEVER ARMED: 0x0984=0 through " << kOpRequestCapCycles
-                      << " cycles after the in-loop arm -- NOT requesting OP (would Er74.1). Unexpected (arming was solved); check the "
-                      << "[dc] arm readback (0x0981 activation) above.\n";
+            // SYNC0 armed (0x0984=1) but never PULSED (0x098E static) within ~1 s -- well
+            // past the ~100 ms first-edge. The ESC reports armed but is not generating
+            // edges -> genuine dead-ESC / start-time refusal (vendor/Arthur territory), NOT
+            // a too-early-OP timing miss. Do NOT request OP (would Er74.1). Abort cleanly.
+            std::cout << "[B] !!! SYNC0 ARMED BUT NEVER PULSED: 0x0984=1 but 0x098E static through " << kOpRequestCapCycles
+                      << " cycles (~1 s, >> the 100 ms first-edge) after the in-loop arm -- the ESC is not generating edges. NOT "
+                      << "requesting OP (would Er74.1). This is the genuine no-pulse case (ESC start-time / silicon -> vendor).\n";
             break;  // abort cleanly
         }
         // Full WKC == outputs processing == in OP with live command flow.
