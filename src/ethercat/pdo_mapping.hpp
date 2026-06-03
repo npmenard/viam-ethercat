@@ -116,6 +116,14 @@ struct MasterConfig {
     // before it fires. ~15 ms puts the first edge inside the watchdog window (master is
     // already phase-locked, so the start stays safely in the future). Bench-tunable.
     std::int64_t dc_sync_start_delay_ns = 15'000'000;
+    // Arm SYNC0 in PRE-OP (after the phase-lock), BEFORE requesting SAFE-OP, so SYNC0 is
+    // already FIRING (start_delay ~15 ms) when the drive validates its DC config at the
+    // PRE-OP->SAFE-OP transition. Required by a drive that (a) rejects SM-sync at OP with
+    // AL 0x0027 "freerun not supported" -- so DC sync-type (0x1C32:01=2) is mandatory --
+    // AND (b) AL 0x0030-rejects DC config at SAFE-OP unless SYNC0 is already pulsing. The
+    // synthesis: force DC type (postremap) + arm-firing-SYNC0 in PRE-OP. false = arm
+    // post-SAFE-OP (caller-driven / self-contained paths).
+    bool dc_arm_in_preop = false;
     // After the post-DC SDO writes (SM sync-type -> DC SYNC0), pump this many paced PD
     // cycles BEFORE requesting SAFE-OP so the drive APPLIES the DC config -- copies the
     // live ESC SYNC0 cycle (0x09A0) into the read-only CoE 0x1C32:02. Without it the

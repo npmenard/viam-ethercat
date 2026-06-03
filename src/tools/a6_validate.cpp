@@ -111,8 +111,12 @@ extern "C" void on_sigint(int) {
 // Build the PROFILE POSITION MasterConfig for one A6, mirroring
 // etc/a6-hardware.example.json (RxPDO 0x1600 = ctrl + target-pos + profile-vel;
 // TxPDO 0x1A00 = fault + status + mode-display + pos + vel + torque).
-MasterConfig build_a6_pp_config(
-    const std::string& ifname, std::int32_t dc_target_ns, std::int32_t dc_sync0_shift_ns, bool sm_dc_sync, std::int64_t dc_start_delay_ns) {
+MasterConfig build_a6_pp_config(const std::string& ifname,
+                                std::int32_t dc_target_ns,
+                                std::int32_t dc_sync0_shift_ns,
+                                bool sm_dc_sync,
+                                std::int64_t dc_start_delay_ns,
+                                bool arm_in_preop) {
     MasterConfig cfg;
     cfg.ifname = ifname;
     cfg.target_loop_rate_hz = 1000;                  // 1 ms SYNC0 = 4 x 250 us (A6-legal)
@@ -122,6 +126,7 @@ MasterConfig build_a6_pp_config(
     cfg.dc_sync_shift_ns = dc_target_ns;             // send-phase target (-1 = auto mid-cycle); --dc-target-ns sweep
     cfg.dc_sync0_shift_ns = dc_sync0_shift_ns;       // SYNC0 CyclShift; --dc-shift-ns sweep
     cfg.dc_sync_start_delay_ns = dc_start_delay_ns;  // first-edge delay (beats the A6 ~50ms watchdog); --dc-start-delay-ns
+    cfg.dc_arm_in_preop = arm_in_preop;              // arm SYNC0 in PRE-OP (firing before SAFE-OP); --arm-in-preop
     cfg.max_consecutive_wkc_errors = 5;
 
     SlaveConfig a6;
@@ -260,6 +265,7 @@ struct Options {
     std::int32_t dc_sync0_shift_ns = 0;           // SYNC0 CyclShift; sweep with --dc-shift-ns
     std::int64_t dc_start_delay_ns = 15'000'000;  // SYNC0 first-edge delay (beats A6 ~50ms watchdog); --dc-start-delay-ns
     bool sm_dc_sync = false;                      // --sm-dc-sync: write SM2/SM3 sync type = DC SYNC0 (Er74.1 fix)
+    bool arm_in_preop = false;                    // --arm-in-preop: arm SYNC0 (firing) in PRE-OP before SAFE-OP
 };
 
 }  // namespace
@@ -288,21 +294,27 @@ int main(int argc, char** argv) {
             opt.dc_sync0_shift_ns = std::stoi(args[++i]);  // SYNC0 CyclShift passed to ecx_dcsync0
         } else if (a == "--dc-start-delay-ns" && i + 1 < args.size()) {
             opt.dc_start_delay_ns = std::stoll(args[++i]);  // SYNC0 first-edge delay (vs SOEM's 100ms)
+        } else if (a == "--arm-in-preop") {
+            opt.arm_in_preop = true;  // arm SYNC0 (firing) in PRE-OP before SAFE-OP (synthesis path)
         } else if (a == "--sm-dc-sync") {
             opt.sm_dc_sync = true;  // write SM2/SM3 sync type = DC SYNC0 (targeted Er74.1 fix)
         } else if (a.rfind("--", 0) != 0) {
             opt.ifname = a;
         } else {
-            std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N]\n"
-                      << "                   [--dc-target-ns NS] [--dc-shift-ns NS] [--dc-start-delay-ns NS] [--sm-dc-sync]\n"
-                      << "  --dc-start-delay-ns: SYNC0 first-edge delay (default 15000000=15ms). The A6's sync\n"
-                      << "                  watchdog (~50ms) is shorter than SOEM's 100ms default, which would trip\n"
-                      << "                  'no sync' before the first edge; 15ms beats it. Raise toward ~40ms or lower\n"
-                      << "                  toward ~5ms if the bench shows the watchdog window differs.\n"
-                      << "  --dc-target-ns: master send-phase lock target within the 1ms cycle (-1=auto mid ~500000).\n"
-                      << "                  SWEEP on Er74.0 cycle-error: try 100000 (just after SYNC0) or 900000 (just\n"
-                      << "                  before) to find where the drive accepts the frame relative to its SYNC0 edge.\n"
-                      << "  --dc-shift-ns:  SYNC0 pulse CyclShift (ecx_dcsync0) -- moves the SYNC0 edge itself.\n";
+            std::cerr
+                << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N]\n"
+                << "                   [--dc-target-ns NS] [--dc-shift-ns NS] [--dc-start-delay-ns NS] [--sm-dc-sync] [--arm-in-preop]\n"
+                << "  --arm-in-preop: arm SYNC0 in PRE-OP so it is firing before SAFE-OP. Pair with --sm-dc-sync:\n"
+                << "                  the A6 needs DC sync-type (0x1C32:01=2) to run OP (else AL 0x0027) AND a\n"
+                << "                  pulsing SYNC0 at the SAFE-OP DC validation (else AL 0x0030). This is the synthesis.\n"
+                << "  --dc-start-delay-ns: SYNC0 first-edge delay (default 15000000=15ms). The A6's sync\n"
+                << "                  watchdog (~50ms) is shorter than SOEM's 100ms default, which would trip\n"
+                << "                  'no sync' before the first edge; 15ms beats it. Raise toward ~40ms or lower\n"
+                << "                  toward ~5ms if the bench shows the watchdog window differs.\n"
+                << "  --dc-target-ns: master send-phase lock target within the 1ms cycle (-1=auto mid ~500000).\n"
+                << "                  SWEEP on Er74.0 cycle-error: try 100000 (just after SYNC0) or 900000 (just\n"
+                << "                  before) to find where the drive accepts the frame relative to its SYNC0 edge.\n"
+                << "  --dc-shift-ns:  SYNC0 pulse CyclShift (ecx_dcsync0) -- moves the SYNC0 edge itself.\n";
             return 2;
         }
     }
@@ -329,10 +341,12 @@ int main(int argc, char** argv) {
 
     std::cout << "[dc] send-phase target = " << (opt.dc_target_ns < 0 ? "auto(mid-cycle)" : std::to_string(opt.dc_target_ns) + "ns")
               << " | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns | SYNC0 start delay = " << opt.dc_start_delay_ns << "ns"
-              << " | SM DC-sync write = " << (opt.sm_dc_sync ? "ON (0x1C32/33:01=2)" : "off") << "\n\n";
+              << " | SM DC-sync write = " << (opt.sm_dc_sync ? "ON (0x1C32/33:01=2)" : "off")
+              << " | arm = " << (opt.arm_in_preop ? "PRE-OP (firing before SAFE-OP)" : "post-SAFE-OP in-loop") << "\n\n";
 
-    Master master(build_a6_pp_config(opt.ifname, opt.dc_target_ns, opt.dc_sync0_shift_ns, opt.sm_dc_sync, opt.dc_start_delay_ns),
-                  std::make_unique<SoemBackend>());
+    Master master(
+        build_a6_pp_config(opt.ifname, opt.dc_target_ns, opt.dc_sync0_shift_ns, opt.sm_dc_sync, opt.dc_start_delay_ns, opt.arm_in_preop),
+        std::make_unique<SoemBackend>());
 
     // --- Stage A: open + enumerate + read-only SDO identity (PRE-OP) ---
     try {
@@ -488,7 +502,7 @@ int main(int argc, char** argv) {
     int healthy_hold_streak = 0;                         // consecutive cycles fault-free + clock-locked in SAFE-OP (OP gate)
     constexpr int kPersistentFaultGiveUp = 2000;         // ~2 s faulted in OP despite reset -> STOP (protect the drive)
     constexpr int kHealthyHoldCycles = 200;              // ~200 ms fault-free + clock-locked in SAFE-OP -> safe to request OP
-    bool dc_armed = false;                               // SYNC0 armed in-loop yet?
+    bool dc_armed = opt.arm_in_preop;                    // SYNC0 armed yet? (already true if configure() armed it in PRE-OP)
     std::int64_t sm_cycle = -1;                          // latest 0x1C32:02 read (ns), -1 = not yet read (DIAGNOSTIC only)
     std::uint64_t arm_tick = 0;                          // tick at which we armed (cap is relative to this)
     constexpr int kArmAfterLockStreak = 200;             // arm SYNC0 once the master holds phase-lock this long (~200 ms)

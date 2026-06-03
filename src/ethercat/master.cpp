@@ -206,9 +206,29 @@ void Master::configure(bool reach_op) {
                                kDcPreopLockStreak,
                                preop_streak >= kDcPreopLockStreak ? " -> LOCKED" : " -> NOT locked (cap hit)");
 
-            // Cross into SAFE-OP with the master ALREADY locked, then keep pumping
-            // through the drive's cycle-measurement window so the value it latches into
-            // 0x1C32:02 is the clean locked 1 ms.
+            // SYNTHESIS (arm-in-PRE-OP): arm SYNC0 NOW, on the locked clock, so it is
+            // already FIRING (start_delay ~15 ms) when we request SAFE-OP. A drive that
+            // needs DC sync-type to run OP (else AL 0x0027) AND rejects DC config at the
+            // SAFE-OP transition unless SYNC0 is pulsing (AL 0x0030) needs exactly this:
+            // force 0x1C32:01=2 (postremap, already applied) + a live SYNC0 at the PS
+            // validation. Apply the post-DC cycle handshake here too (0x09A0 is live now),
+            // then pump past the start delay so edges are firing before SAFE-OP.
+            if (config_.dc_arm_in_preop) {
+                backend_->arm_dc_sync(cycle_ns, config_.dc_sync0_shift_ns, config_.dc_sync_start_delay_ns);
+                for (const SlaveConfig& sc : config_.slaves) {
+                    apply_sdo_writes(sc.slave_id, sc.postdc_sdo_writes);
+                }
+                const auto fire_cycles = static_cast<std::uint32_t>(config_.dc_sync_start_delay_ns / static_cast<std::int64_t>(cycle_ns)) +
+                                         kDcSafeopMeasureCycles;
+                (void)phase_lock_pump(cycle_ns, dc_shift, fire_cycles, 0, next, dc_integral);
+                (void)std::fprintf(stderr,
+                                   "[ethercat] armed SYNC0 in PRE-OP (start delay %lld ns); SYNC0 firing before SAFE-OP request\n",
+                                   static_cast<long long>(config_.dc_sync_start_delay_ns));
+            }
+
+            // Cross into SAFE-OP with the master ALREADY locked (and, in arm-in-PRE-OP
+            // mode, SYNC0 already firing), then keep pumping through the drive's
+            // cycle-measurement window so the value it latches into 0x1C32:02 is clean.
             backend_->request_state(0, EcatState::SafeOp);
             // RE-BASE the deadline: request_state() blocks on the AL statecheck WITHOUT
             // pumping process data, so `next` is now several ms in the PAST. Without this
@@ -223,11 +243,10 @@ void Master::configure(bool reach_op) {
             backend_->request_state(0, EcatState::SafeOp);
         }
 
-        // DC step 2: arm SYNC0 -- ONLY on the self-contained path (reach_op=true, e.g. the
-        // module). On the caller-driven path (reach_op=false, e.g. a6_validate) the arm is
-        // DEFERRED to the caller's RT loop via Master::arm_dc_sync(), which arms a few
-        // cycles in once it has re-confirmed phase-lock.
-        if (reach_op) {
+        // DC step 2: arm SYNC0 post-SAFE-OP -- ONLY on the self-contained path
+        // (reach_op=true) AND when not already armed in PRE-OP. On the caller-driven path
+        // (reach_op=false, e.g. a6_validate) the arm is DEFERRED to the caller's RT loop.
+        if (reach_op && !config_.dc_arm_in_preop) {
             backend_->configure_dc_sync(cycle_ns, config_.dc_sync0_shift_ns, config_.dc_sync_start_delay_ns);
         }
     } else {
@@ -238,10 +257,10 @@ void Master::configure(bool reach_op) {
     // :08 Get-Cycle) that populates the read-only 0x1C32:02 the drive validates. Needs
     // the ESC cycle register 0x09A0 live, i.e. AFTER the SYNC0 arm. (0x1C32:01 = DC-mode
     // switch stays in postremap, PRE-OP -- writable only before configdc.) Applied here
-    // ONLY on the self-contained path (reach_op=true): the arm has already run above. On
-    // the caller-driven path (reach_op=false) the arm is deferred to the caller's RT
-    // loop, so the caller applies these post-arm via Master::apply_postdc_writes().
-    if (reach_op) {
+    // ONLY on the self-contained path (reach_op=true) and NOT arm-in-PRE-OP (which
+    // already applied them above, after the PRE-OP arm). On the caller-driven path the
+    // arm is deferred to the caller's RT loop, which applies these via apply_postdc_writes().
+    if (reach_op && !config_.dc_arm_in_preop) {
         for (const SlaveConfig& sc : config_.slaves) {
             apply_sdo_writes(sc.slave_id, sc.postdc_sdo_writes);
         }
