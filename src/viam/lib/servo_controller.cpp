@@ -772,6 +772,10 @@ bool ServoController::is_disconnected() const noexcept {
     return stopping_.load(std::memory_order_acquire) || watchdog_expired();
 }
 
+std::uint64_t ServoController::loop_cycle() const noexcept {
+    return state_.loop_cycle.load(std::memory_order_relaxed);
+}
+
 std::int32_t ServoController::velocity_counts() const noexcept {
     return state_.velocity.load(std::memory_order_relaxed);
 }

@@ -547,18 +547,54 @@ TEST("ServoController(#18): clear-then-refault flicker -> give-up (not false rec
     sim->inject_fault(1);
     CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));
 
+    const std::uint64_t c0 = ctrl.loop_cycle();
     ctrl.request_fault_reset();
     // The give-up latches the CTRL verdict; the flickering drive settles back to Fault
     // after its final momentary clear (the live #16 drive tier is only present while
     // dev==Fault), so poll until BOTH tiers compose -- a flicker yields give-up, not
-    // recovery.
+    // recovery. Generous wall-clock BACKSTOP only (real bound is the cycle delta below).
     CHECK(wait_until(
         [&] {
             const std::string e = ctrl.last_error();
             return e.find("fault-reset ineffective") != std::string::npos && e.find("0x6320") != std::string::npos;
         },
-        std::chrono::milliseconds(2000)));
+        std::chrono::milliseconds(5000)));
     CHECK(!ctrl.is_powered());
+    // CYCLE-BASED BOUND (not wall-time): the give-up must land within ~1.5x the window.
+    // A regression that decremented reset_cycles_remaining_ only on Fault cycles would let
+    // the flicker (half the cycles are momentary clears) stretch the give-up to ~2x the
+    // window -- this blows the cycle bound even though a loose wall-clock timeout might
+    // still pass on a fast loop. (window=200 default; +K +enable-ladder +poll latency.)
+    const std::uint64_t elapsed = ctrl.loop_cycle() - c0;
+    CHECK(elapsed < cfg.fault_reset_window_cycles * 3 / 2);
+}
+
+// (4b) Sanity companion: a LARGE hold -- the clear holds past K, the drive reaches
+// Operational (true recovery), THEN re-faults later. That later fault is a NEW episode
+// -> generic Faulted with the live #16 code, NOT FaultResetFailed (which would wrongly
+// blame the reset). Pins the new-fault-after-recovery boundary.
+TEST("ServoController(#18): clear that HOLDS past K recovers, a later refault is a new fault") {
+    SimBackend* sim = nullptr;
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
+    cfg.fault_code_labels = {{0x6320, "Er74.0 / cycle error"}};
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim, /*feedback=*/true)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    // Hold the clear far past K (3) so it CONFIRMS -> recovers to Operational...
+    sim->set_fault_clear_then_refault(1, 100);
+    sim->set_fault_code(1, 0x6320);
+    sim->inject_fault(1);
+    CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.request_fault_reset();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(2000)));  // confirmed recovery
+
+    // ...then the type-c re-fault fires (~100 cycles after the clear) -> a NEW fault while
+    // Operational -> Faulted with the live drive code, but NOT the FaultResetFailed verdict.
+    CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(2000)));
+    const std::string err = ctrl.last_error();
+    CHECK(err.find("0x6320") != std::string::npos);                   // live drive tier (new fault)
+    CHECK(err.find("fault-reset ineffective") == std::string::npos);  // NOT a reset failure
 }
 
 // (5) Type-(b) then cause removed: a fresh reset recovers once the cause is gone.

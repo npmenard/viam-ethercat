@@ -125,6 +125,10 @@ class ServoController {
     // Viam units (the 0x606C scaling is a drive-unit question, applied there, not
     // here). master_-free + lock-free, symmetric with position_revs().
     std::int32_t velocity_counts() const noexcept;
+    // RT loop heartbeat counter (cycles since start). Lock-free atomic read, master_-free.
+    // For tests that need a CYCLE-based bound (e.g. #18: assert a give-up happens within
+    // N loop-cycles, robust to the async loop's wall-clock rate under TSan/SCHED_OTHER).
+    std::uint64_t loop_cycle() const noexcept;
 
    private:
     // --- lifecycle FSM (std::variant; each state's step() in the .cpp) ---
