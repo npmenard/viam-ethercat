@@ -236,9 +236,14 @@ class TxStaging {
     std::atomic<std::uint32_t> reading_{kNone};              // slot the RT reader is copying (hazard cell)
     std::size_t size_;
     std::array<std::array<std::byte, kMaxPdoBytes>, 3> slots_{};
-    // Debug-only single-writer tripwire (see TRIPWIRE above). [[maybe_unused]]
-    // because the guard compiles out under NDEBUG.
-    [[maybe_unused]] std::atomic<bool> staging_{false};
+    // Debug-only single-writer tripwire (see TRIPWIRE above): the member EXISTS only
+    // in debug builds, where stage_outputs's #ifndef NDEBUG reentrancy guard uses it.
+    // Guarding the member to match its uses (rather than tagging it [[maybe_unused]])
+    // keeps it conforming on GCC, whose -Werror=attributes rejects [[maybe_unused]] on
+    // a non-static data member -- and leaves no unused field under NDEBUG on clang.
+#ifndef NDEBUG
+    std::atomic<bool> staging_{false};
+#endif
 };
 
 // ----------------------------------------------------------------------------
