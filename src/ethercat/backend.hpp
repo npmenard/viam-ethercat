@@ -145,20 +145,25 @@ class EcatBackend {
     // phase offset (ecx_dcsync0 CyclShift): the SYNC0 edge fires `sync0_shift_ns` after
     // the DC base time. Tune it (with the master's send phase) so the drive latches a
     // FRESH output frame at SYNC0.
-    virtual void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
+    // `start_delay_ns` replaces SOEM's hardcoded 100 ms SyncDelay: how far in the future
+    // the FIRST SYNC0 edge is scheduled. Short (~15 ms) so a drive whose sync watchdog is
+    // < 100 ms (the A6) sees the first pulse before its watchdog trips.
+    virtual void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns, std::int64_t start_delay_ns) {
         (void)cycle_ns;
         (void)sync0_shift_ns;
+        (void)start_delay_ns;
     }
 
-    // DC step 2, IN-LOOP variant for the caller-driven path: ecx_dcsync0 ONLY, no prime
+    // DC step 2, IN-LOOP variant for the caller-driven path: arm SYNC0 ONLY, no prime
     // pump (the caller's RT loop is ALREADY pumping phase-locked PD). Call a few cycles
     // into the SAFE-OP loop, once synchronized PD is flowing AND the master is phase-
     // locking, so the drive arms SYNC0 against a live, disciplined clock it has just
-    // proven in sync -- which is what a DC drive (the A6) requires before it will
-    // generate SYNC0 / permit OP. Default no-op (sim / free-run drives).
-    virtual void arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
+    // proven in sync. `start_delay_ns` = first-edge delay (see configure_dc_sync).
+    // Default no-op (sim / free-run drives).
+    virtual void arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns, std::int64_t start_delay_ns) {
         (void)cycle_ns;
         (void)sync0_shift_ns;
+        (void)start_delay_ns;
     }
 
     // Distributed-Clock system time (ns) latched at the last exchange(), for

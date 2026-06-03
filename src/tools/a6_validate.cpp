@@ -111,15 +111,17 @@ extern "C" void on_sigint(int) {
 // Build the PROFILE POSITION MasterConfig for one A6, mirroring
 // etc/a6-hardware.example.json (RxPDO 0x1600 = ctrl + target-pos + profile-vel;
 // TxPDO 0x1A00 = fault + status + mode-display + pos + vel + torque).
-MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_target_ns, std::int32_t dc_sync0_shift_ns, bool sm_dc_sync) {
+MasterConfig build_a6_pp_config(
+    const std::string& ifname, std::int32_t dc_target_ns, std::int32_t dc_sync0_shift_ns, bool sm_dc_sync, std::int64_t dc_start_delay_ns) {
     MasterConfig cfg;
     cfg.ifname = ifname;
-    cfg.target_loop_rate_hz = 1000;             // 1 ms SYNC0 = 4 x 250 us (A6-legal)
-    cfg.use_distributed_clocks = true;          // A6 supports ONLY DC sync
-    cfg.dc_lock_cycles = 2000;                  // up to 2 s phase-locking warmup -> enter OP aligned
-    cfg.dc_settle_cycles = 1000;                // ~1 s post-OP grace while the phase finishes locking
-    cfg.dc_sync_shift_ns = dc_target_ns;        // send-phase target (-1 = auto mid-cycle); --dc-target-ns sweep
-    cfg.dc_sync0_shift_ns = dc_sync0_shift_ns;  // SYNC0 CyclShift; --dc-shift-ns sweep
+    cfg.target_loop_rate_hz = 1000;                  // 1 ms SYNC0 = 4 x 250 us (A6-legal)
+    cfg.use_distributed_clocks = true;               // A6 supports ONLY DC sync
+    cfg.dc_lock_cycles = 2000;                       // up to 2 s phase-locking warmup -> enter OP aligned
+    cfg.dc_settle_cycles = 1000;                     // ~1 s post-OP grace while the phase finishes locking
+    cfg.dc_sync_shift_ns = dc_target_ns;             // send-phase target (-1 = auto mid-cycle); --dc-target-ns sweep
+    cfg.dc_sync0_shift_ns = dc_sync0_shift_ns;       // SYNC0 CyclShift; --dc-shift-ns sweep
+    cfg.dc_sync_start_delay_ns = dc_start_delay_ns;  // first-edge delay (beats the A6 ~50ms watchdog); --dc-start-delay-ns
     cfg.max_consecutive_wkc_errors = 5;
 
     SlaveConfig a6;
@@ -254,9 +256,10 @@ struct Options {
     double move_revs = 0.0;
     double move_rpm = 60.0;
     int seconds = 6;
-    std::int32_t dc_target_ns = -1;      // send-phase lock target (-1 = auto mid-cycle); sweep with --dc-target-ns
-    std::int32_t dc_sync0_shift_ns = 0;  // SYNC0 CyclShift; sweep with --dc-shift-ns
-    bool sm_dc_sync = false;             // --sm-dc-sync: write SM2/SM3 sync type = DC SYNC0 (Er74.1 fix)
+    std::int32_t dc_target_ns = -1;               // send-phase lock target (-1 = auto mid-cycle); sweep with --dc-target-ns
+    std::int32_t dc_sync0_shift_ns = 0;           // SYNC0 CyclShift; sweep with --dc-shift-ns
+    std::int64_t dc_start_delay_ns = 15'000'000;  // SYNC0 first-edge delay (beats A6 ~50ms watchdog); --dc-start-delay-ns
+    bool sm_dc_sync = false;                      // --sm-dc-sync: write SM2/SM3 sync type = DC SYNC0 (Er74.1 fix)
 };
 
 }  // namespace
@@ -283,13 +286,19 @@ int main(int argc, char** argv) {
             opt.dc_target_ns = std::stoi(args[++i]);  // send-phase lock target (-1 = auto mid-cycle)
         } else if (a == "--dc-shift-ns" && i + 1 < args.size()) {
             opt.dc_sync0_shift_ns = std::stoi(args[++i]);  // SYNC0 CyclShift passed to ecx_dcsync0
+        } else if (a == "--dc-start-delay-ns" && i + 1 < args.size()) {
+            opt.dc_start_delay_ns = std::stoll(args[++i]);  // SYNC0 first-edge delay (vs SOEM's 100ms)
         } else if (a == "--sm-dc-sync") {
             opt.sm_dc_sync = true;  // write SM2/SM3 sync type = DC SYNC0 (targeted Er74.1 fix)
         } else if (a.rfind("--", 0) != 0) {
             opt.ifname = a;
         } else {
             std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N]\n"
-                      << "                   [--dc-target-ns NS] [--dc-shift-ns NS] [--sm-dc-sync]\n"
+                      << "                   [--dc-target-ns NS] [--dc-shift-ns NS] [--dc-start-delay-ns NS] [--sm-dc-sync]\n"
+                      << "  --dc-start-delay-ns: SYNC0 first-edge delay (default 15000000=15ms). The A6's sync\n"
+                      << "                  watchdog (~50ms) is shorter than SOEM's 100ms default, which would trip\n"
+                      << "                  'no sync' before the first edge; 15ms beats it. Raise toward ~40ms or lower\n"
+                      << "                  toward ~5ms if the bench shows the watchdog window differs.\n"
                       << "  --dc-target-ns: master send-phase lock target within the 1ms cycle (-1=auto mid ~500000).\n"
                       << "                  SWEEP on Er74.0 cycle-error: try 100000 (just after SYNC0) or 900000 (just\n"
                       << "                  before) to find where the drive accepts the frame relative to its SYNC0 edge.\n"
@@ -319,10 +328,11 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[dc] send-phase target = " << (opt.dc_target_ns < 0 ? "auto(mid-cycle)" : std::to_string(opt.dc_target_ns) + "ns")
-              << " | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns"
+              << " | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns | SYNC0 start delay = " << opt.dc_start_delay_ns << "ns"
               << " | SM DC-sync write = " << (opt.sm_dc_sync ? "ON (0x1C32/33:01=2)" : "off") << "\n\n";
 
-    Master master(build_a6_pp_config(opt.ifname, opt.dc_target_ns, opt.dc_sync0_shift_ns, opt.sm_dc_sync), std::make_unique<SoemBackend>());
+    Master master(build_a6_pp_config(opt.ifname, opt.dc_target_ns, opt.dc_sync0_shift_ns, opt.sm_dc_sync, opt.dc_start_delay_ns),
+                  std::make_unique<SoemBackend>());
 
     // --- Stage A: open + enumerate + read-only SDO identity (PRE-OP) ---
     try {

@@ -228,7 +228,7 @@ void Master::configure(bool reach_op) {
         // DEFERRED to the caller's RT loop via Master::arm_dc_sync(), which arms a few
         // cycles in once it has re-confirmed phase-lock.
         if (reach_op) {
-            backend_->configure_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);
+            backend_->configure_dc_sync(cycle_ns, config_.dc_sync0_shift_ns, config_.dc_sync_start_delay_ns);
         }
     } else {
         backend_->request_state(0, EcatState::SafeOp);
@@ -359,7 +359,7 @@ int Master::phase_lock_pump(std::uint32_t cycle_ns,
 void Master::arm_dc_sync() noexcept {
     const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
     try {
-        backend_->arm_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);  // ecx_dcsync0, no prime (the caller pumps)
+        backend_->arm_dc_sync(cycle_ns, config_.dc_sync0_shift_ns, config_.dc_sync_start_delay_ns);  // short start delay, no prime
     } catch (const std::exception& e) {
         (void)std::fprintf(stderr, "[ethercat] arm_dc_sync failed: %s\n", e.what());
     }

@@ -298,7 +298,7 @@ void SoemBackend::configure_dc_configdc() {
     }
 }
 
-void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
+void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns, std::int64_t start_delay_ns) {
     // Self-contained arm (configure(reach_op=true) path): PRIME a few exchanges so the
     // slave's DC clock (0x0910) is live + forward-moving, THEN arm. The caller-driven
     // path uses arm_dc_sync() directly -- its RT loop is already pumping.
@@ -308,33 +308,52 @@ void SoemBackend::configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_s
         const timespec ts{.tv_sec = 0, .tv_nsec = static_cast<long>(cycle_ns)};
         (void)nanosleep(&ts, nullptr);
     }
-    arm_dc_sync(cycle_ns, sync0_shift_ns);
+    arm_dc_sync(cycle_ns, sync0_shift_ns, start_delay_ns);
 }
 
-void SoemBackend::arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
+void SoemBackend::arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns, std::int64_t start_delay_ns) {
     impl_->dc_cycle_ns = cycle_ns;  // pace the upcoming OP-transition PD pump at this period
 
     // DC step 2 (AFTER SAFE-OP, no prime -- the caller's loop is pumping): arm SYNC0.
-    // ecx_dcsync0 computes the SYNC0 start time from the slave's LIVE local DC system
-    // time (FPRD of 0x0910 at call time), so it MUST be called on a forward-moving
-    // clock. The caller keeps pumping phase-locked PD (carrying the FRMW DC datagram)
-    // and polls dc_sync_status until clock-locked + SYNC0-armed, THEN requests OP.
+    // This is ec_dcsync0's exact ESC register sequence, BUT with a configurable
+    // `start_delay_ns` instead of SOEM's hardcoded 100 ms SyncDelay (ethercatdc.c:24).
+    // The A6's sync watchdog (~50 ms) is SHORTER than 100 ms, so with the stock delay the
+    // drive trips Er74.1 "no sync" in SAFE-OP ~50 ms after arm -- BEFORE the first edge is
+    // due at +100 ms -- and the fault deactivates SYNC0 before it ever fires. A ~15 ms
+    // start delay puts the first edge inside the watchdog window. The start is computed
+    // from the slave's LIVE local DC time (FPRD 0x0910), so the master must already be
+    // pumping (it is -- caller's RT loop). (bench: team-lead.)
     for (int i = 1; i <= impl_->slavecount; ++i) {
         if (impl_->slavelist[i].hasdc == FALSE) {
             throw InitError("slave " + std::to_string(i) + " is not DC-capable (hasdc=0) -- cannot enable SYNC0");
         }
-        const auto si = static_cast<std::uint16_t>(i);
-        // SYNC0 on, `cycle_ns` period, `sync0_shift_ns` CyclShift. The A6 is SYNC0-ONLY
-        // (manual: activation 0x0981 = 0x03 = cyclic+SYNC0, SYNC1 off), so plain
-        // ecx_dcsync0. SOEM writes ESC 0x0980/0x0981/0x0990/0x09A0 to activate the
-        // cyclic pulse `shift` after the DC base time.
-        ecx_dcsync0(&impl_->ctx, si, TRUE, cycle_ns, sync0_shift_ns);
+        const std::uint16_t adp = impl_->slavelist[i].configadr;
+        // ec_dcsync0 sequence with the short start delay (A6 is SYNC0-only: activation
+        // 0x0981 = 0x03 = cyclic + SYNC0, SYNC1 off).
+        std::uint8_t ra = 0;
+        (void)ecx_FPWR(&impl_->port, adp, 0x0981, sizeof(ra), &ra, EC_TIMEOUTRET);  // stop cyclic op
+        std::uint8_t h = 0;
+        (void)ecx_FPWR(&impl_->port, adp, 0x0980, sizeof(h), &h, EC_TIMEOUTRET);  // ECAT (not PDI) controls the SYNC unit
+        std::int64_t t1 = 0;
+        (void)ecx_FPRD(&impl_->port, adp, 0x0910, sizeof(t1), &t1, EC_TIMEOUTRET);  // live local DC system time
+        t1 = etohll(t1);
+        const std::int64_t cyc = static_cast<std::int64_t>(cycle_ns);
+        std::int64_t start = cyc > 0 ? (((t1 + start_delay_ns) / cyc) * cyc) + cyc + sync0_shift_ns : t1 + start_delay_ns + sync0_shift_ns;
+        start = static_cast<std::int64_t>(htoell(static_cast<uint64>(start)));
+        (void)ecx_FPWR(&impl_->port, adp, 0x0990, sizeof(start), &start, EC_TIMEOUTRET);  // SYNC0 start time (8 B)
+        std::int32_t tc = static_cast<std::int32_t>(htoel(cycle_ns));
+        (void)ecx_FPWR(&impl_->port, adp, 0x09A0, sizeof(tc), &tc, EC_TIMEOUTRET);  // SYNC0 cycle time (4 B)
+        ra = 0x03;
+        (void)ecx_FPWR(&impl_->port, adp, 0x0981, sizeof(ra), &ra, EC_TIMEOUTRET);  // activate cyclic + SYNC0
+        // Mirror ec_dcsync0's slave bookkeeping.
+        impl_->slavelist[i].DCactive = TRUE;
+        impl_->slavelist[i].DCshift = sync0_shift_ns;
+        impl_->slavelist[i].DCcycle = static_cast<int32>(cycle_ns);
 
         // Immediate silicon readback: confirm the activation WRITE took (0x0981 b1) and
-        // the start time is a sane near-future. The SYNC0-out unit will not show ARMED
-        // (0x0984) yet -- the start is ~100 ms out and the drive must first observe
-        // synchronized PD -- so arm/lock evidence is the CALLER's dc_sync_status poll.
-        const std::uint16_t adp = impl_->slavelist[i].configadr;
+        // the start time is a sane near-future. The SYNC-out unit will not show ARMED
+        // (0x0984) until the first edge -- ~`start_delay_ns` out -- so the arm/PULSING
+        // evidence is the CALLER's dc_sync_status poll (0x098E toggling).
         std::uint8_t cyclic_ctrl = 0;  // 0x0980 cyclic unit control
         std::uint8_t activation = 0;   // 0x0981 activation: b0 cyclic, b1 SYNC0, b2 SYNC1
         std::uint16_t al_status = 0;   // 0x0134 AL status code (0x2D = DC start time invalid)

@@ -109,6 +109,13 @@ struct MasterConfig {
     // WHERE in the cycle the drive latches our output relative to its SYNC0 -- the A6
     // wants a FRESH frame just before SYNC0, not a stale mid-cycle one. Bench-swept.
     std::int32_t dc_sync0_shift_ns = 0;
+    // SYNC0 first-edge START DELAY (ns) -- how far in the future the SYNC0 arm schedules
+    // the FIRST pulse, replacing SOEM ec_dcsync0's hardcoded 100 ms SyncDelay. A drive
+    // whose sync watchdog is SHORTER than 100 ms (the A6 ~50 ms) trips "no sync" in
+    // SAFE-OP before SOEM's first edge is even due, and the fault deactivates SYNC0
+    // before it fires. ~15 ms puts the first edge inside the watchdog window (master is
+    // already phase-locked, so the start stays safely in the future). Bench-tunable.
+    std::int64_t dc_sync_start_delay_ns = 15'000'000;
     // After the post-DC SDO writes (SM sync-type -> DC SYNC0), pump this many paced PD
     // cycles BEFORE requesting SAFE-OP so the drive APPLIES the DC config -- copies the
     // live ESC SYNC0 cycle (0x09A0) into the read-only CoE 0x1C32:02. Without it the

@@ -34,8 +34,8 @@ class SoemBackend final : public EcatBackend {
     void set_state(std::uint16_t slave, EcatState target) noexcept override;
     EcatState slave_state(std::uint16_t slave) const override;
     void configure_dc_configdc() override;
-    void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) override;
-    void arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) override;
+    void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns, std::int64_t start_delay_ns) override;
+    void arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns, std::int64_t start_delay_ns) override;
     std::int64_t dc_time() const noexcept override;
     DcSyncStatus dc_sync_status() noexcept override;
 
