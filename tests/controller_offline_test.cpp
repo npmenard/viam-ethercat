@@ -453,4 +453,137 @@ TEST("ServoController(#16): unmapped 0x603F/0x606C -> no OOB; velocity falls bac
     CHECK(wait_until([&] { return ctrl.velocity_counts() != 0; }, std::chrono::milliseconds(500)));
 }
 
+// --- #18: fault-reset Resetting sub-state (real-HW recovery) -------------------
+
+// (1) Type-(a) reflect latency: ONE fault_reset recovers across the drive's clear
+// delay. This is the regression guard -- the un-fixed FSM strands in Faulted here
+// (Enabling bounces on the still-Fault drive, the one-shot reset is consumed).
+TEST("ServoController(#18): type-(a) reflect latency -- ONE fault_reset recovers (regression)") {
+    SimBackend* sim = nullptr;
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    CHECK(sim != nullptr);
+
+    sim->set_fault_clear_delay(1, 30);  // accept the reset, reflect the clear after 30 cycles (< 200 window)
+    sim->inject_fault(1);
+    CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));  // faulted
+
+    ctrl.request_fault_reset();  // ONE reset -> Resetting holds the intent across the latency
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(1500)));
+
+    ctrl.go_to(600.0, 1.0);  // fully recovered: a subsequent command works
+    CHECK(ctrl.is_powered());
+}
+
+// (2) Window boundary: a delay comfortably inside the window recovers; a delay far
+// beyond it gives up (stays not-powered + the CTRL diagnostic surfaces).
+TEST("ServoController(#18): recovers below the window, gives up above it") {
+    {
+        SimBackend* sim = nullptr;
+        ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
+        ctrl.start();
+        CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+        sim->set_fault_clear_delay(1, 150);  // inside the 200-cycle window
+        sim->inject_fault(1);
+        CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+        ctrl.request_fault_reset();
+        CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(2000)));  // recovers
+    }
+    {
+        SimBackend* sim = nullptr;
+        ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
+        ctrl.start();
+        CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+        sim->set_fault_clear_delay(1, 100000);  // never reflects within the window
+        sim->inject_fault(1);
+        CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+        ctrl.request_fault_reset();
+        CHECK(wait_until([&] { return ctrl.last_error().find("fault-reset ineffective") != std::string::npos; },
+                         std::chrono::milliseconds(2000)));  // gave up
+        CHECK(!ctrl.is_powered());
+    }
+}
+
+// (3) Type-(b) persistent cause: window expires -> give-up, and last_error composes
+// BOTH tiers -- the live drive code (#16) + the CTRL reset verdict.
+TEST("ServoController(#18): persistent-cause give-up -- last_error composes drive + CTRL tiers") {
+    SimBackend* sim = nullptr;
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
+    cfg.fault_code_labels = {{0x6320, "Er74.0 / cycle error"}};  // gloss for the compose
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim, /*feedback=*/true)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    sim->set_fault_persistent(1, true);  // cause stays active -- no reset clears it
+    sim->set_fault_code(1, 0x6320);
+    sim->inject_fault(1);
+    CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    ctrl.request_fault_reset();  // window expires -> give-up
+    CHECK(wait_until([&] { return ctrl.last_error().find("fault-reset ineffective") != std::string::npos; },
+                     std::chrono::milliseconds(2000)));
+    const std::string err = ctrl.last_error();
+    CHECK(err.find("0x6320") != std::string::npos);                   // #16 drive tier, STILL live
+    CHECK(err.find("fault-reset ineffective") != std::string::npos);  // CTRL tier verdict
+    CHECK(!ctrl.is_powered());
+}
+
+// (4) Type-(b) then cause removed: a fresh reset recovers once the cause is gone.
+TEST("ServoController(#18): once the persistent cause is removed, a reset recovers") {
+    SimBackend* sim = nullptr;
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    sim->set_fault_persistent(1, true);
+    sim->inject_fault(1);
+    CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.request_fault_reset();
+    CHECK(wait_until([&] { return ctrl.last_error().find("fault-reset ineffective") != std::string::npos; },
+                     std::chrono::milliseconds(2000)));  // gave up
+
+    sim->set_fault_persistent(1, false);  // cause removed
+    ctrl.request_fault_reset();           // a NEW reset now clears
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(2000)));
+}
+
+// (5) No-spin guarantee (DA's lane): after a give-up, the FSM does NOT self-issue
+// resets -- removing the cause WITHOUT a new fault_reset must NOT auto-recover; only
+// an explicit reset does. Proves the post-give-up state is steady Faulted, not a spin.
+TEST("ServoController(#18): post-give-up does not self-spin resets") {
+    SimBackend* sim = nullptr;
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    sim->set_fault_persistent(1, true);
+    sim->inject_fault(1);
+    CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.request_fault_reset();
+    CHECK(wait_until([&] { return ctrl.last_error().find("fault-reset ineffective") != std::string::npos; },
+                     std::chrono::milliseconds(2000)));  // gave up
+
+    // Remove the cause but issue NO new reset: a self-spinning FSM would re-edge bit7
+    // and recover; the fixed FSM must STAY faulted (no self-reset).
+    sim->set_fault_persistent(1, false);
+    CHECK(!wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(300)));  // stays faulted
+    CHECK(ctrl.last_error().find("fault-reset ineffective") != std::string::npos);          // verdict still latched
+
+    ctrl.request_fault_reset();  // only an EXPLICIT reset recovers
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(2000)));
+}
+
+// (6) Instant clear (the common case, delay=0 default): one reset recovers, unchanged.
+TEST("ServoController(#18): instant clear (default) -- one reset recovers, unchanged") {
+    SimBackend* sim = nullptr;
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    sim->inject_fault(1);  // no delay hook -> instant clear
+    CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.request_fault_reset();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(1000)));
+}
+
 TEST_MAIN()

@@ -421,14 +421,39 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
         }
         return cw;
     }
+    if (std::holds_alternative<Resetting>(lifecycle_)) {
+        // Operator override: a disable while resetting wins.
+        if (batch.disable) {
+            lifecycle_ = Disabled{};
+            return ControlWord::disable_voltage();
+        }
+        // SUCCESS (type-a): the drive reflected the clear within the window.
+        if (dev != Cia402State::Fault) {
+            lifecycle_ = Enabling{};
+            return fsm_.step(status, Cia402State::OperationEnabled);  // hand off to the enable ladder
+        }
+        // Still faulted, window remaining -> keep presenting the reset edge.
+        if (reset_cycles_remaining_ > 0) {
+            --reset_cycles_remaining_;
+            return fault_reset_with_rearm(status);
+        }
+        // GIVE-UP (type-b): window expired, cause persists. Revert to Faulted with a
+        // diagnostic; do NOT re-enter Resetting (no spin). Cleared by the NEXT fault_reset.
+        latched_ctrl_error_ = RtError::FaultResetFailed;
+        lifecycle_ = Faulted{};
+        return ControlWord::disable_voltage();
+    }
     if (std::holds_alternative<Faulted>(lifecycle_)) {
         if (batch.fault_reset) {
-            // The ONE clear: drop the controller-error latch AND drive the CiA402
-            // rising-edge re-arm. (A persistent bus WkcFault still reappears next
+            // Enter Resetting and HOLD the reset intent for the recovery window: the
+            // command-queue fault_reset is a one-shot (consumed this cycle), so the
+            // sub-state -- not the flag -- carries the intent across the drive's
+            // clear-reflect latency. (A persistent bus WkcFault still reappears next
             // cycle via the live tier -- it needs reconfigure, not fault_reset.)
-            latched_ctrl_error_ = RtError::None;
-            lifecycle_ = Enabling{};
-            return fault_reset_with_rearm(status);
+            latched_ctrl_error_ = RtError::None;  // clear the prior diagnostic (incl. a prior FaultResetFailed)
+            lifecycle_ = Resetting{};
+            reset_cycles_remaining_ = config_.fault_reset_window_cycles;
+            return fault_reset_with_rearm(status);  // present the first reset edge
         }
         return ControlWord::disable_voltage();
     }
@@ -784,6 +809,9 @@ std::string ServoController::last_error() const {
             break;
         case RtError::NotOperational:
             append("drive not operational");
+            break;
+        case RtError::FaultResetFailed:
+            append("fault-reset ineffective -- cause persists");
             break;
         case RtError::None:
             break;

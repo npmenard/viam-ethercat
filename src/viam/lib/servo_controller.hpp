@@ -131,9 +131,10 @@ class ServoController {
     struct Init {};
     struct Enabling {};
     struct Operational {};
+    struct Resetting {};  // holds the fault-reset intent across the drive's clear-reflect latency (spec #18)
     struct Faulted {};
     struct Disabled {};
-    using Lifecycle = std::variant<Init, Enabling, Operational, Faulted, Disabled>;
+    using Lifecycle = std::variant<Init, Enabling, Operational, Resetting, Faulted, Disabled>;
 
     // PP new-set-point handshake sub-FSM (cycle-stepped, with a timeout).
     enum class Handshake : std::uint8_t { Idle, WriteTarget, AwaitAck, ClearBit4, AwaitAckClear };
@@ -141,7 +142,7 @@ class ServoController {
     // CONTROLLER-tier fault reasons (the CTRL tier only -- spec #16 moved the BUS
     // WkcFault out to state_.wkc_faulted). The RT thread only STORES the enum (no
     // string alloc, no mutex on the hot path); last_error() composes the text non-RT.
-    enum class RtError : std::uint8_t { None, HandshakeTimeout, MoveStalled, NotOperational };
+    enum class RtError : std::uint8_t { None, HandshakeTimeout, MoveStalled, NotOperational, FaultResetFailed };
 
     // The RT thread body (loop while !st.stop_requested()). `started` is fulfilled
     // after a clean prelude (or set to an InitError exception on RT-sched failure
@@ -197,10 +198,11 @@ class ServoController {
     std::uint16_t last_cw_ = 0;              // for the fault-reset rising-edge re-arm
     Handshake handshake_ = Handshake::Idle;  // PP set-point handshake sub-state
     std::uint32_t handshake_cycles_remaining_ = 0;
-    std::int32_t target_counts_ = 0;         // latched PP target
-    std::uint32_t profile_vel_ = 0;          // latched PP profile velocity
-    std::int32_t pv_velocity_ = 0;           // latched PV target velocity
-    std::int32_t last_progress_actual_ = 0;  // move no-progress watchdog
+    std::uint32_t reset_cycles_remaining_ = 0;  // Resetting-window countdown, RT-only (spec #18)
+    std::int32_t target_counts_ = 0;            // latched PP target
+    std::uint32_t profile_vel_ = 0;             // latched PP profile velocity
+    std::int32_t pv_velocity_ = 0;              // latched PV target velocity
+    std::int32_t last_progress_actual_ = 0;     // move no-progress watchdog
     std::uint32_t stall_cycles_ = 0;
     std::int32_t prev_actual_ = 0;  // previous-cycle actual (instantaneous velocity estimate)
     bool first_cycle_ = true;       // skip the velocity estimate on the first cycle

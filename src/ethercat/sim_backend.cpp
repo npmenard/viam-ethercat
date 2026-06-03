@@ -186,6 +186,7 @@ void SimBackend::step_device(Slave& s) noexcept {
     using St = Cia402State;
     if (s.faulted.load(std::memory_order_relaxed) && s.device_state != St::Fault) {
         s.device_state = St::Fault;
+        s.clear_countdown_ = 0;  // #18: a fresh fault starts a clean reflect-delay countdown (RT-side, race-free)
     }
 
     switch (s.device_state) {
@@ -240,9 +241,26 @@ void SimBackend::step_device(Slave& s) noexcept {
             s.device_state = St::Fault;
             break;
         case St::Fault:
-            if (fault_reset_rising) {
-                s.faulted.store(false, std::memory_order_relaxed);
-                s.device_state = St::SwitchOnDisabled;
+            // #18: model the drive's Fault->Switch-On-Disabled clear-reflect latency.
+            //  - persistent cause (type-b): the reset edge is ignored, stays Fault.
+            //  - reflect latency `d` (type-a): accept the edge, reflect the clear after d
+            //    exchanges (d=0 = instant, the unchanged default / common case).
+            if (s.fault_persistent.load(std::memory_order_relaxed)) {
+                break;  // cause still active -- no reset clears it
+            }
+            if (fault_reset_rising && s.clear_countdown_ == 0) {
+                const std::uint32_t d = s.fault_clear_delay.load(std::memory_order_relaxed);
+                if (d == 0) {
+                    s.faulted.store(false, std::memory_order_relaxed);
+                    s.device_state = St::SwitchOnDisabled;
+                } else {
+                    s.clear_countdown_ = d;  // accept now, reflect the clear after d cycles
+                }
+            } else if (s.clear_countdown_ > 0) {
+                if (--s.clear_countdown_ == 0) {  // reflect-delay elapsed -> clear now
+                    s.faulted.store(false, std::memory_order_relaxed);
+                    s.device_state = St::SwitchOnDisabled;
+                }
             }
             break;
     }
@@ -373,6 +391,18 @@ void SimBackend::set_fault_code(std::uint16_t slave, std::uint16_t code) noexcep
 void SimBackend::set_stale_fault_code(std::uint16_t slave, std::uint16_t code) noexcept {
     if (slave >= 1 && slave <= slaves_.size()) {
         slaves_[slave - 1].stale_fault_code.store(code, std::memory_order_relaxed);
+    }
+}
+
+void SimBackend::set_fault_clear_delay(std::uint16_t slave, std::uint32_t cycles) noexcept {
+    if (slave >= 1 && slave <= slaves_.size()) {
+        slaves_[slave - 1].fault_clear_delay.store(cycles, std::memory_order_relaxed);
+    }
+}
+
+void SimBackend::set_fault_persistent(std::uint16_t slave, bool on) noexcept {
+    if (slave >= 1 && slave <= slaves_.size()) {
+        slaves_[slave - 1].fault_persistent.store(on, std::memory_order_relaxed);
     }
 }
 

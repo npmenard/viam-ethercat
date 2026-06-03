@@ -62,7 +62,12 @@ struct ServoConfig {
     std::uint64_t stall_threshold_cycles = 10;     // cycle-stall -> stale
     std::size_t command_queue_capacity = 64;       // > 0
     std::uint32_t handshake_timeout_cycles = 100;  // PP bit12 ack timeout
-    std::uint32_t move_timeout_ms = 0;             // 0 = no-progress watchdog only
+    // Fault-reset recovery window: cycles to hold the reset intent waiting for the drive
+    // to reflect Fault->Switch-On-Disabled before giving up (type-(b) persistent cause).
+    // Must exceed the drive's real clear-reflect latency; a too-large N only delays the
+    // give-up diagnostic, never breaks correctness. Tuned to the A6 at first light (#18).
+    std::uint32_t fault_reset_window_cycles = 200;  // 200ms @ 1kHz -- generous default
+    std::uint32_t move_timeout_ms = 0;              // 0 = no-progress watchdog only
 
     // --- diagnostics ---
     // OPTIONAL gloss for the 0x603F drive error code -> human label, surfaced by
