@@ -182,11 +182,23 @@ void SimBackend::step_device(Slave& s) noexcept {
     const bool enable_op = (cw & 0x8FU) == 0x0FU;
     const bool quick_stop = (cw & 0x86U) == 0x02U;
     const bool fault_reset_rising = ((cw & 0x80U) != 0U) && ((prev & 0x80U) == 0U);
+    if (fault_reset_rising) {
+        s.fault_reset_edges.fetch_add(1, std::memory_order_relaxed);  // #18 no-spin observability
+    }
 
     using St = Cia402State;
+    // #18 type-(c): a momentary clear re-faults after its hold elapses (drive accepted
+    // the reset, resumed, re-detected the cause).
+    if (s.refault_countdown_ > 0) {
+        if (--s.refault_countdown_ == 0) {
+            s.faulted.store(true, std::memory_order_relaxed);
+        }
+    }
     if (s.faulted.load(std::memory_order_relaxed) && s.device_state != St::Fault) {
         s.device_state = St::Fault;
-        s.clear_countdown_ = 0;  // #18: a fresh fault starts a clean reflect-delay countdown (RT-side, race-free)
+        // #18: a fresh fault starts clean reflect/refault countdowns (RT-side, race-free).
+        s.clear_countdown_ = 0;
+        s.refault_countdown_ = 0;
     }
 
     switch (s.device_state) {
@@ -240,29 +252,37 @@ void SimBackend::step_device(Slave& s) noexcept {
             // master's Cia402Fsm::step handles it either way.
             s.device_state = St::Fault;
             break;
-        case St::Fault:
-            // #18: model the drive's Fault->Switch-On-Disabled clear-reflect latency.
+        case St::Fault: {
+            // #18: model the drive's Fault->Switch-On-Disabled clear behaviour.
             //  - persistent cause (type-b): the reset edge is ignored, stays Fault.
             //  - reflect latency `d` (type-a): accept the edge, reflect the clear after d
             //    exchanges (d=0 = instant, the unchanged default / common case).
+            //  - clear-then-refault (type-c): on clearing, arm a re-fault after `hold`.
             if (s.fault_persistent.load(std::memory_order_relaxed)) {
                 break;  // cause still active -- no reset clears it
             }
+            const auto do_clear = [&s] {
+                s.faulted.store(false, std::memory_order_relaxed);
+                s.device_state = St::SwitchOnDisabled;
+                const std::uint32_t hold = s.clear_then_refault_hold.load(std::memory_order_relaxed);
+                if (hold > 0) {
+                    s.refault_countdown_ = hold;  // type-(c): arm the momentary-clear re-fault
+                }
+            };
             if (fault_reset_rising && s.clear_countdown_ == 0) {
                 const std::uint32_t d = s.fault_clear_delay.load(std::memory_order_relaxed);
                 if (d == 0) {
-                    s.faulted.store(false, std::memory_order_relaxed);
-                    s.device_state = St::SwitchOnDisabled;
+                    do_clear();  // instant (unchanged default)
                 } else {
                     s.clear_countdown_ = d;  // accept now, reflect the clear after d cycles
                 }
             } else if (s.clear_countdown_ > 0) {
-                if (--s.clear_countdown_ == 0) {  // reflect-delay elapsed -> clear now
-                    s.faulted.store(false, std::memory_order_relaxed);
-                    s.device_state = St::SwitchOnDisabled;
+                if (--s.clear_countdown_ == 0) {  // type-(a) reflect-delay elapsed
+                    do_clear();
                 }
             }
             break;
+        }
     }
 
     // Profile-Position set-point-acknowledge handshake (bit4 / bit12). Mode comes
@@ -404,6 +424,19 @@ void SimBackend::set_fault_persistent(std::uint16_t slave, bool on) noexcept {
     if (slave >= 1 && slave <= slaves_.size()) {
         slaves_[slave - 1].fault_persistent.store(on, std::memory_order_relaxed);
     }
+}
+
+void SimBackend::set_fault_clear_then_refault(std::uint16_t slave, std::uint32_t hold_cycles) noexcept {
+    if (slave >= 1 && slave <= slaves_.size()) {
+        slaves_[slave - 1].clear_then_refault_hold.store(hold_cycles, std::memory_order_relaxed);
+    }
+}
+
+std::uint32_t SimBackend::fault_reset_edge_count(std::uint16_t slave) const noexcept {
+    if (slave >= 1 && slave <= slaves_.size()) {
+        return slaves_[slave - 1].fault_reset_edges.load(std::memory_order_relaxed);
+    }
+    return 0;
 }
 
 void SimBackend::force_short_wkc_once() noexcept {

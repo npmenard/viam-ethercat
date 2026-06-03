@@ -67,7 +67,13 @@ struct ServoConfig {
     // Must exceed the drive's real clear-reflect latency; a too-large N only delays the
     // give-up diagnostic, never breaks correctness. Tuned to the A6 at first light (#18).
     std::uint32_t fault_reset_window_cycles = 200;  // 200ms @ 1kHz -- generous default
-    std::uint32_t move_timeout_ms = 0;              // 0 = no-progress watchdog only
+    // Consecutive dev!=Fault cycles required to confirm the clear STUCK before declaring
+    // reset success (type-(c) clear-then-refault debounce, #18). A refault within this
+    // window counts as reset-ineffective, not a new fault. Small: outlast a flicker, but
+    // don't delay genuine recovery. (Risky direction is too-SMALL fault_reset_window_cycles
+    // -- below the drive's clear-reflect latency it false-fails; keep it >= that latency.)
+    std::uint32_t fault_reset_clear_confirm_cycles = 3;
+    std::uint32_t move_timeout_ms = 0;  // 0 = no-progress watchdog only
 
     // --- diagnostics ---
     // OPTIONAL gloss for the 0x603F drive error code -> human label, surfaced by

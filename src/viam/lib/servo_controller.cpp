@@ -425,22 +425,37 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
         // Operator override: a disable while resetting wins.
         if (batch.disable) {
             lifecycle_ = Disabled{};
+            clear_streak_ = 0;
             return ControlWord::disable_voltage();
         }
-        // SUCCESS (type-a): the drive reflected the clear within the window.
+        // DEBOUNCE the clear: a refault re-arms the streak, so a type-(c) momentary
+        // clear-then-refault never confirms (it is NOT mistaken for success).
         if (dev != Cia402State::Fault) {
+            ++clear_streak_;
+        } else {
+            clear_streak_ = 0;
+        }
+        // SUCCESS (type-a): the clear HELD for K consecutive cycles -> confirmed recovery.
+        if (clear_streak_ >= config_.fault_reset_clear_confirm_cycles) {
             lifecycle_ = Enabling{};
+            clear_streak_ = 0;
             return fsm_.step(status, Cia402State::OperationEnabled);  // hand off to the enable ladder
         }
-        // Still faulted, window remaining -> keep presenting the reset edge.
+        // Window remaining -> keep working. Decrement EVERY cycle (Fault OR confirming),
+        // NOT only on Fault cycles, so a flickering drive's TOTAL dwell stays bounded by
+        // the window regardless of flicker period. Present the reset edge ONLY while in
+        // Fault; while confirming a clear return a NEUTRAL controlword (don't pulse bit7
+        // at an already-clearing drive).
         if (reset_cycles_remaining_ > 0) {
             --reset_cycles_remaining_;
-            return fault_reset_with_rearm(status);
+            return (dev == Cia402State::Fault) ? fault_reset_with_rearm(status) : ControlWord::disable_voltage();
         }
-        // GIVE-UP (type-b): window expired, cause persists. Revert to Faulted with a
-        // diagnostic; do NOT re-enter Resetting (no spin). Cleared by the NEXT fault_reset.
+        // GIVE-UP (type-b never-cleared AND type-c never-confirmed): window expired
+        // without a CONFIRMED clear. Revert to Faulted + diagnostic; do NOT re-enter
+        // Resetting (no spin). Cleared by the NEXT operator fault_reset.
         latched_ctrl_error_ = RtError::FaultResetFailed;
         lifecycle_ = Faulted{};
+        clear_streak_ = 0;
         return ControlWord::disable_voltage();
     }
     if (std::holds_alternative<Faulted>(lifecycle_)) {
@@ -453,6 +468,7 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
             latched_ctrl_error_ = RtError::None;  // clear the prior diagnostic (incl. a prior FaultResetFailed)
             lifecycle_ = Resetting{};
             reset_cycles_remaining_ = config_.fault_reset_window_cycles;
+            clear_streak_ = 0;                      // start the type-c debounce fresh
             return fault_reset_with_rearm(status);  // present the first reset edge
         }
         return ControlWord::disable_voltage();

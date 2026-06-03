@@ -199,6 +199,7 @@ class ServoController {
     Handshake handshake_ = Handshake::Idle;  // PP set-point handshake sub-state
     std::uint32_t handshake_cycles_remaining_ = 0;
     std::uint32_t reset_cycles_remaining_ = 0;  // Resetting-window countdown, RT-only (spec #18)
+    std::uint32_t clear_streak_ = 0;            // consecutive dev!=Fault cycles in Resetting (type-c debounce; RT-only, #18)
     std::int32_t target_counts_ = 0;            // latched PP target
     std::uint32_t profile_vel_ = 0;             // latched PP profile velocity
     std::int32_t pv_velocity_ = 0;              // latched PV target velocity

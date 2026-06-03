@@ -529,7 +529,39 @@ TEST("ServoController(#18): persistent-cause give-up -- last_error composes driv
     CHECK(!ctrl.is_powered());
 }
 
-// (4) Type-(b) then cause removed: a fresh reset recovers once the cause is gone.
+// (4) Type-(c) clear-then-refault: the drive clears MOMENTARILY on the reset edge then
+// re-faults before the K-cycle confirm -> must NOT be mistaken for success -> the same
+// give-up + compose-both as type-(b). Guards the debounce (clear_streak_).
+TEST("ServoController(#18): clear-then-refault flicker -> give-up (not false recovery)") {
+    SimBackend* sim = nullptr;
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
+    cfg.fault_code_labels = {{0x6320, "Er74.0 / cycle error"}};
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim, /*feedback=*/true)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    // Momentary clear holds only 1 cycle (< the 3-cycle confirm) -> the clear never
+    // confirms; the re-edge re-clears -> repeating flicker, bounded by the window.
+    sim->set_fault_clear_then_refault(1, 1);
+    sim->set_fault_code(1, 0x6320);
+    sim->inject_fault(1);
+    CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    ctrl.request_fault_reset();
+    // The give-up latches the CTRL verdict; the flickering drive settles back to Fault
+    // after its final momentary clear (the live #16 drive tier is only present while
+    // dev==Fault), so poll until BOTH tiers compose -- a flicker yields give-up, not
+    // recovery.
+    CHECK(wait_until(
+        [&] {
+            const std::string e = ctrl.last_error();
+            return e.find("fault-reset ineffective") != std::string::npos && e.find("0x6320") != std::string::npos;
+        },
+        std::chrono::milliseconds(2000)));
+    CHECK(!ctrl.is_powered());
+}
+
+// (5) Type-(b) then cause removed: a fresh reset recovers once the cause is gone.
 TEST("ServoController(#18): once the persistent cause is removed, a reset recovers") {
     SimBackend* sim = nullptr;
     ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
@@ -548,10 +580,11 @@ TEST("ServoController(#18): once the persistent cause is removed, a reset recove
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(2000)));
 }
 
-// (5) No-spin guarantee (DA's lane): after a give-up, the FSM does NOT self-issue
-// resets -- removing the cause WITHOUT a new fault_reset must NOT auto-recover; only
-// an explicit reset does. Proves the post-give-up state is steady Faulted, not a spin.
-TEST("ServoController(#18): post-give-up does not self-spin resets") {
+// (6) No-spin guarantee (DA's lane) -- CAPTURE THE EDGE STREAM, not just the end state.
+// After a give-up: (i) zero further bit7 rising edges (no perpetual self-re-edge), and
+// (ii) removing the cause WITHOUT a new reset does NOT auto-recover -- only an explicit
+// reset does. Counting the edges proves the FSM isn't self-spinning Resetting.
+TEST("ServoController(#18): post-give-up has zero bit7 edges + does not self-recover") {
     SimBackend* sim = nullptr;
     ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
     ctrl.start();
@@ -564,14 +597,18 @@ TEST("ServoController(#18): post-give-up does not self-spin resets") {
     CHECK(wait_until([&] { return ctrl.last_error().find("fault-reset ineffective") != std::string::npos; },
                      std::chrono::milliseconds(2000)));  // gave up
 
-    // Remove the cause but issue NO new reset: a self-spinning FSM would re-edge bit7
-    // and recover; the fixed FSM must STAY faulted (no self-reset).
+    // Snapshot the cumulative bit7-edge count at give-up, then hold: a self-spinning FSM
+    // would keep re-edging (count climbs). Remove the cause too -- a spinner would even
+    // recover. The fixed FSM does NEITHER: edges flat AND stays faulted (no self-reset).
+    const std::uint32_t edges_at_giveup = sim->fault_reset_edge_count(1);
     sim->set_fault_persistent(1, false);
-    CHECK(!wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(300)));  // stays faulted
+    CHECK(!wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(300)));  // no self-recovery
+    CHECK_EQ(sim->fault_reset_edge_count(1), edges_at_giveup);                              // ZERO new edges post-give-up
     CHECK(ctrl.last_error().find("fault-reset ineffective") != std::string::npos);          // verdict still latched
 
-    ctrl.request_fault_reset();  // only an EXPLICIT reset recovers
+    ctrl.request_fault_reset();  // only an EXPLICIT reset re-edges + recovers
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(2000)));
+    CHECK(sim->fault_reset_edge_count(1) > edges_at_giveup);  // the explicit reset DID edge
 }
 
 // (6) Instant clear (the common case, delay=0 default): one reset recovers, unchanged.

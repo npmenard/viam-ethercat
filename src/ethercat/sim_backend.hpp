@@ -98,6 +98,15 @@ class SimBackend final : public EcatBackend {
     // clear the fault (the cause is still active, e.g. Er74.0) -- the device stays in
     // Fault regardless of bit7. Turn off (then reset) to model the cause being removed.
     void set_fault_persistent(std::uint16_t slave, bool on) noexcept;
+    // Type-(c) clear-then-refault (spec #18): on a fault_reset rising edge the device
+    // clears MOMENTARILY, then RE-faults after `hold_cycles` exchanges (accepts the reset,
+    // resumes, re-detects the cause). hold_cycles < fault_reset_clear_confirm_cycles
+    // exercises the debounce -> the clear never CONFIRMS -> give-up. 0 = off.
+    void set_fault_clear_then_refault(std::uint16_t slave, std::uint32_t hold_cycles) noexcept;
+    // Cumulative count of controlword bit7 (fault-reset) 0->1 rising edges the device has
+    // seen (spec #18 no-spin test): snapshot after a give-up, poll N cycles, assert it
+    // does NOT climb -> the FSM is not self-re-edging / self-spinning resets.
+    std::uint32_t fault_reset_edge_count(std::uint16_t slave) const noexcept;
     // Force the next send_receive() to report a short WKC (one cycle), to test
     // the master's WKC-fault latch.
     void force_short_wkc_once() noexcept;
@@ -143,14 +152,17 @@ class SimBackend final : public EcatBackend {
         // set_stale_fault_code) while the RT loop reads them in step_device -- the only
         // cross-thread Slave fields. Relaxed is sufficient (independent test signals).
         std::atomic<bool> faulted{false};
-        std::atomic<std::uint16_t> fault_code{0};         // 0x603F code reported while faulted (set_fault_code)
-        std::atomic<std::uint16_t> stale_fault_code{0};   // forces 0x603F = this REGARDLESS of fault state (flag-gating test)
-        std::int32_t profile_velocity = 0;                // last 0x6081 seen in the command image (test visibility; RT-only)
-        std::int32_t velocity = 0;                        // per-cycle actual delta (0x606C de-mask; RT-only)
-        std::atomic<bool> suppress_ack{false};            // test hook (toggled live during a handshake): never assert bit12
-        std::atomic<std::uint32_t> fault_clear_delay{0};  // #18 type-(a) reflect latency (cycles); 0 = instant
-        std::atomic<bool> fault_persistent{false};        // #18 type-(b) cause-persists: reset edge ignored
-        std::uint32_t clear_countdown_ = 0;               // #18 RT-only: active reflect-delay countdown in Fault
+        std::atomic<std::uint16_t> fault_code{0};               // 0x603F code reported while faulted (set_fault_code)
+        std::atomic<std::uint16_t> stale_fault_code{0};         // forces 0x603F = this REGARDLESS of fault state (flag-gating test)
+        std::int32_t profile_velocity = 0;                      // last 0x6081 seen in the command image (test visibility; RT-only)
+        std::int32_t velocity = 0;                              // per-cycle actual delta (0x606C de-mask; RT-only)
+        std::atomic<bool> suppress_ack{false};                  // test hook (toggled live during a handshake): never assert bit12
+        std::atomic<std::uint32_t> fault_clear_delay{0};        // #18 type-(a) reflect latency (cycles); 0 = instant
+        std::atomic<bool> fault_persistent{false};              // #18 type-(b) cause-persists: reset edge ignored
+        std::atomic<std::uint32_t> clear_then_refault_hold{0};  // #18 type-(c) momentary-clear hold cycles (0 = off)
+        std::uint32_t clear_countdown_ = 0;                     // #18 RT-only: active type-(a) reflect-delay countdown in Fault
+        std::uint32_t refault_countdown_ = 0;                   // #18 RT-only: cycles until the type-(c) re-fault fires
+        std::atomic<std::uint32_t> fault_reset_edges{0};        // #18 cumulative bit7 0->1 edges seen (no-spin test: RT-write/test-read)
         // RUNTIME mode of operation -- set ONLY by the master's 0x6060 SDO write (de-masked
         // from model.mode), so a missing/wrong mode set leaves it None and the motor never
         // moves (mode-0 guard), catching the "forgot to set 0x6060" bug offline.
