@@ -92,13 +92,14 @@ struct MasterConfig {
     bool use_distributed_clocks = false;
     // DC bring-up (the ec_sample fold, #20): SYNC0 is armed in PRE-OP inside configure()
     // (stock ecx_dcsync0, before config_map_group -- the drive self-selects DC sync-type
-    // from the armed SYNC0). The RT loop then pumps phase-locked PD and GATEs before OP.
-    //   GATE: consecutive cycles of (PD flowing [wkc>0] && no Er74.1 on any slave) required
-    //   before requesting OP -- proves the drive is exchanging synchronized PD. (WKC can't
-    //   be full in SAFE-OP; full WKC is the OP confirmation, not the gate.) An Er74.1 in
-    //   the window aborts the bring-up (no OP request -- repeated Er74 OP-entry wedges the
-    //   A6). 0 ⇒ 1 (request OP on the first healthy cycle).
-    std::uint32_t dc_op_gate_cycles = 50;
+    // from the armed SYNC0). The RT loop then pumps phase-locked PD a bounded SETTLE and
+    // requests OP ONCE.
+    //   SETTLE: cycles of phase-locked PD to run BEFORE requesting OP, so the master's
+    //   send cadence is disciplined onto SYNC0 first (ec_sample effectively settles its RT
+    //   PD ~400 ms before OP). We do NOT gate this on Er74.1 -- 0x603F=0x8700 in SAFE-OP is
+    //   the NORMAL pre-sync state and clears AT OP, so the gate is a fixed settle, not a
+    //   no-Er74.1 wait. Only applied when DC is on (non-DC needs no settle). 0 ⇒ 1.
+    std::uint32_t dc_op_gate_cycles = 400;
     // Post-OP grace: suppress the consecutive-WKC-error fault latch for this many
     // cycles after reaching OP, so any residual DC phase transient settles without
     // tripping a BusError (the phase PI needs ~hundreds of cycles to fully lock; the

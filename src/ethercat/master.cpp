@@ -19,6 +19,12 @@ namespace {
 
 constexpr std::uint16_t kModesOfOp = 0x6060;  // CiA402 modes-of-operation (U8): PP=1, PV=3; SDO-set in PRE-OP
 constexpr long kNsPerSec = 1'000'000'000L;
+// AWAIT_OP bounds (bringup_step): require this many consecutive (full-WKC && no-Er74.1)
+// cycles to confirm OP is reached + synced (not a transient), and give up after this many
+// cycles without that hold -- a SINGLE OP request (ec_sample does it with Er74.1 present),
+// bounded, never re-requested (hammering OP-entry wedges the A6, CLAUDE.md).
+constexpr std::uint32_t kOpHoldConfirm = 5;   // ~5 ms @ 1 kHz of held sync -> Operational
+constexpr std::uint32_t kAwaitOpBound = 500;  // ~500 ms to reach the held-synced state, else Aborted
 
 std::uint32_t field_key(std::uint16_t index, std::uint8_t sub) noexcept {
     return (static_cast<std::uint32_t>(index) << 8U) | sub;
@@ -212,11 +218,14 @@ void Master::configure() {
     }
 
     // Hand off to the caller's RT loop at SAFE-OP with SYNC0 already armed. It runs
-    // bringup_step() -- GATE (PD flowing + no Er74.1, K cycles) -> request OP -> AWAIT_OP
-    // -- until OPERATIONAL, so operational_ stays false until then. Reset the FSM.
+    // bringup_step() -- SETTLE (bounded phase-locked PD) -> request OP -> AWAIT_OP (hold
+    // for OP + Er74.1-cleared + WKC) -- until OPERATIONAL, so operational_ stays false
+    // until then. Reset the FSM.
     dc_enabled_ = config_.use_distributed_clocks;
-    bringup_phase_ = BringupPhase::Gate;
-    bringup_gate_streak_ = 0;
+    bringup_phase_ = BringupPhase::Settle;
+    bringup_settle_count_ = 0;
+    bringup_await_count_ = 0;
+    bringup_op_hold_streak_ = 0;
     fault_.store(false, std::memory_order_relaxed);
     consecutive_wkc_errors_ = 0;
     settle_remaining_ = 0;
@@ -226,48 +235,53 @@ void Master::configure() {
 BringupStatus Master::bringup_step(bool drive_sync_faulted) noexcept {
     // The caller owns the cadence (clock_nanosleep + dc_phase_correction on dc_time());
     // this does the one cyclic exchange + advances the FSM. SYNC0 was already armed in
-    // configure() (PRE-OP, per ec_sample), so the FSM is just GATE -> request OP ->
-    // AWAIT_OP: pump PD gaplessly, prove sync (no Er74.1), then cross to OP.
+    // configure() (PRE-OP, per ec_sample): SETTLE pumps phase-locked PD a bounded settle,
+    // requests OP ONCE, then AWAIT_OP holds for "OP reached + Er74.1 cleared + WKC holds".
     const int wkc = backend_->exchange();
     last_wkc_.store(wkc, std::memory_order_relaxed);
 
     switch (bringup_phase_) {
-        case BringupPhase::Gate: {
-            // The real "synced" signal is the ABSENCE of Er74.1 (CLAUDE.md). WKC cannot
-            // be full in SAFE-OP (the output SyncManager is inactive until OP), so the
-            // pre-OP gate is "PD flowing (wkc>0) + no sync fault" held K cycles -- THEN
-            // request OP and confirm full WKC at OP (AWAIT_OP). An Er74.1 in the window
-            // means SYNC0 didn't take: abort, never request OP (don't wedge the drive).
-            if (drive_sync_faulted) {
-                bringup_phase_ = BringupPhase::Aborted;
-                return BringupStatus::Aborted;
-            }
-            if (wkc > 0) {
-                ++bringup_gate_streak_;
-            } else {
-                bringup_gate_streak_ = 0;
-            }
-            const std::uint32_t target = config_.dc_op_gate_cycles == 0 ? 1U : config_.dc_op_gate_cycles;
-            if (bringup_gate_streak_ >= target) {
+        case BringupPhase::Settle: {
+            // Pump phase-locked PD a brief settle so the master's send is disciplined
+            // before OP (ec_sample settles RT PD ~400 ms before requesting OP). We do NOT
+            // gate on Er74.1 here: 0x603F=0x8700 in SAFE-OP is the NORMAL pre-sync state --
+            // the A6 completes SYNC0 alignment only once OP cycling starts, so Er74.1
+            // clears AT OP, not before (ec_sample requests OP with it present and succeeds).
+            // Gating on no-Er74.1 here would block the exact transition that works. Non-DC
+            // backends need no settle (1 cycle). Then request OP ONCE (no hammer).
+            const std::uint32_t target = dc_enabled_ ? (config_.dc_op_gate_cycles == 0 ? 1U : config_.dc_op_gate_cycles) : 1U;
+            if (++bringup_settle_count_ >= target) {
                 backend_->set_state(0, EcatState::Op);  // writestate only; this loop pumps the transition
+                bringup_await_count_ = 0;
+                bringup_op_hold_streak_ = 0;
                 bringup_phase_ = BringupPhase::AwaitOp;
             }
             return BringupStatus::Gating;
         }
         case BringupPhase::AwaitOp: {
-            // OP requested; pump the gapless transition. Full WKC is the "reached OP"
-            // signal (the output SM is live only at OP). A sync fault here still aborts.
-            if (drive_sync_faulted) {
-                bringup_phase_ = BringupPhase::Aborted;
-                return BringupStatus::Aborted;
+            // OP requested once; pump the gapless transition. Success = full WKC AND no
+            // Er74.1 held kOpHoldConfirm cycles -- i.e. the drive reached OP, SYNC0 aligned
+            // (Er74.1 cleared), and PD is exchanging cleanly. If that held state isn't
+            // reached within kAwaitOpBound cycles, OP didn't take: abort cleanly with NO
+            // re-request (a single OP request with Er74.1 present is safe -- ec_sample does
+            // it; HAMMERING re-requests is what wedges the A6, CLAUDE.md).
+            ++bringup_await_count_;
+            if (wkc == expected_wkc_ && !drive_sync_faulted) {
+                ++bringup_op_hold_streak_;
+            } else {
+                bringup_op_hold_streak_ = 0;
             }
-            if (wkc == expected_wkc_ && backend_->slave_state(0) == EcatState::Op) {
+            if (bringup_op_hold_streak_ >= kOpHoldConfirm) {
                 operational_.store(true, std::memory_order_relaxed);
                 settle_remaining_ = dc_enabled_ ? config_.dc_settle_cycles : 0;
                 fault_.store(false, std::memory_order_relaxed);
                 consecutive_wkc_errors_ = 0;
                 bringup_phase_ = BringupPhase::Done;
                 return BringupStatus::Operational;
+            }
+            if (bringup_await_count_ >= kAwaitOpBound) {
+                bringup_phase_ = BringupPhase::Aborted;
+                return BringupStatus::Aborted;
             }
             return BringupStatus::AwaitingOp;
         }

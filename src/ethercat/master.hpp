@@ -40,10 +40,10 @@ struct FieldLocation {
 // or Aborted (surface the fault; do NOT immediately re-enter bring-up -- repeated
 // Er74 OP-entry wedges the A6, CLAUDE.md).
 enum class BringupStatus : std::uint8_t {
-    Gating,       // SYNC0 armed in configure(); pumping PD, waiting for "no Er74.1" to hold K cycles before OP
-    AwaitingOp,   // OP requested; waiting for all slaves to reach OP with full WKC
-    Operational,  // all slaves OPERATIONAL -- bring-up complete
-    Aborted,      // a sync fault (Er74.1) appeared during the gate -- SYNC0 did not take
+    Gating,       // SYNC0 armed in configure(); pumping phase-locked PD a bounded SETTLE before requesting OP
+    AwaitingOp,   // OP requested once; awaiting "OP reached + Er74.1 cleared + WKC holds"
+    Operational,  // all slaves OPERATIONAL, synced (WKC holding) -- bring-up complete
+    Aborted,      // OP did not take within the await window (WKC won't hold / Er74.1 didn't clear) -- no re-request
 };
 
 class Master {
@@ -187,12 +187,16 @@ class Master {
     static std::map<std::uint32_t, FieldLocation> build_field_table(std::uint16_t slave, const PdoMap& map);
 
     // Internal phases of the bring-up state machine (bringup_step). SYNC0 is armed in
-    // configure() (PRE-OP, per ec_sample), so the loop only GATEs on sync health then
-    // crosses to OP -- no Settle/Arm phases.
-    enum class BringupPhase : std::uint8_t { Gate, AwaitOp, Done, Aborted };
-    BringupPhase bringup_phase_ = BringupPhase::Gate;  // RT-only
-    std::uint32_t bringup_gate_streak_ = 0;            // RT-only: consecutive no-Er74.1 cycles in GATE
-    bool dc_enabled_ = false;                          // set in configure(): is SYNC0 in play? (gates the post-OP settle grace)
+    // configure() (PRE-OP, per ec_sample). SETTLE pumps phase-locked PD a bounded settle
+    // (NOT gated on Er74.1 -- it is the NORMAL pre-sync state in SAFE-OP and clears AT OP,
+    // per ec_sample), requests OP ONCE, then AWAIT_OP holds for "OP reached + Er74.1
+    // cleared + WKC holds" -- or aborts (no re-request) if that doesn't happen in a window.
+    enum class BringupPhase : std::uint8_t { Settle, AwaitOp, Done, Aborted };
+    BringupPhase bringup_phase_ = BringupPhase::Settle;  // RT-only
+    std::uint32_t bringup_settle_count_ = 0;             // RT-only: SETTLE cycles elapsed before requesting OP
+    std::uint32_t bringup_await_count_ = 0;              // RT-only: AWAIT_OP cycles since requesting OP
+    std::uint32_t bringup_op_hold_streak_ = 0;           // RT-only: consecutive (full-WKC && !Er74.1) cycles at OP
+    bool dc_enabled_ = false;                            // set in configure(): is SYNC0 in play? (gates the post-OP settle grace)
 
     MasterConfig config_;
     std::unique_ptr<EcatBackend> backend_;

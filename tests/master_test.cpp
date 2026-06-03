@@ -295,26 +295,31 @@ TEST("Master(#20): bringup_step drives SAFE-OP -> OPERATIONAL through the FSM ph
     CHECK(!master.fault());
 }
 
-TEST("Master(#20): bringup_step aborts on Er74.1 in the gate and does NOT retry (no hammer)") {
+TEST("Master(#20): bringup_step aborts if Er74.1 never clears at OP, and does NOT retry (no hammer)") {
     MasterConfig cfg = make_config();
-    cfg.use_distributed_clocks = true;  // SYNC0 armed in configure(); the loop GATEs
-    cfg.dc_op_gate_cycles = 50;
+    cfg.use_distributed_clocks = true;  // SYNC0 armed in configure(); the loop SETTLEs then awaits OP
+    cfg.dc_op_gate_cycles = 2;          // short SETTLE for the test
     Master master{cfg, std::make_unique<SimBackend>(make_models())};
     master.init();
     master.configure();
 
-    // Pump a few healthy GATE cycles (gate_streak < 50, still gating)...
-    for (int cycle = 0; cycle < 6; ++cycle) {
-        (void)master.bringup_step(/*drive_sync_faulted=*/false);
+    // SETTLE does NOT abort on Er74.1 (it's the normal pre-sync state) -- even with the
+    // drive reporting Er74.1, the settle completes and OP is requested once.
+    BringupStatus bs = BringupStatus::Gating;
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        bs = master.bringup_step(/*drive_sync_faulted=*/true);
+        CHECK(bs != BringupStatus::Aborted);  // no pre-OP abort on Er74.1
     }
-    // ...then the drive reports Er74.1 (no SYNC0) during the gate -> abort, no OP request.
-    const BringupStatus aborted = master.bringup_step(/*drive_sync_faulted=*/true);
-    CHECK(aborted == BringupStatus::Aborted);
+    // AWAIT_OP: Er74.1 never clears -> the held-synced state (full WKC && !Er74.1) is never
+    // reached -> abort after kAwaitOpBound cycles. (OP was requested ONCE in SETTLE.)
+    for (int cycle = 0; cycle < 600 && bs != BringupStatus::Aborted; ++cycle) {
+        bs = master.bringup_step(/*drive_sync_faulted=*/true);
+    }
+    CHECK(bs == BringupStatus::Aborted);
     CHECK(!master.all_operational());
 
-    // NO-HAMMER: even once the fault clears, the FSM stays Aborted -- it never silently
-    // re-enters bring-up / re-requests OP (repeated Er74 OP-entry wedges the A6). A
-    // re-attempt requires an explicit reconfigure. Many cycles, always Aborted.
+    // NO-HAMMER: the FSM stays Aborted -- it never silently re-enters bring-up / re-requests
+    // OP (repeated Er74 OP-entry wedges the A6). A re-attempt requires an explicit reconfigure.
     for (int cycle = 0; cycle < 200; ++cycle) {
         CHECK(master.bringup_step(/*drive_sync_faulted=*/false) == BringupStatus::Aborted);
     }
