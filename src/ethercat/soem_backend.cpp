@@ -8,7 +8,7 @@
 #include <iostream>
 #include <string>
 
-#include <soem/ethercat.h>
+#include <soem/soem.h>
 
 #include "ethercat/errors.hpp"
 
@@ -80,26 +80,12 @@ std::string pop_coe_abort(ecx_contextt* ctx) {
 
 }  // namespace
 
-// All SOEM-touching state lives here, behind the pimpl. The reentrant API wants
-// a context that points at caller-owned buffers (the global ec_slave[]/ec_*
-// API is exactly this struct wired to file-scope statics); we own them per
-// instance instead, so there is no SOEM global state.
+// All SOEM-touching state lives here, behind the pimpl. SOEM v2's ecx_contextt
+// OWNS its buffers as direct members (port, slavelist[], slavecount, grouplist[],
+// DCtime, the internal eeprom/SM/PDO/mailbox pools, ...) -- so unlike v1.4.0 (where
+// the context was a struct of pointers we wired to per-instance arrays), we just
+// hold ONE zero-initialized context per Master. Still no SOEM global state.
 struct SoemBackend::Impl {
-    ecx_portt port{};
-    ec_slavet slavelist[EC_MAXSLAVE]{};
-    int slavecount{};
-    ec_groupt grouplist[EC_MAXGROUP]{};
-    uint8 esibuf[EC_MAXEEPBUF]{};
-    uint32 esimap[EC_MAXEEPBITMAP]{};
-    ec_eringt elist{};
-    ec_idxstackT idxstack{};
-    boolean ecaterror{};
-    int64 dctime{};
-    ec_SMcommtypet smcommtype[EC_MAX_MAPT]{};
-    ec_PDOassignt pdoassign[EC_MAX_MAPT]{};
-    ec_PDOdesct pdodesc[EC_MAX_MAPT]{};
-    ec_eepromSMt eepsm{};
-    ec_eepromFMMUt eepfmmu{};
     ecx_contextt ctx{};
 
     std::array<std::byte, 8192> iomap{};
@@ -113,32 +99,6 @@ struct SoemBackend::Impl {
     // SYNC0 pulses), so a pulsing unit always shows a change.
     std::array<std::uint8_t, EC_MAXSLAVE> prev_sync0_evt{};
     bool sync0_evt_primed = false;
-
-    Impl() {
-        ctx.port = &port;
-        ctx.slavelist = &slavelist[0];
-        ctx.slavecount = &slavecount;
-        ctx.maxslave = EC_MAXSLAVE;
-        ctx.grouplist = &grouplist[0];
-        ctx.maxgroup = EC_MAXGROUP;
-        ctx.esibuf = &esibuf[0];
-        ctx.esimap = &esimap[0];
-        ctx.esislave = 0;
-        ctx.elist = &elist;
-        ctx.idxstack = &idxstack;
-        ctx.ecaterror = &ecaterror;
-        ctx.DCtO = 0;
-        ctx.DCl = 0;
-        ctx.DCtime = &dctime;
-        ctx.SMcommtype = &smcommtype[0];
-        ctx.PDOassign = &pdoassign[0];
-        ctx.PDOdesc = &pdodesc[0];
-        ctx.eepSM = &eepsm;
-        ctx.eepFMMU = &eepfmmu;
-        ctx.FOEhook = nullptr;
-        ctx.EOEhook = nullptr;
-        ctx.manualstatechange = 0;
-    }
 };
 
 SoemBackend::SoemBackend() : impl_(std::make_unique<Impl>()) {}
@@ -157,7 +117,7 @@ std::size_t SoemBackend::open(std::string_view ifname) {
         throw InitError("failed to open EtherCAT interface '" + name +
                         "': need CAP_NET_RAW (run with setcap or as root) and the interface must exist");
     }
-    const int count = ecx_config_init(&impl_->ctx, FALSE);
+    const int count = ecx_config_init(&impl_->ctx);
     if (count <= 0) {
         ecx_close(&impl_->ctx);
         throw InitError("no EtherCAT slaves found on '" + name + "' (is the bus wired and powered?)");
@@ -171,7 +131,7 @@ SlaveInfo SoemBackend::slave_info(std::uint16_t slave) const {
     if (slave < 1 || slave > impl_->slave_count) {
         throw ConfigError("SoemBackend::slave_info: slave " + std::to_string(slave) + " out of range");
     }
-    const ec_slavet& s = impl_->slavelist[slave];
+    const ec_slavet& s = impl_->ctx.slavelist[slave];
     SlaveInfo info;
     info.position = slave;
     info.vendor_id = s.eep_man;
@@ -185,7 +145,7 @@ SlaveInfo SoemBackend::slave_info(std::uint16_t slave) const {
 void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
     // SOEM's psize is an int; PDO/SDO payloads are tiny, so the cast is safe.
     const int size = static_cast<int>(data.size());
-    const int wkc = ecx_SDOwrite(&impl_->ctx, slave, index, sub, FALSE, size, const_cast<std::byte*>(data.data()), EC_TIMEOUTRXM);
+    const int wkc = ecx_SDOwrite(&impl_->ctx, slave, index, sub, FALSE, size, data.data(), EC_TIMEOUTRXM);
     // A CoE abort can return wkc > 0 but push an error, so check both.
     if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {
         const std::string abort = pop_coe_abort(&impl_->ctx);
@@ -211,13 +171,13 @@ void SoemBackend::map_process_data() {
         throw PdoMappingError("ec_config_map produced an invalid IOmap size (" + std::to_string(used) + "); the bus image may exceed " +
                               std::to_string(impl_->iomap.size()) + " bytes");
     }
-    const ec_groupt& g = impl_->grouplist[0];
+    const ec_groupt& g = impl_->ctx.grouplist[0];
     impl_->expected_wkc = (g.outputsWKC * 2) + g.inputsWKC;
 }
 
 void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
     const std::uint16_t want = to_soem_state(target);
-    impl_->slavelist[slave].state = want;
+    impl_->ctx.slavelist[slave].state = want;
     ecx_writestate(&impl_->ctx, slave);
 
     std::uint16_t reached = 0;
@@ -248,9 +208,9 @@ void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
         // refusal is otherwise opaque on the bench.
         std::string detail;
         ecx_readstate(&impl_->ctx);
-        for (int i = 1; i <= impl_->slavecount; ++i) {
-            const std::uint16_t al = impl_->slavelist[i].ALstatuscode;
-            detail += " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->slavelist[i].state)) +
+        for (int i = 1; i <= impl_->ctx.slavecount; ++i) {
+            const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
+            detail += " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
                       " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
         }
         throw InitError("slave " + std::to_string(slave) + " did not reach state " + to_string(target) + " (reached " +
@@ -262,7 +222,7 @@ void SoemBackend::set_state(std::uint16_t slave, EcatState target) noexcept {
     // Write the state request ONLY -- no pump, no statecheck, no throw. The caller's
     // cyclic loop pumps process data through the transition so a DC drive never sees
     // a gap. slave_state() reports progress.
-    impl_->slavelist[slave].state = to_soem_state(target);
+    impl_->ctx.slavelist[slave].state = to_soem_state(target);
     ecx_writestate(&impl_->ctx, slave);
 }
 
@@ -270,14 +230,14 @@ EcatState SoemBackend::slave_state(std::uint16_t slave) const {
     if (slave > impl_->slave_count) {
         return EcatState::None;
     }
-    return from_soem_state(impl_->slavelist[slave].state);
+    return from_soem_state(impl_->ctx.slavelist[slave].state);
 }
 
 SlaveIo SoemBackend::slave_io(std::uint16_t slave) noexcept {
     if (slave < 1 || slave > impl_->slave_count) {
         return {};
     }
-    const ec_slavet& s = impl_->slavelist[slave];
+    const ec_slavet& s = impl_->ctx.slavelist[slave];
     // SOEM hands out raw uint8* into the IOmap; reinterpret as std::byte spans.
     auto* out = reinterpret_cast<std::byte*>(s.outputs);
     const auto* in = reinterpret_cast<const std::byte*>(s.inputs);
@@ -323,32 +283,32 @@ void SoemBackend::arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_n
     // start delay puts the first edge inside the watchdog window. The start is computed
     // from the slave's LIVE local DC time (FPRD 0x0910), so the master must already be
     // pumping (it is -- caller's RT loop). (bench: team-lead.)
-    for (int i = 1; i <= impl_->slavecount; ++i) {
-        if (impl_->slavelist[i].hasdc == FALSE) {
+    for (int i = 1; i <= impl_->ctx.slavecount; ++i) {
+        if (impl_->ctx.slavelist[i].hasdc == FALSE) {
             throw InitError("slave " + std::to_string(i) + " is not DC-capable (hasdc=0) -- cannot enable SYNC0");
         }
-        const std::uint16_t adp = impl_->slavelist[i].configadr;
+        const std::uint16_t adp = impl_->ctx.slavelist[i].configadr;
         // ec_dcsync0 sequence with the short start delay (A6 is SYNC0-only: activation
         // 0x0981 = 0x03 = cyclic + SYNC0, SYNC1 off).
         std::uint8_t ra = 0;
-        (void)ecx_FPWR(&impl_->port, adp, 0x0981, sizeof(ra), &ra, EC_TIMEOUTRET);  // stop cyclic op
+        (void)ecx_FPWR(&impl_->ctx.port, adp, 0x0981, sizeof(ra), &ra, EC_TIMEOUTRET);  // stop cyclic op
         std::uint8_t h = 0;
-        (void)ecx_FPWR(&impl_->port, adp, 0x0980, sizeof(h), &h, EC_TIMEOUTRET);  // ECAT (not PDI) controls the SYNC unit
+        (void)ecx_FPWR(&impl_->ctx.port, adp, 0x0980, sizeof(h), &h, EC_TIMEOUTRET);  // ECAT (not PDI) controls the SYNC unit
         std::int64_t t1 = 0;
-        (void)ecx_FPRD(&impl_->port, adp, 0x0910, sizeof(t1), &t1, EC_TIMEOUTRET);  // live local DC system time
+        (void)ecx_FPRD(&impl_->ctx.port, adp, 0x0910, sizeof(t1), &t1, EC_TIMEOUTRET);  // live local DC system time
         t1 = etohll(t1);
         const std::int64_t cyc = static_cast<std::int64_t>(cycle_ns);
         std::int64_t start = cyc > 0 ? (((t1 + start_delay_ns) / cyc) * cyc) + cyc + sync0_shift_ns : t1 + start_delay_ns + sync0_shift_ns;
         start = static_cast<std::int64_t>(htoell(static_cast<uint64>(start)));
-        (void)ecx_FPWR(&impl_->port, adp, 0x0990, sizeof(start), &start, EC_TIMEOUTRET);  // SYNC0 start time (8 B)
+        (void)ecx_FPWR(&impl_->ctx.port, adp, 0x0990, sizeof(start), &start, EC_TIMEOUTRET);  // SYNC0 start time (8 B)
         std::int32_t tc = static_cast<std::int32_t>(htoel(cycle_ns));
-        (void)ecx_FPWR(&impl_->port, adp, 0x09A0, sizeof(tc), &tc, EC_TIMEOUTRET);  // SYNC0 cycle time (4 B)
+        (void)ecx_FPWR(&impl_->ctx.port, adp, 0x09A0, sizeof(tc), &tc, EC_TIMEOUTRET);  // SYNC0 cycle time (4 B)
         ra = 0x03;
-        (void)ecx_FPWR(&impl_->port, adp, 0x0981, sizeof(ra), &ra, EC_TIMEOUTRET);  // activate cyclic + SYNC0
+        (void)ecx_FPWR(&impl_->ctx.port, adp, 0x0981, sizeof(ra), &ra, EC_TIMEOUTRET);  // activate cyclic + SYNC0
         // Mirror ec_dcsync0's slave bookkeeping.
-        impl_->slavelist[i].DCactive = TRUE;
-        impl_->slavelist[i].DCshift = sync0_shift_ns;
-        impl_->slavelist[i].DCcycle = static_cast<int32>(cycle_ns);
+        impl_->ctx.slavelist[i].DCactive = TRUE;
+        impl_->ctx.slavelist[i].DCshift = sync0_shift_ns;
+        impl_->ctx.slavelist[i].DCcycle = static_cast<int32>(cycle_ns);
 
         // Immediate silicon readback: confirm the activation WRITE took (0x0981 b1) and
         // the start time is a sane near-future. The SYNC-out unit will not show ARMED
@@ -360,12 +320,12 @@ void SoemBackend::arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_n
         std::uint32_t sync0_cyc = 0;   // 0x09A0 SYNC0 cycle time (ns)
         std::uint64_t start_time = 0;  // 0x0990 start time / next SYNC0 system time
         std::uint64_t sys_time = 0;    // 0x0910 current DC system time (for start-vs-now sanity)
-        (void)ecx_FPRD(&impl_->port, adp, 0x0980, sizeof(cyclic_ctrl), &cyclic_ctrl, EC_TIMEOUTRET);
-        (void)ecx_FPRD(&impl_->port, adp, 0x0981, sizeof(activation), &activation, EC_TIMEOUTRET);
-        (void)ecx_FPRD(&impl_->port, adp, 0x0134, sizeof(al_status), &al_status, EC_TIMEOUTRET);
-        (void)ecx_FPRD(&impl_->port, adp, 0x09A0, sizeof(sync0_cyc), &sync0_cyc, EC_TIMEOUTRET);
-        (void)ecx_FPRD(&impl_->port, adp, 0x0990, sizeof(start_time), &start_time, EC_TIMEOUTRET);
-        (void)ecx_FPRD(&impl_->port, adp, 0x0910, sizeof(sys_time), &sys_time, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->ctx.port, adp, 0x0980, sizeof(cyclic_ctrl), &cyclic_ctrl, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->ctx.port, adp, 0x0981, sizeof(activation), &activation, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->ctx.port, adp, 0x0134, sizeof(al_status), &al_status, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->ctx.port, adp, 0x09A0, sizeof(sync0_cyc), &sync0_cyc, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->ctx.port, adp, 0x0990, sizeof(start_time), &start_time, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->ctx.port, adp, 0x0910, sizeof(sys_time), &sys_time, EC_TIMEOUTRET);
         std::cerr << "[dc] slave " << i << " ARMED SYNC0 @ " << cycle_ns << " ns shift " << sync0_shift_ns << " ns (post-SAFE-OP)\n"
                   << "[dc]   ESC 0x0980 cyclicCtrl=0x" << std::hex << static_cast<unsigned>(cyclic_ctrl) << " 0x0981 activation=0x"
                   << static_cast<unsigned>(activation) << std::dec << " [cyclicEn=" << ((activation & 0x01U) != 0)
@@ -388,8 +348,8 @@ int SoemBackend::exchange() noexcept {
 }
 
 std::int64_t SoemBackend::dc_time() const noexcept {
-    // ctx.DCtime -> &impl_->dctime, refreshed by SOEM on each receive_processdata.
-    return impl_->dctime;
+    // ctx.DCtime is refreshed by SOEM on each receive_processdata.
+    return impl_->ctx.DCtime;
 }
 
 DcSyncStatus SoemBackend::dc_sync_status() noexcept {
@@ -405,23 +365,23 @@ DcSyncStatus SoemBackend::dc_sync_status() noexcept {
     //   0x0134     -- AL status (0x2D = DC start invalid) surfaced for diagnostics.
     constexpr std::uint32_t kLockBandNs = 1000;  // |0x092C| < 1 us => disciplined/locked
     DcSyncStatus st{};
-    if (impl_->slavecount < 1) {
+    if (impl_->ctx.slavecount < 1) {
         return st;  // no slaves -> not ready
     }
     bool all_locked = true;
     bool all_armed = true;
     bool all_pulsing = impl_->sync0_evt_primed;  // can't judge toggle on the first (unprimed) call
     std::uint32_t worst_mag = 0;                 // largest |0x092C| across slaves -> reported as the signed sample
-    for (int i = 1; i <= impl_->slavecount; ++i) {
-        const std::uint16_t adp = impl_->slavelist[i].configadr;
+    for (int i = 1; i <= impl_->ctx.slavecount; ++i) {
+        const std::uint16_t adp = impl_->ctx.slavelist[i].configadr;
         std::uint8_t act_status = 0;  // 0x0984 activation status (b0 = SYNC0 active)
         std::uint32_t time_diff = 0;  // 0x092C system time difference
         std::uint16_t al = 0;         // 0x0134 AL status code
         std::uint8_t sync0_evt = 0;   // 0x098E SYNC0 status/event (changes per pulse if physically firing)
-        (void)ecx_FPRD(&impl_->port, adp, 0x0984, sizeof(act_status), &act_status, EC_TIMEOUTRET);
-        (void)ecx_FPRD(&impl_->port, adp, 0x092C, sizeof(time_diff), &time_diff, EC_TIMEOUTRET);
-        (void)ecx_FPRD(&impl_->port, adp, 0x0134, sizeof(al), &al, EC_TIMEOUTRET);
-        (void)ecx_FPRD(&impl_->port, adp, 0x098E, sizeof(sync0_evt), &sync0_evt, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->ctx.port, adp, 0x0984, sizeof(act_status), &act_status, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->ctx.port, adp, 0x092C, sizeof(time_diff), &time_diff, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->ctx.port, adp, 0x0134, sizeof(al), &al, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->ctx.port, adp, 0x098E, sizeof(sync0_evt), &sync0_evt, EC_TIMEOUTRET);
         const std::uint32_t diff_mag = time_diff & 0x7FFFFFFFU;
         const bool neg = (time_diff & 0x80000000U) != 0;
         all_armed = all_armed && ((act_status & 0x01U) != 0);
@@ -468,7 +428,7 @@ void SoemBackend::close() noexcept {
         // Er74) and wedges its CoE mailbox until a control-power cycle. Disabling
         // SYNC0 first lets the drive fall back cleanly between runs.
         if (impl_->dc_cycle_ns != 0) {
-            for (int i = 1; i <= impl_->slavecount; ++i) {
+            for (int i = 1; i <= impl_->ctx.slavecount; ++i) {
                 ecx_dcsync0(&impl_->ctx, static_cast<std::uint16_t>(i), FALSE, 0, 0);
             }
             impl_->dc_cycle_ns = 0;
