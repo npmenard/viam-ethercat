@@ -109,8 +109,42 @@ std::size_t SoemBackend::open(std::string_view ifname) {
         ecx_close(&impl_->ctx);
         throw InitError("no EtherCAT slaves found on '" + name + "' (is the bus wired and powered?)");
     }
-    impl_->open = true;
     impl_->slave_count = count;
+
+    // PRE-OP settle -- the ec_sample recovery the A6 needs before any SDO. config_init
+    // leaves slaves nominally in PRE-OP, but the CoE mailbox is NOT reliably ready until
+    // we drive a CONFIRMED PRE-OP: the A6 WKC-0's the first SDO otherwise, especially
+    // after a prior faulted run left it in a bad AL state. So (mirroring ec_sample):
+    //   - manualstatechange = 1: WE own every AL transition; stops ecx_config_map_group
+    //     from auto-jumping to SAFE-OP later, so configdc still runs in PRE-OP (#20).
+    //   - bounce any slave NOT in PRE-OP through INIT first (clears a latent AL error a
+    //     prior faulted run burned in), then drive all slaves PRE-OP and CONFIRM it.
+    impl_->ctx.manualstatechange = 1;
+    ecx_readstate(&impl_->ctx);
+    for (int i = 1; i <= count; ++i) {
+        if ((impl_->ctx.slavelist[i].state & 0x0FU) != EC_STATE_PRE_OP) {
+            impl_->ctx.slavelist[i].state = EC_STATE_INIT;
+            ecx_writestate(&impl_->ctx, static_cast<std::uint16_t>(i));
+            ecx_statecheck(&impl_->ctx, static_cast<std::uint16_t>(i), EC_STATE_INIT, EC_TIMEOUTSTATE);
+        }
+    }
+    impl_->ctx.slavelist[0].state = EC_STATE_PRE_OP;
+    ecx_writestate(&impl_->ctx, 0);
+    const std::uint16_t reached = ecx_statecheck(&impl_->ctx, 0, EC_STATE_PRE_OP, 3 * EC_TIMEOUTSTATE);
+    if ((reached & 0x0FU) != EC_STATE_PRE_OP) {
+        std::string detail;
+        ecx_readstate(&impl_->ctx);
+        for (int i = 1; i <= count; ++i) {
+            const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
+            detail += " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
+                      " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
+        }
+        ecx_close(&impl_->ctx);
+        throw InitError("EtherCAT slaves did not settle to PRE-OP on '" + name + "' (reached " + to_string(from_soem_state(reached)) +
+                        "); the CoE mailbox would not be ready for SDO" + detail);
+    }
+
+    impl_->open = true;
     return static_cast<std::size_t>(count);
 }
 
