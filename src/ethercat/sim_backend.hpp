@@ -65,7 +65,7 @@ class SimBackend final : public EcatBackend {
     void map_process_data() override;
     void request_state(std::uint16_t slave, EcatState target) override;
     EcatState slave_state(std::uint16_t slave) const override;
-    void configure_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns, std::int64_t start_delay_ns) override;  // records the cycle
+    void arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) override;  // records the cycle (configured_dc_cycle_ns)
     std::int64_t dc_time() const noexcept override;  // synthetic ramp (advances per exchange) so phase-lock math is sane offline
 
     // EcatBackend -- cyclic
@@ -124,10 +124,10 @@ class SimBackend final : public EcatBackend {
     // suppressed, the controller's new-set-point handshake times out; re-enabling
     // lets a subsequent move complete (handshake-timeout-then-recovery test).
     void suppress_setpoint_ack(std::uint16_t slave, bool on = true) noexcept;
-    // SYNC0 cycle (ns) the master requested via configure_dc_sync, or 0 if it never
-    // did. Lets an offline test assert DC is configured when use_distributed_clocks.
-    // TEST-ONLY: call only after the controller is stopped/joined (set during
-    // configure(), which runs on the lifecycle thread before the RT thread spawns).
+    // SYNC0 cycle (ns) the bring-up armed via arm_dc_sync, or 0 if it never did. Lets an
+    // offline test assert the DC bring-up reached the ARM phase when use_distributed_clocks.
+    // TEST-ONLY: call only after the controller is stopped/joined (set during the RT loop's
+    // bring-up prelude, on the RT thread).
     std::uint32_t configured_dc_cycle_ns() const noexcept;
     // Read back a recorded SDO value (latest write to that object).
     std::vector<std::byte> recorded_sdo(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const;

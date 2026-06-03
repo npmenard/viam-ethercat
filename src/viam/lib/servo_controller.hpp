@@ -91,9 +91,25 @@ class ServoController {
     ~ServoController();  // stop()
 
     // NON-RT lifecycle (exclusive api_mutex_). start(): build+init+configure the
-    // Master (may throw InitError), resolve field offsets ONCE, spawn the RT
-    // thread; the promise/future handshake makes start() throw if the RT thread
+    // Master to SAFE-OP (may throw InitError), resolve field offsets ONCE, spawn the
+    // RT thread; the promise/future handshake makes start() throw if the RT thread
     // can't get SCHED_FIFO and require_realtime.
+    //
+    // CONTRACT (#20): start() SUCCESS means "the RT thread is launched + scheduled",
+    // NOT "operational / powered". Because the DC bring-up must be GAPLESS, OP is
+    // reached INSIDE the RT loop (configure() stops at SAFE-OP -- it cannot reach OP
+    // without gapping the process-data handoff -> Er74), so start() CANNOT block until
+    // OP. It still THROWS synchronously on the one thing it can guarantee up front --
+    // the RT loop being able to RUN (setup_realtime() + require_realtime), via the
+    // started-promise. The DC bring-up OUTCOME is observed ASYNCHRONOUSLY:
+    //   - reached OP   -> is_operational() / is_powered() become true;
+    //   - aborted      -> Er74.1 (no SYNC0) in the gate -> the RT loop surfaces the
+    //                     drive tier + RtError::NotOperational via last_error() and
+    //                     EXITS without auto-retry (repeated Er74 OP-entry wedges the
+    //                     A6); recovery is an explicit reconfigure()/restart.
+    // A command issued before OP+enabled degrades gracefully: await_move() waits/
+    // times-out (the FSM never reaches the completion generation) rather than acting
+    // on a non-operational drive.
     void start();
     // Teardown: stopping_=true + notify_all (wake parked waiters) -> request_stop
     // + join (RETURNS before any reset/destroy).

@@ -12,6 +12,7 @@
 #include <sched.h>
 #include <sys/mman.h>
 
+#include "ethercat/dc_sync.hpp"
 #include "ethercat/errors.hpp"
 #include "ethercat/pdo_buffer.hpp"
 #include "ethercat/soem_backend.hpp"
@@ -26,9 +27,10 @@ constexpr std::uint16_t kStatusword = 0x6041;
 constexpr std::uint16_t kTargetPos = 0x607A;
 constexpr std::uint16_t kActualPos = 0x6064;
 constexpr std::uint16_t kTargetVel = 0x60FF;
-constexpr std::uint16_t kProfileVel = 0x6081;  // PP move speed (carries the GoTo/GoFor rpm); optional in the map
-constexpr std::uint16_t kFaultCode = 0x603F;   // drive error code (TxPDO, optional feedback)
-constexpr std::uint16_t kVelActual = 0x606C;   // velocity actual value (TxPDO, optional feedback)
+constexpr std::uint16_t kProfileVel = 0x6081;     // PP move speed (carries the GoTo/GoFor rpm); optional in the map
+constexpr std::uint16_t kFaultCode = 0x603F;      // drive error code (TxPDO, optional feedback)
+constexpr std::uint16_t kEr74SyncFault = 0x8700;  // 0x603F value for Er74.1 "no SYNC0" -- the DC bring-up abort signal
+constexpr std::uint16_t kVelActual = 0x606C;      // velocity actual value (TxPDO, optional feedback)
 constexpr std::uint64_t kNsPerSec = 1'000'000'000ULL;
 
 // 4-digit uppercase hex of a U16 (e.g. 0x8700 -> "8700"); for last_error()'s
@@ -63,6 +65,7 @@ MasterConfig build_master_config(const ServoConfig& c) {
     slave.rxpdo = c.rxpdo;
     slave.txpdo = c.txpdo;
     slave.default_mode = to_cia402_mode(c.mode);
+    slave.fault_reset = c.fault_reset;  // vendor SDO fault-reset (A6: 0x2031:01=1), cleared at bring-up
 
     MasterConfig mc;
     mc.ifname = c.ifname;
@@ -70,11 +73,11 @@ MasterConfig build_master_config(const ServoConfig& c) {
     mc.slaves = {slave};
     mc.max_consecutive_wkc_errors = static_cast<std::uint32_t>(c.max_consecutive_wkc_errors);
     mc.use_distributed_clocks = c.use_distributed_clocks;
-    // DC bring-up (bench-tuned defaults; only used when DC is on): phase-locking
-    // warmup before OP + a post-OP settle grace while the phase finishes locking.
-    constexpr std::uint32_t kDefaultDcLockCycles = 2000;
+    // Post-OP DC settle grace (cycles) while the SYNC0 phase finishes locking: suppress
+    // the WKC-fault latch so a residual transient doesn't trip a spurious BusError. The
+    // bring-up SETTLE/GATE bounds use MasterConfig's own defaults (dc_arm_settle_cycles /
+    // dc_op_gate_cycles); bench-tune those at first light if needed.
     constexpr std::uint32_t kDefaultDcSettleCycles = 1000;
-    mc.dc_lock_cycles = c.use_distributed_clocks ? kDefaultDcLockCycles : 0;
     mc.dc_settle_cycles = c.use_distributed_clocks ? kDefaultDcSettleCycles : 0;
     return mc;
 }
@@ -98,10 +101,11 @@ ServoController::~ServoController() {
 void ServoController::start() {
     const std::unique_lock<std::shared_mutex> lk(api_mutex_);
 
-    // NOTE: memory for the DC PLL warmup is locked inside Master::configure() (right
-    // before the warmup, MCL_CURRENT only) so it doesn't MCL_FUTURE-lock this thread
-    // before the RT jthread spawns (which would EAGAIN the thread stack). The RT
-    // thread's setup_realtime() does the full MCL_CURRENT|MCL_FUTURE for the loop.
+    // NOTE: configure() reaches SAFE-OP and (for DC) mlockall(MCL_CURRENT)s resident
+    // memory before this thread spawns the RT jthread (MCL_CURRENT only, so it doesn't
+    // MCL_FUTURE-lock this thread's later allocations -> EAGAIN). The RT thread then runs
+    // the DC bring-up prelude (SETTLE->ARM->GATE->OP) to OPERATIONAL; setup_realtime()
+    // does the full MCL_CURRENT|MCL_FUTURE for the loop.
     master_ = std::make_unique<Master>(build_master_config(config_), backend_factory_());
     master_->init();
     master_->configure();
@@ -565,7 +569,65 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
 
     const std::uint16_t slave = config_.slave_id;
     const std::uint64_t period_ns = kNsPerSec / config_.target_loop_rate_hz;
+    const bool dc = config_.use_distributed_clocks;
+    // Phase-lock TARGET: mid-cycle (period/2) from the DC base -- locking on the SYNC0
+    // edge (0) leaves no jitter margin (#20 consolidated the shift to one knob; the PI
+    // target is derived as cycle/2). Only applied when DC is on.
+    const std::int64_t dc_target_shift = static_cast<std::int64_t>(period_ns) / 2;
+    std::int64_t dc_integral = 0;
     std::uint64_t next = monotonic_ns() + period_ns;
+
+    // DC bring-up prelude (#20): configure() left the bus at SAFE-OP; drive the Master
+    // bring-up FSM to OPERATIONAL here, in the single RT loop, so process data flows
+    // continuously (gapless) and SYNC0 is armed only once PD is already flowing. The
+    // gate's drive_sync_faulted is THIS controller's read of 0x603F == Er74.1 ("no
+    // SYNC0", #16 reuse) from the prior step's feedback -- keeping Master free of CiA402
+    // semantics. The caller (here) owns the phase-locked cadence.
+    bool bringup_ok = false;
+    while (!st.stop_requested()) {
+        const std::span<const std::byte> bin = master_->input_image(slave);
+        const std::uint16_t code = f_fault_code_.byte_width != 0 ? load_le<std::uint16_t>(bin.subspan(f_fault_code_.byte_offset, 2)) : 0;
+        const ethercat::BringupStatus bs = master_->bringup_step(code == kEr74SyncFault);
+        if (bs == ethercat::BringupStatus::Operational) {
+            bringup_ok = true;
+        } else if (bs == ethercat::BringupStatus::Aborted) {
+            // SYNC0 did not take (Er74.1 in the gate). Surface root cause (drive tier) +
+            // symptom (not operational); do NOT auto-retry -- repeated Er74 OP-entry
+            // wedges the A6 (NO-CARRIER -> control-power cycle), so a re-attempt needs an
+            // explicit restart/reconfigure. Fall through to the safe-state exit below.
+            state_.drive_fault_code.store(code != 0 ? code : kEr74SyncFault, std::memory_order_relaxed);
+            state_.drive_faulted.store(true, std::memory_order_release);
+            rt_error_.store(RtError::NotOperational, std::memory_order_release);
+            state_.faulted.store(true, std::memory_order_release);
+        }
+        // Maintain the phase-locked cadence even on the terminal step, so the steady loop
+        // picks up one clean period later (no gap).
+        const long corr =
+            dc ? dc_phase_correction(master_->dc_time(), static_cast<std::int64_t>(period_ns), dc_integral, dc_target_shift) : 0;
+        next += static_cast<std::uint64_t>(static_cast<long>(period_ns) + corr);
+        // Phase-preserving overrun catch-up: on a multi-period overrun, skip the missed
+        // whole periods (realign to the SYNC0 grid) instead of firing a back-to-back
+        // off-phase burst. Adding whole periods preserves the sub-period (corrected) phase.
+        for (std::uint64_t now = monotonic_ns(); next <= now; now = monotonic_ns()) {
+            next += period_ns;
+        }
+        timespec bdl{};
+        bdl.tv_sec = static_cast<std::time_t>(next / kNsPerSec);
+        bdl.tv_nsec = static_cast<long>(next % kNsPerSec);
+        (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &bdl, nullptr);
+        if (bs == ethercat::BringupStatus::Operational || bs == ethercat::BringupStatus::Aborted) {
+            break;
+        }
+    }
+    if (!bringup_ok) {
+        // Aborted, or stop requested during bring-up: leave the drive in a safe state
+        // (disable voltage) and exit -- never enter the steady control loop un-operational.
+        if (master_) {
+            store_le<std::uint16_t>(master_->outputs(slave).subspan(f_ctrlword_.byte_offset, 2), ControlWord::disable_voltage());
+            master_->process();
+        }
+        return;
+    }
 
     while (!st.stop_requested()) {
         const CommandBatch batch = commands_.drain();
@@ -595,7 +657,17 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
         master_->process();
         publish_state(status, actual, velocity, in);
 
-        next += period_ns;
+        // Keep the cyclic wakeup phase-locked to DC SYNC0 (ec_sync PI) every cycle when
+        // DC is on, so the master's send holds its phase relative to the drive's pulse
+        // (no slow drift out of lock). No-op (corr 0) on non-DC backends.
+        const long corr =
+            dc ? dc_phase_correction(master_->dc_time(), static_cast<std::int64_t>(period_ns), dc_integral, dc_target_shift) : 0;
+        next += static_cast<std::uint64_t>(static_cast<long>(period_ns) + corr);
+        // Phase-preserving overrun catch-up (see the bring-up loop): skip missed whole
+        // periods on a multi-period overrun rather than bursting off-phase.
+        for (std::uint64_t now = monotonic_ns(); next <= now; now = monotonic_ns()) {
+            next += period_ns;
+        }
         timespec deadline{};
         deadline.tv_sec = static_cast<std::time_t>(next / kNsPerSec);
         deadline.tv_nsec = static_cast<long>(next % kNsPerSec);

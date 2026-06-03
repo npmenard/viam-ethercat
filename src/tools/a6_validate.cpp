@@ -81,8 +81,6 @@ constexpr std::uint8_t kSyncCycleSub = 0x02;       // :02 cycle time (U32 ns, RO
 constexpr std::uint8_t kGetCycleSub = 0x08;        // :08 Get Cycle Time (U16, R/W): 1 = measure
 constexpr std::uint8_t kSync0CycleSub = 0x0A;      // :0a Sync0 Cycle Time (U32 ns, R/W)
 constexpr std::uint16_t kSyncTypeDcSync0 = 2;      // ETG sync type 2 = DC SYNC0
-constexpr std::uint16_t kGetCycleMeasure = 1;      // :08 = 1 -> measure ONCE, populates :02 (needs SYNC0 live)
-constexpr std::uint16_t kGetCycleReset = 0;        // :08 = 0 -> reset any stale measurement before triggering
 constexpr std::uint32_t kSyncCycleNs = 1'000'000;  // SYNC0/SM cycle = loop period (1 ms); must match ESC 0x09A0
 // ETG.1020 measurement diagnostic counters (sub-indices per the A6's REAL OD dump --
 // note SyncError is :13 on this drive, not the ETG-standard :20). Populated by :08=1.
@@ -96,12 +94,6 @@ constexpr double kCountsPerRev = 131072.0;  // A6 single-turn encoder = 2^17
 std::vector<std::byte> le16(std::uint16_t v) {
     return {static_cast<std::byte>(v & 0xFFU), static_cast<std::byte>((v >> 8U) & 0xFFU)};
 }
-std::vector<std::byte> le32(std::uint32_t v) {
-    return {static_cast<std::byte>(v & 0xFFU),
-            static_cast<std::byte>((v >> 8U) & 0xFFU),
-            static_cast<std::byte>((v >> 16U) & 0xFFU),
-            static_cast<std::byte>((v >> 24U) & 0xFFU)};
-}
 
 std::atomic<bool> g_stop{false};
 extern "C" void on_sigint(int) {
@@ -111,65 +103,32 @@ extern "C" void on_sigint(int) {
 // Build the PROFILE POSITION MasterConfig for one A6, mirroring
 // etc/a6-hardware.example.json (RxPDO 0x1600 = ctrl + target-pos + profile-vel;
 // TxPDO 0x1A00 = fault + status + mode-display + pos + vel + torque).
-MasterConfig build_a6_pp_config(const std::string& ifname,
-                                std::int32_t dc_target_ns,
-                                std::int32_t dc_sync0_shift_ns,
-                                bool sm_dc_sync,
-                                std::int64_t dc_start_delay_ns,
-                                bool arm_in_preop) {
+MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_sync0_shift_ns, bool reset_fault) {
     MasterConfig cfg;
     cfg.ifname = ifname;
-    cfg.target_loop_rate_hz = 1000;                  // 1 ms SYNC0 = 4 x 250 us (A6-legal)
-    cfg.use_distributed_clocks = true;               // A6 supports ONLY DC sync
-    cfg.dc_lock_cycles = 2000;                       // up to 2 s phase-locking warmup -> enter OP aligned
-    cfg.dc_settle_cycles = 1000;                     // ~1 s post-OP grace while the phase finishes locking
-    cfg.dc_sync_shift_ns = dc_target_ns;             // send-phase target (-1 = auto mid-cycle); --dc-target-ns sweep
-    cfg.dc_sync0_shift_ns = dc_sync0_shift_ns;       // SYNC0 CyclShift; --dc-shift-ns sweep
-    cfg.dc_sync_start_delay_ns = dc_start_delay_ns;  // first-edge delay (beats the A6 ~50ms watchdog); --dc-start-delay-ns
-    cfg.dc_arm_in_preop = arm_in_preop;              // arm SYNC0 in PRE-OP (firing before SAFE-OP); --arm-in-preop
+    cfg.target_loop_rate_hz = 1000;             // 1 ms SYNC0 = 4 x 250 us (A6-legal)
+    cfg.use_distributed_clocks = true;          // A6 supports ONLY DC sync
+    cfg.dc_sync0_shift_ns = dc_sync0_shift_ns;  // SYNC0 CyclShift; --dc-shift-ns sweep
+    cfg.dc_settle_cycles = 1000;                // ~1 s post-OP grace while the phase finishes locking
     cfg.max_consecutive_wkc_errors = 5;
+    // The bring-up SETTLE/GATE bounds use MasterConfig's defaults (dc_arm_settle_cycles /
+    // dc_op_gate_cycles); the cyclic loop runs SETTLE -> ARM(stock ecx_dcsync0) -> GATE
+    // (no Er74.1) -> request OP, all gapless + phase-locked.
 
     SlaveConfig a6;
     a6.slave_id = 1;
     a6.default_mode = Cia402Mode::ProfilePosition;
-
-    // --sm-dc-sync: put the SM2/SM3 application sync into DC SYNC0 mode (PRE-OP).
-    // Targeted Er74.1 "no sync signal" fix -- the ESC SYNC0 is active but the drive
-    // app may still be free-run. Opt-in: a read-only-object abort would otherwise
-    // block the plain timing-sweep runs. (Panel-confirmed jitter is NOT the issue,
-    // so the C13 sync-tolerance writes were dropped -- the generic preop_sdo_writes
-    // mechanism stays for exactly this kind of drive-config write.)
-    if (sm_dc_sync) {
-        // PRE-DC (postremap = post-assign, before configdc): switch SM2/SM3 to DC SYNC0.
-        // 0x1C32:01 is R/W only BEFORE DC activation -- written post-configdc the A6
-        // rejects it 0x08000022 (wrong state). optional=true: 0x1C33:01 reads a
-        // non-standard 0x22 and may reject; must not abort the run.
-        a6.postremap_sdo_writes = {
-            {kSm2SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0), /*optional=*/true},  // SM2 outputs -> DC SYNC0
-            {kSm3SyncType, kSyncTypeSub, le16(kSyncTypeDcSync0), /*optional=*/true},  // SM3 inputs  -> DC SYNC0
-        };
-        // POST-DC (after dcsync0 set 0x09A0=1ms + SYNC0 pulsing): the ETG.1020
-        // cycle-time handshake. The A6's OD shows 0x1C32:02 (Cycle Time) is READ-ONLY
-        // and is NOT auto-derived -- so we TELL the drive the SYNC0 cycle via the R/W
-        // :0a (Sync0 Cycle Time = 1ms) and trigger a measurement via :08 (Get Cycle
-        // Time = 1). The drive then fills the RO :02 -> SafeOp validates a non-zero
-        // cycle. :0a first (provides the value), then :08 (triggers). All optional.
-        a6.postdc_sdo_writes = {
-            {kSm2SyncType, kGetCycleSub, le16(kGetCycleReset), /*optional=*/true},    // reset any stale measurement first
-            {kSm3SyncType, kGetCycleSub, le16(kGetCycleReset), /*optional=*/true},    //
-            {kSm2SyncType, kSync0CycleSub, le32(kSyncCycleNs), /*optional=*/true},    // SM2 Sync0 Cycle Time = 1 ms
-            {kSm3SyncType, kSync0CycleSub, le32(kSyncCycleNs), /*optional=*/true},    // SM3 Sync0 Cycle Time = 1 ms
-            {kSm2SyncType, kGetCycleSub, le16(kGetCycleMeasure), /*optional=*/true},  // SM2 Get Cycle Time = measure once
-            {kSm3SyncType, kGetCycleSub, le16(kGetCycleMeasure), /*optional=*/true},  // SM3 Get Cycle Time = measure once
-        };
-        // After the handshake, pump up to 250 cycles + poll 0x1C32:02. (Originally a
-        // theory that :02=0 caused the SAFE-OP 0x0030 -- DISPROVEN on HW: :02 populated
-        // 999120 and SAFE-OP still 0x0030'd. Kept as a no-harm diagnostic settle; the
-        // 0x0030 reject with DC sync-type is drive-internal, not a missing :02.)
-        cfg.dc_postwrite_settle_cycles = 250;
-        cfg.dc_settle_poll_index = kSm2SyncType;  // poll 0x1C32...
-        cfg.dc_settle_poll_sub = kSyncCycleSub;   // ...:02 (SM cycle time) until non-zero
+    // The A6's fault-reset is the VENDOR SDO 0x2031:01 = 1 (NOT CiA402 bit7, CLAUDE.md).
+    // --reset-fault clears a latent fault ONCE at bring-up (configure(), after SAFE-OP,
+    // single port owner). Width per the A6 OD (U16 assumed); a wrong width just logs a
+    // length abort (best-effort) -- adjust if first light shows one.
+    if (reset_fault) {
+        a6.fault_reset = SdoWrite{0x2031, 0x01, le16(1)};
     }
+    // #20: we DELIBERATELY do NOT write 0x1C32:01 (SM sync-type). v2's config_map_group
+    // lets the A6 self-select DC SYNC0; forcing it was the self-inflicted AL 0x0030
+    // (CLAUDE.md). The generic preop/postremap SDO mechanisms remain for drives that
+    // need them; the A6 needs none here.
 
     a6.rxpdo.assign_index = 0x1C12;
     a6.rxpdo.pdo_indices = {0x1600};
@@ -262,11 +221,7 @@ struct Options {
     double move_revs = 0.0;
     double move_rpm = 60.0;
     int seconds = 6;
-    std::int32_t dc_target_ns = -1;               // send-phase lock target (-1 = auto mid-cycle); sweep with --dc-target-ns
-    std::int32_t dc_sync0_shift_ns = 0;           // SYNC0 CyclShift; sweep with --dc-shift-ns
-    std::int64_t dc_start_delay_ns = 15'000'000;  // SYNC0 first-edge delay (beats A6 ~50ms watchdog); --dc-start-delay-ns
-    bool sm_dc_sync = false;                      // --sm-dc-sync: write SM2/SM3 sync type = DC SYNC0 (Er74.1 fix)
-    bool arm_in_preop = false;                    // --arm-in-preop: arm SYNC0 (firing) in PRE-OP before SAFE-OP
+    std::int32_t dc_sync0_shift_ns = 0;  // SYNC0 CyclShift passed to ecx_dcsync0; sweep with --dc-shift-ns
 };
 
 }  // namespace
@@ -289,33 +244,17 @@ int main(int argc, char** argv) {
             }
         } else if (a == "--seconds" && i + 1 < args.size()) {
             opt.seconds = std::stoi(args[++i]);
-        } else if (a == "--dc-target-ns" && i + 1 < args.size()) {
-            opt.dc_target_ns = std::stoi(args[++i]);  // send-phase lock target (-1 = auto mid-cycle)
         } else if (a == "--dc-shift-ns" && i + 1 < args.size()) {
             opt.dc_sync0_shift_ns = std::stoi(args[++i]);  // SYNC0 CyclShift passed to ecx_dcsync0
-        } else if (a == "--dc-start-delay-ns" && i + 1 < args.size()) {
-            opt.dc_start_delay_ns = std::stoll(args[++i]);  // SYNC0 first-edge delay (vs SOEM's 100ms)
-        } else if (a == "--arm-in-preop") {
-            opt.arm_in_preop = true;  // arm SYNC0 (firing) in PRE-OP before SAFE-OP (synthesis path)
-        } else if (a == "--sm-dc-sync") {
-            opt.sm_dc_sync = true;  // write SM2/SM3 sync type = DC SYNC0 (targeted Er74.1 fix)
         } else if (a.rfind("--", 0) != 0) {
             opt.ifname = a;
         } else {
-            std::cerr
-                << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N]\n"
-                << "                   [--dc-target-ns NS] [--dc-shift-ns NS] [--dc-start-delay-ns NS] [--sm-dc-sync] [--arm-in-preop]\n"
-                << "  --arm-in-preop: arm SYNC0 in PRE-OP so it is firing before SAFE-OP. Pair with --sm-dc-sync:\n"
-                << "                  the A6 needs DC sync-type (0x1C32:01=2) to run OP (else AL 0x0027) AND a\n"
-                << "                  pulsing SYNC0 at the SAFE-OP DC validation (else AL 0x0030). This is the synthesis.\n"
-                << "  --dc-start-delay-ns: SYNC0 first-edge delay (default 15000000=15ms). The A6's sync\n"
-                << "                  watchdog (~50ms) is shorter than SOEM's 100ms default, which would trip\n"
-                << "                  'no sync' before the first edge; 15ms beats it. Raise toward ~40ms or lower\n"
-                << "                  toward ~5ms if the bench shows the watchdog window differs.\n"
-                << "  --dc-target-ns: master send-phase lock target within the 1ms cycle (-1=auto mid ~500000).\n"
-                << "                  SWEEP on Er74.0 cycle-error: try 100000 (just after SYNC0) or 900000 (just\n"
-                << "                  before) to find where the drive accepts the frame relative to its SYNC0 edge.\n"
-                << "  --dc-shift-ns:  SYNC0 pulse CyclShift (ecx_dcsync0) -- moves the SYNC0 edge itself.\n";
+            std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N] [--dc-shift-ns NS]\n"
+                      << "  The DC bring-up (#20) is automatic: configure() reaches SAFE-OP, then the cyclic loop runs\n"
+                      << "  SETTLE -> arm stock ecx_dcsync0 -> gate on (no Er74.1) -> request OP, all with gapless\n"
+                      << "  phase-locked PD. No manual 0x1C32:01 force, no SYNC0 start-delay hack (CLAUDE.md / spec #20).\n"
+                      << "  --dc-shift-ns: SYNC0 pulse CyclShift (ecx_dcsync0) -- sweep to move the SYNC0 edge if needed.\n"
+                      << "  --reset-fault: clear a latent drive fault at bring-up via the A6 vendor SDO 0x2031:01=1.\n";
             return 2;
         }
     }
@@ -340,14 +279,10 @@ int main(int argc, char** argv) {
         std::cerr << "    [rt] continuing best-effort -- DC SYNC0 may fault under jitter; run with sudo.\n\n";
     }
 
-    std::cout << "[dc] send-phase target = " << (opt.dc_target_ns < 0 ? "auto(mid-cycle)" : std::to_string(opt.dc_target_ns) + "ns")
-              << " | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns | SYNC0 start delay = " << opt.dc_start_delay_ns << "ns"
-              << " | SM DC-sync write = " << (opt.sm_dc_sync ? "ON (0x1C32/33:01=2)" : "off")
-              << " | arm = " << (opt.arm_in_preop ? "PRE-OP (firing before SAFE-OP)" : "post-SAFE-OP in-loop") << "\n\n";
+    std::cout << "[dc] phase-lock target = auto(mid-cycle) | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns"
+              << " | fault-reset at bring-up = " << (opt.reset_fault ? "ON (vendor 0x2031:01=1)" : "off") << "\n\n";
 
-    Master master(
-        build_a6_pp_config(opt.ifname, opt.dc_target_ns, opt.dc_sync0_shift_ns, opt.sm_dc_sync, opt.dc_start_delay_ns, opt.arm_in_preop),
-        std::make_unique<SoemBackend>());
+    Master master(build_a6_pp_config(opt.ifname, opt.dc_sync0_shift_ns, opt.reset_fault), std::make_unique<SoemBackend>());
 
     // --- Stage A: open + enumerate + read-only SDO identity (PRE-OP) ---
     try {
@@ -386,7 +321,7 @@ int main(int argc, char** argv) {
     // writes already applied -- so these SDO reads still work and show exactly what
     // the drive validated. Each group is its own try so a missing sub-index can't
     // suppress the others.
-    const auto dump_sm_config = [&master, &opt]() {
+    const auto dump_sm_config = [&master]() {
         try {
             const auto sm2 = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kSyncTypeSub);
             const auto sm3 = master.sdo_read<std::uint16_t>(slave, kSm3SyncType, kSyncTypeSub);
@@ -394,9 +329,10 @@ int main(int argc, char** argv) {
             const auto min_cycle = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, 0x05);
             const bool dc = sm2 == kSyncTypeDcSync0 && sm3 == kSyncTypeDcSync0;
             std::cout << "[dc] SM sync-type: 0x1C32:01(SM2)=" << sm2 << " 0x1C33:01(SM3)=" << sm3
-                      << (dc ? "  -> DC SYNC0 active" : "  -> NOT DC SYNC0 (0=FreeRun,1=SM,2=DC)") << "\n"
+                      << (dc ? "  -> DC SYNC0 active (drive self-selected; we never force it)" : "  -> NOT DC SYNC0 (0=FreeRun,1=SM,2=DC)")
+                      << "\n"
                       << "[dc]   0x1C32:04 supportedTypes=0x" << std::hex << supported << std::dec << " 0x1C32:05 minCycle=" << min_cycle
-                      << "ns" << (opt.sm_dc_sync ? "  [--sm-dc-sync wrote :01=2 :02=1ms]" : "") << '\n';
+                      << "ns" << '\n';
         } catch (const Error& e) {
             std::cerr << "[dc] SM sync-type read failed (object absent?): " << e.what() << '\n';
         }
@@ -441,15 +377,15 @@ int main(int argc, char** argv) {
     // have a gap between bring-up and the steady loop. reach_op=false stops configure
     // at SAFE-OP + DC; the loop below owns every frame from there.
     try {
-        master.configure(false);
+        master.configure();
     } catch (const Error& e) {
         std::cerr << "[B] configure failed: " << e.what() << "\n"
-                  << "    (a SafeOp AL-reject 0x0030 'invalid DC SYNC config' lands here; SM config below shows what the drive saw.)\n";
+                  << "    (an AL-reject at the SAFE-OP transition lands here; SM config below shows what the drive saw.)\n";
         dump_sm_config();  // bus still open in PRE-OP -> reads work; capture the SM config even on failure
         return 1;
     }
     std::cout << "[B] configured to SAFE-OP, DC enabled (expected WKC=" << master.expected_wkc()
-              << "); phase-locking, then requesting OP with NO frame gap...\n";
+              << "); running the bring-up FSM (SETTLE->ARM->GATE->OP), gapless + phase-locked...\n";
 
     dump_sm_config();
 
@@ -458,28 +394,81 @@ int main(int argc, char** argv) {
     const Cia402State goal = opt.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
     constexpr std::uint32_t kLoopHz = 1000;
     const std::uint32_t period_ns = 1'000'000'000U / kLoopHz;
-    // Send-phase lock target: --dc-target-ns overrides the default mid-cycle. The
-    // master phase-locks (dc_time mod cycle) to this offset; sweeping it (with the
-    // SYNC0 CyclShift) is how we find the window where the A6 latches a FRESH frame.
-    const std::int64_t dc_shift =
-        opt.dc_target_ns < 0 ? static_cast<std::int64_t>(period_ns) / 2 : static_cast<std::int64_t>(opt.dc_target_ns);
+    // Phase-lock TARGET: mid-cycle (period/2 from the DC base) -- locking on the SYNC0
+    // edge leaves no jitter margin. The single DC phase knob is the ecx_dcsync0 CyclShift
+    // (--dc-shift-ns); the PI send-phase target is derived here (#20 consolidated).
+    const std::int64_t dc_shift = static_cast<std::int64_t>(period_ns) / 2;
 
-    // Short label for the EtherCAT state phase (SAFE-OP -> ->OP -> OP) used in prints.
-    const auto phase_label = [](bool in_op, bool requested) -> const char* {
-        if (in_op) {
-            return "OP";
+    const auto bringup_label = [](BringupStatus s) -> const char* {
+        switch (s) {
+            case BringupStatus::Settling:
+                return "SETTLE";
+            case BringupStatus::Arming:
+                return "ARM";
+            case BringupStatus::Gating:
+                return "GATE";
+            case BringupStatus::AwaitingOp:
+                return "AWAIT_OP";
+            case BringupStatus::Operational:
+                return "OPERATIONAL";
+            case BringupStatus::Aborted:
+                return "ABORTED";
         }
-        return requested ? "->OP" : "SAFEOP";
+        return "?";
     };
 
     struct timespec next{};
     (void)clock_gettime(CLOCK_MONOTONIC, &next);
-    const auto t0 = std::chrono::steady_clock::now();
+    std::int64_t dc_integral = 0;
+    long dc_off = 0;
 
+    // --- Phase 1: DC bring-up (#20). configure() left the bus at SAFE-OP; the Master
+    // FSM runs SETTLE -> ARM (stock ecx_dcsync0) -> GATE (no Er74.1) -> request OP ->
+    // AWAIT_OP, while THIS loop owns the gapless, phase-locked cadence. The gate's
+    // drive_sync_faulted is our read of 0x603F == 0x8700 (Er74.1) from the prior cycle.
+    bool reached_op = false;
+    {
+        std::uint64_t btick = 0;
+        while (!g_stop.load()) {
+            sleep_until(next, static_cast<long>(period_ns) + dc_off);
+            const std::span<const std::byte> in = master.input_image(slave);
+            std::uint16_t fc = 0;
+            try {
+                fc = read_tx<std::uint16_t>(master, slave, in, kFaultCode);
+            } catch (const Error&) {  // 0x603F not mapped -> treat as no sync fault
+            }
+            const BringupStatus bs = master.bringup_step(fc == 0x8700);
+            dc_off = dc_phase_correction(master.dc_time(), static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
+            if (++btick % 200 == 0) {
+                std::cout << "[B] bring-up t=" << btick << " " << bringup_label(bs) << " wkc=" << master.last_wkc() << "/"
+                          << master.expected_wkc() << " dcPhase=" << (master.dc_time() % static_cast<std::int64_t>(period_ns)) << "ns\n";
+            }
+            if (bs == BringupStatus::Operational) {
+                reached_op = true;
+                break;
+            }
+            if (bs == BringupStatus::Aborted) {
+                std::cerr << "[B] !!! BRING-UP ABORTED: drive reported Er74.1 (no SYNC0) during the OP gate -- SYNC0 is not\n"
+                          << "    reaching the drive. NOT requesting OP (repeated Er74 OP-entry wedges the A6). Power-cycle +\n"
+                          << "    check DC wiring/cycle; sweep --dc-shift-ns. last_error: " << master.last_error() << '\n';
+                break;
+            }
+        }
+    }
+    if (!reached_op) {
+        dump_sm_config();
+        std::cout << "\n[B] bring-up did not reach OP; closing.\n";
+        master.close();
+        return 1;
+    }
+    std::cout << "[B] *** OPERATIONAL *** WKC=" << master.last_wkc() << "/" << master.expected_wkc()
+              << " -- DC bring-up complete (no Er74.1), entering CiA402 control loop\n";
+    dump_sm_config();
+
+    // --- Phase 2: steady CiA402 control loop (hold / optional PP move), phase-locked.
+    const auto t0 = std::chrono::steady_clock::now();
     std::uint16_t last_cw = 0;
     bool announced_op = false;
-    bool op_reached_announced = false;
-    bool op_requested = false;
     bool setpoint_latched = false;
     bool move_done = false;
     bool was_faulted = false;
@@ -488,228 +477,59 @@ int main(int argc, char** argv) {
     std::int32_t target = 0;
     std::uint64_t tick = 0;
     int wkc_bad = 0;
-    int wkc_bad_streak = 0;
-    int wkc_bad_max_streak = 0;
-    int locked_streak = 0;
-    std::int64_t dc_integral = 0;
-    long dc_off = 0;
-    // The bring-up flow, in ONE gapless loop:
-    //   (1) pump phase-locked PD in SAFE-OP until the MASTER is send-phase locked;
-    //   (2) THEN arm SYNC0 IN-LOOP (master.arm_dc_sync) with a short start delay so the
-    //       first edge beats the A6's ~50ms sync watchdog;
-    //   (3) keep pumping + watch the drive stay FAULT-FREE in SAFE-OP (the real proof
-    //       SYNC0 is reaching it -- 0x0984/0x098E are PDI-consumed, unusable as a gate);
-    //   (4) once fault-free + clock-locked for a healthy hold, request OP (gapless).
-    DcSyncStatus dcs{};
-    bool dc_sync_announced = false;
-    int op_fault_streak = 0;                             // consecutive cycles faulted-in-OP (persistent-cause give-up)
-    int healthy_hold_streak = 0;                         // consecutive cycles fault-free + clock-locked in SAFE-OP (OP gate)
-    constexpr int kPersistentFaultGiveUp = 2000;         // ~2 s faulted in OP despite reset -> STOP (protect the drive)
-    constexpr int kHealthyHoldCycles = 200;              // ~200 ms fault-free + clock-locked in SAFE-OP -> safe to request OP
-    bool dc_armed = opt.arm_in_preop;                    // SYNC0 armed yet? (already true if configure() armed it in PRE-OP)
-    std::int64_t sm_cycle = -1;                          // latest 0x1C32:02 read (ns), -1 = not yet read (DIAGNOSTIC only)
-    std::uint64_t arm_tick = 0;                          // tick at which we armed (cap is relative to this)
-    constexpr int kArmAfterLockStreak = 200;             // arm SYNC0 once the master holds phase-lock this long (~200 ms)
-    constexpr std::uint64_t kDcPollEvery = 50;           // poll dc_sync_status every 50 cycles (~20 Hz), ADDITIVE to PD
-    constexpr std::uint64_t kOpRequestCapCycles = 1000;  // ~1 s AFTER arming: no healthy hold -> abort (SYNC0 not reaching drive)
-    // NOTE on 0x1C32:02 (RO SM cycle): on a CLEAN drive it reads 0 in SAFE-OP and is only
-    // MEASURED/populated by the drive AT the OP transition (bench: the 999120 we chased
-    // earlier was a polluted-drive residual). So we do NOT gate OP on it -- a "verify
-    // ==1ms before OP" check can never pass (the value only exists after the OP it would
-    // block). Instead the PRE-OP phase-lock makes the OP-ENTRY measurement clean, and the
-    // bounded give-up is the safety net. 0x1C32:02 stays a DIAGNOSTIC (poll trace +
-    // fault-edge read) so we can see what the drive measured at/after OP.
-
-    // Read the RO SM2 cycle time (0x1C32:02) the drive validates at OP -- watch it
-    // re-derive toward 1000000 once a clean SYNC0 is pulsing (vs a stale cached value
-    // like 999680 a prior dirty bring-up burned in -> Er74.0 cycle error). SDO read =
-    // a mailbox round-trip that BLOCKS the loop, so only call it where a stalled cycle
-    // is harmless: pre-OP (no cycle enforcement yet) or when already faulted. -1 = not
-    // readable this cycle.
-    const auto read_sm_cycle = [&master]() -> std::int64_t {
-        try {
-            return static_cast<std::int64_t>(master.sdo_read<std::uint32_t>(slave, kSm2SyncType, kSyncCycleSub));
-        } catch (const Error&) {
-            return -1;
-        }
-    };
 
     while (!g_stop.load()) {
-        // DEADLINE-FIRST: advance the phase-corrected deadline and sleep to it BEFORE
-        // exchanging -- one unbroken cadence from the first frame, so the drive never
-        // sees a gap through SAFE-OP -> OP.
         sleep_until(next, static_cast<long>(period_ns) + dc_off);
         master.process();
         ++tick;
-
         const int raw_wkc = master.last_wkc();
         if (raw_wkc != master.expected_wkc()) {
             ++wkc_bad;
-            ++wkc_bad_streak;
-            wkc_bad_max_streak = std::max(wkc_bad_max_streak, wkc_bad_streak);
-        } else {
-            wkc_bad_streak = 0;
         }
-
-        // DC phase-lock correction for the NEXT cycle (mid-cycle target).
         const std::int64_t dct = master.dc_time();
         dc_off = dc_phase_correction(dct, static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
-        locked_streak = dc_phase_locked(dct, static_cast<std::int64_t>(period_ns), dc_shift) ? locked_streak + 1 : 0;
-
-        // STEP 2 -- ARM SYNC0 IN-LOOP, once the master holds phase-lock, while
-        // synchronized PD is already flowing. This is the crux of the SOEM-author flow:
-        // dcsync0 runs HERE (post-SAFE-OP, PD live, master disciplined), NOT in
-        // configure(). My bet (and the team-lead's): the A6 generates SYNC0 only when it
-        // arms against a clock it is already observing in sync.
-        if (!dc_armed && locked_streak >= kArmAfterLockStreak) {
-            master.arm_dc_sync();
-            dc_armed = true;
-            arm_tick = tick;
-            std::cout << "[B] master phase-locked (lockStreak=" << locked_streak << ", dcPhase~"
-                      << (dct % static_cast<std::int64_t>(period_ns)) << "ns) -> ARMING SYNC0 in-loop (post-SAFE-OP, PD flowing)\n";
-            // --sm-dc-sync: NOW that the arm set the ESC SYNC0 cycle (0x09A0) live, run
-            // the ETG.1020 cycle-time handshake (0x1C32:0a/:08) so the drive populates
-            // the RO 0x1C32:02 it validates at the OP transition. configure() deferred
-            // these to here (post-arm) on the caller-driven path.
-            if (opt.sm_dc_sync) {
-                master.apply_postdc_writes();
-                std::cout << "[B] applied post-arm ETG.1020 cycle handshake (0x1C32:0a/:08) -> populating 0x1C32:02\n";
-            }
-        }
-
-        // STEP 3 -- poll the slave DC-sync health at ~20 Hz (FPRD, additive to PD), until
-        // a clean OP is reached. DIAGNOSTIC ONLY: 0x0984 (armed) and 0x098E (pulse status)
-        // are PDI-CONSUMED on the A6 -- once the drive's MCU owns the SYNC unit it
-        // reads/acks them each pulse, so the master samples 0/static even while SYNC0 IS
-        // firing. The reliable signals are 0x092C (clock lock) and the ABSENCE of the
-        // Er74.1 no-sync fault (checked below from the statusword). The OP gate uses those.
-        if (dc_armed && !op_reached_announced && (tick % kDcPollEvery == 0)) {
-            dcs = master.dc_sync_status();
-            sm_cycle = read_sm_cycle();
-            std::cout << "[B]   " << (op_requested ? "OP-poll" : "poll") << " t=" << tick
-                      << " 0x0984=" << (dcs.sync0_active ? "ARMED" : "0(PDI?)")
-                      << " 0x098E=" << (dcs.sync0_pulsing ? "toggling" : "static(PDI?)") << " 0x092C=" << dcs.sys_time_diff_ns << "ns("
-                      << (dcs.clock_locked ? "LOCKED" : "unlocked") << ") lockStreak=" << locked_streak << " AL=0x" << std::hex
-                      << dcs.al_status << std::dec << " 0x1C32:02=" << sm_cycle << "ns\n";
-            if (!dc_sync_announced) {
-                std::cout << "[B] *** SYNC0 ARMED *** -- holding in SAFE-OP, watching for fault-free + clock-locked (the real sync-OK "
-                          << "proof; 0x0984/0x098E are PDI-consumed)\n";
-                dc_sync_announced = true;
-            }
-        }
-        // Full WKC == outputs processing == in OP with live command flow.
-        const bool op = op_requested && raw_wkc == master.expected_wkc();
 
         const std::span<const std::byte> in = master.input_image(slave);
         const Status status{read_tx<std::uint16_t>(master, slave, in, kStatusword)};
         const std::int32_t pos = read_tx<std::int32_t>(master, slave, in, kPositionActual);
         const std::int32_t vel = read_tx<std::int32_t>(master, slave, in, kVelocityActual);
 
-        if (op && !hold_captured) {
+        if (!hold_captured) {
             hold_pos = pos;
             target = pos;
             hold_captured = true;
         }
-        if (op && !op_reached_announced) {
-            std::cout << "[B] *** OPERATIONAL *** WKC=" << raw_wkc << "/" << master.expected_wkc() << ", holding at " << hold_pos << '\n';
-            op_reached_announced = true;
-        }
 
-        // DIAGNOSTIC: capture the CiA402 error code 0x603F on EVERY Fault entry (not
-        // just under --reset-fault). The A6 faults AT OP ENTRY on a DC timing miss --
-        // 0x8700 = Er74.1 "no SYNC0", 0x6320 = Er74.0 "cycle error" -- so the exact
-        // code at the transition tells the bench which way to sweep --dc-target-ns /
-        // --dc-shift-ns. Printed immediately so it's never lost between status prints.
         const bool faulted = status.decode() == Cia402State::Fault;
         if (faulted && !was_faulted) {
             const auto fault_code = read_tx<std::uint16_t>(master, slave, in, kFaultCode);
-            // Read 0x1C32:02 on the fault edge (drive already faulted -> a stalled cycle
-            // from the SDO read is harmless): a 0x6320 Er74.0 "cycle error" with :02 !=
-            // 1000000 (e.g. a stale 999680) is the smoking gun for the cached-cycle theory.
-            std::cout << "[B] !!! DRIVE FAULT @ " << phase_label(op, op_requested) << " t=" << tick / kLoopHz << "s: 0x603F=0x" << std::hex
-                      << fault_code << " sw=0x" << status.raw << std::dec << " dcPhase=" << (dct % static_cast<std::int64_t>(period_ns))
-                      << "ns 0x1C32:02=" << read_sm_cycle() << "ns";
-            if (opt.reset_fault) {
-                std::cout << " -- running CiA402 fault-reset (no energize)...";
-            }
-            std::cout << '\n';
+            std::cout << "[B] !!! DRIVE FAULT t=" << tick / kLoopHz << "s: 0x603F=0x" << std::hex << fault_code << " sw=0x" << status.raw
+                      << std::dec << " dcPhase=" << (dct % static_cast<std::int64_t>(period_ns)) << "ns\n";
         } else if (!faulted && was_faulted) {
             std::cout << "[B] *** FAULT CLEARED *** -> " << to_string(status.decode()) << '\n';
         }
         was_faulted = faulted;
 
-        // OP GATE (healthy-hold) -- request OP once the drive has proven sync the only
-        // RELIABLE way: by sitting FAULT-FREE in SAFE-OP with SYNC0 armed + the clock
-        // locked. The A6's 0x0984/0x098E are PDI-consumed (master samples 0/static even
-        // while SYNC0 fires), so the ABSENCE of the Er74.1 no-sync fault IS the sync-OK
-        // signal. Require not-faulted + clock-locked for ~200ms (master-lock is the arm
-        // precondition), then request OP gapless. team-lead's call after the 15ms-delay
-        // fix made the drive sit healthy in SAFE-OP.
-        if (dc_armed && !op_requested) {
-            healthy_hold_streak = (!faulted && dcs.clock_locked) ? healthy_hold_streak + 1 : 0;
-            if (healthy_hold_streak >= kHealthyHoldCycles) {
-                master.request_op();
-                op_requested = true;
-                std::cout << "[B] DC-sync HEALTHY HOLD (" << kHealthyHoldCycles
-                          << " cycles fault-free + clock-locked in SAFE-OP, SYNC0 armed) -> requesting OP "
-                          << "(SYNC0 is reaching the drive -- no Er74.1)\n";
-            } else if (tick >= arm_tick + kOpRequestCapCycles) {
-                std::cout << "[B] !!! NO HEALTHY HOLD: drive did not stay fault-free + clock-locked for " << kHealthyHoldCycles
-                          << " cycles within ~1 s of arming (faulted=" << faulted << " clockLocked=" << dcs.clock_locked
-                          << ") -- NOT requesting OP. SYNC0 likely not reaching the drive; sweep --dc-start-delay-ns.\n";
-                break;  // abort cleanly -- never request OP into a no-sync state
-            }
-        }
-
-        // BOUNDED GIVE-UP: if the drive stays faulted in OP despite the auto fault-reset
-        // -- a persistent-CAUSE fault like Er74.0 cycle-error, where the bit7 reset edge
-        // fires but the cause is still active -- STOP cleanly instead of spinning the
-        // reset for the whole --seconds. Repeated OP-entry faults are what wedged the
-        // drive (NO-CARRIER) last run, so giving up protects the (power-cycle-scarce)
-        // drive AND keeps the result legible (the live drive code is named, not masked).
-        // A transient fault that clears resets the streak and the run continues.
-        if (op_requested && faulted) {
-            ++op_fault_streak;
-            if (op_fault_streak >= kPersistentFaultGiveUp) {
-                std::cout << "[B] !!! fault-reset INEFFECTIVE: drive fault 0x" << std::hex
-                          << read_tx<std::uint16_t>(master, slave, in, kFaultCode) << std::dec << " persists " << op_fault_streak
-                          << " cycles after OP (cause not cleared) -- STOPPING to protect "
-                          << "the drive (repeated OP-entry faults wedge it). Fix the cycle cause; do not re-run blind.\n";
-                break;
-            }
-        } else if (!faulted) {
-            op_fault_streak = 0;
-        }
-
-        // Decide the controlword for this cycle.
         const std::span<std::byte> out = master.outputs(slave);
         std::uint16_t cw = fsm.step(status, goal);
-
         if (faulted) {
-            // A latched fault (Er74) takes PRECEDENCE over the CiA402 ladder and the
-            // shutdown/enable branches below: it must be cleared before the drive will
-            // engage SYNC0 / accept commands, and it must clear in SAFE-OP (DURING
-            // sync-proving) as well as OP. CiA402 fault-reset = 0x00 -> 0x80 (bit7)
-            // rising edge -> 0x06. Generate the edge by toggling bit7: 0x80 when it was
-            // low last cycle, 0x00 when it was high. The fault code was already captured
-            // + printed on the latch edge above, so auto-resetting loses no diagnostic.
+            // Generic CiA402 bit7 fault-reset edge (the A6's real reset is the vendor
+            // 0x2031:01 SDO, issued at bring-up; this is the in-loop steady-state fallback).
             cw = (last_cw & ControlWord::kFaultResetBit) ? 0x0000 : ControlWord::fault_reset();
-        } else if (op && opt.enable && status.operation_enabled()) {
+        } else if (opt.enable && status.operation_enabled()) {
             if (!announced_op) {
                 std::cout << "[B] *** OPERATION ENABLED *** (motor energized, holding at " << hold_pos << ")\n";
                 announced_op = true;
             }
-            // Hold or move. Keep profile velocity + target populated every cycle.
             if (opt.move_pp && !move_done) {
                 target = hold_pos + static_cast<std::int32_t>(opt.move_revs * kCountsPerRev);
             }
             write_rx<std::int32_t>(master, slave, out, kTargetPosition, target);
             write_rx<std::uint32_t>(master, slave, out, kProfileVelocity, profile_vel);
-
             std::uint16_t base = ControlWord::enable_operation();  // 0x0F
             if (opt.move_pp && !move_done) {
-                // bit4 handshake: assert new-setpoint, hold until the drive acks
-                // (bit12), then drop it so the next move can re-arm.
+                // bit4 handshake: assert new-setpoint, hold until the drive acks (bit12),
+                // then drop it so the next move can re-arm.
                 if (!setpoint_latched) {
                     base = ControlWord::with_new_setpoint(base, true);  // 0x1F
                     if (status.setpoint_acknowledged()) {
@@ -717,7 +537,6 @@ int main(int argc, char** argv) {
                     }
                 } else {
                     base = ControlWord::with_new_setpoint(base, false);  // back to 0x0F
-                    // A6 bit10 is useless; use actual-vs-target within tolerance.
                     if (std::abs(pos - target) < 300) {
                         move_done = true;
                         std::cout << "[B] move complete: pos=" << pos << " (target " << target << ")\n";
@@ -728,35 +547,20 @@ int main(int argc, char** argv) {
         } else if (!opt.enable) {
             cw = ControlWord::shutdown();  // 0x06 -> ReadyToSwitchOn, NOT energized
         }
-
         write_rx<std::uint16_t>(master, slave, out, kControlword, cw);
         last_cw = cw;
 
-        if (tick % 200 == 0) {  // ~5 Hz decoded-PDO print, through SAFE-OP AND OP (red_test-style)
-            const std::int64_t dc_phase = period_ns != 0 ? dct % static_cast<std::int64_t>(period_ns) : 0;
-            // Decode BOTH directions from the live process image (one snapshot/cycle, per
-            // #16): RxPDO = what we command the drive; TxPDO = what it feeds back.
+        if (tick % 200 == 0) {  // ~5 Hz decoded-PDO print
             const std::span<const std::byte> outimg = master.outputs(slave);
             const auto rx_cw = read_rx<std::uint16_t>(master, slave, outimg, kControlword);
             const auto rx_tpos = read_rx<std::int32_t>(master, slave, outimg, kTargetPosition);
-            const auto rx_pvel = read_rx<std::uint32_t>(master, slave, outimg, kProfileVelocity);
             const auto fc = read_tx<std::uint16_t>(master, slave, in, kFaultCode);
             const auto mode_now = read_tx<std::int8_t>(master, slave, in, kModeDisplay);
-            const auto torque = read_tx<std::int16_t>(master, slave, in, kTorqueActual);
-            std::cout << "    t=" << tick / kLoopHz << "s " << phase_label(op, op_requested) << '\n';
-            std::cout << "      Rx(cmd) : cw=0x" << std::hex << rx_cw << std::dec << " targetPos=" << rx_tpos << " profVel=" << rx_pvel
-                      << '\n';
-            std::cout << "      Tx(fb)  : " << to_string(status.decode()) << " sw=0x" << std::hex << status.raw << " 0x603F=0x" << fc
-                      << std::dec << " mode=" << static_cast<int>(mode_now) << " pos=" << pos << " vel=" << vel << " torq=" << torque
-                      << '\n';
-            std::cout << "      bus/DC  : wkc=" << raw_wkc << "/" << master.expected_wkc() << " badWKC=" << wkc_bad
-                      << "(maxRun=" << wkc_bad_max_streak << ") DCtime=" << dct << " dcPhase=" << dc_phase << "ns(off=" << dc_off << ")"
-                      << " lockStreak=" << locked_streak << (master.fault() ? " [BUS FAULT]" : "") << '\n';
-            const char* dc_sync_note = op ? "" : " (healthy-hold for OP)";
-            std::cout << "      DC-sync : 0x0984=" << (dcs.sync0_active ? "ARMED" : "0(PDI?)")
-                      << " 0x098E=" << (dcs.sync0_pulsing ? "tgl" : "static") << " clock=" << (dcs.clock_locked ? "LOCKED" : "unlocked")
-                      << " 0x092C=" << dcs.sys_time_diff_ns << "ns healthyHold=" << healthy_hold_streak << " AL=0x" << std::hex
-                      << dcs.al_status << std::dec << dc_sync_note << '\n';
+            std::cout << "    t=" << tick / kLoopHz << "s " << to_string(status.decode()) << " sw=0x" << std::hex << status.raw
+                      << " 0x603F=0x" << fc << std::dec << " mode=" << static_cast<int>(mode_now) << " Rx.cw=0x" << std::hex << rx_cw
+                      << std::dec << " targetPos=" << rx_tpos << " pos=" << pos << " vel=" << vel << " wkc=" << raw_wkc << "/"
+                      << master.expected_wkc() << " badWKC=" << wkc_bad << " dcPhase=" << (dct % static_cast<std::int64_t>(period_ns))
+                      << "ns" << (master.fault() ? " [BUS FAULT]" : "") << '\n';
         }
 
         if (master.fault()) {
@@ -780,7 +584,6 @@ int main(int argc, char** argv) {
     }
     master.close();
 
-    std::cout << "=== done. bad-WKC cycles: " << wkc_bad << " / " << tick << " (max consecutive run: " << wkc_bad_max_streak
-              << "; raw per-cycle, not the masked working_counter) ===\n";
+    std::cout << "=== done. bad-WKC cycles: " << wkc_bad << " / " << tick << " (raw per-cycle, not the masked working_counter) ===\n";
     return 0;
 }

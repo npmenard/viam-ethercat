@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -73,13 +74,14 @@ struct SlaveConfig {
     // RE-DEFAULT 0x1C32 when the PDO assignment changes -- so a sync-type write done
     // before the assignment gets clobbered back to its default. Empty for most slaves.
     std::vector<SdoWrite> postremap_sdo_writes;
-    // SDO writes applied in PRE-OP AFTER configure_dc_sync (SYNC0 configured + the ESC
-    // cycle register 0x09A0 set + SYNC0 pulsing), immediately before the SAFE-OP
-    // request. The SM sync-type switch to DC (0x1C32:01 = 2) belongs here for drives
-    // that SNAPSHOT the read-only SM cycle time 0x1C32:02 from the live 0x09A0 at the
-    // moment they enter DC mode -- switching earlier (while 0x09A0 is still 0) latches
-    // 0x1C32:02 = 0 -> AL 0x0030 "Invalid DC SYNC config". Empty for most slaves.
-    std::vector<SdoWrite> postdc_sdo_writes;
+    // OPTIONAL drive-specific fault-reset SDO, cleared once in configure() AFTER SAFE-OP
+    // (single port owner, before the RT thread spawns -- so it's a plain blocking SDO, no
+    // queue). The A6's fault-reset is a VENDOR SDO write `1` to 0x2031:01, NOT CiA402
+    // controlword bit7 (CLAUDE.md). Config DATA: present ⇒ that SDO is the bring-up clear;
+    // absent ⇒ no vendor reset (a generic CiA402 drive uses the controlword bit7 path the
+    // controller already drives). The steady-state operator reset is a separate concern
+    // (#22). `data` is the raw little-endian value (A6: a single 0x01 byte).
+    std::optional<SdoWrite> fault_reset;
 };
 
 // Master-level configuration.
@@ -88,53 +90,31 @@ struct MasterConfig {
     std::uint32_t target_loop_rate_hz = 1000;
     std::vector<SlaveConfig> slaves;
     bool use_distributed_clocks = false;
-    // When DC is on: number of PACED, PHASE-LOCKING process-data exchanges (at the
-    // SYNC0 cycle) to run after enabling SYNC0 and BEFORE requesting OP -- the warmup
-    // runs the DC phase-lock PI until the phase is in-band (or this budget is spent),
-    // so the bus enters OP already phase-aligned (WKC 3/3 from cycle 0) instead of
-    // an unpaced burst (-> A6 refuses OP / WKC drops). 0 = skip the warmup (sim).
-    std::uint32_t dc_lock_cycles = 0;
+    // DC bring-up (the ec_sample fold, #20): the RT loop pumps phase-locked PD from
+    // cycle 0, then runs SETTLE -> ARM(stock ecx_dcsync0) -> GATE -> request OP, all
+    // while PD flows continuously (so SYNC0 is never armed into a gap). These two bound
+    // that prelude; 0 ⇒ defaults applied at the gate.
+    //   SETTLE: paced phase-locking exchanges to run AFTER the DC clock is live and
+    //   BEFORE arming SYNC0, so dcsync0 computes its start off a disciplined clock
+    //   (~tens of cycles is ample; NOT the old 200-cycle lock-proof).
+    std::uint32_t dc_arm_settle_cycles = 50;
+    //   GATE: consecutive cycles of (WKC full && no Er74.1 on any slave) required after
+    //   the arm before requesting OP -- proves the drive accepted SYNC0 and is exchanging
+    //   synchronized PD. An Er74.1 within the window aborts the bring-up (no OP request).
+    std::uint32_t dc_op_gate_cycles = 50;
     // Post-OP grace: suppress the consecutive-WKC-error fault latch for this many
     // cycles after reaching OP, so any residual DC phase transient settles without
     // tripping a BusError (the phase PI needs ~hundreds of cycles to fully lock; the
     // latch fires in ~5). 0 = latch immediately. Bench-tunable.
     std::uint32_t dc_settle_cycles = 0;
-    // Phase-lock TARGET: lock (dc_time mod cycle) to this offset (ns) instead of 0.
-    // The default -1 = auto = cycle/2 (mid-cycle) -- locking at the SYNC0 EDGE (0)
-    // leaves no margin, so normal +/-jitter pushes a frame past the pulse -> stale
-    // latch -> intermittent WKC drop. Mid-cycle keeps the send far from both edges.
-    std::int32_t dc_sync_shift_ns = -1;
-    // SYNC0 pulse CyclShift (ns) passed to ecx_dcsync0: the SYNC0 edge fires this
-    // long after the DC base time. With the send phase (dc_sync_shift_ns) this tunes
-    // WHERE in the cycle the drive latches our output relative to its SYNC0 -- the A6
-    // wants a FRESH frame just before SYNC0, not a stale mid-cycle one. Bench-swept.
+    // SYNC0 pulse CyclShift (ns) passed to ecx_dcsync0: the SYNC0 edge fires this long
+    // after the DC base time. The single DC phase knob (#20 consolidated the old
+    // dc_sync_shift_ns/dc_sync0_shift_ns pair): it sets BOTH the ecx_dcsync0 CyclShift
+    // and the master's phase-lock target, so the master's send and the drive's SYNC0
+    // hold a fixed relationship. The phase-lock TARGET is derived as cycle/2 from the
+    // SYNC0 edge (mid-cycle margin -- locking on the edge leaves no room for jitter).
+    // Bench-swept at first light. 0 = SYNC0 on the DC base.
     std::int32_t dc_sync0_shift_ns = 0;
-    // SYNC0 first-edge START DELAY (ns) -- how far in the future the SYNC0 arm schedules
-    // the FIRST pulse, replacing SOEM ec_dcsync0's hardcoded 100 ms SyncDelay. A drive
-    // whose sync watchdog is SHORTER than 100 ms (the A6 ~50 ms) trips "no sync" in
-    // SAFE-OP before SOEM's first edge is even due, and the fault deactivates SYNC0
-    // before it fires. ~15 ms puts the first edge inside the watchdog window (master is
-    // already phase-locked, so the start stays safely in the future). Bench-tunable.
-    std::int64_t dc_sync_start_delay_ns = 15'000'000;
-    // Arm SYNC0 in PRE-OP (after the phase-lock), BEFORE requesting SAFE-OP, so SYNC0 is
-    // already FIRING (start_delay ~15 ms) when the drive validates its DC config at the
-    // PRE-OP->SAFE-OP transition. Required by a drive that (a) rejects SM-sync at OP with
-    // AL 0x0027 "freerun not supported" -- so DC sync-type (0x1C32:01=2) is mandatory --
-    // AND (b) AL 0x0030-rejects DC config at SAFE-OP unless SYNC0 is already pulsing. The
-    // synthesis: force DC type (postremap) + arm-firing-SYNC0 in PRE-OP. false = arm
-    // post-SAFE-OP (caller-driven / self-contained paths).
-    bool dc_arm_in_preop = false;
-    // After the post-DC SDO writes (SM sync-type -> DC SYNC0), pump this many paced PD
-    // cycles BEFORE requesting SAFE-OP so the drive APPLIES the DC config -- copies the
-    // live ESC SYNC0 cycle (0x09A0) into the read-only CoE 0x1C32:02. Without it the
-    // drive validates an incomplete DC config (0x1C32:02 still 0) at the PS transition
-    // -> AL 0x0030. 0 = no settle.
-    std::uint32_t dc_postwrite_settle_cycles = 0;
-    // Optional CoE object (index:sub) polled each cycle during that settle: break the
-    // settle early once it reads NON-ZERO (the drive has applied the DC config, e.g.
-    // 0x1C32:02 went 0 -> SYNC0 cycle). index 0 = no poll, just the fixed window.
-    std::uint16_t dc_settle_poll_index = 0;
-    std::uint8_t dc_settle_poll_sub = 0;
     // Latch a BusError only after this many CONSECUTIVE short/abnormal WKC
     // cycles (a single transient bad cycle should not hard-fault). Reset on any
     // good cycle.

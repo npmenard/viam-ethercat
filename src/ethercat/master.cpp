@@ -12,18 +12,13 @@
 #include <sys/mman.h>
 
 #include "ethercat/cia402.hpp"
-#include "ethercat/dc_sync.hpp"
 
 namespace ethercat {
 
 namespace {
 
-constexpr int kPrimeCycles = 3;               // exchanges in SAFE-OP so slaves have valid outputs before OP
 constexpr std::uint16_t kModesOfOp = 0x6060;  // CiA402 modes-of-operation (U8): PP=1, PV=3; SDO-set in PRE-OP
 constexpr long kNsPerSec = 1'000'000'000L;
-constexpr int kDcPreopLockStreak = 200;                // PRE-OP: hold phase-lock this many cycles before crossing to SAFE-OP
-constexpr std::uint32_t kDcSafeopMeasureCycles = 500;  // SAFE-OP: keep pumping (gapless) while the drive measures its cycle
-constexpr int kDcWarmupLockStreak = 50;                // post-SAFE-OP warmup: streak before requesting OP
 
 std::uint32_t field_key(std::uint16_t index, std::uint8_t sub) noexcept {
     return (static_cast<std::uint32_t>(index) << 8U) | sub;
@@ -80,7 +75,7 @@ std::map<std::uint32_t, FieldLocation> Master::build_field_table(std::uint16_t s
     return fields;
 }
 
-void Master::configure(bool reach_op) {
+void Master::configure() {
     // Maps are writable only in PRE-OP and are not stored in EEPROM, so this runs
     // every configure() / power-on.
     backend_->request_state(0, EcatState::PreOp);
@@ -156,256 +151,152 @@ void Master::configure(bool reach_op) {
         rt.tx_fields = build_field_table(sc.slave_id, sc.txpdo);
     }
 
-    // Distributed Clocks: the SOEM-author (Arthur Ketels) canonical order. A DC drive
-    // proves it is in sync from synchronized, DC-phase-locked PDO TRAFFIC observed in
-    // SAFE-OP; only then will it permit OP. So the sequence is:
-    //   configdc (PRE-OP, offsets only) -> request SAFE-OP -> dcsync0 (arm SYNC0 on a
-    //   fresh live clock) -> pump a phase-locked PD loop in SAFE-OP -> request OP.
-    // Arming SYNC0 in PRE-OP (the old order) schedules it off a not-yet-disciplined
-    // clock and the drive never sees the synchronized transfer it requires -> Er74 /
-    // AL 0x0030. cycle = loop period; the A6 needs a multiple of 250 us (1 ms valid).
+    // Distributed Clocks: the ec_sample working sequence (#20 / CLAUDE.md). v2's
+    // config_map_group lets the drive SELF-SELECT its DC sync-type (we NEVER force
+    // 0x1C32:01 -- that was the self-inflicted AL 0x0030). configure() does step 1
+    // (configdc, PRE-OP offsets only) then stops at SAFE-OP. The SYNC0 arm + OP request
+    // happen LATER, in the caller's single RT loop via bringup_step(), so process data
+    // flows continuously through SAFE-OP->OP and SYNC0 is armed on a live clock, never
+    // into a gap (the whole #17 wall was working around v1.4.0 + that force).
     const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
 
-    // DC step 1 (PRE-OP): configdc -- reference clock + system-time offset + delay.
     if (config_.use_distributed_clocks) {
+        // DC step 1 (PRE-OP): configdc -- reference clock + system-time offset + delay.
         backend_->configure_dc_configdc();
-    }
-
-    const std::int64_t dc_shift = config_.dc_sync_shift_ns < 0 ? static_cast<std::int64_t>(cycle_ns) / 2 : config_.dc_sync_shift_ns;
-    if (config_.use_distributed_clocks) {
-        // Lock CURRENT memory (the IOmap + SOEM context are resident after
-        // map_process_data) before ANY RT-paced pumping (the PRE-OP lock, the measure
-        // window, the warmup), so a page fault never spikes the phase. NOT MCL_FUTURE:
-        // this can run on a non-RT thread that later spawns the RT jthread, and
-        // MCL_FUTURE would make that thread's stack alloc hit RLIMIT_MEMLOCK -> EAGAIN.
+        // Lock resident memory (IOmap + SOEM context) before the RT thread spawns and
+        // starts pacing SYNC0, so a page fault never spikes the phase. MCL_CURRENT only
+        // (NOT MCL_FUTURE: the RT jthread's stack alloc would otherwise hit
+        // RLIMIT_MEMLOCK -> EAGAIN).
         if (mlockall(MCL_CURRENT) != 0) {
             (void)std::fprintf(stderr,
-                               "[ethercat] mlockall(MCL_CURRENT) failed (errno=%d) before the DC warmup: grant "
-                               "CAP_IPC_LOCK / RLIMIT_MEMLOCK=infinity; the SYNC0 PLL lock may be unreliable.\n",
+                               "[ethercat] mlockall(MCL_CURRENT) failed (errno=%d): grant CAP_IPC_LOCK / "
+                               "RLIMIT_MEMLOCK=infinity; the SYNC0 PLL lock may be unreliable.\n",
                                errno);
         }
-
-        // DC step 1.5 -- PHASE-LOCK THE MASTER IN PRE-OP, BEFORE crossing to SAFE-OP. The
-        // A6 latches its RO SM cycle (0x1C32:02) from the FIRST SM2-event period it sees
-        // at the PRE-OP->SAFE-OP transition, then validates THAT at OP -- it does NOT
-        // re-derive it from SYNC0. If the master is still phase-locking when SM2 turns on,
-        // that first period is the jittery ~999 us unlocked transient -> latched ->
-        // Er74.0 (0x6320) cycle error at OP. ec_DCtime updates via the FRMW datagram even
-        // in PRE-OP, so the master CAN lock here. Lock FIRST, then cross over so the
-        // drive's first measurement is the clean, locked 1 ms rate. (bench: team-lead.)
-        // dc_lock_cycles == 0 (sim / module) skips the warmup entirely -- request SAFE-OP
-        // straight away (SimBackend has no real DC clock to lock to).
-        if (config_.dc_lock_cycles > 0) {
-            timespec next{};
-            (void)clock_gettime(CLOCK_MONOTONIC, &next);
-            std::int64_t dc_integral = 0;
-            const int preop_streak = phase_lock_pump(cycle_ns, dc_shift, config_.dc_lock_cycles, kDcPreopLockStreak, next, dc_integral);
-            (void)std::fprintf(stderr,
-                               "[ethercat] PRE-OP phase-lock: streak=%d (target %d) before SAFE-OP%s\n",
-                               preop_streak,
-                               kDcPreopLockStreak,
-                               preop_streak >= kDcPreopLockStreak ? " -> LOCKED" : " -> NOT locked (cap hit)");
-
-            // arm-in-PRE-OP: arm SYNC0 NOW, on the locked clock, so it is already FIRING
-            // (start_delay ~15 ms) when we request SAFE-OP. This was the SYNTHESIS attempt
-            // for a drive that needs DC sync-type to run OP (else AL 0x0027) AND
-            // 0x0030-rejects DC config at the SAFE-OP transition: force 0x1C32:01=2 +
-            // present a live SYNC0 at the PS validation. NOTE: on the A6 this did NOT clear
-            // the 0x0030 -- even DC-type + firing-SYNC0-before-SAFE-OP is rejected, so that
-            // reject is drive-internal (not a missing live SYNC0). Kept as a benchable
-            // option (flag). Applies the post-DC cycle handshake here (0x09A0 live), then
-            // pumps past the start delay so edges are firing before SAFE-OP.
-            if (config_.dc_arm_in_preop) {
-                backend_->arm_dc_sync(cycle_ns, config_.dc_sync0_shift_ns, config_.dc_sync_start_delay_ns);
-                for (const SlaveConfig& sc : config_.slaves) {
-                    apply_sdo_writes(sc.slave_id, sc.postdc_sdo_writes);
-                }
-                const auto fire_cycles = static_cast<std::uint32_t>(config_.dc_sync_start_delay_ns / static_cast<std::int64_t>(cycle_ns)) +
-                                         kDcSafeopMeasureCycles;
-                (void)phase_lock_pump(cycle_ns, dc_shift, fire_cycles, 0, next, dc_integral);
-                (void)std::fprintf(stderr,
-                                   "[ethercat] armed SYNC0 in PRE-OP (start delay %lld ns); SYNC0 firing before SAFE-OP request\n",
-                                   static_cast<long long>(config_.dc_sync_start_delay_ns));
-            }
-
-            // Cross into SAFE-OP with the master ALREADY locked (and, in arm-in-PRE-OP
-            // mode, SYNC0 already firing), then keep pumping through the drive's
-            // cycle-measurement window so the value it latches into 0x1C32:02 is clean.
-            backend_->request_state(0, EcatState::SafeOp);
-            // RE-BASE the deadline: request_state() blocks on the AL statecheck WITHOUT
-            // pumping process data, so `next` is now several ms in the PAST. Without this
-            // the measure window's first cycles fire back-to-back catching up -> a sub-ms
-            // FIRST SM2-event period -> exactly the mis-measurement we're preventing (the
-            // A6 latches that first period into 0x1C32:02). Fresh base = the first
-            // post-SAFE-OP frame lands one clean cycle from now. The integral (phase) is
-            // preserved across the re-base, so the master is still locked.
-            (void)clock_gettime(CLOCK_MONOTONIC, &next);
-            (void)phase_lock_pump(cycle_ns, dc_shift, kDcSafeopMeasureCycles, 0, next, dc_integral);
-        } else {
-            backend_->request_state(0, EcatState::SafeOp);
-        }
-
-        // DC step 2: arm SYNC0 post-SAFE-OP -- ONLY on the self-contained path
-        // (reach_op=true) AND when not already armed in PRE-OP. On the caller-driven path
-        // (reach_op=false, e.g. a6_validate) the arm is DEFERRED to the caller's RT loop.
-        if (reach_op && !config_.dc_arm_in_preop) {
-            backend_->configure_dc_sync(cycle_ns, config_.dc_sync0_shift_ns, config_.dc_sync_start_delay_ns);
-        }
-    } else {
-        backend_->request_state(0, EcatState::SafeOp);
     }
 
-    // POST-DC SDO writes -- the ETG.1020 cycle-time handshake (0x1C32:0a Sync0 cycle +
-    // :08 Get-Cycle) that populates the read-only 0x1C32:02 the drive validates. Needs
-    // the ESC cycle register 0x09A0 live, i.e. AFTER the SYNC0 arm. (0x1C32:01 = DC-mode
-    // switch stays in postremap, PRE-OP -- writable only before configdc.) Applied here
-    // ONLY on the self-contained path (reach_op=true) and NOT arm-in-PRE-OP (which
-    // already applied them above, after the PRE-OP arm). On the caller-driven path the
-    // arm is deferred to the caller's RT loop, which applies these via apply_postdc_writes().
-    if (reach_op && !config_.dc_arm_in_preop) {
-        for (const SlaveConfig& sc : config_.slaves) {
-            apply_sdo_writes(sc.slave_id, sc.postdc_sdo_writes);
-        }
-    }
+    // Stop at SAFE-OP. PRE-OP->SAFE-OP needs no process data, and no SYNC0 is armed yet,
+    // so the configure->RT-thread handoff gap is harmless (nothing is expecting pulses).
+    backend_->request_state(0, EcatState::SafeOp);
 
-    // POST-DC SETTLE: pump paced PD so the drive APPLIES the DC config -- copies the
-    // live ESC SYNC0 cycle (0x09A0) into the read-only CoE 0x1C32:02. Optionally poll a
-    // CoE object each cycle and break early once it reads non-zero (config applied).
-    if (reach_op && config_.use_distributed_clocks && config_.dc_postwrite_settle_cycles > 0) {
-        const std::uint16_t poll_slave = config_.slaves.front().slave_id;
-        timespec next{};
-        (void)clock_gettime(CLOCK_MONOTONIC, &next);
-        std::array<std::byte, 4> poll_buf{};
-        bool applied = false;
-        std::uint32_t i = 0;
-        for (; i < config_.dc_postwrite_settle_cycles && !applied; ++i) {
-            (void)backend_->exchange();
-            if (config_.dc_settle_poll_index != 0) {
-                try {
-                    const std::size_t n =
-                        backend_->sdo_read(poll_slave, config_.dc_settle_poll_index, config_.dc_settle_poll_sub, poll_buf);
-                    std::uint32_t v = 0;
-                    for (std::size_t b = 0; b < n && b < poll_buf.size(); ++b) {
-                        v |= static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(poll_buf[b])) << (8U * b);
-                    }
-                    applied = (v != 0);
-                } catch (const Error&) {  // NOLINT(bugprone-empty-catch) -- object not readable yet; settle another cycle
-                }
-            }
-            next.tv_nsec += static_cast<long>(cycle_ns);
-            while (next.tv_nsec >= kNsPerSec) {
-                next.tv_nsec -= kNsPerSec;
-                next.tv_sec += 1;
-            }
-            (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
-        }
-        if (config_.dc_settle_poll_index != 0) {
-            (void)std::fprintf(stderr,
-                               "[ethercat] post-DC settle: %u cycles, poll 0x%04X:%02X %s\n",
-                               i,
-                               static_cast<unsigned>(config_.dc_settle_poll_index),
-                               static_cast<unsigned>(config_.dc_settle_poll_sub),
-                               applied ? "-> NON-ZERO (DC config applied)" : "-> still 0 after settle (NOT applied)");
-        }
-    }
-
-    if (config_.use_distributed_clocks && reach_op) {
-        // Post-SAFE-OP, SYNC0-armed warmup before OP (self-contained path): re-confirm
-        // the phase-lock (the postdc settle above may have broken the cadence), so the
-        // bus enters OP already aligned (WKC 3/3 from cycle 0). The PRE-OP lock + measure
-        // window already ran; this is the final convergence before the OP request.
-        // dc_lock_cycles = 0 skips it (sim). a6_validate (reach_op=false) instead owns the
-        // whole arm->lock->gate->OP sequence in its own continuous loop.
-        timespec next{};
-        (void)clock_gettime(CLOCK_MONOTONIC, &next);
-        std::int64_t dc_integral = 0;
-        (void)phase_lock_pump(cycle_ns, dc_shift, config_.dc_lock_cycles, kDcWarmupLockStreak, next, dc_integral);
-    } else if (reach_op) {
-        for (int i = 0; i < kPrimeCycles; ++i) {
-            (void)backend_->exchange();
-        }
-    }
-
-    fault_.store(false, std::memory_order_relaxed);
-    consecutive_wkc_errors_ = 0;
-    if (reach_op) {
-        backend_->request_state(0, EcatState::Op);
-        if (backend_->slave_state(0) != EcatState::Op) {
-            throw InitError("EtherCAT bus on '" + config_.ifname + "': not all slaves reached OPERATIONAL (bus is " +
-                            to_string(backend_->slave_state(0)) + ")");
-        }
-        // Post-OP DC settle grace (no WKC latch while the phase finishes locking).
-        settle_remaining_ = config_.use_distributed_clocks ? config_.dc_settle_cycles : 0;
-        operational_.store(true, std::memory_order_relaxed);
-    } else {
-        // CALLER-DRIVEN bring-up: leave the bus in SAFE-OP with DC enabled; the
-        // caller's CONTINUOUS cyclic loop runs the phase-lock warmup, requests OP
-        // (request_op()) once locked, and keeps cycling -- so a DC drive sees an
-        // unbroken stream of frames through SAFE-OP->OP (no gap -> no Er74). A big
-        // grace covers the expected short WKC across that whole window.
-        settle_remaining_ = config_.dc_lock_cycles + config_.dc_settle_cycles + static_cast<std::uint32_t>(kPrimeCycles);
-        operational_.store(true, std::memory_order_relaxed);
-    }
-}
-
-int Master::phase_lock_pump(std::uint32_t cycle_ns,
-                            std::int64_t shift_ns,
-                            std::uint32_t max_cycles,
-                            int target_streak,
-                            timespec& next,
-                            std::int64_t& integral) noexcept {
-    int streak = 0;
-    for (std::uint32_t i = 0; i < max_cycles; ++i) {
-        (void)backend_->exchange();
-        const std::int64_t dct = backend_->dc_time();
-        const long corr = dc_phase_correction(dct, static_cast<std::int64_t>(cycle_ns), integral, shift_ns);
-        streak = dc_phase_locked(dct, static_cast<std::int64_t>(cycle_ns), shift_ns) ? streak + 1 : 0;
-        if (target_streak > 0 && streak >= target_streak) {
-            return streak;  // phase held in-band -> caller may advance state
-        }
-        next.tv_nsec += static_cast<long>(cycle_ns) + corr;
-        while (next.tv_nsec >= kNsPerSec) {
-            next.tv_nsec -= kNsPerSec;
-            next.tv_sec += 1;
-        }
-        while (next.tv_nsec < 0) {  // a correction can push the deadline slightly negative
-            next.tv_nsec += kNsPerSec;
-            next.tv_sec -= 1;
-        }
-        (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
-    }
-    return streak;
-}
-
-void Master::arm_dc_sync() noexcept {
-    const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
-    try {
-        backend_->arm_dc_sync(cycle_ns, config_.dc_sync0_shift_ns, config_.dc_sync_start_delay_ns);  // short start delay, no prime
-    } catch (const std::exception& e) {
-        (void)std::fprintf(stderr, "[ethercat] arm_dc_sync failed: %s\n", e.what());
-    }
-}
-
-void Master::apply_postdc_writes() noexcept {
+    // Clear a latent drive fault while still the SINGLE port owner (before the RT thread
+    // spawns) -- a direct blocking vendor SDO. The A6's fault-reset is 0x2031:01 = 1, NOT
+    // CiA402 controlword bit7 (CLAUDE.md); it is CONFIG DATA (absent ⇒ no vendor reset,
+    // a generic CiA402 drive uses the bit7 path the controller drives). Best-effort: a
+    // failed clear is logged, not fatal (the bring-up gate still guards OP entry).
     for (const SlaveConfig& sc : config_.slaves) {
-        for (const SdoWrite& w : sc.postdc_sdo_writes) {
+        if (sc.fault_reset.has_value()) {
+            const SdoWrite& fr = *sc.fault_reset;
             try {
-                backend_->sdo_write(sc.slave_id, w.index, w.subindex, w.data);
-            } catch (const std::exception& e) {
+                backend_->sdo_write(sc.slave_id, fr.index, fr.subindex, fr.data);
+            } catch (const Error& e) {
                 (void)std::fprintf(stderr,
-                                   "[ethercat] post-arm SDO write to slave %u object 0x%04X:%02X %s (continuing): %s\n",
+                                   "[ethercat] bring-up fault-reset SDO (slave %u 0x%04X:%02X) failed (continuing): %s\n",
                                    static_cast<unsigned>(sc.slave_id),
-                                   static_cast<unsigned>(w.index),
-                                   static_cast<unsigned>(w.subindex),
-                                   w.optional ? "rejected" : "FAILED",
+                                   static_cast<unsigned>(fr.index),
+                                   static_cast<unsigned>(fr.subindex),
                                    e.what());
             }
         }
     }
+
+    // Hand off to the caller's RT loop at SAFE-OP. It runs bringup_step() (SETTLE -> ARM
+    // -> GATE -> request OP -> AWAIT_OP) until OPERATIONAL, so operational_ stays false
+    // until then. Stash the DC params + reset the bring-up FSM.
+    dc_enabled_ = config_.use_distributed_clocks;
+    dc_cycle_ns_ = cycle_ns;
+    dc_sync0_shift_ns_ = config_.dc_sync0_shift_ns;
+    bringup_phase_ = BringupPhase::Settle;
+    bringup_settle_count_ = 0;
+    bringup_gate_streak_ = 0;
+    fault_.store(false, std::memory_order_relaxed);
+    consecutive_wkc_errors_ = 0;
+    settle_remaining_ = 0;
+    operational_.store(false, std::memory_order_relaxed);
 }
 
-void Master::request_op() noexcept {
-    backend_->set_state(0, EcatState::Op);  // writestate only; the caller's loop pumps the transition
+BringupStatus Master::bringup_step(bool drive_sync_faulted) noexcept {
+    // The caller owns the cadence (clock_nanosleep + dc_phase_correction on dc_time());
+    // this does the one cyclic exchange + advances the FSM. PD flows EVERY step from the
+    // first, so SYNC0 (armed in the ARM phase) is never armed into a gap.
+    const int wkc = backend_->exchange();
+    last_wkc_.store(wkc, std::memory_order_relaxed);
+
+    switch (bringup_phase_) {
+        case BringupPhase::Settle: {
+            // Pump phase-locked PD until the DC clock is live (dcsync0 computes its start
+            // off the slave's live 0x0910) and a short settle has elapsed. ~tens of
+            // cycles -- NOT the old 200-cycle lock proof. Non-DC backends skip the clock
+            // wait. dc_arm_settle_cycles == 0 ⇒ arm next cycle.
+            ++bringup_settle_count_;
+            const bool clock_live = !dc_enabled_ || backend_->dc_time() != 0;
+            const std::uint32_t target = config_.dc_arm_settle_cycles == 0 ? 1U : config_.dc_arm_settle_cycles;
+            if (bringup_settle_count_ >= target && clock_live) {
+                bringup_phase_ = BringupPhase::Arm;
+            }
+            return BringupStatus::Settling;
+        }
+        case BringupPhase::Arm: {
+            // Arm SYNC0 with stock ecx_dcsync0 (no-op on non-DC backends). PD is already
+            // flowing, so the arm lands on a live, disciplined clock.
+            if (dc_enabled_) {
+                try {
+                    backend_->arm_dc_sync(dc_cycle_ns_, dc_sync0_shift_ns_);
+                } catch (const std::exception& e) {
+                    (void)std::fprintf(stderr, "[ethercat] arm_dc_sync failed: %s\n", e.what());
+                    bringup_phase_ = BringupPhase::Aborted;
+                    return BringupStatus::Aborted;
+                }
+            }
+            bringup_gate_streak_ = 0;
+            bringup_phase_ = BringupPhase::Gate;
+            return BringupStatus::Arming;
+        }
+        case BringupPhase::Gate: {
+            // The real "synced" signal is the ABSENCE of Er74.1 (CLAUDE.md). WKC cannot
+            // be full in SAFE-OP (the output SyncManager is inactive until OP), so the
+            // pre-OP gate is "PD flowing (wkc>0) + no sync fault" held K cycles -- THEN
+            // request OP and confirm full WKC at OP (AWAIT_OP). An Er74.1 in the window
+            // means SYNC0 didn't take: abort, never request OP (don't wedge the drive).
+            if (drive_sync_faulted) {
+                bringup_phase_ = BringupPhase::Aborted;
+                return BringupStatus::Aborted;
+            }
+            if (wkc > 0) {
+                ++bringup_gate_streak_;
+            } else {
+                bringup_gate_streak_ = 0;
+            }
+            const std::uint32_t target = config_.dc_op_gate_cycles == 0 ? 1U : config_.dc_op_gate_cycles;
+            if (bringup_gate_streak_ >= target) {
+                backend_->set_state(0, EcatState::Op);  // writestate only; this loop pumps the transition
+                bringup_phase_ = BringupPhase::AwaitOp;
+            }
+            return BringupStatus::Gating;
+        }
+        case BringupPhase::AwaitOp: {
+            // OP requested; pump the gapless transition. Full WKC is the "reached OP"
+            // signal (the output SM is live only at OP). A sync fault here still aborts.
+            if (drive_sync_faulted) {
+                bringup_phase_ = BringupPhase::Aborted;
+                return BringupStatus::Aborted;
+            }
+            if (wkc == expected_wkc_ && backend_->slave_state(0) == EcatState::Op) {
+                operational_.store(true, std::memory_order_relaxed);
+                settle_remaining_ = dc_enabled_ ? config_.dc_settle_cycles : 0;
+                fault_.store(false, std::memory_order_relaxed);
+                consecutive_wkc_errors_ = 0;
+                bringup_phase_ = BringupPhase::Done;
+                return BringupStatus::Operational;
+            }
+            return BringupStatus::AwaitingOp;
+        }
+        case BringupPhase::Done:
+            return BringupStatus::Operational;
+        case BringupPhase::Aborted:
+            return BringupStatus::Aborted;
+    }
+    return BringupStatus::Aborted;  // unreachable; satisfies the compiler
 }
 
 void Master::process() noexcept {

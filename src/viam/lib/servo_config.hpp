@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -56,6 +57,12 @@ struct ServoConfig {
     // The SYNC0 cycle = 1e9 / target_loop_rate_hz; that period MUST be a value the
     // drive accepts (A6: an integer multiple of 250 us -> use 1000/500/250 Hz).
     bool use_distributed_clocks = false;
+    // OPTIONAL vendor fault-reset SDO, cleared once at bring-up (Master::configure(),
+    // after SAFE-OP, pre-spawn). The A6's fault-reset is a vendor SDO write 1 to
+    // 0x2031:01, NOT CiA402 controlword bit7 (CLAUDE.md). CONFIG DATA from the hardware
+    // JSON: present ⇒ that SDO clears a latent fault at bring-up; absent ⇒ a generic
+    // CiA402 drive uses the controlword bit7 path the controller already drives.
+    std::optional<ethercat::SdoWrite> fault_reset;
 
     // --- health / boundary ---
     int max_consecutive_wkc_errors = 5;            // WKC latch threshold (passed to Master)

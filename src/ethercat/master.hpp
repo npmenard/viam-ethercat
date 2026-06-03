@@ -35,6 +35,19 @@ struct FieldLocation {
     std::size_t byte_width = 0;
 };
 
+// Status of the DC bring-up state machine (Master::bringup_step). The caller drives
+// one step per cyclic exchange until it sees Operational (switch to the steady loop)
+// or Aborted (surface the fault; do NOT immediately re-enter bring-up -- repeated
+// Er74 OP-entry wedges the A6, CLAUDE.md).
+enum class BringupStatus : std::uint8_t {
+    Settling,     // pumping phase-locked PD; DC clock coming live, not yet armed
+    Arming,       // SYNC0 armed this step (stock ecx_dcsync0)
+    Gating,       // armed; waiting for "no Er74.1" to hold K cycles before requesting OP
+    AwaitingOp,   // OP requested; waiting for all slaves to reach OP with full WKC
+    Operational,  // all slaves OPERATIONAL -- bring-up complete
+    Aborted,      // a sync fault (Er74.1) appeared during the gate -- SYNC0 did not take
+};
+
 class Master {
    public:
     // Validates config (no I/O). Throws ConfigError on a bad config.
@@ -52,36 +65,32 @@ class Master {
     // match the config.
     void init();
 
-    // PRE-OP -> apply the PDO remap per slave -> map the process image -> size
-    // the PdoCaches + build the flat field tables -> SAFE-OP -> [DC: enable SYNC0] ->
-    // [reach_op: phase-lock warmup -> OP] . Re-applies the map every call (A6 map
-    // isn't in EEPROM). Throws InitError/PdoMappingError naming the offending slave.
+    // PRE-OP -> apply the PDO remap per slave -> map the process image -> size the
+    // PdoCaches + build the flat field tables -> [DC: configdc (PRE-OP)] -> SAFE-OP ->
+    // [fault_reset: clear a latent drive fault via the vendor SDO]. Re-applies the map
+    // every call (A6 map isn't in EEPROM). Throws InitError/PdoMappingError naming the
+    // offending slave.
     //
-    // reach_op = false: stop at SAFE-OP with DC enabled and DON'T run the warmup or
-    // request OP -- for a CONTINUOUS bring-up where the caller's own cyclic loop runs
-    // the phase-lock warmup, calls request_op() once locked, and keeps cycling, so a
-    // DC drive sees no frame gap through SAFE-OP->OP (the only safe path on the A6,
-    // which faults out of OP on a single missed SYNC0 frame).
-    void configure(bool reach_op = true);
+    // configure() STOPS AT SAFE-OP: it does NOT arm SYNC0 and does NOT request OP. The
+    // caller's single cyclic loop runs the bring-up to OP via bringup_step() -- so a DC
+    // drive sees CONTINUOUS process data through SAFE-OP->OP (no frame gap -> no Er74),
+    // and SYNC0 is armed only once PD is already flowing (#20 / CLAUDE.md). The blocking
+    // fault-reset SDO is the LAST thing configure() does, while it is still the single
+    // port owner (before the RT thread spawns).
+    void configure();
 
-    // Caller-driven in-loop SYNC0 arm (only after configure(reach_op=false)): arm the
-    // ESC SYNC-out unit from the RT loop, AFTER SAFE-OP, once synchronized PD is
-    // flowing and the master is phase-locking -- a DC drive (the A6) generates SYNC0 /
-    // permits OP only once it has proven sync from that traffic. Call ONCE; then keep
-    // pumping + poll dc_sync_status until ready, then request_op(). Never throws.
-    void arm_dc_sync() noexcept;
-
-    // Caller-driven post-arm SDO writes (only after configure(reach_op=false) + an
-    // in-loop arm_dc_sync()): apply each slave's postdc_sdo_writes -- the ETG.1020
-    // cycle-time handshake that needs the ESC SYNC0 cycle (0x09A0) live. configure()
-    // skips these on the caller-driven path because the arm is deferred to the loop;
-    // the caller invokes this once, just after arming. Never throws (optional+mandatory
-    // writes both logged, never propagated into the RT loop).
-    void apply_postdc_writes() noexcept;
-
-    // Caller-driven OP request (only after configure(reach_op=false)): writes the
-    // OP state request; the caller's cyclic loop pumps the transition. Never throws.
-    void request_op() noexcept;
+    // One cyclic step of the DC bring-up state machine, called from the caller's RT loop
+    // AFTER configure() (which left the bus at SAFE-OP). It performs the cyclic exchange()
+    // and advances SETTLE -> ARM(stock ecx_dcsync0) -> GATE -> request OP -> AWAIT_OP ->
+    // OPERATIONAL, returning the new status. The CALLER owns the cadence: it does the
+    // clock_nanosleep deadline + dc_phase_correction(dc_time(), ...) around this call, so
+    // PD stays phase-locked and gapless. `drive_sync_faulted` is the caller's read of the
+    // drive's Er74.1 no-sync fault (0x603F == 0x8700) from the PREVIOUS step's feedback
+    // image -- passing it in keeps Master free of CiA402 semantics and lets both
+    // ServoController and the thin #21 program reuse this. Never throws. On Operational
+    // the caller switches to its steady loop; on Aborted it must surface the fault and
+    // NOT immediately re-enter bring-up (bounded -- repeated Er74 OP-entry wedges the A6).
+    BringupStatus bringup_step(bool drive_sync_faulted) noexcept;
 
     void close() noexcept;
 
@@ -131,11 +140,6 @@ class Master {
     std::int64_t dc_time() const noexcept {
         return backend_->dc_time();
     }
-    // Live DC-sync health for the SAFE-OP -> OP gate: poll while pumping phase-locked
-    // PD in SAFE-OP, request OP only once `.ready` (slave clock locked + SYNC0 armed).
-    DcSyncStatus dc_sync_status() const noexcept {
-        return backend_->dc_sync_status();
-    }
     std::string last_error() const;
 
     // Latest feedback snapshot for a slave (1-based).
@@ -182,19 +186,18 @@ class Master {
     SlaveRuntime& runtime_for(std::uint16_t slave);
     const SlaveRuntime& runtime_for(std::uint16_t slave) const;
 
-    // Pump `max_cycles` exchanges while running the DC phase-lock PI, sharing the
-    // caller's `next` deadline + `integral` so back-to-back calls stay on ONE
-    // continuous cadence (gapless across a state change). `target_streak > 0` returns
-    // early once the phase has held in-band that many consecutive cycles; 0 = run all
-    // cycles. Returns the final consecutive-locked streak. noexcept (RT-paced setup).
-    int phase_lock_pump(std::uint32_t cycle_ns,
-                        std::int64_t shift_ns,
-                        std::uint32_t max_cycles,
-                        int target_streak,
-                        timespec& next,
-                        std::int64_t& integral) noexcept;
-
     static std::map<std::uint32_t, FieldLocation> build_field_table(std::uint16_t slave, const PdoMap& map);
+
+    // Internal phases of the bring-up state machine (bringup_step). Distinct from the
+    // public BringupStatus so the "armed this step" edge (Arming) is a transient the
+    // caller sees once while the internal phase is already Gate.
+    enum class BringupPhase : std::uint8_t { Settle, Arm, Gate, AwaitOp, Done, Aborted };
+    BringupPhase bringup_phase_ = BringupPhase::Settle;  // RT-only
+    std::uint32_t bringup_settle_count_ = 0;             // RT-only: SETTLE cycles elapsed
+    std::uint32_t bringup_gate_streak_ = 0;              // RT-only: consecutive no-Er74.1 cycles in GATE
+    bool dc_enabled_ = false;                            // set in configure(): is SYNC0 in play?
+    std::uint32_t dc_cycle_ns_ = 0;                      // SYNC0 cycle = 1e9 / loop rate (set in configure())
+    std::int32_t dc_sync0_shift_ns_ = 0;                 // ecx_dcsync0 CyclShift (set in configure())
 
     MasterConfig config_;
     std::unique_ptr<EcatBackend> backend_;
