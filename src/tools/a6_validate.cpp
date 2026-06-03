@@ -162,9 +162,10 @@ MasterConfig build_a6_pp_config(const std::string& ifname,
             {kSm2SyncType, kGetCycleSub, le16(kGetCycleMeasure), /*optional=*/true},  // SM2 Get Cycle Time = measure once
             {kSm3SyncType, kGetCycleSub, le16(kGetCycleMeasure), /*optional=*/true},  // SM3 Get Cycle Time = measure once
         };
-        // After the handshake, pump up to 250 cycles so the drive measures + populates
-        // the RO 0x1C32:02; break early the moment :02 reads non-zero. Without this
-        // settle the drive validates :02=0 at SafeOp -> AL 0x0030.
+        // After the handshake, pump up to 250 cycles + poll 0x1C32:02. (Originally a
+        // theory that :02=0 caused the SAFE-OP 0x0030 -- DISPROVEN on HW: :02 populated
+        // 999120 and SAFE-OP still 0x0030'd. Kept as a no-harm diagnostic settle; the
+        // 0x0030 reject with DC sync-type is drive-internal, not a missing :02.)
         cfg.dc_postwrite_settle_cycles = 250;
         cfg.dc_settle_poll_index = kSm2SyncType;  // poll 0x1C32...
         cfg.dc_settle_poll_sub = kSyncCycleSub;   // ...:02 (SM cycle time) until non-zero
@@ -399,27 +400,30 @@ int main(int argc, char** argv) {
         } catch (const Error& e) {
             std::cerr << "[dc] SM sync-type read failed (object absent?): " << e.what() << '\n';
         }
-        // Cycle-time handshake state: :02 (RO Cycle Time -- the value SafeOp validates),
-        // :0a (Sync0 Cycle Time -- what we told the drive), :08 (Get Cycle Time -- the
-        // measure trigger; auto-resets to 0 when done). :02 flipping 0 -> 1000000 after
-        // the :0a/:08 writes is the smoking gun that the DC config is now valid.
+        // Cycle-time handshake state: :02 (RO Cycle Time), :0a (Sync0 Cycle Time -- what
+        // we told the drive), :08 (Get Cycle Time -- the measure trigger; auto-resets to 0
+        // when done). NOTE: :02 is NOT the 0x0030 cause -- DISPROVEN on HW (bench saw :02
+        // populated 999120 AND still 0x0030; and :02=0 with SM-sync passes SAFE-OP). The
+        // A6 measures :02 at OP entry, not SAFE-OP, so 0 here is NORMAL. The 0x0030 reject
+        // with DC sync-type is drive-internal (not visible master-side). Shown FYI only.
         try {
             const auto cyc2 = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, kSyncCycleSub);
             const auto cyc0a = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, kSync0CycleSub);
             const auto get08 = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kGetCycleSub);
-            const char* note = "  (non-1ms -- unexpected)";
+            const char* note = "  (drive's own measurement)";
             if (cyc2 == 0) {
-                note = "  *** :02=0 -> drive hasn't populated Cycle Time -> AL 0x0030 ***";
+                note = "  (0 = not yet measured; NORMAL in SAFE-OP, NOT the 0x0030 cause)";
             } else if (cyc2 == kSyncCycleNs) {
-                note = "  -> Cycle Time populated, DC config VALID";
+                note = "  (= 1ms)";
             }
             std::cout << "[dc]   0x1C32:02 CycleTime(RO)=" << cyc2 << "ns 0x1C32:0a Sync0CycleTime=" << cyc0a
                       << "ns 0x1C32:08 GetCycleTime=" << get08 << note << '\n';
         } catch (const Error& e) {
             std::cerr << "[dc]   0x1C32 cycle-time readback failed: " << e.what() << '\n';
         }
-        // ETG.1020 measurement diagnostics: if :02 populates but 0x0030 persists, these
-        // say why -- SM-event-missed / cycle-too-small / SyncError (updated by :08=1).
+        // ETG.1020 measurement diagnostics (FYI): SM-event-missed / cycle-too-small /
+        // SyncError, updated by :08=1. (0x0030 persists even with :02 populated + these
+        // clear, so they are not the cause either -- the reject is drive-internal.)
         try {
             const auto missed = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kSmMissedSub);
             const auto too_small = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kCycleTooSmallSub);

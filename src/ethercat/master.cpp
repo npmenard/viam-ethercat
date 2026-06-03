@@ -206,13 +206,15 @@ void Master::configure(bool reach_op) {
                                kDcPreopLockStreak,
                                preop_streak >= kDcPreopLockStreak ? " -> LOCKED" : " -> NOT locked (cap hit)");
 
-            // SYNTHESIS (arm-in-PRE-OP): arm SYNC0 NOW, on the locked clock, so it is
-            // already FIRING (start_delay ~15 ms) when we request SAFE-OP. A drive that
-            // needs DC sync-type to run OP (else AL 0x0027) AND rejects DC config at the
-            // SAFE-OP transition unless SYNC0 is pulsing (AL 0x0030) needs exactly this:
-            // force 0x1C32:01=2 (postremap, already applied) + a live SYNC0 at the PS
-            // validation. Apply the post-DC cycle handshake here too (0x09A0 is live now),
-            // then pump past the start delay so edges are firing before SAFE-OP.
+            // arm-in-PRE-OP: arm SYNC0 NOW, on the locked clock, so it is already FIRING
+            // (start_delay ~15 ms) when we request SAFE-OP. This was the SYNTHESIS attempt
+            // for a drive that needs DC sync-type to run OP (else AL 0x0027) AND
+            // 0x0030-rejects DC config at the SAFE-OP transition: force 0x1C32:01=2 +
+            // present a live SYNC0 at the PS validation. NOTE: on the A6 this did NOT clear
+            // the 0x0030 -- even DC-type + firing-SYNC0-before-SAFE-OP is rejected, so that
+            // reject is drive-internal (not a missing live SYNC0). Kept as a benchable
+            // option (flag). Applies the post-DC cycle handshake here (0x09A0 live), then
+            // pumps past the start delay so edges are firing before SAFE-OP.
             if (config_.dc_arm_in_preop) {
                 backend_->arm_dc_sync(cycle_ns, config_.dc_sync0_shift_ns, config_.dc_sync_start_delay_ns);
                 for (const SlaveConfig& sc : config_.slaves) {
