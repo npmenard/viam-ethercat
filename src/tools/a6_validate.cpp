@@ -480,18 +480,18 @@ int main(int argc, char** argv) {
     int op_fault_streak = 0;                             // consecutive cycles faulted-in-OP (persistent-cause give-up)
     constexpr int kPersistentFaultGiveUp = 2000;         // ~2 s faulted in OP despite reset -> STOP (protect the drive)
     bool dc_armed = false;                               // SYNC0 armed in-loop yet?
-    bool cycle_ready = false;                            // 0x1C32:02 re-derived clean (== 1 ms) from the firing SYNC0?
-    std::int64_t sm_cycle = -1;                          // latest 0x1C32:02 read (ns), -1 = not yet read
+    std::int64_t sm_cycle = -1;                          // latest 0x1C32:02 read (ns), -1 = not yet read (DIAGNOSTIC only)
     std::uint64_t arm_tick = 0;                          // tick at which we armed (cap is relative to this)
     constexpr int kArmAfterLockStreak = 200;             // arm SYNC0 once the master holds phase-lock this long (~200 ms)
     constexpr std::uint64_t kDcPollEvery = 50;           // poll dc_sync_status every 50 cycles (~20 Hz), ADDITIVE to PD
-    constexpr std::uint64_t kOpRequestCapCycles = 8000;  // ~8 s AFTER arming: request OP even if never ready (failure path)
-    // The drive measures its SM/SYNC0 cycle into the RO 0x1C32:02; pre-SYNC0 it reads
-    // the jittery SM-event period (~999 us) and validates THAT at OP -> Er74.0 cycle
-    // error. Once SYNC0 is firing it re-derives the exact 1 ms hardware period -> gate OP
-    // on 0x1C32:02 landing within a tight band of 1 ms (NOT the ~1 us-short SM value).
-    constexpr std::int64_t kTargetCycleNs = 1'000'000;
-    constexpr std::int64_t kCleanCycleBandNs = 256;  // |0x1C32:02 - 1ms| <= this => re-derived clean
+    constexpr std::uint64_t kOpRequestCapCycles = 8000;  // ~8 s AFTER arming: SYNC0 never armed -> abort (failure path)
+    // NOTE on 0x1C32:02 (RO SM cycle): on a CLEAN drive it reads 0 in SAFE-OP and is only
+    // MEASURED/populated by the drive AT the OP transition (bench: the 999120 we chased
+    // earlier was a polluted-drive residual). So we do NOT gate OP on it -- a "verify
+    // ==1ms before OP" check can never pass (the value only exists after the OP it would
+    // block). Instead the PRE-OP phase-lock makes the OP-ENTRY measurement clean, and the
+    // bounded give-up is the safety net. 0x1C32:02 stays a DIAGNOSTIC (poll trace +
+    // fault-edge read) so we can see what the drive measured at/after OP.
 
     // Read the RO SM2 cycle time (0x1C32:02) the drive validates at OP -- watch it
     // re-derive toward 1000000 once a clean SYNC0 is pulsing (vs a stale cached value
@@ -550,51 +550,40 @@ int main(int argc, char** argv) {
             }
         }
 
-        // STEP 3 -- after arming, poll the slave DC-sync health AND the RO cycle 0x1C32:02
-        // at ~20 Hz (pre-OP, so the SDO read is safe). 0x0984 (SYNC0 armed) is the
-        // load-bearing DC-sync bit (single-slave: 0x092C ~ 0 trivially). 0x1C32:02 starts
-        // at the jittery SM-event period (~999 us) and must RE-DERIVE to a clean 1 ms once
-        // SYNC0 is firing -- watch it converge 999xxx -> 1000000. Trace until fully ready.
+        // STEP 3 -- after arming, poll the slave DC-sync health at ~20 Hz (pre-OP, SDO
+        // read safe). 0x0984 (SYNC0 armed) is the load-bearing DC-sync bit (single-slave:
+        // 0x092C ~ 0 trivially). 0x1C32:02 is read as a DIAGNOSTIC only (it is 0 in
+        // SAFE-OP on a clean drive -- the drive measures it AT OP entry -- so it is NOT a
+        // gate; see the NOTE above). Trace until SYNC0 is armed (the OP go-signal).
         if (dc_armed && !op_requested && (tick % kDcPollEvery == 0)) {
             dcs = master.dc_sync_status();
             dc_ready = dcs.ready;
             sm_cycle = read_sm_cycle();
-            cycle_ready = sm_cycle >= 0 && std::llabs(sm_cycle - kTargetCycleNs) <= kCleanCycleBandNs;
-            if (!(dc_ready && cycle_ready)) {  // trace through the proving window (stops once ready for OP)
+            if (!dc_ready) {  // trace through the proving window (stops once SYNC0 armed -> ready for OP)
                 std::cout << "[B]   poll t=" << tick << " 0x0984=" << (dcs.sync0_active ? "ARMED" : "0")
                           << " 0x092C=" << dcs.sys_time_diff_ns << "ns lockStreak=" << locked_streak << " AL=0x" << std::hex
-                          << dcs.al_status << std::dec << " 0x1C32:02=" << sm_cycle << "ns"
-                          << (cycle_ready ? " (CLEAN 1ms)" : " (STALE -- latched, won't change)") << '\n';
+                          << dcs.al_status << std::dec << " 0x1C32:02=" << sm_cycle << "ns (0 in SAFE-OP is normal; measured at OP)\n";
             }
             if (dcs.sync0_active && !dc_sync_announced) {
                 std::cout << "[B] *** SYNC0 ARMED *** (0x0984 b0=1), clock " << (dcs.clock_locked ? "LOCKED" : "unlocked")
-                          << " (0x092C=" << dcs.sys_time_diff_ns << "ns) -- now verifying the latched 0x1C32:02 is a clean 1ms\n";
+                          << " (0x092C=" << dcs.sys_time_diff_ns << "ns)\n";
                 dc_sync_announced = true;
             }
         }
 
-        // STEP 4 -- VERIFY, not WAIT. The A6 latches 0x1C32:02 ONCE at SM2 activation
-        // (SAFE-OP entry, during configure's measure window) and NEVER re-measures, so
-        // once SYNC0 is armed (dc_ready) we just READ the latched value:
-        //   clean 1ms  -> request OP (first light).
-        //   stale ~999us -> the PRE-OP phase-lock did NOT take; this value will NOT
-        //     change, so polling is futile and requesting OP would Er74.0 0x6320 (and
-        //     wedge the drive). ABORT cleanly -- the only recovery is to re-lock in
-        //     PRE-OP (re-run), per the architect's verify-not-wait / type-(b) give-up.
+        // STEP 4 -- request OP once master-locked + SYNC0-armed + clock-locked (dc_ready).
+        // We deliberately do NOT gate on 0x1C32:02: on a clean drive it is 0 in SAFE-OP and
+        // is only measured AT the OP transition, so a verify-before-OP gate can never pass.
+        // The PRE-OP phase-lock is the actual fix -- the master crosses into SAFE-OP already
+        // locked, so the drive's OP-entry cycle measurement should be a clean 1 ms (no
+        // Er74.0). This is the real test of that hypothesis. The bounded give-up below is
+        // the safety net if the OP-entry measurement is still off (stops at ~2 s, no wedge).
         const bool cap_hit = dc_armed && tick >= arm_tick + kOpRequestCapCycles;
         if (!op_requested && dc_armed && dc_ready) {
-            if (cycle_ready) {
-                master.request_op();
-                op_requested = true;
-                std::cout << "[B] DC-sync READY (SYNC0 armed + clock locked + 0x1C32:02=" << sm_cycle << "ns CLEAN) -> requesting OP\n";
-            } else {
-                std::cout
-                    << "[B] !!! CYCLE-LOCK FAILED: SYNC0 armed but 0x1C32:02=" << sm_cycle
-                    << "ns (not the clean 1000000) -- the A6 latched a STALE cycle at SAFE-OP entry; the PRE-OP phase-lock did NOT "
-                    << "take. 0x1C32:02 is latched once + never re-measured, so it will NOT change. NOT requesting OP (would Er74.0 "
-                    << "+ wedge the drive). Re-run; if it persists the PRE-OP lock isn't holding -> raise the streak / widen the band.\n";
-                break;  // abort cleanly -- re-lock in PRE-OP (re-run) is the only recovery
-            }
+            master.request_op();
+            op_requested = true;
+            std::cout << "[B] DC-sync READY (master locked + SYNC0 armed + clock locked) -> requesting OP "
+                      << "(0x1C32:02 is measured at OP entry; PRE-OP lock should make it a clean 1ms)\n";
         } else if (!op_requested && dc_armed && cap_hit) {
             // SYNC0 never armed within the cap. Arming was solved (d5ff073), so this is
             // unexpected -- surface it but do NOT request OP into a no-SYNC0 state (Er74.1).
