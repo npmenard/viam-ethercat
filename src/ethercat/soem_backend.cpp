@@ -107,6 +107,12 @@ struct SoemBackend::Impl {
     int slave_count = 0;
     std::uint32_t dc_cycle_ns = 0;  // SYNC0 cycle once DC is enabled; paces the OP-transition PD pump
     bool open = false;
+    // 0x098E (SYNC0 status) from the PREVIOUS dc_sync_status() call, per slave -- to
+    // detect whether SYNC0 is PHYSICALLY pulsing (the register changes across polls if
+    // edges are firing) vs merely "armed" (0x0984 set). Polls are ~50 ms apart (~50
+    // SYNC0 pulses), so a pulsing unit always shows a change.
+    std::array<std::uint8_t, EC_MAXSLAVE> prev_sync0_evt{};
+    bool sync0_evt_primed = false;
 
     Impl() {
         ctx.port = &port;
@@ -385,19 +391,31 @@ DcSyncStatus SoemBackend::dc_sync_status() noexcept {
     }
     bool all_locked = true;
     bool all_armed = true;
-    std::uint32_t worst_mag = 0;  // largest |0x092C| across slaves -> reported as the signed sample
+    bool all_pulsing = impl_->sync0_evt_primed;  // can't judge toggle on the first (unprimed) call
+    std::uint32_t worst_mag = 0;                 // largest |0x092C| across slaves -> reported as the signed sample
     for (int i = 1; i <= impl_->slavecount; ++i) {
         const std::uint16_t adp = impl_->slavelist[i].configadr;
         std::uint8_t act_status = 0;  // 0x0984 activation status (b0 = SYNC0 active)
         std::uint32_t time_diff = 0;  // 0x092C system time difference
         std::uint16_t al = 0;         // 0x0134 AL status code
+        std::uint8_t sync0_evt = 0;   // 0x098E SYNC0 status/event (changes per pulse if physically firing)
         (void)ecx_FPRD(&impl_->port, adp, 0x0984, sizeof(act_status), &act_status, EC_TIMEOUTRET);
         (void)ecx_FPRD(&impl_->port, adp, 0x092C, sizeof(time_diff), &time_diff, EC_TIMEOUTRET);
         (void)ecx_FPRD(&impl_->port, adp, 0x0134, sizeof(al), &al, EC_TIMEOUTRET);
+        (void)ecx_FPRD(&impl_->port, adp, 0x098E, sizeof(sync0_evt), &sync0_evt, EC_TIMEOUTRET);
         const std::uint32_t diff_mag = time_diff & 0x7FFFFFFFU;
         const bool neg = (time_diff & 0x80000000U) != 0;
         all_armed = all_armed && ((act_status & 0x01U) != 0);
         all_locked = all_locked && (diff_mag < kLockBandNs);
+        // PHYSICAL-pulse check: 0x098E differs from the previous poll => edges fired
+        // between polls. If it is STATIC despite 0x0984=1, the ESC reports "armed" but
+        // is not actually generating SYNC0 (an arm/start-time issue we can still fix);
+        // if it toggles, SYNC0 IS pulsing (any "no sync" is then downstream of the ESC).
+        const auto si = static_cast<std::size_t>(i);
+        if (si < impl_->prev_sync0_evt.size()) {
+            all_pulsing = all_pulsing && (sync0_evt != impl_->prev_sync0_evt[si]);
+            impl_->prev_sync0_evt[si] = sync0_evt;
+        }
         if (diff_mag >= worst_mag) {
             worst_mag = diff_mag;
             st.sys_time_diff_ns = neg ? -static_cast<std::int32_t>(diff_mag) : static_cast<std::int32_t>(diff_mag);
@@ -406,9 +424,10 @@ DcSyncStatus SoemBackend::dc_sync_status() noexcept {
             st.al_status = al;  // surface any non-zero AL code
         }
     }
+    impl_->sync0_evt_primed = true;
     st.clock_locked = all_locked;
     st.sync0_active = all_armed;
-    st.sync0_pulsing = all_armed;  // arm level; edge proof is the configure-time 0x098E double-read
+    st.sync0_pulsing = all_pulsing;  // 0x098E toggled across polls => SYNC0 physically generating
     st.ready = all_locked && all_armed;
     return st;
 }

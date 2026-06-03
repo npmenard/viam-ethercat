@@ -555,14 +555,25 @@ int main(int argc, char** argv) {
         // 0x092C ~ 0 trivially). 0x1C32:02 is read as a DIAGNOSTIC only (it is 0 in
         // SAFE-OP on a clean drive -- the drive measures it AT OP entry -- so it is NOT a
         // gate; see the NOTE above). Trace until SYNC0 is armed (the OP go-signal).
-        if (dc_armed && !op_requested && (tick % kDcPollEvery == 0)) {
+        if (dc_armed && (tick % kDcPollEvery == 0)) {
             dcs = master.dc_sync_status();
             dc_ready = dcs.ready;
             sm_cycle = read_sm_cycle();
-            if (!dc_ready) {  // trace through the proving window (stops once SYNC0 armed -> ready for OP)
+            if (!op_requested && !dc_ready) {  // PRE-OP proving trace (stops once SYNC0 armed -> ready for OP)
                 std::cout << "[B]   poll t=" << tick << " 0x0984=" << (dcs.sync0_active ? "ARMED" : "0")
-                          << " 0x092C=" << dcs.sys_time_diff_ns << "ns lockStreak=" << locked_streak << " AL=0x" << std::hex
-                          << dcs.al_status << std::dec << " 0x1C32:02=" << sm_cycle << "ns (0 in SAFE-OP is normal; measured at OP)\n";
+                          << " 0x098E=" << (dcs.sync0_pulsing ? "PULSING" : "static") << " 0x092C=" << dcs.sys_time_diff_ns
+                          << "ns lockStreak=" << locked_streak << " AL=0x" << std::hex << dcs.al_status << std::dec
+                          << " 0x1C32:02=" << sm_cycle << "ns (0 in SAFE-OP is normal; measured at OP)\n";
+            } else if (op_requested) {
+                // POST-OP DISCRIMINATOR (team-lead): is the ESC PHYSICALLY generating SYNC0?
+                // 0x098E toggling across polls => real edges firing -> any "no sync" is
+                // downstream of the ESC (MCU/routing). 0x098E STATIC despite 0x0984=1 =>
+                // the ESC reports armed but is NOT pulsing (an arm/start-time issue, still
+                // ours to fix). Many polls over the ~2 s faulted window => a reliable read.
+                std::cout << "[B]   OP-poll t=" << tick
+                          << " 0x098E=" << (dcs.sync0_pulsing ? "PULSING (SYNC0 generating)" : "STATIC (NOT generating despite 0x0984=1!)")
+                          << " 0x0984=" << (dcs.sync0_active ? "ARMED" : "0") << " 0x092C=" << dcs.sys_time_diff_ns << "ns AL=0x"
+                          << std::hex << dcs.al_status << std::dec << '\n';
             }
             if (dcs.sync0_active && !dc_sync_announced) {
                 std::cout << "[B] *** SYNC0 ARMED *** (0x0984 b0=1), clock " << (dcs.clock_locked ? "LOCKED" : "unlocked")

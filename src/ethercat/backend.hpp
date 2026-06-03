@@ -71,7 +71,7 @@ struct DcSyncStatus {
     std::int32_t sys_time_diff_ns = 0;  // worst |0x092C| seen (signed sample, the real lock signal -- NOT 0x0930)
     bool clock_locked = false;          // every slave's |0x092C| within the lock band
     bool sync0_active = false;          // every slave's 0x0984 b0 set (SYNC-out unit ARMED)
-    bool sync0_pulsing = false;         // every slave's 0x098E toggled across the two samples (edges firing)
+    bool sync0_pulsing = false;         // every slave's 0x098E changed since the PREVIOUS dc_sync_status() poll (SYNC0 physically firing)
     std::uint16_t al_status = 0;        // worst 0x0134 AL status code (0x2D = DC start invalid)
     bool ready = false;                 // clock_locked && sync0_active on ALL slaves -> safe to request OP
 };
