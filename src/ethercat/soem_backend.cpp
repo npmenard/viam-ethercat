@@ -400,6 +400,19 @@ void SoemBackend::close() noexcept {
             }
             impl_->dc_cycle_ns = 0;
         }
+        // Walk the drive DOWN to INIT before dropping the master -- the standard EtherCAT
+        // teardown. Leaving it in OP with SYNC0 just disabled + the socket dropped left the
+        // drive's DC subsystem un-re-syncable on the IMMEDIATELY following bring-up (a perfect
+        // odd/even alternation -- a successful run's locked-then-killed DC poisoned the next run;
+        // a failed run that never locked DC did not -- which blocked the energized first move,
+        // 4/4 "OP did not hold"). The INIT transition RESETS the drive's SMs + DC state, so the
+        // next config_init starts from a clean slate regardless of what the SYNC0-disable left.
+        // ec_sample sidesteps this by being killed in OP (the drive falls to INIT on carrier
+        // loss); this is the deterministic equivalent. Best-effort + bounded -- close() is
+        // noexcept and ecx_writestate/ecx_statecheck do not throw.
+        impl_->ctx.slavelist[0].state = EC_STATE_INIT;
+        ecx_writestate(&impl_->ctx, 0);
+        ecx_statecheck(&impl_->ctx, 0, EC_STATE_INIT, EC_TIMEOUTSTATE);
         ecx_close(&impl_->ctx);
         impl_->open = false;
     }
