@@ -142,6 +142,31 @@ std::size_t SoemBackend::open(std::string_view ifname) {
                         "); the CoE mailbox would not be ready for SDO" + detail);
     }
 
+    // AL-state PRE-OP is necessary but NOT sufficient for SDO. ecx_statecheck above confirms
+    // only the AL state (reg 0x0130); after the manual INIT->PRE-OP bounce the slave needs a
+    // brief moment to make its CoE mailbox-out SyncManager (SM0) WRITABLE. If configure()'s
+    // first SDO races that window, ecx_mbxsend finds SM0 not-ready and returns without sending
+    // -> WKC 0 ("SDO ... working counter 0"). That race -- intermittent, masked by retries as a
+    // bogus "drive wedge / needs power-cycle" -- is the real bug (wire-diagnosed): the bounce is
+    // OURS (it skips the mailbox-ready timing config_init's own transition would have). Close the
+    // gap deterministically: per slave, poll SM0's mailbox-out status until empty (writable)
+    // before returning, so open()'s "mailbox ready for SDO" contract is REAL, not just AL-state.
+    for (int i = 1; i <= count; ++i) {
+        if (impl_->ctx.slavelist[i].mbx_l == 0) {
+            continue;  // no CoE mailbox on this slave (e.g. simple I/O) -> nothing to wait on
+        }
+        if (ecx_mbxempty(&impl_->ctx, static_cast<std::uint16_t>(i), EC_TIMEOUTRXM) <= 0) {
+            std::string detail;
+            ecx_readstate(&impl_->ctx);
+            const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
+            detail = " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
+                     " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
+            ecx_close(&impl_->ctx);
+            throw InitError("slave " + std::to_string(i) + " CoE mailbox-out (SM0) not ready for SDO after PRE-OP on '" + name +
+                            "' (mailbox-empty wait timed out)" + detail);
+        }
+    }
+
     impl_->open = true;
     return static_cast<std::size_t>(count);
 }
@@ -162,10 +187,26 @@ SlaveInfo SoemBackend::slave_info(std::uint16_t slave) const {
     return info;
 }
 
+// Bounded retry for a transient WKC-0 (mailbox momentarily not ready right after a state
+// transition). Retry ONLY on WKC <= 0 with no CoE abort -- a CoE abort returns WKC > 0 with
+// an error pushed (a real rejection that retrying won't fix). All SDO access here is setup-time
+// (PDO remap / mode / fault-reset), never on the RT path, so a few ms of backoff is safe.
+namespace {
+constexpr int kSdoRetries = 4;
+constexpr std::uint32_t kSdoRetryBackoffUs = 2000;  // ~2 ms; the mailbox readies within a couple ms
+}  // namespace
+
 void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
     // SOEM's psize is an int; PDO/SDO payloads are tiny, so the cast is safe.
     const int size = static_cast<int>(data.size());
-    const int wkc = ecx_SDOwrite(&impl_->ctx, slave, index, sub, FALSE, size, data.data(), EC_TIMEOUTRXM);
+    int wkc = 0;
+    for (int attempt = 0; attempt < kSdoRetries; ++attempt) {
+        wkc = ecx_SDOwrite(&impl_->ctx, slave, index, sub, FALSE, size, data.data(), EC_TIMEOUTRXM);
+        if (wkc > 0) {
+            break;  // got a response (success OR CoE abort -- both decided by the check below); no retry
+        }
+        (void)osal_usleep(kSdoRetryBackoffUs);  // WKC 0: transient mailbox-not-ready -> brief backoff + retry
+    }
     // A CoE abort can return wkc > 0 but push an error, so check both.
     if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {
         const std::string abort = pop_coe_abort(&impl_->ctx);
@@ -176,7 +217,15 @@ void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8
 
 std::size_t SoemBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
     int size = static_cast<int>(out.size());
-    const int wkc = ecx_SDOread(&impl_->ctx, slave, index, sub, FALSE, &size, out.data(), EC_TIMEOUTRXM);
+    int wkc = 0;
+    for (int attempt = 0; attempt < kSdoRetries; ++attempt) {
+        size = static_cast<int>(out.size());  // ecx_SDOread updates size in place; reset per attempt
+        wkc = ecx_SDOread(&impl_->ctx, slave, index, sub, FALSE, &size, out.data(), EC_TIMEOUTRXM);
+        if (wkc > 0) {
+            break;
+        }
+        (void)osal_usleep(kSdoRetryBackoffUs);
+    }
     if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {
         const std::string abort = pop_coe_abort(&impl_->ctx);
         throw BusError("SDO read from slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" + std::to_string(sub) +
