@@ -201,6 +201,10 @@ struct Options {
     bool enable = false;
     bool move_pp = false;
     bool move_sine = false;  // --move-sine: CSP streamed soft-started sine (energized)
+    bool csp_probe = false;  // --csp-probe: bring up in CSP mode (0x6060=8) but DO NOT enable --
+                             // just read+print feedback. Diagnostic: confirms whether read_tx
+                             // returns valid sw/pos in CSP without energizing (CSP-feedback vs
+                             // wedge isolation). Non-energizing; safe.
     bool reset_fault = false;
     double move_revs = 0.0;
     double move_rpm = 60.0;
@@ -232,6 +236,8 @@ int main(int argc, char** argv) {
         } else if (a == "--move-sine") {
             opt.move_sine = true;
             opt.enable = true;  // an energized move requires enabling
+        } else if (a == "--csp-probe") {
+            opt.csp_probe = true;  // CSP mode, NO enable -- read+print feedback only (diagnostic)
         } else if (a == "--sine-amplitude" && i + 1 < args.size()) {
             opt.sine_amplitude = std::stod(args[++i]);
         } else if (a == "--sine-period" && i + 1 < args.size()) {
@@ -256,17 +262,23 @@ int main(int argc, char** argv) {
                       << "               (no velocity step). --follow-err-limit N (counts, def 5000): abort+disable if\n"
                       << "               |commanded-actual| exceeds it. Mutually exclusive with --move-pp.\n"
                       << "  --move-pp REVS [RPM]: *** MOTION *** PP-mode relative move via the bit4 handshake.\n"
+                      << "  --csp-probe: NON-energizing diagnostic -- bring up in CSP mode (0x6060=8), hold at\n"
+                      << "               ReadyToSwitchOn (NO enable), print feedback. Confirms whether read_tx returns\n"
+                      << "               valid sw/pos in CSP without energizing (isolates CSP-feedback vs a wedged drive).\n"
                       << "  --dc-shift-ns: SYNC0 pulse CyclShift (ecx_dcsync0) -- sweep to move the SYNC0 edge if needed.\n"
                       << "  --reset-fault: clear a latent drive fault at bring-up via the A6 vendor SDO 0x2031:01=1.\n";
             return 2;
         }
     }
 
-    if (opt.move_pp && opt.move_sine) {
-        std::cerr << "error: --move-pp and --move-sine are mutually exclusive (one mode of operation at a time)\n";
+    const int mode_flags = static_cast<int>(opt.move_pp) + static_cast<int>(opt.move_sine) + static_cast<int>(opt.csp_probe);
+    if (mode_flags > 1) {
+        std::cerr << "error: --move-pp / --move-sine / --csp-probe are mutually exclusive (one mode of operation at a time)\n";
         return 2;
     }
-    const Cia402Mode mode = opt.move_sine ? Cia402Mode::CyclicSyncPosition : Cia402Mode::ProfilePosition;
+    // --csp-probe and --move-sine both select CSP (0x6060=8); --move-pp and the plain/no-move
+    // default select ProfilePosition. --csp-probe is the non-energizing CSP feedback diagnostic.
+    const Cia402Mode mode = (opt.move_sine || opt.csp_probe) ? Cia402Mode::CyclicSyncPosition : Cia402Mode::ProfilePosition;
 
     (void)std::signal(SIGINT, on_sigint);
 
