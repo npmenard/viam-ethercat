@@ -4,13 +4,16 @@
 
 namespace ethercat {
 
-// CiA402 "modes of operation" (object 0x6060 / display 0x6061). Only the two we
-// drive today are enumerated; CSP/CSV can be added later. Values match the
-// DS402 wire encoding.
+// CiA402 "modes of operation" (object 0x6060 / display 0x6061). Values match the
+// DS402 wire encoding. The enable ladder (0x06->0x07->0x0F via Cia402Fsm::step) is
+// MODE-AGNOSTIC -- it only advances the DS402 state machine, so every mode reaches
+// OperationEnabled the same way; only post-enable streaming differs (PP = bit4
+// new-set-point handshake; CSP = stream 0x607A every cycle with cw held at 0x0F).
 enum class Cia402Mode : std::int8_t {
     None = 0,
     ProfilePosition = 1,
     ProfileVelocity = 3,
+    CyclicSyncPosition = 8,  // CSP: master streams target position (0x607A) every cycle
 };
 
 // The eight canonical CiA402 drive states (the DS402 state machine).

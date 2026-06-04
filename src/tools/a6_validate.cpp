@@ -45,6 +45,7 @@
 #include "ethercat/pdo_buffer.hpp"
 #include "ethercat/pdo_mapping.hpp"
 #include "ethercat/soem_backend.hpp"
+#include "tools/sine_move.hpp"
 
 namespace {
 
@@ -78,10 +79,13 @@ extern "C" void on_sigint(int) {
     g_stop.store(true);
 }
 
-// Build the PROFILE POSITION MasterConfig for one A6, mirroring
-// etc/a6-hardware.example.json (RxPDO 0x1600 = ctrl + target-pos + profile-vel;
-// TxPDO 0x1A00 = fault + status + mode-display + pos + vel + torque).
-MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_sync0_shift_ns, bool reset_fault) {
+// Build the MasterConfig for one A6, mirroring etc/a6-hardware.example.json (RxPDO
+// 0x1600 = ctrl + target-pos + profile-vel; TxPDO 0x1A00 = fault + status +
+// mode-display + pos + vel + torque). `mode` selects 0x6060: ProfilePosition (the
+// bit4-handshake --move-pp) or CyclicSyncPosition (the streamed --move-sine). Both
+// reuse the SAME PDO map -- 0x607A serves the PP target AND the CSP streamed target --
+// so one builder covers both; only the post-enable control semantics differ.
+MasterConfig build_a6_config(const std::string& ifname, std::int32_t dc_sync0_shift_ns, bool reset_fault, Cia402Mode mode) {
     MasterConfig cfg;
     cfg.ifname = ifname;
     cfg.target_loop_rate_hz = 1000;             // 1 ms SYNC0 = 4 x 250 us (A6-legal)
@@ -96,7 +100,7 @@ MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_sync0
 
     SlaveConfig a6;
     a6.slave_id = 1;
-    a6.default_mode = Cia402Mode::ProfilePosition;
+    a6.default_mode = mode;  // 0x6060 set in configure(); PP=1 (handshake) or CSP=8 (streamed sine)
     // The A6's fault-reset is the VENDOR SDO 0x2031:01 = 1 (NOT CiA402 bit7, CLAUDE.md).
     // --reset-fault clears a latent fault ONCE at bring-up (configure(), after SAFE-OP,
     // single port owner). Width per the A6 OD (U16 assumed); a wrong width just logs a
@@ -196,9 +200,13 @@ struct Options {
     std::string ifname = "enp86s0";
     bool enable = false;
     bool move_pp = false;
+    bool move_sine = false;  // --move-sine: CSP streamed soft-started sine (energized)
     bool reset_fault = false;
     double move_revs = 0.0;
     double move_rpm = 60.0;
+    double sine_amplitude = 20000.0;       // counts (peak); --sine-amplitude
+    double sine_period = 4.0;              // seconds; --sine-period
+    std::int32_t follow_err_limit = 5000;  // counts; CSP tool-level following-error abort; --follow-err-limit
     int seconds = 6;
     std::int32_t dc_sync0_shift_ns = 0;  // SYNC0 CyclShift passed to ecx_dcsync0; sweep with --dc-shift-ns
 };
@@ -221,6 +229,15 @@ int main(int argc, char** argv) {
             if (i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0) {
                 opt.move_rpm = std::stod(args[++i]);
             }
+        } else if (a == "--move-sine") {
+            opt.move_sine = true;
+            opt.enable = true;  // an energized move requires enabling
+        } else if (a == "--sine-amplitude" && i + 1 < args.size()) {
+            opt.sine_amplitude = std::stod(args[++i]);
+        } else if (a == "--sine-period" && i + 1 < args.size()) {
+            opt.sine_period = std::stod(args[++i]);
+        } else if (a == "--follow-err-limit" && i + 1 < args.size()) {
+            opt.follow_err_limit = std::stoi(args[++i]);
         } else if (a == "--seconds" && i + 1 < args.size()) {
             opt.seconds = std::stoi(args[++i]);
         } else if (a == "--dc-shift-ns" && i + 1 < args.size()) {
@@ -228,22 +245,37 @@ int main(int argc, char** argv) {
         } else if (a.rfind("--", 0) != 0) {
             opt.ifname = a;
         } else {
-            std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N] [--dc-shift-ns NS]\n"
+            std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]]\n"
+                      << "                   [--move-sine [--sine-amplitude N] [--sine-period S]] [--seconds N] [--dc-shift-ns NS]\n"
                       << "  The DC bring-up (#20) is automatic: configure() arms SYNC0 in PRE-OP + reaches SAFE-OP,\n"
                       << "  then the cyclic loop runs SETTLE (phase-locked PD) -> request OP once -> AWAIT_OP (hold\n"
-                      << "  for OP + sync), all gapless. No manual 0x1C32:01 force, no SYNC0 start-delay hack;\n"
-                      << "  Er74.1 in SAFE-OP is normal pre-sync and clears at OP (CLAUDE.md / spec #20).\n"
+                      << "  for OP + sync), all gapless. Er74.1 in SAFE-OP is normal pre-sync, clears at OP.\n"
+                      << "  --move-sine: *** ENERGIZED MOTION *** CSP-mode soft-started position sine, relative to the\n"
+                      << "               enable position. pos(t)=pos_enable + A*min(1,t/T)*sin(2*pi*t/T); A=--sine-amplitude\n"
+                      << "               (counts, def 20000), T=--sine-period (s, def 4.0). CSP-safe (no jump) + ramped\n"
+                      << "               (no velocity step). --follow-err-limit N (counts, def 5000): abort+disable if\n"
+                      << "               |commanded-actual| exceeds it. Mutually exclusive with --move-pp.\n"
+                      << "  --move-pp REVS [RPM]: *** MOTION *** PP-mode relative move via the bit4 handshake.\n"
                       << "  --dc-shift-ns: SYNC0 pulse CyclShift (ecx_dcsync0) -- sweep to move the SYNC0 edge if needed.\n"
                       << "  --reset-fault: clear a latent drive fault at bring-up via the A6 vendor SDO 0x2031:01=1.\n";
             return 2;
         }
     }
 
+    if (opt.move_pp && opt.move_sine) {
+        std::cerr << "error: --move-pp and --move-sine are mutually exclusive (one mode of operation at a time)\n";
+        return 2;
+    }
+    const Cia402Mode mode = opt.move_sine ? Cia402Mode::CyclicSyncPosition : Cia402Mode::ProfilePosition;
+
     (void)std::signal(SIGINT, on_sigint);
 
     std::cout << "=== A6-EC validation on '" << opt.ifname << "' ===\n"
-              << "mode: PROFILE POSITION | enable=" << (opt.enable ? "YES (motor energizes)" : "no")
-              << " | move=" << (opt.move_pp ? std::to_string(opt.move_revs) + " rev @ " + std::to_string(opt.move_rpm) + " rpm" : "none")
+              << "mode: " << to_string(mode) << " | enable=" << (opt.enable ? "YES (motor energizes)" : "no") << " | move="
+              << (opt.move_sine ? "SINE A=" + std::to_string(static_cast<long>(opt.sine_amplitude)) +
+                                      "ct T=" + std::to_string(opt.sine_period) + "s (CSP, soft-started)"
+                  : opt.move_pp ? std::to_string(opt.move_revs) + " rev @ " + std::to_string(opt.move_rpm) + " rpm (PP)"
+                                : "none (hold)")
               << "\n\n";
 
     // DC SYNC0 cycle = loop period; the A6 requires an integer multiple of 250 us
@@ -262,7 +294,7 @@ int main(int argc, char** argv) {
     std::cout << "[dc] phase-lock target = auto(mid-cycle) | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns"
               << " | fault-reset at bring-up = " << (opt.reset_fault ? "ON (vendor 0x2031:01=1)" : "off") << "\n\n";
 
-    Master master(build_a6_pp_config(opt.ifname, opt.dc_sync0_shift_ns, opt.reset_fault), std::make_unique<SoemBackend>());
+    Master master(build_a6_config(opt.ifname, opt.dc_sync0_shift_ns, opt.reset_fault, mode), std::make_unique<SoemBackend>());
 
     // --- Stage A: open + enumerate + read-only SDO identity (PRE-OP) ---
     try {
@@ -386,6 +418,12 @@ int main(int argc, char** argv) {
     std::int32_t target = 0;
     std::uint64_t tick = 0;
     int wkc_bad = 0;
+    // CSP sine state: pos_enable (origin captured at OperationEnabled), enable_tick (t=0
+    // reference), last_sine_target (held during graceful shutdown so the shaft isn't yanked).
+    std::int32_t pos_enable = 0;
+    std::uint64_t enable_tick = 0;
+    std::int32_t last_sine_target = 0;
+    bool safety_abort = false;  // CSP: bit13/0x603F tripped -> disable immediately (no hold)
 
     while (!g_stop.load()) {
         sleep_until(next, static_cast<long>(period_ns) + dc_off);
@@ -419,6 +457,31 @@ int main(int argc, char** argv) {
         }
         was_faulted = faulted;
 
+        // CSP energized-motion safety net (#24): once we're STREAMING the sine, ANY
+        // drive-unhappy signal -- Fault (bit3), following-error / position-deviation
+        // (statusword bit13), or a nonzero 0x603F -- aborts the move and disables
+        // IMMEDIATELY (no hold). We do NOT auto-reset + re-energize mid-motion. At ~14 rpm
+        // soft-started this won't trip (0x6065 deviation window is ~24 revs); it's the
+        // guard for the first energized run. (The enable-ladder fault path above still
+        // clears a PRE-enable latent fault; this only arms after OperationEnabled.)
+        if (opt.move_sine && announced_op) {
+            const auto fc_now = read_tx<std::uint16_t>(master, slave, in, kFaultCode);
+            // Tool-level following-error abort (architect-required): how far actual lags the
+            // last commanded target. This is the EARLY net -- the drive's own bit13 fires
+            // only at 0x6065 (~24 revs on the A6), a full runaway; a moderate deviation
+            // (can't track / mechanical bind / tuning surprise) trips this ~5000-count
+            // (~0.04 rev) limit first. Skip the seed cycle (no commanded target streamed yet).
+            const std::int32_t follow_err = (tick > enable_tick) ? (last_sine_target - pos) : 0;
+            if (status.fault() || status.following_error() || fc_now != 0 || std::abs(follow_err) > opt.follow_err_limit) {
+                std::cerr << "[B] !!! CSP SAFETY ABORT: fault(bit3)=" << status.fault()
+                          << " followingError(bit13)=" << status.following_error() << " 0x603F=0x" << std::hex << fc_now << std::dec
+                          << " follow_err=" << follow_err << " (limit " << opt.follow_err_limit
+                          << ") -- stopping the sine + disabling immediately.\n";
+                safety_abort = true;
+                break;
+            }
+        }
+
         const std::span<std::byte> out = master.outputs(slave);
         std::uint16_t cw = fsm.step(status, goal);
         if (faulted) {
@@ -427,32 +490,61 @@ int main(int argc, char** argv) {
             cw = (last_cw & ControlWord::kFaultResetBit) ? 0x0000 : ControlWord::fault_reset();
         } else if (opt.enable && status.operation_enabled()) {
             if (!announced_op) {
-                std::cout << "[B] *** OPERATION ENABLED *** (motor energized, holding at " << hold_pos << ")\n";
+                pos_enable = pos;  // CSP-safe origin: actual position the cycle OperationEnabled is reached
+                enable_tick = tick;
                 announced_op = true;
+                std::cout << "[B] *** OPERATION ENABLED *** (motor energized at pos=" << pos_enable << ")\n";
             }
-            if (opt.move_pp && !move_done) {
-                target = hold_pos + static_cast<std::int32_t>(opt.move_revs * kCountsPerRev);
-            }
-            write_rx<std::int32_t>(master, slave, out, kTargetPosition, target);
-            write_rx<std::uint32_t>(master, slave, out, kProfileVelocity, profile_vel);
-            std::uint16_t base = ControlWord::enable_operation();  // 0x0F
-            if (opt.move_pp && !move_done) {
-                // bit4 handshake: assert new-setpoint, hold until the drive acks (bit12),
-                // then drop it so the next move can re-arm.
-                if (!setpoint_latched) {
-                    base = ControlWord::with_new_setpoint(base, true);  // 0x1F
-                    if (status.setpoint_acknowledged()) {
-                        setpoint_latched = true;
-                    }
-                } else {
-                    base = ControlWord::with_new_setpoint(base, false);  // back to 0x0F
-                    if (std::abs(pos - target) < 300) {
-                        move_done = true;
-                        std::cout << "[B] move complete: pos=" << pos << " (target " << target << ")\n";
+            if (opt.move_sine) {
+                // CSP: stream the soft-started relative-to-enable sine every cycle; cw held
+                // at 0x0F, NO bit4 handshake (that's PP). CSP-safe: sin(0)=0 -> the first
+                // target == pos_enable (zero jump); the amplitude ramps in over the first
+                // period so velocity starts gentle (see sine_move.hpp). No profile-velocity
+                // (0x6081) write -- CSP follows the streamed position directly.
+                const double t = static_cast<double>(tick - enable_tick) / static_cast<double>(kLoopHz);
+                target = ethercat::tools::csp_target_counts(true, pos, pos_enable, opt.sine_amplitude, opt.sine_period, t);
+                last_sine_target = target;
+                write_rx<std::int32_t>(master, slave, out, kTargetPosition, target);
+                cw = ControlWord::enable_operation();  // 0x0F
+            } else {
+                // --move-pp (bit4 handshake) or plain hold at the enable position.
+                if (opt.move_pp && !move_done) {
+                    target = hold_pos + static_cast<std::int32_t>(opt.move_revs * kCountsPerRev);
+                }
+                write_rx<std::int32_t>(master, slave, out, kTargetPosition, target);
+                write_rx<std::uint32_t>(master, slave, out, kProfileVelocity, profile_vel);
+                std::uint16_t base = ControlWord::enable_operation();  // 0x0F
+                if (opt.move_pp && !move_done) {
+                    // bit4 handshake: assert new-setpoint, hold until the drive acks (bit12),
+                    // then drop it so the next move can re-arm.
+                    if (!setpoint_latched) {
+                        base = ControlWord::with_new_setpoint(base, true);  // 0x1F
+                        if (status.setpoint_acknowledged()) {
+                            setpoint_latched = true;
+                        }
+                    } else {
+                        base = ControlWord::with_new_setpoint(base, false);  // back to 0x0F
+                        if (std::abs(pos - target) < 300) {
+                            move_done = true;
+                            std::cout << "[B] move complete: pos=" << pos << " (target " << target << ")\n";
+                        }
                     }
                 }
+                cw = base;
             }
-            cw = base;
+        } else if (opt.enable && opt.move_sine) {
+            // CSP enable-jump fix: we are climbing the CiA402 ladder (06->07->0F) toward
+            // OperationEnabled but not there yet (and not faulted). cw is already the ladder
+            // step from fsm.step() above; the critical bit is 0x607A. In CSP the drive latches
+            // its FIRST setpoint from the 0x607A on the cw=0x0F frame that TRIGGERS OE -- which
+            // is one of THESE ladder frames, not a post-OE frame. So stream target = live actual
+            // every ladder cycle -> that frame carries target==actual -> genuine zero jump
+            // (csp_target_counts(false,...) returns pos_actual). Without this, 0x607A stays 0
+            // and the drive slews from the absolute-encoder position toward 0 on enable.
+            target = ethercat::tools::csp_target_counts(false, pos, pos_enable, opt.sine_amplitude, opt.sine_period, 0.0);
+            last_sine_target = target;  // keep coherent for the graceful-hold + follow-err seed
+            write_rx<std::int32_t>(master, slave, out, kTargetPosition, target);
+            // cw left as fsm.step()'s ladder climb (06/07/0F as appropriate).
         } else if (!opt.enable) {
             cw = ControlWord::shutdown();  // 0x06 -> ReadyToSwitchOn, NOT energized
         }
@@ -465,11 +557,14 @@ int main(int argc, char** argv) {
             const auto rx_tpos = read_rx<std::int32_t>(master, slave, outimg, kTargetPosition);
             const auto fc = read_tx<std::uint16_t>(master, slave, in, kFaultCode);
             const auto mode_now = read_tx<std::int8_t>(master, slave, in, kModeDisplay);
+            // CSP tracking: commanded target (0x607A) vs actual (0x6064) + following error.
+            const std::int32_t follow_err = rx_tpos - pos;
             std::cout << "    t=" << tick / kLoopHz << "s " << to_string(status.decode()) << " sw=0x" << std::hex << status.raw
                       << " 0x603F=0x" << fc << std::dec << " mode=" << static_cast<int>(mode_now) << " Rx.cw=0x" << std::hex << rx_cw
-                      << std::dec << " targetPos=" << rx_tpos << " pos=" << pos << " vel=" << vel << " wkc=" << raw_wkc << "/"
-                      << master.expected_wkc() << " badWKC=" << wkc_bad << " dcPhase=" << (dct % static_cast<std::int64_t>(period_ns))
-                      << "ns" << (master.fault() ? " [BUS FAULT]" : "") << '\n';
+                      << std::dec << " cmdTarget=" << rx_tpos << " pos=" << pos << " followErr=" << follow_err << " vel=" << vel
+                      << " wkc=" << raw_wkc << "/" << master.expected_wkc() << " badWKC=" << wkc_bad
+                      << " dcPhase=" << (dct % static_cast<std::int64_t>(period_ns)) << "ns" << (master.fault() ? " [BUS FAULT]" : "")
+                      << '\n';
         }
 
         if (master.fault()) {
@@ -484,7 +579,21 @@ int main(int argc, char** argv) {
         }
     }
 
-    // --- graceful shutdown: disable the drive, flush a few cycles, close ---
+    // --- graceful shutdown ---
+    // CSP: stop streaming the sine but HOLD the last commanded position a few cycles
+    // (cw stays 0x0F, target frozen at last_sine_target) before disabling -- do NOT snap
+    // to 0 or to pos_enable, which would yank the shaft. The drive is still in OP here, so
+    // keep PD phase-locked. (Skipped if we never energized / never started the sine.)
+    if (opt.move_sine && announced_op && !master.fault() && !safety_abort) {
+        std::cout << "\n[B] sine stopped -- holding last commanded pos=" << last_sine_target << " for ~100ms, then disabling...\n";
+        for (int i = 0; i < 100; ++i) {
+            sleep_until(next, static_cast<long>(period_ns) + dc_off);
+            master.process();
+            dc_off = dc_phase_correction(master.dc_time(), static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
+            write_rx<std::int32_t>(master, slave, master.outputs(slave), kTargetPosition, last_sine_target);
+            write_rx<std::uint16_t>(master, slave, master.outputs(slave), kControlword, ControlWord::enable_operation());
+        }
+    }
     std::cout << "\n[B] disabling drive (controlword -> 0x00) and closing...\n";
     for (int i = 0; i < 50; ++i) {
         master.process();
