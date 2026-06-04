@@ -18,7 +18,6 @@
 // best-effort (no SCHED_FIFO) -- fine for validation. NOT a production path;
 // the real driver is the Viam module.
 
-#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -74,16 +73,12 @@ constexpr std::uint16_t kIdentity = 0x1018;
 //   :08 Get Cycle Time R/W  -- 1 = measure/calc the cycle time (ETG.1020 handshake).
 //   :0a Sync0 Cycle T. R/W  -- the master TELLS the drive the SYNC0 cycle (ns) here;
 //                              the drive then fills the RO :02 -> valid DC config.
-constexpr std::uint16_t kSm2SyncType = 0x1C32;     // SM2 (outputs/RxPDO)
-constexpr std::uint16_t kSm3SyncType = 0x1C33;     // SM3 (inputs/TxPDO)
-constexpr std::uint8_t kSyncTypeSub = 0x01;        // :01 sync type (R/W, pre-DC)
-constexpr std::uint8_t kSyncCycleSub = 0x02;       // :02 cycle time (U32 ns, RO -- SafeOp validates this)
-constexpr std::uint8_t kGetCycleSub = 0x08;        // :08 Get Cycle Time (U16, R/W): 1 = measure
-constexpr std::uint8_t kSync0CycleSub = 0x0A;      // :0a Sync0 Cycle Time (U32 ns, R/W)
-constexpr std::uint16_t kSyncTypeDcSync0 = 2;      // ETG sync type 2 = DC SYNC0
-constexpr std::uint32_t kSyncCycleNs = 1'000'000;  // SYNC0/SM cycle = loop period (1 ms); must match ESC 0x09A0
-// ETG.1020 measurement diagnostic counters (sub-indices per the A6's REAL OD dump --
-// note SyncError is :13 on this drive, not the ETG-standard :20). Populated by :08=1.
+constexpr std::uint16_t kSm2SyncType = 0x1C32;  // SM2 (outputs/RxPDO)
+constexpr std::uint16_t kSm3SyncType = 0x1C33;  // SM3 (inputs/TxPDO)
+constexpr std::uint8_t kSyncTypeSub = 0x01;     // :01 sync type (R/W, pre-DC): 2 = DC SYNC0
+constexpr std::uint16_t kSyncTypeDcSync0 = 2;   // ETG sync type 2 = DC SYNC0
+// DC error counters (sub-indices per the A6's REAL OD dump -- note SyncError is :13 on
+// this drive, not the ETG-standard :20). The genuine sync-fail instrumentation.
 constexpr std::uint8_t kSmMissedSub = 0x0B;       // :0b SM-event missed counter (U16)
 constexpr std::uint8_t kCycleTooSmallSub = 0x0C;  // :0c Cycle Time Too Small counter (U16)
 constexpr std::uint8_t kSyncErrorSub = 0x13;      // :13 Sync Error (BOOL)
@@ -338,30 +333,12 @@ int main(int argc, char** argv) {
         } catch (const Error& e) {
             std::cerr << "[dc] SM sync-type read failed (object absent?): " << e.what() << '\n';
         }
-        // Cycle-time handshake state: :02 (RO Cycle Time), :0a (Sync0 Cycle Time -- what
-        // we told the drive), :08 (Get Cycle Time -- the measure trigger; auto-resets to 0
-        // when done). NOTE: :02 is NOT the 0x0030 cause -- DISPROVEN on HW (bench saw :02
-        // populated 999120 AND still 0x0030; and :02=0 with SM-sync passes SAFE-OP). The
-        // A6 measures :02 at OP entry, not SAFE-OP, so 0 here is NORMAL. The 0x0030 reject
-        // with DC sync-type is drive-internal (not visible master-side). Shown FYI only.
-        try {
-            const auto cyc2 = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, kSyncCycleSub);
-            const auto cyc0a = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, kSync0CycleSub);
-            const auto get08 = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kGetCycleSub);
-            const char* note = "  (drive's own measurement)";
-            if (cyc2 == 0) {
-                note = "  (0 = not yet measured; NORMAL in SAFE-OP, NOT the 0x0030 cause)";
-            } else if (cyc2 == kSyncCycleNs) {
-                note = "  (= 1ms)";
-            }
-            std::cout << "[dc]   0x1C32:02 CycleTime(RO)=" << cyc2 << "ns 0x1C32:0a Sync0CycleTime=" << cyc0a
-                      << "ns 0x1C32:08 GetCycleTime=" << get08 << note << '\n';
-        } catch (const Error& e) {
-            std::cerr << "[dc]   0x1C32 cycle-time readback failed: " << e.what() << '\n';
-        }
-        // ETG.1020 measurement diagnostics (FYI): SM-event-missed / cycle-too-small /
-        // SyncError, updated by :08=1. (0x0030 persists even with :02 populated + these
-        // clear, so they are not the cause either -- the reject is drive-internal.)
+        // DC error counters (0x1C32 :0b SMmissed / :0c cycleTooSmall / :13 syncError) --
+        // the genuine "why did sync fail" instrumentation for the next HW bring-up:
+        // SMmissed = WKC-drift / a missed SM event, cycleTooSmall = the 0x001B-watchdog
+        // class, syncError = SYNC0 not aligning. (The cycle-time-theory reads :02/:0a/:08
+        // were dropped -- the 0x0030/cached-cycle hypothesis they chased is bench-disproven
+        // + recorded in CLAUDE.md.)
         try {
             const auto missed = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kSmMissedSub);
             const auto too_small = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kCycleTooSmallSub);

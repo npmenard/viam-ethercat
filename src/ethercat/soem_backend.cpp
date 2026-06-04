@@ -1,10 +1,8 @@
 #include "ethercat/soem_backend.hpp"
 
-#include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstdint>
-#include <cstring>
-#include <ctime>
 #include <iostream>
 #include <string>
 
@@ -197,32 +195,17 @@ void SoemBackend::map_process_data() {
 }
 
 void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
+    // OP is reached ONLY via set_state() + bringup_step()'s pumped RT loop; request_state
+    // is PRE-OP/SAFE-OP only. It statechecks WITHOUT pumping process data, so requesting OP
+    // here would gap a DC drive (no PD during the transition -> Er74). Loud trap, not a
+    // silent one (the old OP-pump branch here was dead after the #20 fold).
+    assert(target != EcatState::Op && "request_state: OP goes via set_state + bringup_step; this path doesn't pump PD");
+
     const std::uint16_t want = to_soem_state(target);
     impl_->ctx.slavelist[slave].state = want;
     ecx_writestate(&impl_->ctx, slave);
 
-    std::uint16_t reached = 0;
-    if (target == EcatState::Op) {
-        // A DC-only drive rejects OP (AL 0x0027) unless it sees LIVE process data +
-        // SYNC0 events during the transition -- so pump PD while statechecking, and
-        // PACE the pump at the SYNC0 cycle so the sends align to the slave's DC
-        // pulse (an unpaced burst doesn't). ~200 cycles of settle.
-        for (int chk = 0; chk < 200; ++chk) {
-            ecx_send_processdata(&impl_->ctx);
-            ecx_receive_processdata(&impl_->ctx, EC_TIMEOUTRET);
-            reached = ecx_statecheck(&impl_->ctx, slave, want, 50000);
-            if (reached == want) {
-                break;
-            }
-            if (impl_->dc_cycle_ns > 0) {
-                const timespec ts{.tv_sec = 0, .tv_nsec = static_cast<long>(impl_->dc_cycle_ns)};
-                (void)nanosleep(&ts, nullptr);
-            }
-        }
-    } else {
-        reached = ecx_statecheck(&impl_->ctx, slave, want, EC_TIMEOUTSTATE);
-    }
-
+    const std::uint16_t reached = ecx_statecheck(&impl_->ctx, slave, want, EC_TIMEOUTSTATE);
     if (reached != want) {
         // Refresh every slave's AL state + AL status code so the error names WHY
         // (e.g. "Invalid DC SYNC Configuration", "SM watchdog") -- a SAFE-OP->OP

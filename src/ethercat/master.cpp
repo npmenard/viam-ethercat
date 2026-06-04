@@ -4,7 +4,6 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
-#include <ctime>
 #include <span>
 #include <string>
 #include <utility>
