@@ -75,8 +75,8 @@ MasterConfig build_master_config(const ServoConfig& c) {
     mc.use_distributed_clocks = c.use_distributed_clocks;
     // Post-OP DC settle grace (cycles) while the SYNC0 phase finishes locking: suppress
     // the WKC-fault latch so a residual transient doesn't trip a spurious BusError. The
-    // bring-up SETTLE/GATE bounds use MasterConfig's own defaults (dc_arm_settle_cycles /
-    // dc_op_gate_cycles); bench-tune those at first light if needed.
+    // bring-up SETTLE bound uses MasterConfig's own default (dc_op_gate_cycles);
+    // bench-tune it at first light if needed.
     constexpr std::uint32_t kDefaultDcSettleCycles = 1000;
     mc.dc_settle_cycles = c.use_distributed_clocks ? kDefaultDcSettleCycles : 0;
     return mc;
@@ -104,8 +104,8 @@ void ServoController::start() {
     // NOTE: configure() reaches SAFE-OP and (for DC) mlockall(MCL_CURRENT)s resident
     // memory before this thread spawns the RT jthread (MCL_CURRENT only, so it doesn't
     // MCL_FUTURE-lock this thread's later allocations -> EAGAIN). The RT thread then runs
-    // the DC bring-up prelude (SETTLE->ARM->GATE->OP) to OPERATIONAL; setup_realtime()
-    // does the full MCL_CURRENT|MCL_FUTURE for the loop.
+    // the DC bring-up prelude (SETTLE -> request OP -> AWAIT_OP) to OPERATIONAL;
+    // setup_realtime() does the full MCL_CURRENT|MCL_FUTURE for the loop.
     master_ = std::make_unique<Master>(build_master_config(config_), backend_factory_());
     master_->init();
     master_->configure();

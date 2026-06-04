@@ -111,9 +111,10 @@ MasterConfig build_a6_pp_config(const std::string& ifname, std::int32_t dc_sync0
     cfg.dc_sync0_shift_ns = dc_sync0_shift_ns;  // SYNC0 CyclShift; --dc-shift-ns sweep
     cfg.dc_settle_cycles = 1000;                // ~1 s post-OP grace while the phase finishes locking
     cfg.max_consecutive_wkc_errors = 5;
-    // The bring-up SETTLE/GATE bounds use MasterConfig's defaults (dc_arm_settle_cycles /
-    // dc_op_gate_cycles); the cyclic loop runs SETTLE -> ARM(stock ecx_dcsync0) -> GATE
-    // (no Er74.1) -> request OP, all gapless + phase-locked.
+    // The bring-up SETTLE bound uses MasterConfig's default (dc_op_gate_cycles). SYNC0 is
+    // armed in PRE-OP inside configure() (before config_map_group); the cyclic loop then
+    // runs SETTLE (phase-locked PD) -> request OP once -> AWAIT_OP (hold for OP + sync),
+    // all gapless.
 
     SlaveConfig a6;
     a6.slave_id = 1;
@@ -250,9 +251,10 @@ int main(int argc, char** argv) {
             opt.ifname = a;
         } else {
             std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]] [--seconds N] [--dc-shift-ns NS]\n"
-                      << "  The DC bring-up (#20) is automatic: configure() reaches SAFE-OP, then the cyclic loop runs\n"
-                      << "  SETTLE -> arm stock ecx_dcsync0 -> gate on (no Er74.1) -> request OP, all with gapless\n"
-                      << "  phase-locked PD. No manual 0x1C32:01 force, no SYNC0 start-delay hack (CLAUDE.md / spec #20).\n"
+                      << "  The DC bring-up (#20) is automatic: configure() arms SYNC0 in PRE-OP + reaches SAFE-OP,\n"
+                      << "  then the cyclic loop runs SETTLE (phase-locked PD) -> request OP once -> AWAIT_OP (hold\n"
+                      << "  for OP + sync), all gapless. No manual 0x1C32:01 force, no SYNC0 start-delay hack;\n"
+                      << "  Er74.1 in SAFE-OP is normal pre-sync and clears at OP (CLAUDE.md / spec #20).\n"
                       << "  --dc-shift-ns: SYNC0 pulse CyclShift (ecx_dcsync0) -- sweep to move the SYNC0 edge if needed.\n"
                       << "  --reset-fault: clear a latent drive fault at bring-up via the A6 vendor SDO 0x2031:01=1.\n";
             return 2;
@@ -385,7 +387,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout << "[B] configured to SAFE-OP, DC enabled (expected WKC=" << master.expected_wkc()
-              << "); running the bring-up FSM (SETTLE->ARM->GATE->OP), gapless + phase-locked...\n";
+              << "); running the bring-up FSM (SETTLE -> request OP -> AWAIT_OP), gapless + phase-locked...\n";
 
     dump_sm_config();
 
@@ -418,10 +420,12 @@ int main(int argc, char** argv) {
     std::int64_t dc_integral = 0;
     long dc_off = 0;
 
-    // --- Phase 1: DC bring-up (#20). configure() left the bus at SAFE-OP; the Master
-    // FSM runs SETTLE -> ARM (stock ecx_dcsync0) -> GATE (no Er74.1) -> request OP ->
-    // AWAIT_OP, while THIS loop owns the gapless, phase-locked cadence. The gate's
-    // drive_sync_faulted is our read of 0x603F == 0x8700 (Er74.1) from the prior cycle.
+    // --- Phase 1: DC bring-up (#20). configure() armed SYNC0 in PRE-OP + left the bus at
+    // SAFE-OP; the Master FSM runs SETTLE (phase-locked PD) -> request OP once -> AWAIT_OP
+    // (hold for OP + Er74.1-cleared + WKC), while THIS loop owns the gapless, phase-locked
+    // cadence. drive_sync_faulted = our read of 0x603F == 0x8700 (Er74.1) from the prior
+    // cycle; it's the NORMAL pre-sync state in SAFE-OP (clears at OP), so it gates the
+    // post-OP hold, not the request -- see bringup_step.
     bool reached_op = false;
     {
         std::uint64_t btick = 0;
@@ -444,9 +448,10 @@ int main(int argc, char** argv) {
                 break;
             }
             if (bs == BringupStatus::Aborted) {
-                std::cerr << "[B] !!! BRING-UP ABORTED: drive reported Er74.1 (no SYNC0) during the OP gate -- SYNC0 is not\n"
-                          << "    reaching the drive. NOT requesting OP (repeated Er74 OP-entry wedges the A6). Power-cycle +\n"
-                          << "    check DC wiring/cycle; sweep --dc-shift-ns. last_error: " << master.last_error() << '\n';
+                std::cerr << "[B] !!! BRING-UP ABORTED: OP did not hold within the await window -- the drive did not reach\n"
+                          << "    OP with WKC 3/3 + Er74.1 cleared (SYNC0 likely not truly established). OP was requested\n"
+                          << "    ONCE + not re-requested (repeated Er74 OP-entry wedges the A6). Power-cycle + check DC\n"
+                          << "    wiring/cycle; sweep --dc-shift-ns. last_error: " << master.last_error() << '\n';
                 break;
             }
         }

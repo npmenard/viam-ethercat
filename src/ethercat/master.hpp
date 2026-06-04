@@ -78,9 +78,10 @@ class Master {
     void configure();
 
     // One cyclic step of the DC bring-up state machine, called from the caller's RT loop
-    // AFTER configure() (which left the bus at SAFE-OP). It performs the cyclic exchange()
-    // and advances SETTLE -> ARM(stock ecx_dcsync0) -> GATE -> request OP -> AWAIT_OP ->
-    // OPERATIONAL, returning the new status. The CALLER owns the cadence: it does the
+    // AFTER configure() (which left the bus at SAFE-OP with SYNC0 already armed in PRE-OP).
+    // It performs the cyclic exchange() and advances SETTLE (bounded phase-locked PD) ->
+    // request OP once -> AWAIT_OP (hold for OP + sync) -> OPERATIONAL, returning the new
+    // status. The CALLER owns the cadence: it does the
     // clock_nanosleep deadline + dc_phase_correction(dc_time(), ...) around this call, so
     // PD stays phase-locked and gapless. `drive_sync_faulted` is the caller's read of the
     // drive's Er74.1 no-sync fault (0x603F == 0x8700) from the PREVIOUS step's feedback
