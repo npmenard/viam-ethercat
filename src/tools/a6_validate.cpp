@@ -60,28 +60,11 @@ constexpr std::uint16_t kProfileVelocity = 0x6081;
 constexpr std::uint16_t kVelocityActual = 0x606C;
 constexpr std::uint16_t kTorqueActual = 0x6077;
 constexpr std::uint16_t kFaultCode = 0x603F;
-constexpr std::uint16_t kIdentity = 0x1018;
-
-// SM synchronization objects 0x1C32 (SM2/outputs) / 0x1C33 (SM3/inputs), per
-// ETG.1020. Confirmed against the A6's REAL object dictionary (slaveinfo -sdo):
-//   :01 Sync Type      R/W  -- 2 = DC SYNC0 (default 1 = SM-synchron). Writable ONLY
-//                              before DC activation; post-configdc it 0x08000022-rejects.
-//   :02 Cycle Time     RO   -- the value SafeOp validates; the A6 does NOT auto-derive
-//                              it from the ESC 0x09A0. Must be populated via :0a + :08.
-//   :04 Supported      RO   -- 0x0004 = DC SYNC0 only (confirms SYNC1 N/A).
-//   :05 Min Cycle      RO   -- 250000 ns.
-//   :08 Get Cycle Time R/W  -- 1 = measure/calc the cycle time (ETG.1020 handshake).
-//   :0a Sync0 Cycle T. R/W  -- the master TELLS the drive the SYNC0 cycle (ns) here;
-//                              the drive then fills the RO :02 -> valid DC config.
-constexpr std::uint16_t kSm2SyncType = 0x1C32;  // SM2 (outputs/RxPDO)
-constexpr std::uint16_t kSm3SyncType = 0x1C33;  // SM3 (inputs/TxPDO)
-constexpr std::uint8_t kSyncTypeSub = 0x01;     // :01 sync type (R/W, pre-DC): 2 = DC SYNC0
-constexpr std::uint16_t kSyncTypeDcSync0 = 2;   // ETG sync type 2 = DC SYNC0
-// DC error counters (sub-indices per the A6's REAL OD dump -- note SyncError is :13 on
-// this drive, not the ETG-standard :20). The genuine sync-fail instrumentation.
-constexpr std::uint8_t kSmMissedSub = 0x0B;       // :0b SM-event missed counter (U16)
-constexpr std::uint8_t kCycleTooSmallSub = 0x0C;  // :0c Cycle Time Too Small counter (U16)
-constexpr std::uint8_t kSyncErrorSub = 0x13;      // :13 Sync Error (BOOL)
+// NOTE: this tool reads NO raw CoE objects -- identity comes from Master::slave_info()
+// and live status/position from the PDO snapshot. The DC sync-type / health-counter
+// objects (0x1C32 / 0x1C33) are the LIBRARY's to own; reaching OP via the bring-up FSM
+// is the DC-confirmation. (The DC error-counter knowledge lives in the runbook DC §7,
+// with a documented re-add path if a future DC-timing issue needs live counts.)
 
 constexpr double kCountsPerRev = 131072.0;  // A6 single-turn encoder = 2^17
 
@@ -292,81 +275,31 @@ int main(int argc, char** argv) {
     // reaching here means the A6 was found. (slave_count()/slaves_ isn't populated
     // until configure(), so don't read it yet.)
     std::cout << "[A] bus up: A6 enumerated (1 slave, matches config).\n";
-    try {
-        const auto vendor = master.sdo_read<std::uint32_t>(1, kIdentity, 1);
-        const auto product = master.sdo_read<std::uint32_t>(1, kIdentity, 2);
-        const auto revision = master.sdo_read<std::uint32_t>(1, kIdentity, 3);
-        const auto mode_disp = master.sdo_read<std::int8_t>(1, kModeDisplay, 0);
-        const auto sw = master.sdo_read<std::uint16_t>(1, kStatusword, 0);
-        const auto pos = master.sdo_read<std::int32_t>(1, kPositionActual, 0);
-        std::cout << "    identity 0x1018: vendor=0x" << std::hex << vendor << " product=0x" << product << " rev=0x" << revision << std::dec
-                  << "\n"
-                  << "    statusword 0x6041 = 0x" << std::hex << sw << std::dec << " -> " << to_string(Status{sw}.decode()) << "\n"
-                  << "    mode display 0x6061 = " << static_cast<int>(mode_disp) << " | position 0x6064 = " << pos << " counts\n";
-    } catch (const Error& e) {
-        std::cerr << "[A] SDO read failed (CoE mailbox issue): " << e.what() << '\n';
-        return 1;
-    }
-    std::cout << "[A] OK -- EtherCAT comms + CoE SDO confirmed.\n\n";
+    // Identity from the library's enumeration view (SlaveInfo) -- NOT a raw CoE 0x1018
+    // poke. This tool consumes the library API only; the library OWNS EtherCAT object
+    // access (the user's boundary). Live status/position come from the PDO snapshot in
+    // the loop below, so no pre-loop CoE feedback peek is needed either.
+    const SlaveInfo info = master.slave_info(1);
+    std::cout << "    identity: vendor=0x" << std::hex << info.vendor_id << " product=0x" << info.product_code << " rev=0x" << info.revision
+              << std::dec << " name=\"" << info.name << "\" (Rx " << info.output_bytes << "B / Tx " << info.input_bytes << "B)\n"
+              << "[A] OK -- EtherCAT enumeration confirmed.\n\n";
 
     const std::uint16_t slave = 1;
-
-    // Dump the drive's SM sync configuration (type :01, cycle :02, supported :04, min
-    // :05). Defined here so we can call it on BOTH the success path AND the
-    // configure-FAILED path: a SafeOp AL-reject (0x0030 "invalid DC SYNC config")
-    // makes configure() throw, but the bus stays open in PRE-OP with the post-assign
-    // writes already applied -- so these SDO reads still work and show exactly what
-    // the drive validated. Each group is its own try so a missing sub-index can't
-    // suppress the others.
-    const auto dump_sm_config = [&master]() {
-        try {
-            const auto sm2 = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kSyncTypeSub);
-            const auto sm3 = master.sdo_read<std::uint16_t>(slave, kSm3SyncType, kSyncTypeSub);
-            const auto supported = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, 0x04);
-            const auto min_cycle = master.sdo_read<std::uint32_t>(slave, kSm2SyncType, 0x05);
-            const bool dc = sm2 == kSyncTypeDcSync0 && sm3 == kSyncTypeDcSync0;
-            std::cout << "[dc] SM sync-type: 0x1C32:01(SM2)=" << sm2 << " 0x1C33:01(SM3)=" << sm3
-                      << (dc ? "  -> DC SYNC0 active (drive self-selected; we never force it)" : "  -> NOT DC SYNC0 (0=FreeRun,1=SM,2=DC)")
-                      << "\n"
-                      << "[dc]   0x1C32:04 supportedTypes=0x" << std::hex << supported << std::dec << " 0x1C32:05 minCycle=" << min_cycle
-                      << "ns" << '\n';
-        } catch (const Error& e) {
-            std::cerr << "[dc] SM sync-type read failed (object absent?): " << e.what() << '\n';
-        }
-        // DC error counters (0x1C32 :0b SMmissed / :0c cycleTooSmall / :13 syncError) --
-        // the genuine "why did sync fail" instrumentation for the next HW bring-up:
-        // SMmissed = WKC-drift / a missed SM event, cycleTooSmall = the 0x001B-watchdog
-        // class, syncError = SYNC0 not aligning. (The cycle-time-theory reads :02/:0a/:08
-        // were dropped -- the 0x0030/cached-cycle hypothesis they chased is bench-disproven
-        // + recorded in CLAUDE.md.)
-        try {
-            const auto missed = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kSmMissedSub);
-            const auto too_small = master.sdo_read<std::uint16_t>(slave, kSm2SyncType, kCycleTooSmallSub);
-            const auto sync_err = master.sdo_read<std::uint8_t>(slave, kSm2SyncType, kSyncErrorSub);
-            std::cout << "[dc]   0x1C32 diag: :0b SMmissed=" << missed << " :0c cycleTooSmall=" << too_small
-                      << " :13 syncError=" << static_cast<int>(sync_err) << '\n';
-        } catch (const Error& e) {
-            std::cerr << "[dc]   0x1C32 diag-counter readback failed: " << e.what() << '\n';
-        }
-    };
 
     // --- Stage B: configure to SAFE-OP + DC, then ONE continuous loop that
     // phase-locks, requests OP, and runs the CiA402 sequence -- all on an unbroken
     // cadence. The A6 faults out of OP on a SINGLE missed SYNC0 frame, so we must NOT
-    // have a gap between bring-up and the steady loop. reach_op=false stops configure
-    // at SAFE-OP + DC; the loop below owns every frame from there.
+    // have a gap between bring-up and the steady loop. configure() stops at SAFE-OP + DC
+    // (SYNC0 armed in PRE-OP); the loop below owns every frame from there.
     try {
         master.configure();
     } catch (const Error& e) {
         std::cerr << "[B] configure failed: " << e.what() << "\n"
-                  << "    (an AL-reject at the SAFE-OP transition lands here; SM config below shows what the drive saw.)\n";
-        dump_sm_config();  // bus still open in PRE-OP -> reads work; capture the SM config even on failure
+                  << "    (an AL-reject at the SAFE-OP transition lands here; the AL status code in the message names why.)\n";
         return 1;
     }
     std::cout << "[B] configured to SAFE-OP, DC enabled (expected WKC=" << master.expected_wkc()
               << "); running the bring-up FSM (SETTLE -> request OP -> AWAIT_OP), gapless + phase-locked...\n";
-
-    dump_sm_config();
 
     const auto profile_vel = static_cast<std::uint32_t>(opt.move_rpm / 60.0 * kCountsPerRev);
     const Cia402Fsm fsm;
@@ -434,14 +367,12 @@ int main(int argc, char** argv) {
         }
     }
     if (!reached_op) {
-        dump_sm_config();
-        std::cout << "\n[B] bring-up did not reach OP; closing.\n";
+        std::cout << "\n[B] bring-up did not reach OP; closing. (last_error: " << master.last_error() << ")\n";
         master.close();
         return 1;
     }
     std::cout << "[B] *** OPERATIONAL *** WKC=" << master.last_wkc() << "/" << master.expected_wkc()
               << " -- DC bring-up complete (no Er74.1), entering CiA402 control loop\n";
-    dump_sm_config();
 
     // --- Phase 2: steady CiA402 control loop (hold / optional PP move), phase-locked.
     const auto t0 = std::chrono::steady_clock::now();

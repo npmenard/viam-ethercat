@@ -155,6 +155,7 @@ SlaveInfo SoemBackend::slave_info(std::uint16_t slave) const {
     info.position = slave;
     info.vendor_id = s.eep_man;
     info.product_code = s.eep_id;
+    info.revision = s.eep_rev;
     info.name = s.name;
     info.input_bytes = s.Ibytes;
     info.output_bytes = s.Obytes;

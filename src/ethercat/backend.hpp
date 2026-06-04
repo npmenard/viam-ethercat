@@ -50,6 +50,7 @@ struct SlaveInfo {
     std::uint16_t position = 0;  // 1-based ring position (SOEM convention)
     std::uint32_t vendor_id = 0;
     std::uint32_t product_code = 0;
+    std::uint32_t revision = 0;  // EEPROM revision (0x1018:3) -- library-sourced identity
     std::string name;
     std::size_t input_bytes = 0;   // TxPDO feedback image size (slave -> master)
     std::size_t output_bytes = 0;  // RxPDO command image size (master -> slave)

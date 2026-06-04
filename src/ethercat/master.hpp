@@ -11,7 +11,6 @@
 // (a bus fault is LATCHED into an atomic flag, never thrown). Everything else
 // runs non-RT at init/configure/shutdown and may throw with clear text.
 
-#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -114,6 +113,12 @@ class Master {
     std::size_t slave_count() const noexcept {
         return slaves_.size();
     }
+    // Identity + image sizes for a slave (1-based), from enumeration -- the library's
+    // typed view of the bus, so tools/callers read identity through the API instead of
+    // poking CoE 0x1018 directly. Valid after init(). Throws ConfigError if out of range.
+    SlaveInfo slave_info(std::uint16_t slave) const {
+        return backend_->slave_info(slave);
+    }
     bool all_operational() const noexcept {
         return operational_.load(std::memory_order_relaxed);
     }
@@ -151,23 +156,12 @@ class Master {
     FieldLocation rx_field(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const;
     FieldLocation tx_field(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const;
 
-    // Typed CoE SDO access (non-RT).
-    template <PdoScalar T>
-    T sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) {
-        std::array<std::byte, sizeof(T)> buf{};
-        const std::size_t n = backend_->sdo_read(slave, index, sub, buf);
-        if (n < sizeof(T)) {
-            throw BusError("SDO read of slave " + std::to_string(slave) + " object returned " + std::to_string(n) + " bytes, expected " +
-                           std::to_string(sizeof(T)));
-        }
-        return load_le<T>(buf);
-    }
-    template <PdoScalar T>
-    void sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, T value) {
-        std::array<std::byte, sizeof(T)> buf{};
-        store_le<T>(buf, value);
-        backend_->sdo_write(slave, index, sub, buf);
-    }
+    // NOTE: there is intentionally NO public typed CoE SDO accessor on Master. CoE object
+    // access is the LIBRARY's responsibility -- Master::configure() does the PDO-remap /
+    // 0x6060 / fault-reset writes internally via the backend, and identity is read through
+    // slave_info(). Tools/callers must NOT poke raw objects; they consume the typed API
+    // (slave_info / configure / bringup_step / process / input_image / outputs). The raw
+    // sdo_read/sdo_write live at the EcatBackend level (library-internal) by design.
 
    private:
     // Per-slave runtime state. Holds a (non-movable) PdoCache, so it lives in a
