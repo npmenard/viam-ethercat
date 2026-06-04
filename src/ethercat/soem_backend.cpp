@@ -69,6 +69,14 @@ std::string pop_coe_abort(ecx_contextt* ctx) {
     return detail;
 }
 
+// Per-slave "[slave N state=... ALstatuscode=...]" detail for a mailbox/init fault message.
+std::string mbx_fault_detail(ecx_contextt* ctx, int slave) {
+    ecx_readstate(ctx);
+    const std::uint16_t al = ctx->slavelist[slave].ALstatuscode;
+    return " [slave " + std::to_string(slave) + " state=" + to_string(from_soem_state(ctx->slavelist[slave].state)) +
+           " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
+}
+
 }  // namespace
 
 // All SOEM-touching state lives here, behind the pimpl. SOEM v2's ecx_contextt
@@ -115,38 +123,18 @@ std::size_t SoemBackend::open(std::string_view ifname) {
     // after a prior faulted run left it in a bad AL state. So (mirroring ec_sample):
     //   - manualstatechange = 1: WE own every AL transition; stops ecx_config_map_group
     //     from auto-jumping to SAFE-OP later, so configdc still runs in PRE-OP (#20).
-    //   - recover any slave NOT in PRE-OP via INIT + a MAILBOX-SM REPROGRAM (below), then
-    //     drive all slaves PRE-OP and CONFIRM it.
+    //   - bounce any slave NOT in PRE-OP through INIT first (clears a latent AL error a prior
+    //     faulted run burned in), then drive all slaves PRE-OP and CONFIRM it. (In practice
+    //     config_init already reaches PRE-OP cleanly, so this bounce rarely fires -- it's the
+    //     recovery path for a genuinely stuck/faulted slave; the wire confirms the steady case
+    //     enters PRE-OP without it. The first-SDO readiness is handled by the warm-up below.)
     impl_->ctx.manualstatechange = 1;
     ecx_readstate(&impl_->ctx);
     for (int i = 1; i <= count; ++i) {
         if ((impl_->ctx.slavelist[i].state & 0x0FU) != EC_STATE_PRE_OP) {
-            // Recover a slave a prior faulted run left out of PRE-OP. Drive it to INIT, then
-            // RE-PROGRAM its mailbox SyncManagers before climbing back to PRE-OP. The SM
-            // reprogram is the bug fix (wire-diagnosed): re-writing SM0/SM1 makes the slave
-            // RE-INIT its CoE mailbox and RESET its mailbox session counter. A BARE
-            // writestate(INIT) bounce skips this, so the slave keeps a stale mailbox counter
-            // from the prior run and IGNORES configure()'s first SDO (counter collision -> no
-            // mailbox-in response -> "SDO ... working counter 0"), intermittently (~6/10). This
-            // is the mailbox-resync half of ecx_reconfig_slave -- but WITHOUT its forced
-            // PRE-OP->SAFE-OP step, which would let the A6 latch SM-sync before configure()
-            // arms SYNC0 (-> Er74.1, undoing #20). We must stay in PRE-OP here.
-            const std::uint16_t cfgadr = impl_->ctx.slavelist[i].configadr;
             impl_->ctx.slavelist[i].state = EC_STATE_INIT;
             ecx_writestate(&impl_->ctx, static_cast<std::uint16_t>(i));
             ecx_statecheck(&impl_->ctx, static_cast<std::uint16_t>(i), EC_STATE_INIT, EC_TIMEOUTSTATE);
-            for (int sm = 0; sm < EC_MAXSM; ++sm) {
-                if (impl_->ctx.slavelist[i].SM[sm].StartAddr != 0) {
-                    ecx_FPWR(&impl_->ctx.port,
-                             cfgadr,
-                             static_cast<std::uint16_t>(ECT_REG_SM0 + static_cast<std::size_t>(sm) * sizeof(ec_smt)),
-                             static_cast<std::uint16_t>(sizeof(ec_smt)),
-                             &impl_->ctx.slavelist[i].SM[sm],
-                             EC_TIMEOUTRET);
-                }
-            }
-            impl_->ctx.slavelist[i].mbx_cnt = 0;  // resync the master-side counter with the slave's reset
-            (void)osal_usleep(5000);              // let the slave process the SM re-init (mirrors ecx_reconfig_slave)
         }
     }
     impl_->ctx.slavelist[0].state = EC_STATE_PRE_OP;
@@ -165,28 +153,57 @@ std::size_t SoemBackend::open(std::string_view ifname) {
                         "); the CoE mailbox would not be ready for SDO" + detail);
     }
 
-    // AL-state PRE-OP is necessary but NOT sufficient for SDO. ecx_statecheck above confirms
-    // only the AL state (reg 0x0130); after the manual INIT->PRE-OP bounce the slave needs a
-    // brief moment to make its CoE mailbox-out SyncManager (SM0) WRITABLE. If configure()'s
-    // first SDO races that window, ecx_mbxsend finds SM0 not-ready and returns without sending
-    // -> WKC 0 ("SDO ... working counter 0"). That race -- intermittent, masked by retries as a
-    // bogus "drive wedge / needs power-cycle" -- is the real bug (wire-diagnosed): the bounce is
-    // OURS (it skips the mailbox-ready timing config_init's own transition would have). Close the
-    // gap deterministically: per slave, poll SM0's mailbox-out status until empty (writable)
-    // before returning, so open()'s "mailbox ready for SDO" contract is REAL, not just AL-state.
+    // Reaching PRE-OP (AL state, reg 0x0130) is necessary but NOT sufficient for SDO -- two
+    // mailbox-readiness gaps remain, both closed here per CoE-capable slave (mbx_l > 0):
+    //
+    // (1) SEND side: SM0 (mailbox-out) must be WRITABLE before the first ecx_mbxsend, else it
+    //     returns without sending -> WKC 0. Poll ecx_mbxempty until SM0 is empty/writable.
+    // (2) HANDLER side (the real "wedge", wire-diagnosed): even with SM0 writable, the A6's CoE
+    //     HANDLER is not always ready for the FIRST mailbox message right after the PRE-OP
+    //     transition -- it ACKs the write (WKC 1) but never fills mailbox-in, silently IGNORING
+    //     the first CoE SDO (no response within the full timeout). Once the first SDO IS
+    //     processed, every subsequent SDO works (counter clean, all 0x60). Absorb that
+    //     cold-handler race with a benign, idempotent WARM-UP READ (0x1018:01 vendor ID, always
+    //     present) retried until it answers -- gating CoE-handler liveness BEFORE configure()
+    //     issues the real, stateful remap writes. A retry belongs HERE (a readiness-gating read),
+    //     NOT on the remap writes (re-sending those advances the mailbox counter / double-applies
+    //     -> desynced map). Per-attempt timeout is short so a cold handler fails fast and retries.
     for (int i = 1; i <= count; ++i) {
+        const auto slave = static_cast<std::uint16_t>(i);
         if (impl_->ctx.slavelist[i].mbx_l == 0) {
-            continue;  // no CoE mailbox on this slave (e.g. simple I/O) -> nothing to wait on
+            continue;  // no CoE mailbox on this slave (e.g. simple I/O) -> nothing to warm up
         }
-        if (ecx_mbxempty(&impl_->ctx, static_cast<std::uint16_t>(i), EC_TIMEOUTRXM) <= 0) {
-            std::string detail;
-            ecx_readstate(&impl_->ctx);
-            const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
-            detail = " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
-                     " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
+        // (1) SM0 writable.
+        if (ecx_mbxempty(&impl_->ctx, slave, EC_TIMEOUTRXM) <= 0) {
+            const std::string detail = mbx_fault_detail(&impl_->ctx, i);
             ecx_close(&impl_->ctx);
             throw InitError("slave " + std::to_string(i) + " CoE mailbox-out (SM0) not ready for SDO after PRE-OP on '" + name +
                             "' (mailbox-empty wait timed out)" + detail);
+        }
+        // (2) CoE handler live -- warm-up read until it answers.
+        constexpr int kWarmupTries = 25;
+        constexpr int kWarmupTimeoutUs = 50'000;  // 50 ms/try: warm round-trip ~1.4ms, cold fails fast
+        constexpr std::uint32_t kWarmupGapUs = 2'000;
+        std::uint32_t vendor = 0;
+        int warm_wkc = 0;
+        for (int attempt = 0; attempt < kWarmupTries; ++attempt) {
+            int psize = static_cast<int>(sizeof(vendor));
+            warm_wkc = ecx_SDOread(&impl_->ctx, slave, 0x1018, 0x01, FALSE, &psize, &vendor, kWarmupTimeoutUs);
+            if (warm_wkc > 0) {
+                break;
+            }
+            (void)osal_usleep(kWarmupGapUs);
+        }
+        // Drain any errors the ignored warm-up attempts queued, so they don't bleed into the
+        // first real configure() SDO's ecx_iserror() check.
+        ec_errort err{};
+        while (ecx_poperror(&impl_->ctx, &err)) {
+        }
+        if (warm_wkc <= 0) {
+            const std::string detail = mbx_fault_detail(&impl_->ctx, i);
+            ecx_close(&impl_->ctx);
+            throw InitError("slave " + std::to_string(i) + " CoE handler did not answer a warm-up SDO read (0x1018:01) after PRE-OP on '" +
+                            name + "'" + detail);
         }
     }
 
