@@ -134,22 +134,40 @@ std::size_t SoemBackend::open(std::string_view ifname) {
                         detail);
     }
 
-    // PATIENT CoE handler warm-up. The A6 in some states is SLOW on EVERYTHING -- the same
-    // drive-slowness that makes SAFE-OP->OP take >10s (handled by the patient OP-await) also
-    // makes its CoE HANDLER slow to ready after the PRE-OP transition: it silently IGNORES the
-    // first SDO (mailbox-out ACKs, but mailbox-in never fills) for up to SECONDS, then every
-    // subsequent SDO works. ec_sample tolerates this by being patient. So, per CoE-capable slave
-    // (mbx_l > 0), gate CoE-handler liveness with a benign, idempotent read (0x1018:01 vendor ID,
-    // always present) retried until it answers, with a GENEROUS ~15s bound (300 x 50ms) -- the
-    // same patience philosophy as the 30s OP-await. The read's own mbxsend also covers send-side
-    // (SM0-writable) readiness, so no separate wait is needed. We do NOT reprogram SMs / reset the
-    // mailbox counter / bounce through INIT (2009d47's misdiagnosis -- ec_sample does none of it);
-    // this is purely a patient readiness gate before configure()'s first stateful remap write.
+    // PATIENT CoE mailbox readiness gate (two parts, per CoE-capable slave). The A6 in some
+    // states is SLOW on EVERYTHING -- the same drive-slowness that makes SAFE-OP->OP take >10s
+    // (handled by the patient OP-await) also makes its CoE mailbox slow to ready after the PRE-OP
+    // transition. Two distinct slow phases, both waited out patiently here, BEFORE configure()'s
+    // first stateful remap write:
+    //   (1) SEND side  -- SM0 (mailbox-out) must be writable or ecx_mbxsend never transmits.
+    //   (2) HANDLER side -- even once writable, the A6 ignores the FIRST SDO for up to seconds
+    //                       (mailbox-out ACKs, mailbox-in never fills), then every SDO works.
+    // ec_sample tolerates both by being patient (and its config_init happens to cycle the mailbox
+    // first -- its first real send is already counter 5). We do NOT reprogram SMs / reset the
+    // mailbox counter / bounce through INIT (2009d47's misdiagnosis -- ec_sample does none of it).
     for (int i = 1; i <= count; ++i) {
         const auto slave = static_cast<std::uint16_t>(i);
         if (impl_->ctx.slavelist[i].mbx_l == 0) {
             continue;  // no CoE mailbox on this slave (e.g. simple I/O) -> nothing to warm up
         }
+        // (1) PATIENT send-side gate -- SM0 mailbox-out must be EMPTY/WRITABLE. If it is not,
+        // ecx_mbxsend bails WITHOUT putting a frame on the wire (no FPWR to 0x1000), so the warm-up
+        // read below never actually asks the slave anything -- it just times out. (Wire-proven:
+        // 60583c7 dropped this wait on the theory that the read's own mbxsend covers it; it does
+        // NOT on the A6 -> 0 mailbox frames sent, 0/7.) The A6's mailbox-out can stay non-writable
+        // for SECONDS when cold (ec_sample's config_init cycles the mailbox first -- its first real
+        // send is already counter 5; we hit a cold mailbox), so wait it out PATIENTLY.
+        constexpr int kMbxEmptyTimeoutUs = 10'000'000;  // ~10s patient -- same philosophy as the warm-up/OP-await
+        if (ecx_mbxempty(&impl_->ctx, slave, kMbxEmptyTimeoutUs) <= 0) {
+            ecx_readstate(&impl_->ctx);
+            const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
+            std::string detail = " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
+                                 " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
+            ecx_close(&impl_->ctx);
+            throw InitError("slave " + std::to_string(i) + " CoE mailbox-out (SM0) not writable within ~10s after PRE-OP on '" + name +
+                            "' -- mbxsend would not transmit" + detail);
+        }
+        // (2) PATIENT handler warm-up -- now that SM0 is writable, the read actually goes out.
         constexpr int kWarmupTries = 300;         // ~15s @ ~50ms/try -- patient, matching drive slowness
         constexpr int kWarmupTimeoutUs = 50'000;  // 50 ms/try: warm round-trip ~1.4ms, cold fails fast
         constexpr std::uint32_t kWarmupGapUs = 2'000;
