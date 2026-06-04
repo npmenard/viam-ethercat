@@ -109,15 +109,13 @@ std::size_t SoemBackend::open(std::string_view ifname) {
     }
     impl_->slave_count = count;
 
-    // PRE-OP confirm -- matches ec_sample's bring-up (ec_sample.c:300-327) EXACTLY, no more.
-    // config_init leaves slaves nominally in PRE-OP; manualstatechange=1 makes WE own every AL
-    // transition (stops config_map_group auto-jumping to SAFE-OP, so configdc still runs in
-    // PRE-OP, #20), then we drive all slaves to PRE-OP and CONFIRM it. Then return -- the first
-    // SDO (configure()'s remap) goes straight after, exactly as ec_sample does on THIS drive,
-    // and it works. (Earlier divergent machinery here -- a confirmed-INIT bounce, an SM0-empty
-    // wait, a CoE warm-up read -- chased a misdiagnosis: the wire showed the steady case reaches
-    // PRE-OP cleanly and the first SDO lands without any of it. Golden rule: match the working
-    // reference, don't pre-emptively patch.)
+    // PRE-OP confirm -- matches ec_sample's bring-up (ec_sample.c:300-327). config_init leaves
+    // slaves nominally in PRE-OP; manualstatechange=1 makes WE own every AL transition (stops
+    // config_map_group auto-jumping to SAFE-OP, so configdc still runs in PRE-OP, #20), then we
+    // drive all slaves to PRE-OP and CONFIRM it. (We do NOT do an INIT->PRE-OP writestate bounce
+    // or an SM/mailbox-counter reprogram -- those were a misdiagnosis; ec_sample does neither, and
+    // the wire showed the steady case reaches PRE-OP cleanly without them.) The one thing the A6
+    // DOES need after PRE-OP is the patient CoE-handler warm-up below.
     impl_->ctx.manualstatechange = 1;
     ecx_readstate(&impl_->ctx);
     impl_->ctx.slavelist[0].state = EC_STATE_PRE_OP;
@@ -134,6 +132,52 @@ std::size_t SoemBackend::open(std::string_view ifname) {
         ecx_close(&impl_->ctx);
         throw InitError("EtherCAT slaves did not reach PRE-OP on '" + name + "' (reached " + to_string(from_soem_state(reached)) + ")" +
                         detail);
+    }
+
+    // PATIENT CoE handler warm-up. The A6 in some states is SLOW on EVERYTHING -- the same
+    // drive-slowness that makes SAFE-OP->OP take >10s (handled by the patient OP-await) also
+    // makes its CoE HANDLER slow to ready after the PRE-OP transition: it silently IGNORES the
+    // first SDO (mailbox-out ACKs, but mailbox-in never fills) for up to SECONDS, then every
+    // subsequent SDO works. ec_sample tolerates this by being patient. So, per CoE-capable slave
+    // (mbx_l > 0), gate CoE-handler liveness with a benign, idempotent read (0x1018:01 vendor ID,
+    // always present) retried until it answers, with a GENEROUS ~15s bound (300 x 50ms) -- the
+    // same patience philosophy as the 30s OP-await. The read's own mbxsend also covers send-side
+    // (SM0-writable) readiness, so no separate wait is needed. We do NOT reprogram SMs / reset the
+    // mailbox counter / bounce through INIT (2009d47's misdiagnosis -- ec_sample does none of it);
+    // this is purely a patient readiness gate before configure()'s first stateful remap write.
+    for (int i = 1; i <= count; ++i) {
+        const auto slave = static_cast<std::uint16_t>(i);
+        if (impl_->ctx.slavelist[i].mbx_l == 0) {
+            continue;  // no CoE mailbox on this slave (e.g. simple I/O) -> nothing to warm up
+        }
+        constexpr int kWarmupTries = 300;         // ~15s @ ~50ms/try -- patient, matching drive slowness
+        constexpr int kWarmupTimeoutUs = 50'000;  // 50 ms/try: warm round-trip ~1.4ms, cold fails fast
+        constexpr std::uint32_t kWarmupGapUs = 2'000;
+        std::uint32_t vendor = 0;
+        int warm_wkc = 0;
+        for (int attempt = 0; attempt < kWarmupTries; ++attempt) {
+            int psize = static_cast<int>(sizeof(vendor));
+            warm_wkc = ecx_SDOread(&impl_->ctx, slave, 0x1018, 0x01, FALSE, &psize, &vendor, kWarmupTimeoutUs);
+            if (warm_wkc > 0) {
+                break;
+            }
+            (void)osal_usleep(kWarmupGapUs);
+        }
+        // Drain the errors the ignored attempts queued so they don't bleed into configure()'s
+        // first real SDO (its ecx_iserror() check).
+        ec_errort err{};
+        while (ecx_poperror(&impl_->ctx, &err)) {
+        }
+        if (warm_wkc <= 0) {
+            ecx_readstate(&impl_->ctx);
+            const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
+            std::string detail = " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
+                                 " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
+            ecx_close(&impl_->ctx);
+            throw InitError("slave " + std::to_string(i) +
+                            " CoE handler did not answer a warm-up SDO read (0x1018:01) within ~15s after PRE-OP on '" + name + "'" +
+                            detail);
+        }
     }
 
     impl_->open = true;
