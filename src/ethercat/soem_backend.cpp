@@ -115,15 +115,38 @@ std::size_t SoemBackend::open(std::string_view ifname) {
     // after a prior faulted run left it in a bad AL state. So (mirroring ec_sample):
     //   - manualstatechange = 1: WE own every AL transition; stops ecx_config_map_group
     //     from auto-jumping to SAFE-OP later, so configdc still runs in PRE-OP (#20).
-    //   - bounce any slave NOT in PRE-OP through INIT first (clears a latent AL error a
-    //     prior faulted run burned in), then drive all slaves PRE-OP and CONFIRM it.
+    //   - recover any slave NOT in PRE-OP via INIT + a MAILBOX-SM REPROGRAM (below), then
+    //     drive all slaves PRE-OP and CONFIRM it.
     impl_->ctx.manualstatechange = 1;
     ecx_readstate(&impl_->ctx);
     for (int i = 1; i <= count; ++i) {
         if ((impl_->ctx.slavelist[i].state & 0x0FU) != EC_STATE_PRE_OP) {
+            // Recover a slave a prior faulted run left out of PRE-OP. Drive it to INIT, then
+            // RE-PROGRAM its mailbox SyncManagers before climbing back to PRE-OP. The SM
+            // reprogram is the bug fix (wire-diagnosed): re-writing SM0/SM1 makes the slave
+            // RE-INIT its CoE mailbox and RESET its mailbox session counter. A BARE
+            // writestate(INIT) bounce skips this, so the slave keeps a stale mailbox counter
+            // from the prior run and IGNORES configure()'s first SDO (counter collision -> no
+            // mailbox-in response -> "SDO ... working counter 0"), intermittently (~6/10). This
+            // is the mailbox-resync half of ecx_reconfig_slave -- but WITHOUT its forced
+            // PRE-OP->SAFE-OP step, which would let the A6 latch SM-sync before configure()
+            // arms SYNC0 (-> Er74.1, undoing #20). We must stay in PRE-OP here.
+            const std::uint16_t cfgadr = impl_->ctx.slavelist[i].configadr;
             impl_->ctx.slavelist[i].state = EC_STATE_INIT;
             ecx_writestate(&impl_->ctx, static_cast<std::uint16_t>(i));
             ecx_statecheck(&impl_->ctx, static_cast<std::uint16_t>(i), EC_STATE_INIT, EC_TIMEOUTSTATE);
+            for (int sm = 0; sm < EC_MAXSM; ++sm) {
+                if (impl_->ctx.slavelist[i].SM[sm].StartAddr != 0) {
+                    ecx_FPWR(&impl_->ctx.port,
+                             cfgadr,
+                             static_cast<std::uint16_t>(ECT_REG_SM0 + static_cast<std::size_t>(sm) * sizeof(ec_smt)),
+                             static_cast<std::uint16_t>(sizeof(ec_smt)),
+                             &impl_->ctx.slavelist[i].SM[sm],
+                             EC_TIMEOUTRET);
+                }
+            }
+            impl_->ctx.slavelist[i].mbx_cnt = 0;  // resync the master-side counter with the slave's reset
+            (void)osal_usleep(5000);              // let the slave process the SM re-init (mirrors ecx_reconfig_slave)
         }
     }
     impl_->ctx.slavelist[0].state = EC_STATE_PRE_OP;
@@ -187,26 +210,14 @@ SlaveInfo SoemBackend::slave_info(std::uint16_t slave) const {
     return info;
 }
 
-// Bounded retry for a transient WKC-0 (mailbox momentarily not ready right after a state
-// transition). Retry ONLY on WKC <= 0 with no CoE abort -- a CoE abort returns WKC > 0 with
-// an error pushed (a real rejection that retrying won't fix). All SDO access here is setup-time
-// (PDO remap / mode / fault-reset), never on the RT path, so a few ms of backoff is safe.
-namespace {
-constexpr int kSdoRetries = 4;
-constexpr std::uint32_t kSdoRetryBackoffUs = 2000;  // ~2 ms; the mailbox readies within a couple ms
-}  // namespace
-
 void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
-    // SOEM's psize is an int; PDO/SDO payloads are tiny, so the cast is safe.
+    // SOEM's psize is an int; PDO/SDO payloads are tiny, so the cast is safe. Single-shot, NO
+    // WKC-0 retry: with the mailbox-counter resync in open() the first SDO lands first time, and
+    // a blind re-send is actively harmful -- it advances the mailbox counter / can double-apply a
+    // remap write, desyncing the map (the "OP did not hold" failure). A genuine CoE abort returns
+    // WKC > 0 with an error pushed and is surfaced below; WKC 0 is now a real, reportable fault.
     const int size = static_cast<int>(data.size());
-    int wkc = 0;
-    for (int attempt = 0; attempt < kSdoRetries; ++attempt) {
-        wkc = ecx_SDOwrite(&impl_->ctx, slave, index, sub, FALSE, size, data.data(), EC_TIMEOUTRXM);
-        if (wkc > 0) {
-            break;  // got a response (success OR CoE abort -- both decided by the check below); no retry
-        }
-        (void)osal_usleep(kSdoRetryBackoffUs);  // WKC 0: transient mailbox-not-ready -> brief backoff + retry
-    }
+    const int wkc = ecx_SDOwrite(&impl_->ctx, slave, index, sub, FALSE, size, data.data(), EC_TIMEOUTRXM);
     // A CoE abort can return wkc > 0 but push an error, so check both.
     if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {
         const std::string abort = pop_coe_abort(&impl_->ctx);
@@ -217,15 +228,7 @@ void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8
 
 std::size_t SoemBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
     int size = static_cast<int>(out.size());
-    int wkc = 0;
-    for (int attempt = 0; attempt < kSdoRetries; ++attempt) {
-        size = static_cast<int>(out.size());  // ecx_SDOread updates size in place; reset per attempt
-        wkc = ecx_SDOread(&impl_->ctx, slave, index, sub, FALSE, &size, out.data(), EC_TIMEOUTRXM);
-        if (wkc > 0) {
-            break;
-        }
-        (void)osal_usleep(kSdoRetryBackoffUs);
-    }
+    const int wkc = ecx_SDOread(&impl_->ctx, slave, index, sub, FALSE, &size, out.data(), EC_TIMEOUTRXM);
     if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {
         const std::string abort = pop_coe_abort(&impl_->ctx);
         throw BusError("SDO read from slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" + std::to_string(sub) +
