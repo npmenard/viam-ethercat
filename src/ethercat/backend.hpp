@@ -117,6 +117,16 @@ class EcatBackend {
         }
     }
 
+    // ec_sample's SAFE-OP->OP recovery nudge (ec_sample.c:143-155), for the OP-await wait:
+    // refresh AL state and, per slave (0 = all), ACK a SAFE_OP+ERROR (write SAFE_OP+ACK) or
+    // RE-REQUEST OP from a plain SAFE_OP (write OP). The A6's SAFE-OP->OP can take many seconds;
+    // ec_sample waits it out with PD flowing + these repeated nudges (NOT a single request).
+    // Writes the AL-control register only -- the caller's loop keeps pumping process data, so
+    // PD never gaps. Default no-op (sim / free-run drives reach OP from the single set_state).
+    virtual void reack_op(std::uint16_t slave) noexcept {
+        (void)slave;
+    }
+
     // DC step 1, in PRE-OP: ecx_configdc -- detect DC-capable slaves, designate the
     // reference clock, write each slave's system-time offset (0x0920) + propagation
     // delay (0x0928). Offsets only; SYNC0 is NOT armed here. Per the SOEM author

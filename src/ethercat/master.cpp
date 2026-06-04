@@ -18,12 +18,16 @@ namespace {
 
 constexpr std::uint16_t kModesOfOp = 0x6060;  // CiA402 modes-of-operation (U8): PP=1, PV=3; SDO-set in PRE-OP
 constexpr long kNsPerSec = 1'000'000'000L;
-// AWAIT_OP bounds (bringup_step): require this many consecutive (full-WKC && no-Er74.1)
-// cycles to confirm OP is reached + synced (not a transient), and give up after this many
-// cycles without that hold -- a SINGLE OP request (ec_sample does it with Er74.1 present),
-// bounded, never re-requested (hammering OP-entry wedges the A6, CLAUDE.md).
-constexpr std::uint32_t kOpHoldConfirm = 5;   // ~5 ms @ 1 kHz of held sync -> Operational
-constexpr std::uint32_t kAwaitOpBound = 500;  // ~500 ms to reach the held-synced state, else Aborted
+// AWAIT_OP bounds (bringup_step): require this many consecutive (full-WKC && no-Er74.1) cycles
+// to confirm OP is reached + synced (not a transient), and give up only after a GENEROUS window.
+// The A6's SAFE-OP->OP is SLOW in some states -- wire-measured >11s (up to ~24s) on this drive --
+// and ec_sample reaches OP by WAITING IT OUT with PD flowing + repeated SAFE-OP recovery nudges
+// (it is NOT a single-request/no-hammer transition; that earlier assumption was the bug that
+// made us abort ~20x too early). So: wide bound, and re-ack/re-request OP every kOpNudgeInterval
+// cycles via backend reack_op() (ec_sample's check-thread recovery) while PD keeps flowing.
+constexpr std::uint32_t kOpHoldConfirm = 5;      // ~5 ms @ 1 kHz of held sync -> Operational
+constexpr std::uint32_t kAwaitOpBound = 30'000;  // ~30 s @ 1 kHz to reach OP (ec_sample patience), else Aborted
+constexpr std::uint32_t kOpNudgeInterval = 10;   // re-ack/re-request OP every ~10 ms (ec_sample check cadence)
 
 std::uint32_t field_key(std::uint16_t index, std::uint8_t sub) noexcept {
     return (static_cast<std::uint32_t>(index) << 8U) | sub;
@@ -247,7 +251,8 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted) noexcept {
             // the A6 completes SYNC0 alignment only once OP cycling starts, so Er74.1
             // clears AT OP, not before (ec_sample requests OP with it present and succeeds).
             // Gating on no-Er74.1 here would block the exact transition that works. Non-DC
-            // backends need no settle (1 cycle). Then request OP ONCE (no hammer).
+            // backends need no settle (1 cycle). Then make the INITIAL OP request; AwaitOp keeps
+            // re-requesting (reack_op) until it sticks, the way ec_sample waits out the A6.
             const std::uint32_t target = dc_enabled_ ? (config_.dc_op_gate_cycles == 0 ? 1U : config_.dc_op_gate_cycles) : 1U;
             if (++bringup_settle_count_ >= target) {
                 backend_->set_state(0, EcatState::Op);  // writestate only; this loop pumps the transition
@@ -258,13 +263,17 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted) noexcept {
             return BringupStatus::Gating;
         }
         case BringupPhase::AwaitOp: {
-            // OP requested once; pump the gapless transition. Success = full WKC AND no
-            // Er74.1 held kOpHoldConfirm cycles -- i.e. the drive reached OP, SYNC0 aligned
-            // (Er74.1 cleared), and PD is exchanging cleanly. If that held state isn't
-            // reached within kAwaitOpBound cycles, OP didn't take: abort cleanly with NO
-            // re-request (a single OP request with Er74.1 present is safe -- ec_sample does
-            // it; HAMMERING re-requests is what wedges the A6, CLAUDE.md).
+            // Pump the gapless transition while WAITING OUT the A6's slow SAFE-OP->OP (seconds).
+            // Success = full WKC AND no Er74.1 held kOpHoldConfirm cycles -- i.e. the drive reached
+            // OP, SYNC0 aligned (Er74.1 cleared), and PD is exchanging cleanly. Every
+            // kOpNudgeInterval cycles, run ec_sample's SAFE-OP recovery (reack_op): ACK a
+            // SAFE_OP+ERROR / re-request OP from SAFE_OP. This is self-gating -- once the drive is
+            // in OP, reack_op is a no-op -- and PD keeps flowing (no watchdog starve). Only after
+            // the generous kAwaitOpBound without the held-synced state do we give up.
             ++bringup_await_count_;
+            if (bringup_await_count_ % kOpNudgeInterval == 0) {
+                backend_->reack_op(0);
+            }
             if (wkc == expected_wkc_ && !drive_sync_faulted) {
                 ++bringup_op_hold_streak_;
             } else {

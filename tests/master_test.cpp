@@ -295,7 +295,7 @@ TEST("Master(#20): bringup_step drives SAFE-OP -> OPERATIONAL through the FSM ph
     CHECK(!master.fault());
 }
 
-TEST("Master(#20): bringup_step aborts if Er74.1 never clears at OP, and does NOT retry (no hammer)") {
+TEST("Master(#20): bringup_step waits out OP (ec_sample patience) and aborts only after the generous window") {
     MasterConfig cfg = make_config();
     cfg.use_distributed_clocks = true;  // SYNC0 armed in configure(); the loop SETTLEs then awaits OP
     cfg.dc_op_gate_cycles = 2;          // short SETTLE for the test
@@ -304,22 +304,30 @@ TEST("Master(#20): bringup_step aborts if Er74.1 never clears at OP, and does NO
     master.configure();
 
     // SETTLE does NOT abort on Er74.1 (it's the normal pre-sync state) -- even with the
-    // drive reporting Er74.1, the settle completes and OP is requested once.
+    // drive reporting Er74.1, the settle completes and the initial OP request goes out.
     BringupStatus bs = BringupStatus::Gating;
     for (int cycle = 0; cycle < 3; ++cycle) {
         bs = master.bringup_step(/*drive_sync_faulted=*/true);
         CHECK(bs != BringupStatus::Aborted);  // no pre-OP abort on Er74.1
     }
     // AWAIT_OP: Er74.1 never clears -> the held-synced state (full WKC && !Er74.1) is never
-    // reached -> abort after kAwaitOpBound cycles. (OP was requested ONCE in SETTLE.)
-    for (int cycle = 0; cycle < 600 && bs != BringupStatus::Aborted; ++cycle) {
+    // reached. The FSM does NOT abort early -- it waits out the A6's slow SAFE-OP->OP
+    // (ec_sample reaches OP >11s in), re-requesting OP each nudge interval while PD flows --
+    // and only gives up after the generous kAwaitOpBound. So it must still be AwaitingOp well
+    // past the OLD ~500-cycle bound...
+    for (int cycle = 0; cycle < 2'000; ++cycle) {
+        bs = master.bringup_step(/*drive_sync_faulted=*/true);
+        CHECK(bs == BringupStatus::AwaitingOp);  // patient: not aborted at 500/600/2000 cycles
+    }
+    // ...and eventually aborts once the wide window elapses (kAwaitOpBound ~30k cycles).
+    for (int cycle = 0; cycle < 40'000 && bs != BringupStatus::Aborted; ++cycle) {
         bs = master.bringup_step(/*drive_sync_faulted=*/true);
     }
     CHECK(bs == BringupStatus::Aborted);
     CHECK(!master.all_operational());
 
-    // NO-HAMMER: the FSM stays Aborted -- it never silently re-enters bring-up / re-requests
-    // OP (repeated Er74 OP-entry wedges the A6). A re-attempt requires an explicit reconfigure.
+    // Aborted is TERMINAL -- a re-attempt requires an explicit reconfigure(), so the FSM stays
+    // Aborted even once the fault clears (it does not silently re-enter bring-up).
     for (int cycle = 0; cycle < 200; ++cycle) {
         CHECK(master.bringup_step(/*drive_sync_faulted=*/false) == BringupStatus::Aborted);
     }

@@ -69,14 +69,6 @@ std::string pop_coe_abort(ecx_contextt* ctx) {
     return detail;
 }
 
-// Per-slave "[slave N state=... ALstatuscode=...]" detail for a mailbox/init fault message.
-std::string mbx_fault_detail(ecx_contextt* ctx, int slave) {
-    ecx_readstate(ctx);
-    const std::uint16_t al = ctx->slavelist[slave].ALstatuscode;
-    return " [slave " + std::to_string(slave) + " state=" + to_string(from_soem_state(ctx->slavelist[slave].state)) +
-           " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
-}
-
 }  // namespace
 
 // All SOEM-touching state lives here, behind the pimpl. SOEM v2's ecx_contextt
@@ -117,26 +109,17 @@ std::size_t SoemBackend::open(std::string_view ifname) {
     }
     impl_->slave_count = count;
 
-    // PRE-OP settle -- the ec_sample recovery the A6 needs before any SDO. config_init
-    // leaves slaves nominally in PRE-OP, but the CoE mailbox is NOT reliably ready until
-    // we drive a CONFIRMED PRE-OP: the A6 WKC-0's the first SDO otherwise, especially
-    // after a prior faulted run left it in a bad AL state. So (mirroring ec_sample):
-    //   - manualstatechange = 1: WE own every AL transition; stops ecx_config_map_group
-    //     from auto-jumping to SAFE-OP later, so configdc still runs in PRE-OP (#20).
-    //   - bounce any slave NOT in PRE-OP through INIT first (clears a latent AL error a prior
-    //     faulted run burned in), then drive all slaves PRE-OP and CONFIRM it. (In practice
-    //     config_init already reaches PRE-OP cleanly, so this bounce rarely fires -- it's the
-    //     recovery path for a genuinely stuck/faulted slave; the wire confirms the steady case
-    //     enters PRE-OP without it. The first-SDO readiness is handled by the warm-up below.)
+    // PRE-OP confirm -- matches ec_sample's bring-up (ec_sample.c:300-327) EXACTLY, no more.
+    // config_init leaves slaves nominally in PRE-OP; manualstatechange=1 makes WE own every AL
+    // transition (stops config_map_group auto-jumping to SAFE-OP, so configdc still runs in
+    // PRE-OP, #20), then we drive all slaves to PRE-OP and CONFIRM it. Then return -- the first
+    // SDO (configure()'s remap) goes straight after, exactly as ec_sample does on THIS drive,
+    // and it works. (Earlier divergent machinery here -- a confirmed-INIT bounce, an SM0-empty
+    // wait, a CoE warm-up read -- chased a misdiagnosis: the wire showed the steady case reaches
+    // PRE-OP cleanly and the first SDO lands without any of it. Golden rule: match the working
+    // reference, don't pre-emptively patch.)
     impl_->ctx.manualstatechange = 1;
     ecx_readstate(&impl_->ctx);
-    for (int i = 1; i <= count; ++i) {
-        if ((impl_->ctx.slavelist[i].state & 0x0FU) != EC_STATE_PRE_OP) {
-            impl_->ctx.slavelist[i].state = EC_STATE_INIT;
-            ecx_writestate(&impl_->ctx, static_cast<std::uint16_t>(i));
-            ecx_statecheck(&impl_->ctx, static_cast<std::uint16_t>(i), EC_STATE_INIT, EC_TIMEOUTSTATE);
-        }
-    }
     impl_->ctx.slavelist[0].state = EC_STATE_PRE_OP;
     ecx_writestate(&impl_->ctx, 0);
     const std::uint16_t reached = ecx_statecheck(&impl_->ctx, 0, EC_STATE_PRE_OP, 3 * EC_TIMEOUTSTATE);
@@ -149,62 +132,8 @@ std::size_t SoemBackend::open(std::string_view ifname) {
                       " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
         }
         ecx_close(&impl_->ctx);
-        throw InitError("EtherCAT slaves did not settle to PRE-OP on '" + name + "' (reached " + to_string(from_soem_state(reached)) +
-                        "); the CoE mailbox would not be ready for SDO" + detail);
-    }
-
-    // Reaching PRE-OP (AL state, reg 0x0130) is necessary but NOT sufficient for SDO -- two
-    // mailbox-readiness gaps remain, both closed here per CoE-capable slave (mbx_l > 0):
-    //
-    // (1) SEND side: SM0 (mailbox-out) must be WRITABLE before the first ecx_mbxsend, else it
-    //     returns without sending -> WKC 0. Poll ecx_mbxempty until SM0 is empty/writable.
-    // (2) HANDLER side (the real "wedge", wire-diagnosed): even with SM0 writable, the A6's CoE
-    //     HANDLER is not always ready for the FIRST mailbox message right after the PRE-OP
-    //     transition -- it ACKs the write (WKC 1) but never fills mailbox-in, silently IGNORING
-    //     the first CoE SDO (no response within the full timeout). Once the first SDO IS
-    //     processed, every subsequent SDO works (counter clean, all 0x60). Absorb that
-    //     cold-handler race with a benign, idempotent WARM-UP READ (0x1018:01 vendor ID, always
-    //     present) retried until it answers -- gating CoE-handler liveness BEFORE configure()
-    //     issues the real, stateful remap writes. A retry belongs HERE (a readiness-gating read),
-    //     NOT on the remap writes (re-sending those advances the mailbox counter / double-applies
-    //     -> desynced map). Per-attempt timeout is short so a cold handler fails fast and retries.
-    for (int i = 1; i <= count; ++i) {
-        const auto slave = static_cast<std::uint16_t>(i);
-        if (impl_->ctx.slavelist[i].mbx_l == 0) {
-            continue;  // no CoE mailbox on this slave (e.g. simple I/O) -> nothing to warm up
-        }
-        // (1) SM0 writable.
-        if (ecx_mbxempty(&impl_->ctx, slave, EC_TIMEOUTRXM) <= 0) {
-            const std::string detail = mbx_fault_detail(&impl_->ctx, i);
-            ecx_close(&impl_->ctx);
-            throw InitError("slave " + std::to_string(i) + " CoE mailbox-out (SM0) not ready for SDO after PRE-OP on '" + name +
-                            "' (mailbox-empty wait timed out)" + detail);
-        }
-        // (2) CoE handler live -- warm-up read until it answers.
-        constexpr int kWarmupTries = 25;
-        constexpr int kWarmupTimeoutUs = 50'000;  // 50 ms/try: warm round-trip ~1.4ms, cold fails fast
-        constexpr std::uint32_t kWarmupGapUs = 2'000;
-        std::uint32_t vendor = 0;
-        int warm_wkc = 0;
-        for (int attempt = 0; attempt < kWarmupTries; ++attempt) {
-            int psize = static_cast<int>(sizeof(vendor));
-            warm_wkc = ecx_SDOread(&impl_->ctx, slave, 0x1018, 0x01, FALSE, &psize, &vendor, kWarmupTimeoutUs);
-            if (warm_wkc > 0) {
-                break;
-            }
-            (void)osal_usleep(kWarmupGapUs);
-        }
-        // Drain any errors the ignored warm-up attempts queued, so they don't bleed into the
-        // first real configure() SDO's ecx_iserror() check.
-        ec_errort err{};
-        while (ecx_poperror(&impl_->ctx, &err)) {
-        }
-        if (warm_wkc <= 0) {
-            const std::string detail = mbx_fault_detail(&impl_->ctx, i);
-            ecx_close(&impl_->ctx);
-            throw InitError("slave " + std::to_string(i) + " CoE handler did not answer a warm-up SDO read (0x1018:01) after PRE-OP on '" +
-                            name + "'" + detail);
-        }
+        throw InitError("EtherCAT slaves did not reach PRE-OP on '" + name + "' (reached " + to_string(from_soem_state(reached)) + ")" +
+                        detail);
     }
 
     impl_->open = true;
@@ -298,6 +227,31 @@ void SoemBackend::set_state(std::uint16_t slave, EcatState target) noexcept {
     // a gap. slave_state() reports progress.
     impl_->ctx.slavelist[slave].state = to_soem_state(target);
     ecx_writestate(&impl_->ctx, slave);
+}
+
+void SoemBackend::reack_op(std::uint16_t slave) noexcept {
+    // ec_sample's SAFE-OP->OP recovery nudge (ec_sample.c:143-155): refresh AL state, then per
+    // slave ACK a SAFE_OP+ERROR (write SAFE_OP+ACK) or RE-REQUEST OP from a plain SAFE_OP (write
+    // OP). The A6's SAFE-OP->OP can take many seconds; ec_sample waits it out with PD flowing +
+    // these repeated nudges (NOT a single request), so the bring-up FSM calls this periodically
+    // during the OP-await wait. Writes the AL-control register only (the caller keeps pumping PD,
+    // so the SyncManager watchdog never starves -> no AL 0x001B). Best-effort, no throw.
+    ecx_readstate(&impl_->ctx);
+    const int lo = (slave == 0) ? 1 : slave;
+    const int hi = (slave == 0) ? impl_->slave_count : slave;
+    for (int i = lo; i <= hi; ++i) {
+        ec_slavet& s = impl_->ctx.slavelist[i];
+        if (s.state == (EC_STATE_SAFE_OP + EC_STATE_ERROR)) {
+            s.state = EC_STATE_SAFE_OP + EC_STATE_ACK;  // ACK the error (ec_sample.c:143-147)
+            ecx_writestate(&impl_->ctx, static_cast<std::uint16_t>(i));
+        } else if (s.state == EC_STATE_SAFE_OP) {
+            s.state = EC_STATE_OPERATIONAL;  // re-request OP (ec_sample.c:149-154)
+            if (s.mbxhandlerstate == ECT_MBXH_LOST) {
+                s.mbxhandlerstate = ECT_MBXH_CYCLIC;
+            }
+            ecx_writestate(&impl_->ctx, static_cast<std::uint16_t>(i));
+        }
+    }
 }
 
 EcatState SoemBackend::slave_state(std::uint16_t slave) const {
