@@ -134,6 +134,14 @@ std::size_t SoemBackend::open(std::string_view ifname) {
                         detail);
     }
 
+    // CRITICAL: refresh EACH slave's cached state to PRE-OP. statecheck(slave 0) only updates the
+    // group state (slavelist[0]); slavelist[1..n].state stays at whatever the pre-transition
+    // readstate saw (INIT). ecx_mbxsend's direct-send path is gated on slavelist[slave].state >=
+    // PRE_OP -- with a stale INIT it takes NEITHER the cyclic NOR the direct path and returns 0
+    // WITHOUT transmitting (verified on the wire: 0 mailbox frames). ec_sample calls ecx_readstate
+    // after reaching PRE-OP (ec_sample.c:303) for exactly this reason.
+    ecx_readstate(&impl_->ctx);
+
     // PATIENT CoE mailbox readiness gate (two parts, per CoE-capable slave). The A6 in some
     // states is SLOW on EVERYTHING -- the same drive-slowness that makes SAFE-OP->OP take >10s
     // (handled by the patient OP-await) also makes its CoE mailbox slow to ready after the PRE-OP
