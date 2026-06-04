@@ -227,15 +227,13 @@ int main(int argc, char** argv) {
         } else if (a == "--reset-fault") {
             opt.reset_fault = true;
         } else if (a == "--move-pp" && i + 1 < args.size()) {
-            opt.move_pp = true;
-            opt.enable = true;  // a move requires enabling
+            opt.move_pp = true;  // requires an EXPLICIT --enable (checked below) -- no implicit energize
             opt.move_revs = std::stod(args[++i]);
             if (i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0) {
                 opt.move_rpm = std::stod(args[++i]);
             }
         } else if (a == "--move-sine") {
-            opt.move_sine = true;
-            opt.enable = true;  // an energized move requires enabling
+            opt.move_sine = true;  // requires an EXPLICIT --enable (checked below) -- no implicit energize
         } else if (a == "--csp-probe") {
             opt.csp_probe = true;  // CSP mode, NO enable -- read+print feedback only (diagnostic)
         } else if (a == "--sine-amplitude" && i + 1 < args.size()) {
@@ -252,16 +250,19 @@ int main(int argc, char** argv) {
             opt.ifname = a;
         } else {
             std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]]\n"
-                      << "                   [--move-sine [--sine-amplitude N] [--sine-period S]] [--seconds N] [--dc-shift-ns NS]\n"
+                      << "                   [--move-sine [--sine-amplitude N] [--sine-period S]] [--csp-probe] [--seconds N] "
+                         "[--dc-shift-ns NS]\n"
                       << "  The DC bring-up (#20) is automatic: configure() arms SYNC0 in PRE-OP + reaches SAFE-OP,\n"
                       << "  then the cyclic loop runs SETTLE (phase-locked PD) -> request OP once -> AWAIT_OP (hold\n"
                       << "  for OP + sync), all gapless. Er74.1 in SAFE-OP is normal pre-sync, clears at OP.\n"
-                      << "  --move-sine: *** ENERGIZED MOTION *** CSP-mode soft-started position sine, relative to the\n"
-                      << "               enable position. pos(t)=pos_enable + A*min(1,t/T)*sin(2*pi*t/T); A=--sine-amplitude\n"
-                      << "               (counts, def 20000), T=--sine-period (s, def 4.0). CSP-safe (no jump) + ramped\n"
-                      << "               (no velocity step). --follow-err-limit N (counts, def 5000): abort+disable if\n"
-                      << "               |commanded-actual| exceeds it. Mutually exclusive with --move-pp.\n"
-                      << "  --move-pp REVS [RPM]: *** MOTION *** PP-mode relative move via the bit4 handshake.\n"
+                      << "  --enable: energize to OperationEnabled (holding torque). REQUIRED for any move below --\n"
+                      << "            --move-pp/--move-sine no longer imply it, so a forgotten --enable fails closed.\n"
+                      << "  --move-sine: *** ENERGIZED MOTION (needs --enable) *** CSP-mode soft-started position sine,\n"
+                      << "               relative to the enable position. pos(t)=pos_enable + A*min(1,t/T)*sin(2*pi*t/T);\n"
+                      << "               A=--sine-amplitude (counts, def 20000), T=--sine-period (s, def 4.0). CSP-safe\n"
+                      << "               (no jump) + ramped (no velocity step). --follow-err-limit N (counts, def 5000):\n"
+                      << "               abort+disable if |commanded-actual| exceeds it. Mutually exclusive with --move-pp.\n"
+                      << "  --move-pp REVS [RPM]: *** MOTION (needs --enable) *** PP-mode relative move via the bit4 handshake.\n"
                       << "  --csp-probe: NON-energizing diagnostic -- bring up in CSP mode (0x6060=8), hold at\n"
                       << "               ReadyToSwitchOn (NO enable), print feedback. Confirms whether read_tx returns\n"
                       << "               valid sw/pos in CSP without energizing (isolates CSP-feedback vs a wedged drive).\n"
@@ -274,6 +275,17 @@ int main(int argc, char** argv) {
     const int mode_flags = static_cast<int>(opt.move_pp) + static_cast<int>(opt.move_sine) + static_cast<int>(opt.csp_probe);
     if (mode_flags > 1) {
         std::cerr << "error: --move-pp / --move-sine / --csp-probe are mutually exclusive (one mode of operation at a time)\n";
+        return 2;
+    }
+    // SAFETY: a move must NOT silently energize. --move-pp/--move-sine no longer imply --enable;
+    // they require it explicitly, so a forgotten --enable FAILS CLOSED (refuses to energize)
+    // instead of moving the shaft. (Near-miss: --move-sine used to imply enable -> a "no-enable"
+    // invocation would have energized + moved at the default amplitude.) For a non-energizing CSP
+    // feedback read, use --csp-probe.
+    if ((opt.move_pp || opt.move_sine) && !opt.enable) {
+        std::cerr << "error: --move-pp / --move-sine command ENERGIZED MOTION and require an explicit --enable\n"
+                  << "       (safety: motion must be a deliberate opt-in -- a forgotten --enable will not silently move the shaft).\n"
+                  << "       For a non-energizing CSP feedback read, use --csp-probe instead.\n";
         return 2;
     }
     // --csp-probe and --move-sine both select CSP (0x6060=8); --move-pp and the plain/no-move
