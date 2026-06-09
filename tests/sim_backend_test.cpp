@@ -7,6 +7,7 @@
 #include "ethercat/cia402.hpp"
 #include "ethercat/errors.hpp"
 #include "ethercat/pdo_buffer.hpp"
+#include "ethercat/pdo_mapping.hpp"
 #include "ethercat/sim_backend.hpp"
 #include "test_harness.hpp"
 
@@ -187,6 +188,44 @@ TEST("SimBackend: double scan throws; short-WKC hook fires once") {
     be.force_short_wkc_once();
     CHECK_EQ(be.exchange(), expected - 1);  // short once
     CHECK_EQ(be.exchange(), expected);      // back to normal
+}
+
+// --- #32 hygiene fixes -------------------------------------------------------
+
+// #32.1: backend sdo_read/sdo_write bounds-check an out-of-range slave with a
+// clear-text BusError naming the configured count -- before touching the bus.
+TEST("#32.1: sdo bounds-check throws BusError naming the configured count") {
+    SimBackend be(std::vector<SimSlaveModel>{a6_like_model()});  // exactly 1 slave
+    (void)be.open("sim0");
+    std::array<std::byte, 2> buf{};
+    CHECK_THROWS_MSG(be.sdo_read(99, 0x6041, 0, buf), ethercat::BusError, "configured 1");
+    CHECK_THROWS_MSG(be.sdo_write(99, 0x6040, 0, buf), ethercat::BusError, "configured 1");
+    CHECK_THROWS_MSG(be.sdo_read(0, 0x6041, 0, buf), ethercat::BusError, "out of range");  // 0 is not a 1-based id
+    // In-range still works (no throw): write then read back the same object.
+    const std::array<std::byte, 2> val{std::byte{0x34}, std::byte{0x12}};
+    be.sdo_write(1, 0x6040, 0, val);
+    CHECK_EQ(be.sdo_read(1, 0x6040, 0, buf), std::size_t{2});
+}
+
+// #32.2: a GENERIC (non-mapping) SDO abort surfaces as SdoError; the SAME abort
+// on a MAPPING object, routed through apply_pdo_map, surfaces as PdoMappingError.
+TEST("#32.2: generic SDO abort -> SdoError; mapping-object abort -> PdoMappingError") {
+    SimBackend be(std::vector<SimSlaveModel>{a6_like_model()});
+    (void)be.open("sim0");
+
+    // (a) a non-mapping object (mode 0x6060) aborts -> SdoError (NOT PdoMappingError).
+    be.set_sdo_write_abort(1, 0x6060, 0);
+    const std::array<std::byte, 1> mode{std::byte{8}};
+    CHECK_THROWS(be.sdo_write(1, 0x6060, 0, mode), ethercat::SdoError);
+
+    // (b) a mapping-object write (0x1C12:00, the first write apply_pdo_map issues)
+    // aborts -> apply_pdo_map re-tags it PdoMappingError (the name is correct there).
+    be.set_sdo_write_abort(1, 0x1C12, 0);
+    ethercat::PdoMap rx;
+    rx.assign_index = 0x1C12;
+    rx.pdo_indices = {0x1600};
+    rx.entries[0x1600] = {{0x6040, 0, 16}, {0x607A, 0, 32}};
+    CHECK_THROWS(ethercat::apply_pdo_map(be, 1, rx), ethercat::PdoMappingError);
 }
 
 TEST_MAIN()

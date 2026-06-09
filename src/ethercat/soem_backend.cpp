@@ -232,17 +232,28 @@ void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8
     // a blind re-send is actively harmful -- it advances the mailbox counter / can double-apply a
     // remap write, desyncing the map (the "OP did not hold" failure). A genuine CoE abort returns
     // WKC > 0 with an error pushed and is surfaced below; WKC 0 is now a real, reportable fault.
+    if (slave < 1 || slave > impl_->slave_count) {
+        throw BusError("SoemBackend::sdo_write: slave " + std::to_string(slave) + " out of range (configured " +
+                       std::to_string(impl_->slave_count) + ")");
+    }
     const int size = static_cast<int>(data.size());
     const int wkc = ecx_SDOwrite(&impl_->ctx, slave, index, sub, FALSE, size, data.data(), EC_TIMEOUTRXM);
-    // A CoE abort can return wkc > 0 but push an error, so check both.
+    // A CoE abort can return wkc > 0 but push an error, so check both. This is the GENERIC SDO
+    // tier -> SdoError (carries the abort code); it is NOT PdoMappingError. apply_pdo_map wraps
+    // its mapping-object writes (0x1C1x/0x16xx/0x1Axx) to surface PdoMappingError where that name
+    // is correct -- a non-mapping abort (mode 0x6060, vendor/tuning, fault-reset) stays SdoError.
     if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {
         const std::string abort = pop_coe_abort(&impl_->ctx);
-        throw PdoMappingError("SDO write to slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" +
-                              std::to_string(sub) + " failed (working counter " + std::to_string(wkc) + ")" + abort);
+        throw SdoError("SDO write to slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" + std::to_string(sub) +
+                       " failed (working counter " + std::to_string(wkc) + ")" + abort);
     }
 }
 
 std::size_t SoemBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
+    if (slave < 1 || slave > impl_->slave_count) {
+        throw BusError("SoemBackend::sdo_read: slave " + std::to_string(slave) + " out of range (configured " +
+                       std::to_string(impl_->slave_count) + ")");
+    }
     int size = static_cast<int>(out.size());
     const int wkc = ecx_SDOread(&impl_->ctx, slave, index, sub, FALSE, &size, out.data(), EC_TIMEOUTRXM);
     if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {

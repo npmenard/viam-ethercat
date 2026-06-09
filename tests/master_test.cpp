@@ -410,4 +410,41 @@ TEST("Master: ctor validates config (clear-text ConfigError)") {
     CHECK_THROWS_MSG(Master(bad_rate, std::make_unique<SimBackend>(make_models())), ethercat::ConfigError, "target_loop_rate_hz");
 }
 
+// #32.3: the DC settle-cycle counts are MasterConfig fields (documented + tunable
+// without a recompile). Defaults reproduce today's values, and a Settle-phase
+// override (dc_op_gate_cycles) is honored by bringup_step.
+TEST("#32.3: dc settle cycles are MasterConfig fields (defaults + Settle override honored)") {
+    CHECK_EQ(MasterConfig{}.dc_op_gate_cycles, std::uint32_t{400});  // today's SETTLE count
+    CHECK_EQ(MasterConfig{}.dc_settle_cycles, std::uint32_t{0});     // today's post-OP grace
+
+    MasterConfig cfg = make_config();
+    cfg.use_distributed_clocks = true;
+    cfg.dc_op_gate_cycles = 5;  // short, explicit SETTLE
+    Master m{cfg, std::make_unique<SimBackend>(make_models())};
+    m.init();
+    m.configure();
+    // SETTLE pumps exactly dc_op_gate_cycles phase-locked cycles (Gating) before requesting OP,
+    // so the first 5 steps are Gating and the settle is done only after the 5th.
+    for (int c = 0; c < 5; ++c) {
+        CHECK(m.bringup_step(/*drive_sync_faulted=*/false) == BringupStatus::Gating);
+    }
+    CHECK(m.bringup_step(/*drive_sync_faulted=*/false) != BringupStatus::Gating);  // OP requested after exactly 5
+}
+
+// #32.4: dc_sync0_shift_ns (the ecx_dcsync0 CyclShift) is a MasterConfig field that
+// threads through configure() to the backend's arm_dc_sync call unchanged.
+TEST("#32.4: dc_sync0_shift_ns threads through configure() to the backend arm call") {
+    CHECK_EQ(MasterConfig{}.dc_sync0_shift_ns, std::int32_t{0});  // default: SYNC0 on the DC base
+
+    MasterConfig cfg = make_config();
+    cfg.use_distributed_clocks = true;
+    cfg.dc_sync0_shift_ns = 12345;
+    auto backend = std::make_unique<SimBackend>(make_models());
+    SimBackend* raw = backend.get();
+    Master m{cfg, std::move(backend)};
+    m.init();
+    m.configure();  // arms SYNC0 in PRE-OP (DC on) -> backend records the CyclShift it received
+    CHECK_EQ(raw->configured_dc_sync0_shift_ns(), std::int32_t{12345});
+}
+
 TEST_MAIN()

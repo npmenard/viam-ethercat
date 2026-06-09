@@ -11,12 +11,19 @@ namespace ethercat {
 
 namespace {
 
-// Write a little-endian scalar as an SDO download.
+// Write a little-endian scalar as an SDO download. These are the MAPPING-object writes
+// (0x1C1x/0x16xx/0x1Axx): the backend's generic sdo_write throws SdoError on a CoE abort, so
+// re-tag it as PdoMappingError HERE -- the one place the mapping context makes that name correct
+// (#32 note 14). A transport/bounds BusError propagates unchanged (not a "mapping rejected").
 template <PdoScalar T>
 void sdo_write_scalar(EcatBackend& backend, std::uint16_t slave, std::uint16_t index, std::uint8_t sub, T value) {
     std::array<std::byte, sizeof(T)> buf{};
     store_le<T>(buf, value);
-    backend.sdo_write(slave, index, sub, buf);
+    try {
+        backend.sdo_write(slave, index, sub, buf);
+    } catch (const SdoError& e) {
+        throw PdoMappingError(std::string("PDO mapping write rejected: ") + e.what());
+    }
 }
 
 std::string hex16(std::uint16_t v) {

@@ -129,11 +129,20 @@ class SimBackend final : public EcatBackend {
     // TEST-ONLY: call only after the controller is stopped/joined (set during the RT loop's
     // bring-up prelude, on the RT thread).
     std::uint32_t configured_dc_cycle_ns() const noexcept;
+    // SYNC0 CyclShift (ns) the bring-up passed to arm_dc_sync (the config's dc_sync0_shift_ns).
+    // Lets an offline test assert the config value threads through to the backend's DC arm call
+    // (#32 note 4). TEST-ONLY: read after the controller is stopped/joined.
+    std::int32_t configured_dc_sync0_shift_ns() const noexcept;
     // Read back a recorded SDO value (latest write to that object).
     std::vector<std::byte> recorded_sdo(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const;
     // Ordered log of SDO write keys ((index<<8)|sub) for asserting the remap
     // sub-protocol ordering (configure() test).
     std::vector<std::uint32_t> sdo_log(std::uint16_t slave) const;
+    // Make a subsequent sdo_write to object index:sub ABORT (throw SdoError carrying `abort_code`),
+    // modelling a drive rejecting an SDO download. Lets the #32 note-14 test assert the error tier:
+    // a non-mapping object aborts -> SdoError; a mapping object (0x1C1x/0x16xx/0x1Axx) aborts ->
+    // apply_pdo_map re-tags it PdoMappingError. Idempotent; call once per object to arm.
+    void set_sdo_write_abort(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::uint32_t abort_code = 0x06090011U);
 
    private:
     struct Slave {
@@ -142,6 +151,7 @@ class SimBackend final : public EcatBackend {
         std::vector<std::byte> input_image;                          // TxPDO (master reads)
         std::map<std::uint32_t, std::vector<std::byte>> dictionary;  // recorded SDO writes, key=(index<<8)|sub
         std::vector<std::uint32_t> sdo_write_order;                  // SDO write keys in order (configure() ordering test)
+        std::map<std::uint32_t, std::uint32_t> sdo_write_aborts;     // test: key=(index<<8)|sub -> CoE abort code to throw
         EcatState state = EcatState::Init;
         Cia402State device_state = Cia402State::NotReadyToSwitchOn;
         std::uint16_t prev_ctrlword = 0;
@@ -178,8 +188,9 @@ class SimBackend final : public EcatBackend {
     // still O(1); the inner output_image/input_image vectors stay contiguous.
     std::deque<Slave> slaves_;
     int expected_wkc_ = 0;
-    std::uint32_t dc_cycle_ns_ = 0;     // last configure_dc_sync() cycle (0 = never requested)
-    std::int64_t synthetic_dc_ns_ = 0;  // synthetic DC clock, advanced each exchange() (dc_time())
+    std::uint32_t dc_cycle_ns_ = 0;       // last configure_dc_sync() cycle (0 = never requested)
+    std::int32_t dc_sync0_shift_ns_ = 0;  // last arm_dc_sync() SYNC0 CyclShift (config dc_sync0_shift_ns; #32 note 4)
+    std::int64_t synthetic_dc_ns_ = 0;    // synthetic DC clock, advanced each exchange() (dc_time())
     bool open_ = false;
     bool short_wkc_once_ = false;                // one-shot (master_test drives it synchronously; RT-only)
     std::atomic<bool> short_wkc_sticky_{false};  // toggled non-RT while the RT loop reads it in exchange() -> atomic

@@ -82,9 +82,16 @@ SlaveInfo SimBackend::slave_info(std::uint16_t slave) const {
 
 void SimBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
     if (slave < 1 || slave > slaves_.size()) {
-        throw PdoMappingError("SimBackend::sdo_write: slave " + std::to_string(slave) + " out of range");
+        throw BusError("SimBackend::sdo_write: slave " + std::to_string(slave) + " out of range (configured " +
+                       std::to_string(slaves_.size()) + ")");
     }
     Slave& s = slaves_[slave - 1];
+    // Test injection (#32 note 14): simulate a drive CoE abort on this object. SdoError is the
+    // GENERIC SDO tier; apply_pdo_map re-tags it PdoMappingError for the mapping objects.
+    if (const auto it = s.sdo_write_aborts.find(sdo_key(index, sub)); it != s.sdo_write_aborts.end()) {
+        throw SdoError("SimBackend: slave " + std::to_string(slave) + " aborted SDO write to object " + std::to_string(index) + ":" +
+                       std::to_string(sub) + " (CoE abort code " + std::to_string(it->second) + ")");
+    }
     s.dictionary[sdo_key(index, sub)] = std::vector<std::byte>(data.begin(), data.end());
     s.sdo_write_order.push_back(sdo_key(index, sub));
     // De-mask: the runtime mode of operation comes from the 0x6060 SDO (U8), NOT
@@ -96,7 +103,8 @@ void SimBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_
 
 std::size_t SimBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
     if (slave < 1 || slave > slaves_.size()) {
-        throw PdoMappingError("SimBackend::sdo_read: slave " + std::to_string(slave) + " out of range");
+        throw BusError("SimBackend::sdo_read: slave " + std::to_string(slave) + " out of range (configured " +
+                       std::to_string(slaves_.size()) + ")");
     }
     const Slave& s = slaves_[slave - 1];
     const auto it = s.dictionary.find(sdo_key(index, sub));
@@ -454,12 +462,24 @@ void SimBackend::suppress_setpoint_ack(std::uint16_t slave, bool on) noexcept {
 }
 
 void SimBackend::arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
-    (void)sync0_shift_ns;     // no real SYNC0 unit to phase
-    dc_cycle_ns_ = cycle_ns;  // record that the bring-up armed SYNC0 (configured_dc_cycle_ns)
+    dc_cycle_ns_ = cycle_ns;              // record that the bring-up armed SYNC0 (configured_dc_cycle_ns)
+    dc_sync0_shift_ns_ = sync0_shift_ns;  // record the CyclShift the config threaded through (#32 note 4)
 }
 
 std::uint32_t SimBackend::configured_dc_cycle_ns() const noexcept {
     return dc_cycle_ns_;
+}
+
+std::int32_t SimBackend::configured_dc_sync0_shift_ns() const noexcept {
+    return dc_sync0_shift_ns_;
+}
+
+void SimBackend::set_sdo_write_abort(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::uint32_t abort_code) {
+    if (slave < 1 || slave > slaves_.size()) {
+        throw BusError("SimBackend::set_sdo_write_abort: slave " + std::to_string(slave) + " out of range (configured " +
+                       std::to_string(slaves_.size()) + ")");
+    }
+    slaves_[slave - 1].sdo_write_aborts[sdo_key(index, sub)] = abort_code;
 }
 
 std::int64_t SimBackend::dc_time() const noexcept {

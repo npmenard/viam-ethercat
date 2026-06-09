@@ -38,11 +38,22 @@ class InitError : public Error {
 };
 
 // A PDO mapping could not be applied to a slave: an entry overflows the SM, an
-// SDO write to 0x1C12/0x1C13/0x1600/0x1A00 was rejected, or the requested map
-// is otherwise invalid for the slave.
+// SDO write to a MAPPING object (0x1C12/0x1C13/0x1600/0x1A00) was rejected, or
+// the requested map is otherwise invalid for the slave. Reserved for the mapping
+// sub-protocol (apply_pdo_map) -- a generic non-mapping SDO abort is an SdoError,
+// not this (so the error type matches the operator's mental model on the bench).
 class PdoMappingError : public Error {
    public:
     explicit PdoMappingError(const std::string& what) : Error(what) {}
+};
+
+// A generic CoE SDO transfer was aborted by the drive (a non-mapping object: mode
+// 0x6060, a vendor/tuning write, the fault-reset 0x2031, ...). Carries the drive's
+// CoE abort code in the message. Distinct from PdoMappingError (which is specific
+// to the 0x1C1x/0x16xx/0x1Axx mapping writes) and from BusError (WKC/transport).
+class SdoError : public Error {
+   public:
+    explicit SdoError(const std::string& what) : Error(what) {}
 };
 
 // An attempt to read/write past the end of a PDO buffer (cursor overrun, short
