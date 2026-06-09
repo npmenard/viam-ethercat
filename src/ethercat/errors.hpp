@@ -37,11 +37,15 @@ class InitError : public Error {
     explicit InitError(const std::string& what) : Error(what) {}
 };
 
-// A PDO mapping could not be applied to a slave: an entry overflows the SM, an
-// SDO write to a MAPPING object (0x1C12/0x1C13/0x1600/0x1A00) was rejected, or
-// the requested map is otherwise invalid for the slave. Reserved for the mapping
-// sub-protocol (apply_pdo_map) -- a generic non-mapping SDO abort is an SdoError,
-// not this (so the error type matches the operator's mental model on the bench).
+// A MAP-MEMBERSHIP failure ("the map can't satisfy you"), spanning two cases:
+//   - a mapping could not be APPLIED to a slave (apply_pdo_map: an entry overflows
+//     the SM, an SDO write to a mapping object 0x1C12/0x1C13/0x1600/0x1A00 was
+//     rejected, or the requested map is invalid for the slave); OR
+//   - a RUNTIME PDO access referenced an object NOT in the applied map
+//     (Rpdo::get / Tpdo::put resolve) -- distinct operator fix: "add it to the map".
+// A generic non-mapping SDO abort is SdoError; a MALFORMED access (wrong width /
+// past frame) is PdoAccessError; a bad slave id is ConfigError -- so the error type
+// matches the operator's mental model on the bench.
 class PdoMappingError : public Error {
    public:
     explicit PdoMappingError(const std::string& what) : Error(what) {}
@@ -56,12 +60,11 @@ class SdoError : public Error {
     explicit SdoError(const std::string& what) : Error(what) {}
 };
 
-// An invalid PDO field access: the object isn't in the slave's PDO map, the
-// Field's typed width disagrees with the mapping, or the access runs past the
-// buffer (cursor overrun / short frame). Thrown by PdoReader/PdoWriter and the
-// Rpdo/Tpdo resolve path; the message names the cause + offset/size. (Distinct
-// from PdoMappingError, which is RESERVED for the configure-time apply_pdo_map
-// sub-protocol -- this is the RUNTIME access tier.)
+// A MALFORMED PDO field access ("your access is malformed"): the Field's typed
+// width disagrees with the mapping, or the access runs past the buffer (cursor
+// overrun / short frame). Thrown by PdoReader/PdoWriter and the Rpdo/Tpdo resolve
+// path; the message names the cause + offset/size. (Object-not-in-map is the
+// separate PdoMappingError -- a map-membership concern, not a malformed access.)
 class PdoAccessError : public Error {
    public:
     explicit PdoAccessError(const std::string& what) : Error(what) {}

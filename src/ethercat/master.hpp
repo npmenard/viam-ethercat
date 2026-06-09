@@ -213,12 +213,13 @@ class Master {
     Tpdo make_tpdo(std::uint16_t slave);
 
     // Resolve a Field<> to its byte location in the slave's command (rx) / feedback (tx) image
-    // (#30 §5). Templated so it knows sizeof(F::type): asserts the Field's width matches the
-    // mapped object -- throws PdoAccessError (clear text) if the object isn't mapped OR if
-    // sizeof(F::type)*8 != the mapped object's bit_length (catches a silent wrong-width read,
-    // e.g. an int16 alias on a 32-bit-mapped object). This is the resolution used by Rpdo/Tpdo
-    // per-call AND the one the RT path calls ONCE at configure to cache a FieldLocation (then
-    // the noexcept load_le/store_le(image, loc) free fns run per cycle -- no per-cycle resolve).
+    // (#30 §5). Templated so it knows sizeof(F::type): clear-text throws on the throw-tier split
+    // -- PdoMappingError if the object isn't mapped (map-membership), PdoAccessError if
+    // sizeof(F::type)*8 != the mapped object's bit_length (a malformed/wrong-width access, e.g.
+    // an int16 alias on a 32-bit-mapped object -- catches a silent wrong-width read). This is the
+    // resolution used by Rpdo/Tpdo per-call AND the one the RT path calls ONCE at configure to
+    // cache a FieldLocation (then the noexcept load_le/store_le(image, loc) free fns run per cycle
+    // -- no per-cycle resolve).
     template <class F>
     FieldLocation resolve_rx(std::uint16_t slave) const {
         return resolve_field(runtime_for(slave).rx_fields, F::index, F::sub, sizeof(typename F::type), slave, /*is_tx=*/false);
@@ -254,8 +255,9 @@ class Master {
     static std::map<std::uint32_t, FieldLocation> build_field_table(std::uint16_t slave, const PdoMap& map);
 
     // Shared resolution body for resolve_rx/resolve_tx (#30 §5): look the object up in `table`,
-    // throw PdoAccessError (clear text) if it isn't mapped or its mapped width != want_width
-    // (the templated callers pass sizeof(F::type) so the width-vs-T check happens at resolve).
+    // clear-text throw PdoMappingError if it isn't mapped (map-membership) or PdoAccessError if
+    // its mapped width != want_width (malformed access; the templated callers pass sizeof(F::type)
+    // so the width-vs-T check happens at resolve).
     FieldLocation resolve_field(const std::map<std::uint32_t, FieldLocation>& table,
                                 std::uint16_t index,
                                 std::uint8_t sub,
@@ -302,11 +304,11 @@ class Rpdo {
    public:
     // Resolve F's index:sub in the slave's TxPDO (feedback) field table and read
     // sizeof(F::type) little-endian at that offset. Throws PdoMappingError if the
-    // object isn't mapped, or PdoAccessError if it would read past the frame. The
-    // width comes from F::type -- per-field width-vs-T is the caller's contract (§1).
+    // object isn't mapped (map-membership), or PdoAccessError if the width disagrees
+    // with the mapping or the read runs past the frame (malformed access).
     template <class F>
     typename F::type get() const {
-        // resolve_tx throws PdoAccessError on not-in-map OR width-mismatch (#30 §5).
+        // resolve_tx: PdoMappingError on not-in-map, PdoAccessError on width-mismatch (#30 §5).
         const FieldLocation loc = master_->template resolve_tx<F>(slave_);
         if (loc.byte_offset + sizeof(typename F::type) > snap_.size) {
             throw PdoAccessError("Rpdo::get object " + std::to_string(F::index) + ":" + std::to_string(F::sub) + " reads " +
@@ -346,10 +348,11 @@ class Tpdo {
    public:
     // Resolve F's index:sub in the slave's RxPDO (command) field table and write
     // sizeof(F::type) little-endian at that offset into the staged copy. Throws
-    // PdoAccessError if not mapped / width-mismatch / past the frame.
+    // PdoMappingError if not mapped (map-membership); PdoAccessError on width-mismatch
+    // or past the frame (malformed access).
     template <class F>
     void put(typename F::type v) {
-        // resolve_rx throws PdoAccessError on not-in-map OR width-mismatch (#30 §5).
+        // resolve_rx: PdoMappingError on not-in-map, PdoAccessError on width-mismatch (#30 §5).
         const FieldLocation loc = master_->template resolve_rx<F>(slave_);
         if (loc.byte_offset + sizeof(typename F::type) > size_) {
             throw PdoAccessError("Tpdo::put object " + std::to_string(F::index) + ":" + std::to_string(F::sub) + " writes " +

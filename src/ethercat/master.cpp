@@ -426,12 +426,12 @@ FieldLocation Master::resolve_field(const std::map<std::uint32_t, FieldLocation>
     const char* const which = is_tx ? "TxPDO (feedback)" : "RxPDO (command)";
     const auto it = table.find(field_key(index, sub));
     if (it == table.end()) {
-        // PdoAccessError (NOT PdoMappingError): #32 RESERVED PdoMappingError for the apply_pdo_map
-        // sub-protocol -- the runtime Rpdo/Tpdo resolve path must not re-broaden it. All three
-        // runtime resolve/access failures (not-in-map, width-mismatch, past-frame) are the one
-        // PdoAccessError tier; the clear-text message names the specific cause.
-        throw PdoAccessError("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
-                             " is not in the " + which + " map");
+        // NOT-IN-MAP is a MAP-MEMBERSHIP failure -> PdoMappingError ("the map can't satisfy you";
+        // distinct operator fix = "add it to the map"). PdoMappingError spans BOTH apply-time
+        // (apply_pdo_map) and this runtime access of an un-mapped object. A MALFORMED access
+        // (wrong width / past frame) is the separate PdoAccessError tier below.
+        throw PdoMappingError("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
+                              " is not in the " + which + " map");
     }
     // #30 §5 width assertion (PROVISIONAL, pending the user's call via team-lead -- built but
     // trivially removable): the Field's T must match the mapped object's width. Catches a silent
