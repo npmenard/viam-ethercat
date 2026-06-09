@@ -203,18 +203,18 @@ TEST("#30 P2a.1: an Rpdo is a frozen, frame-consistent snapshot") {
     CHECK(fresh.get<cia402::Statusword>() != sw_mid);  // ladder advanced past SwitchedOn
 }
 
-// (5) resolve-throw on not-in-map -> PdoAccessError (a field-resolution miss is a
-// logic/config error, not a BusError/WKC fault, per DA's #32-#1 semantics), both directions.
-TEST("#30 P2a.5: get/put of an unmapped object throws PdoAccessError") {
+// (5) resolve-throw on NOT-IN-MAP -> PdoMappingError (a map concern; the confirmed throw-tier
+// split: not-mapped = PdoMappingError, wrong-access [width / past-frame] = PdoAccessError).
+TEST("#30 P2a.5: get/put of an unmapped object throws PdoMappingError") {
     Master m{make_config(), std::make_unique<SimBackend>(make_models())};
     m.init();
     m.configure();  // field tables are built here; OP not required for resolution
 
     const Rpdo r = m.read_rpdo(1);
-    CHECK_THROWS(r.get<cia402::FaultCode>(), ethercat::PdoAccessError);  // 0x603F not in this TxPDO
+    CHECK_THROWS(r.get<cia402::FaultCode>(), ethercat::PdoMappingError);  // 0x603F not in this TxPDO
 
     Tpdo t = m.make_tpdo(1);
-    CHECK_THROWS(t.put<cia402::ProfileVelocity>(std::uint32_t{5}), ethercat::PdoAccessError);  // 0x6081 not in this RxPDO
+    CHECK_THROWS(t.put<cia402::ProfileVelocity>(std::uint32_t{5}), ethercat::PdoMappingError);  // 0x6081 not in this RxPDO
 }
 
 // (6) an over-wide T on a mapped object -> PdoAccessError. (With the §5 width assert this trips

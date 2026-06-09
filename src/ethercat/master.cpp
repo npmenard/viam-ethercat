@@ -426,13 +426,17 @@ FieldLocation Master::resolve_field(const std::map<std::uint32_t, FieldLocation>
     const char* const which = is_tx ? "TxPDO (feedback)" : "RxPDO (command)";
     const auto it = table.find(field_key(index, sub));
     if (it == table.end()) {
-        throw PdoAccessError("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
-                             " is not in the " + which + " map");
+        // NOT-MAPPED is a MAP concern -> PdoMappingError (the throw-tier split confirmed at gate:
+        // not-mapped = PdoMappingError, wrong-access [width / past-frame] = PdoAccessError).
+        throw PdoMappingError("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
+                              " is not in the " + which + " map");
     }
-    // #30 §5 width assertion: the Field's T must match the mapped object's width. Catches a
-    // silent wrong-width read (e.g. an int16 alias against a 32-bit-mapped object would read 2
-    // of 4 bytes in-bounds, no throw). Verified here (configure-time for the RT cached offsets,
-    // per-call for the off-RT throwing get/put); the runtime FieldLocation stays offset-only.
+    // #30 §5 width assertion (PROVISIONAL, pending the user's call via team-lead -- built but
+    // trivially removable): the Field's T must match the mapped object's width. Catches a silent
+    // wrong-width access (e.g. an int16 alias against a 32-bit-mapped object would read 2 of 4
+    // bytes in-bounds, no throw). A WRONG-WIDTH access -> PdoAccessError (not a map concern: the
+    // object IS mapped; the access width is wrong). Checked against the retained byte_width here;
+    // when byte_width drops in P2c this switches to the entry's bit_length.
     if (it->second.byte_width != want_width) {
         throw PdoAccessError("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
                              " width mismatch -- the Field type is " + std::to_string(want_width) + " byte(s) but the object is mapped " +

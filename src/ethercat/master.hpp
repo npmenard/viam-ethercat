@@ -200,6 +200,16 @@ class Master {
     // hands it to TxStaging (transmitted next process()). An UNSUBMITTED Tpdo never touches
     // the bus (drop it = no-op). BENCH/direct-PDO path only (#30 §6: the servo module command
     // path stays CommandQueue+FSM). Throws ConfigError on an unknown slave.
+    //
+    // CONTRACT (it's a per-cycle transient, single-consumer; no runtime guard -- the doc IS it):
+    //  1. Do NOT MIX a direct outputs() write with a Tpdo/submit() on the SAME slave in the SAME
+    //     cycle. make_tpdo() snapshots the seed AT CALL TIME, and process() drains the staged
+    //     frame OVER the command image, so submit() wins at drain. The order bites:
+    //     make_tpdo -> direct outputs() write -> submit() silently overwrites the direct write
+    //     with the pre-write seed (make-EARLY is the trap; a direct write BEFORE make_tpdo is
+    //     captured into the seed and is fine). Pick one writer per slave per cycle.
+    //  2. Do NOT HOLD a Tpdo across cycles. The seed goes stale; a late submit() lands a stale
+    //     frame on the bus. Make -> put -> submit all in one cycle, then drop it.
     Tpdo make_tpdo(std::uint16_t slave);
 
     // Resolve a Field<> to its byte location in the slave's command (rx) / feedback (tx) image
@@ -327,6 +337,11 @@ class Rpdo {
 // carry over unchanged. put<F>() writes into the copy; submit() hands it to the
 // slave's TxStaging (the RT process() takes it and transmits next cycle). An
 // unsubmitted Tpdo never touches the bus -- dropping it is a no-op.
+//
+// PER-CYCLE TRANSIENT (see make_tpdo): do NOT hold it across cycles (the seed goes
+// stale -> a late submit() lands a stale frame), and do NOT mix it with a direct
+// outputs() write on the same slave in the same cycle (submit() wins at drain, and
+// make_tpdo's seed is snapshotted at call time). Make -> put -> submit -> drop.
 class Tpdo {
    public:
     // Resolve F's index:sub in the slave's RxPDO (command) field table and write
