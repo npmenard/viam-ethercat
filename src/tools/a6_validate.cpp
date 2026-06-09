@@ -69,9 +69,13 @@ constexpr std::uint16_t kFaultCode = 0x603F;
 
 constexpr double kCountsPerRev = 131072.0;  // A6 single-turn encoder = 2^17
 
-// Little-endian object values for an SDO write.
-std::vector<std::byte> le16(std::uint16_t v) {
-    return {static_cast<std::byte>(v & 0xFFU), static_cast<std::byte>((v >> 8U) & 0xFFU)};
+// Little-endian SDO-value bytes via the shared store_le (no hand-rolled packing -- #32 note 1
+// retired the duplicate le16 helper). For the one config-time SDO value (fault-reset 0x2031:01).
+template <PdoScalar T>
+std::vector<std::byte> sdo_value(T v) {
+    std::vector<std::byte> b(sizeof(T));
+    store_le<T>(b, v);
+    return b;
 }
 
 std::atomic<bool> g_stop{false};
@@ -106,7 +110,7 @@ MasterConfig build_a6_config(const std::string& ifname, std::int32_t dc_sync0_sh
     // single port owner). Width per the A6 OD (U16 assumed); a wrong width just logs a
     // length abort (best-effort) -- adjust if first light shows one.
     if (reset_fault) {
-        a6.fault_reset = SdoWrite{0x2031, 0x01, le16(1)};
+        a6.fault_reset = SdoWrite{0x2031, 0x01, sdo_value<std::uint16_t>(1)};
     }
     // #20: we DELIBERATELY do NOT write 0x1C32:01 (SM sync-type). v2's config_map_group
     // lets the A6 self-select DC SYNC0; forcing it was the self-inflicted AL 0x0030
@@ -136,27 +140,13 @@ MasterConfig build_a6_config(const std::string& ifname, std::int32_t dc_sync0_sh
     return cfg;
 }
 
-// Read a scalar out of a slave's feedback image using the flat field table.
-template <PdoScalar T>
-T read_tx(const Master& m, std::uint16_t slave, std::span<const std::byte> img, std::uint16_t index, std::uint8_t sub = 0) {
-    const FieldLocation loc = m.tx_field(slave, index, sub);
-    return load_le<T>(img.subspan(loc.byte_offset, loc.byte_width));
-}
-
-// Write a scalar into a slave's command image using the flat field table.
-template <PdoScalar T>
-void write_rx(const Master& m, std::uint16_t slave, std::span<std::byte> img, std::uint16_t index, T value, std::uint8_t sub = 0) {
-    const FieldLocation loc = m.rx_field(slave, index, sub);
-    store_le<T>(img.subspan(loc.byte_offset, loc.byte_width), value);
-}
-
-// Read a scalar back out of a slave's COMMAND image (RxPDO) for logging -- shows what
-// the master is actually sending the drive this cycle, decoded from the live image.
-template <PdoScalar T>
-T read_rx(const Master& m, std::uint16_t slave, std::span<const std::byte> img, std::uint16_t index, std::uint8_t sub = 0) {
-    const FieldLocation loc = m.rx_field(slave, index, sub);
-    return load_le<T>(img.subspan(loc.byte_offset, loc.byte_width));
-}
+// PDO access (#30 P2b): reads via Master::read_rpdo()->get<cia402::Field>() (a frame-consistent
+// feedback snapshot), writes via Master::make_tpdo()->put<cia402::Field>()+submit() (a seeded
+// command builder). The ad-hoc le16/read_tx/write_rx/read_rx helpers are retired -- the typed
+// API resolves offsets + widths internally from the cia402:: Field aliases. Phase-1 bring-up is
+// the one exception: bringup_step() does exchange() but does NOT publish the seqlock snapshot
+// (only process() does), so read_rpdo would be STALE there -- Phase 1 reads the LIVE feedback
+// image with the noexcept load_le(image, loc) + a one-time resolve_tx<F> instead.
 
 // Lock memory + go SCHED_FIFO so the cyclic loop's jitter stays inside the DC
 // SYNC0 window. WITHOUT this, best-effort scheduling jitter makes the A6 miss the
@@ -202,7 +192,7 @@ struct Options {
     bool move_pp = false;
     bool move_sine = false;  // --move-sine: CSP streamed soft-started sine (energized)
     bool csp_probe = false;  // --csp-probe: bring up in CSP mode (0x6060=8) but DO NOT enable --
-                             // just read+print feedback. Diagnostic: confirms whether read_tx
+                             // just read+print feedback. Diagnostic: confirms whether the read path
                              // returns valid sw/pos in CSP without energizing (CSP-feedback vs
                              // wedge isolation). Non-energizing; safe.
     bool reset_fault = false;
@@ -264,7 +254,7 @@ int main(int argc, char** argv) {
                       << "               abort+disable if |commanded-actual| exceeds it. Mutually exclusive with --move-pp.\n"
                       << "  --move-pp REVS [RPM]: *** MOTION (needs --enable) *** PP-mode relative move via the bit4 handshake.\n"
                       << "  --csp-probe: NON-energizing diagnostic -- bring up in CSP mode (0x6060=8), hold at\n"
-                      << "               ReadyToSwitchOn (NO enable), print feedback. Confirms whether read_tx returns\n"
+                      << "               ReadyToSwitchOn (NO enable), print feedback. Confirms whether the read path returns\n"
                       << "               valid sw/pos in CSP without energizing (isolates CSP-feedback vs a wedged drive).\n"
                       << "  --dc-shift-ns: SYNC0 pulse CyclShift (ecx_dcsync0) -- sweep to move the SYNC0 edge if needed.\n"
                       << "  --reset-fault: clear a latent drive fault at bring-up via the A6 vendor SDO 0x2031:01=1.\n";
@@ -397,10 +387,12 @@ int main(int argc, char** argv) {
         std::uint64_t btick = 0;
         while (!g_stop.load()) {
             sleep_until(next, static_cast<long>(period_ns) + dc_off);
+            // Phase 1 reads the LIVE feedback image: bringup_step() does exchange() but does NOT
+            // publish the seqlock snapshot (only process() does), so read_rpdo would be stale here.
             const std::span<const std::byte> in = master.input_image(slave);
             std::uint16_t fc = 0;
             try {
-                fc = read_tx<std::uint16_t>(master, slave, in, kFaultCode);
+                fc = load_le<cia402::FaultCode::type>(in, master.resolve_tx<cia402::FaultCode>(slave));
             } catch (const Error&) {  // 0x603F not mapped -> treat as no sync fault
             }
             const BringupStatus bs = master.bringup_step(fc == 0x8700);
@@ -460,10 +452,13 @@ int main(int argc, char** argv) {
         const std::int64_t dct = master.dc_time();
         dc_off = dc_phase_correction(dct, static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
 
-        const std::span<const std::byte> in = master.input_image(slave);
-        const Status status{read_tx<std::uint16_t>(master, slave, in, kStatusword)};
-        const std::int32_t pos = read_tx<std::int32_t>(master, slave, in, kPositionActual);
-        const std::int32_t vel = read_tx<std::int32_t>(master, slave, in, kVelocityActual);
+        // ONE frame-consistent feedback snapshot per cycle (process() published it above); every
+        // get<> below reads the same frame. Typed cia402:: aliases resolve offset + width.
+        const Rpdo rpdo = master.read_rpdo(slave);
+        const Status status{rpdo.get<cia402::Statusword>()};
+        const std::int32_t pos = rpdo.get<cia402::PositionActual>();
+        const std::int32_t vel = rpdo.get<cia402::VelocityActual>();
+        const std::uint16_t fc = rpdo.get<cia402::FaultCode>();  // once: fault-edge + safety net + log
 
         if (!hold_captured) {
             hold_pos = pos;
@@ -473,8 +468,7 @@ int main(int argc, char** argv) {
 
         const bool faulted = status.decode() == Cia402State::Fault;
         if (faulted && !was_faulted) {
-            const auto fault_code = read_tx<std::uint16_t>(master, slave, in, kFaultCode);
-            std::cout << "[B] !!! DRIVE FAULT t=" << tick / kLoopHz << "s: 0x603F=0x" << std::hex << fault_code << " sw=0x" << status.raw
+            std::cout << "[B] !!! DRIVE FAULT t=" << tick / kLoopHz << "s: 0x603F=0x" << std::hex << fc << " sw=0x" << status.raw
                       << std::dec << " dcPhase=" << (dct % static_cast<std::int64_t>(period_ns)) << "ns\n";
         } else if (!faulted && was_faulted) {
             std::cout << "[B] *** FAULT CLEARED *** -> " << to_string(status.decode()) << '\n';
@@ -489,16 +483,15 @@ int main(int argc, char** argv) {
         // guard for the first energized run. (The enable-ladder fault path above still
         // clears a PRE-enable latent fault; this only arms after OperationEnabled.)
         if (opt.move_sine && announced_op) {
-            const auto fc_now = read_tx<std::uint16_t>(master, slave, in, kFaultCode);
             // Tool-level following-error abort (architect-required): how far actual lags the
             // last commanded target. This is the EARLY net -- the drive's own bit13 fires
             // only at 0x6065 (~24 revs on the A6), a full runaway; a moderate deviation
             // (can't track / mechanical bind / tuning surprise) trips this ~5000-count
             // (~0.04 rev) limit first. Skip the seed cycle (no commanded target streamed yet).
             const std::int32_t follow_err = (tick > enable_tick) ? (last_sine_target - pos) : 0;
-            if (status.fault() || status.following_error() || fc_now != 0 || std::abs(follow_err) > opt.follow_err_limit) {
+            if (status.fault() || status.following_error() || fc != 0 || std::abs(follow_err) > opt.follow_err_limit) {
                 std::cerr << "[B] !!! CSP SAFETY ABORT: fault(bit3)=" << status.fault()
-                          << " followingError(bit13)=" << status.following_error() << " 0x603F=0x" << std::hex << fc_now << std::dec
+                          << " followingError(bit13)=" << status.following_error() << " 0x603F=0x" << std::hex << fc << std::dec
                           << " follow_err=" << follow_err << " (limit " << opt.follow_err_limit
                           << ") -- stopping the sine + disabling immediately.\n";
                 safety_abort = true;
@@ -506,7 +499,11 @@ int main(int argc, char** argv) {
             }
         }
 
-        const std::span<std::byte> out = master.outputs(slave);
+        // Seeded command builder: a COPY of the live command image, so fields we don't put()
+        // carry over. We put TargetPosition / ProfileVelocity in the branches and ControlWord
+        // once at the end, then submit() -> process() transmits it next cycle. Per-cycle
+        // transient (make -> put -> submit -> drop); never mixed with a direct outputs() write.
+        Tpdo tpdo = master.make_tpdo(slave);
         std::uint16_t cw = fsm.step(status, goal);
         if (faulted) {
             // Generic CiA402 bit7 fault-reset edge (the A6's real reset is the vendor
@@ -528,15 +525,15 @@ int main(int argc, char** argv) {
                 const double t = static_cast<double>(tick - enable_tick) / static_cast<double>(kLoopHz);
                 target = ethercat::tools::csp_target_counts(true, pos, pos_enable, opt.sine_amplitude, opt.sine_period, t);
                 last_sine_target = target;
-                write_rx<std::int32_t>(master, slave, out, kTargetPosition, target);
+                tpdo.put<cia402::TargetPosition>(target);
                 cw = ControlWord::enable_operation();  // 0x0F
             } else {
                 // --move-pp (bit4 handshake) or plain hold at the enable position.
                 if (opt.move_pp && !move_done) {
                     target = hold_pos + static_cast<std::int32_t>(opt.move_revs * kCountsPerRev);
                 }
-                write_rx<std::int32_t>(master, slave, out, kTargetPosition, target);
-                write_rx<std::uint32_t>(master, slave, out, kProfileVelocity, profile_vel);
+                tpdo.put<cia402::TargetPosition>(target);
+                tpdo.put<cia402::ProfileVelocity>(profile_vel);
                 std::uint16_t base = ControlWord::enable_operation();  // 0x0F
                 if (opt.move_pp && !move_done) {
                     // bit4 handshake: assert new-setpoint, hold until the drive acks (bit12),
@@ -567,25 +564,24 @@ int main(int argc, char** argv) {
             // and the drive slews from the absolute-encoder position toward 0 on enable.
             target = ethercat::tools::csp_target_counts(false, pos, pos_enable, opt.sine_amplitude, opt.sine_period, 0.0);
             last_sine_target = target;  // keep coherent for the graceful-hold + follow-err seed
-            write_rx<std::int32_t>(master, slave, out, kTargetPosition, target);
+            tpdo.put<cia402::TargetPosition>(target);
             // cw left as fsm.step()'s ladder climb (06/07/0F as appropriate).
         } else if (!opt.enable) {
             cw = ControlWord::shutdown();  // 0x06 -> ReadyToSwitchOn, NOT energized
         }
-        write_rx<std::uint16_t>(master, slave, out, kControlword, cw);
+        tpdo.put<cia402::ControlWord>(cw);
+        tpdo.submit();
         last_cw = cw;
 
         if (tick % 200 == 0) {  // ~5 Hz decoded-PDO print
-            const std::span<const std::byte> outimg = master.outputs(slave);
-            const auto rx_cw = read_rx<std::uint16_t>(master, slave, outimg, kControlword);
-            const auto rx_tpos = read_rx<std::int32_t>(master, slave, outimg, kTargetPosition);
-            const auto fc = read_tx<std::uint16_t>(master, slave, in, kFaultCode);
-            const auto mode_now = read_tx<std::int8_t>(master, slave, in, kModeDisplay);
+            // Command side = the locals we just put()/submit()ed this cycle (cw, target);
+            // feedback side = the per-cycle rpdo snapshot (fc read at top, mode read here).
+            const auto mode_now = rpdo.get<cia402::ModeDisplay>();
             // CSP tracking: commanded target (0x607A) vs actual (0x6064) + following error.
-            const std::int32_t follow_err = rx_tpos - pos;
+            const std::int32_t follow_err = target - pos;
             std::cout << "    t=" << tick / kLoopHz << "s " << to_string(status.decode()) << " sw=0x" << std::hex << status.raw
-                      << " 0x603F=0x" << fc << std::dec << " mode=" << static_cast<int>(mode_now) << " Rx.cw=0x" << std::hex << rx_cw
-                      << std::dec << " cmdTarget=" << rx_tpos << " pos=" << pos << " followErr=" << follow_err << " vel=" << vel
+                      << " 0x603F=0x" << fc << std::dec << " mode=" << static_cast<int>(mode_now) << " Rx.cw=0x" << std::hex << cw
+                      << std::dec << " cmdTarget=" << target << " pos=" << pos << " followErr=" << follow_err << " vel=" << vel
                       << " wkc=" << raw_wkc << "/" << master.expected_wkc() << " badWKC=" << wkc_bad
                       << " dcPhase=" << (dct % static_cast<std::int64_t>(period_ns)) << "ns" << (master.fault() ? " [BUS FAULT]" : "")
                       << '\n';
@@ -614,14 +610,18 @@ int main(int argc, char** argv) {
             sleep_until(next, static_cast<long>(period_ns) + dc_off);
             master.process();
             dc_off = dc_phase_correction(master.dc_time(), static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
-            write_rx<std::int32_t>(master, slave, master.outputs(slave), kTargetPosition, last_sine_target);
-            write_rx<std::uint16_t>(master, slave, master.outputs(slave), kControlword, ControlWord::enable_operation());
+            Tpdo tpdo = master.make_tpdo(slave);
+            tpdo.put<cia402::TargetPosition>(last_sine_target);
+            tpdo.put<cia402::ControlWord>(ControlWord::enable_operation());
+            tpdo.submit();
         }
     }
     std::cout << "\n[B] disabling drive (controlword -> 0x00) and closing...\n";
     for (int i = 0; i < 50; ++i) {
         master.process();
-        write_rx<std::uint16_t>(master, slave, master.outputs(slave), kControlword, ControlWord::disable_voltage());
+        Tpdo tpdo = master.make_tpdo(slave);
+        tpdo.put<cia402::ControlWord>(ControlWord::disable_voltage());
+        tpdo.submit();
         sleep_until(next, static_cast<long>(period_ns));
     }
     master.close();
