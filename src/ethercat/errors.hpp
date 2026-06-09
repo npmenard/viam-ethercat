@@ -56,8 +56,12 @@ class SdoError : public Error {
     explicit SdoError(const std::string& what) : Error(what) {}
 };
 
-// An attempt to read/write past the end of a PDO buffer (cursor overrun, short
-// frame). Thrown by PdoReader/PdoWriter; message names the offset and size.
+// An invalid PDO field access: the object isn't in the slave's PDO map, the
+// Field's typed width disagrees with the mapping, or the access runs past the
+// buffer (cursor overrun / short frame). Thrown by PdoReader/PdoWriter and the
+// Rpdo/Tpdo resolve path; the message names the cause + offset/size. (Distinct
+// from PdoMappingError, which is RESERVED for the configure-time apply_pdo_map
+// sub-protocol -- this is the RUNTIME access tier.)
 class PdoAccessError : public Error {
    public:
     explicit PdoAccessError(const std::string& what) : Error(what) {}
