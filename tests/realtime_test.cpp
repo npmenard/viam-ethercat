@@ -102,6 +102,34 @@ TEST("DcPacer::step never moves the deadline backwards (high-rate underflow guar
     }
 }
 
+// The PRODUCTION pace() re-reads the clock each catch-up iteration; exercise that exact
+// multi-read path by injecting an ADVANCING clock into advance_to_deadline (the same core
+// pace() runs with monotonic_ns). As the clock climbs past further grid points mid-loop,
+// the deadline keeps skipping WHOLE periods until it leads the latest reading -- a single
+// FIXED snapshot would have stopped earlier, so reaching 5'001'000 proves the re-read
+// tracks a moving clock (and stays phase-preserved). Closes the step()-fixed-now vs
+// pace()-re-read coverage nuance without changing the production form.
+TEST("DcPacer::advance_to_deadline re-read catch-up tracks an ADVANCING clock") {
+    realtime::DcPacer pacer(kPeriod, kShift);
+    constexpr std::uint64_t base = 1000;
+    pacer.reset(base);
+    // advance(0) -> next_ = base + period = 1'001'000. Readings climb ~1 period each, so the
+    // re-read keeps finding next_ behind: skips to 2'001'000, 3'001'000, 4'001'000, 5'001'000,
+    // then 4'500'000 < 5'001'000 stops. A FIXED now=1'500'000 would have stopped at 2'001'000.
+    const std::uint64_t clk_seq[] = {1'500'000, 2'500'000, 3'500'000, 4'500'000, 4'500'000, 4'500'000};
+    std::size_t i = 0;
+    auto now = [&]() noexcept {
+        const std::uint64_t v = clk_seq[i];
+        if (i + 1 < (sizeof(clk_seq) / sizeof(clk_seq[0]))) {
+            ++i;
+        }
+        return v;
+    };
+    const std::uint64_t dl = pacer.advance_to_deadline(/*dc_time=*/0, now);
+    CHECK_EQ(dl, std::uint64_t{5'001'000});  // re-read tracked the advancing clock (4 skips)
+    CHECK((dl - base) % kPeriod == 0);       // phase preserved on the base grid
+}
+
 // setup()/lock_current() must be callable + noexcept offline. SCHED_FIFO needs
 // CAP_SYS_NICE (returns false without it; may succeed under sudo) -- we don't assert
 // the value, only that it doesn't throw/crash. setup() runs in a short-lived thread so

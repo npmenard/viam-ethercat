@@ -16,6 +16,7 @@
 // loop). DcPacer::pace() and step() are noexcept and allocation-free -- safe on
 // the cyclic path. run_to_operational() is the bring-up pump (pre-steady-state).
 
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -80,8 +81,15 @@ class DcPacer {
     // period_ns: the cyclic period; shift_ns: the SYNC0 phase target (dc_sync.hpp,
     // typically period/2). The first deadline is armed at construction (now +
     // period); call reset() to re-arm against a chosen base.
+    // PRECONDITION: period_ns > 0 (asserted). For BYTE-IDENTICAL steady-state pacing the
+    // period must ALSO exceed dc_phase_correction's max_correction (+/-50us, dc_sync.hpp):
+    // when period > clamp, `period + corr` is always > 0, so every cycle advances by
+    // exactly period + corr. At sub-50us periods the advance() underflow clamp keeps the
+    // deadline monotonic (never backwards) but steady-state is no longer bit-identical.
     DcPacer(std::uint64_t period_ns, std::int64_t shift_ns) noexcept
-        : period_ns_(period_ns), shift_ns_(shift_ns), next_(monotonic_ns() + period_ns) {}
+        : period_ns_(period_ns), shift_ns_(shift_ns), next_(monotonic_ns() + period_ns) {
+        assert(period_ns_ > 0 && "DcPacer: period_ns must be positive");
+    }
 
     // Re-arm the absolute deadline to `first_deadline_ns` and zero the integral.
     // (Production: align to a known epoch; tests: set a deterministic base.)
@@ -108,28 +116,37 @@ class DcPacer {
         next_ += static_cast<std::uint64_t>(delta);
     }
 
-    // Deterministic, sleep-FREE testable core: advance one phase-corrected period, then
-    // phase-preservingly skip WHOLE missed periods past the INJECTED `now_ns` (never
-    // rebase) so a transient overrun realigns to the SYNC0 grid instead of firing an
-    // off-phase LRW burst. Mutates the integral + deadline; returns the new deadline.
-    // (pace() is the production form; this exposes the same math with an injected clock.)
-    std::uint64_t step(std::int64_t dc_time_ns, std::uint64_t now_ns) noexcept {
+    // Advance one phase-corrected period, then phase-preservingly skip WHOLE missed
+    // periods while the deadline is behind the clock -- calling now() EACH iteration
+    // (never rebase) so a transient overrun realigns to the SYNC0 grid instead of firing
+    // an off-phase LRW burst. Templated on the clock: production (pace) injects
+    // monotonic_ns so it RE-READS the clock per iteration -- byte-equivalent to the
+    // ServoController RT loop's `for (now=monotonic_ns(); next<=now; now=monotonic_ns())`
+    // -- AND a test can inject an ADVANCING clock to exercise that exact multi-read path.
+    // noexcept + alloc-free (the callable inlines; NOT std::function). No sleep; returns
+    // the new absolute deadline. Mutates the integral + deadline.
+    template <class NowFn>
+    std::uint64_t advance_to_deadline(std::int64_t dc_time_ns, NowFn now) noexcept {
         advance(dc_time_ns);
-        while (next_ <= now_ns) {
+        for (std::uint64_t t = now(); next_ <= t; t = now()) {
             next_ += period_ns_;
         }
         return next_;
     }
 
-    // One cyclic iteration (production): advance one phase-corrected period, then the
-    // skip-catch-up RE-READING the clock each iteration -- byte-equivalent to the
-    // ServoController RT loop's `for (now=monotonic_ns(); next<=now; now=monotonic_ns())`
-    // -- then sleep (CLOCK_MONOTONIC, TIMER_ABSTIME) to the absolute deadline.
+    // Deterministic, sleep-FREE skip-arithmetic unit form: advance_to_deadline with a
+    // FIXED injected clock (the catch-up sees one constant `now_ns`). The unit tests use
+    // this for the phase/correction/integral math; the ADVANCING-clock re-read path
+    // (what production pace() runs) is covered by a separate test via advance_to_deadline.
+    std::uint64_t step(std::int64_t dc_time_ns, std::uint64_t now_ns) noexcept {
+        return advance_to_deadline(dc_time_ns, [now_ns]() noexcept { return now_ns; });
+    }
+
+    // One cyclic iteration (production): advance + skip-catch-up RE-READING monotonic_ns()
+    // each iteration (byte-equivalent to the ServoController RT loop), then sleep
+    // (CLOCK_MONOTONIC, TIMER_ABSTIME) to the absolute deadline.
     void pace(std::int64_t dc_time_ns) noexcept {
-        advance(dc_time_ns);
-        for (std::uint64_t now = monotonic_ns(); next_ <= now; now = monotonic_ns()) {
-            next_ += period_ns_;
-        }
+        (void)advance_to_deadline(dc_time_ns, []() noexcept { return monotonic_ns(); });
         timespec ts{};
         ts.tv_sec = static_cast<std::time_t>(next_ / kNsPerSec);
         ts.tv_nsec = static_cast<long>(next_ % kNsPerSec);
