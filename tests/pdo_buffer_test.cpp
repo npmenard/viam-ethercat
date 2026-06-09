@@ -117,7 +117,18 @@ TEST("reading past the end throws PdoAccessError and leaves the cursor put") {
 TEST("writing past the end throws PdoAccessError") {
     Buf<2> buf{};
     PdoWriter w{buf};
+    // The 4-byte write into a 2-byte buffer is a DELIBERATE overflow that exercises the
+    // runtime bounds guard (it throws BEFORE any store). GCC-14's -Warray-bounds static
+    // analysis false-positives on the un-taken OOB store path inside the inlined write();
+    // suppress locally so the deliberate test compiles under -Werror. (clang does not warn.)
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#endif
     CHECK_THROWS(w.write<std::uint32_t>(0), PdoAccessError);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     w.write<std::uint16_t>(0xFFFF);
     CHECK_THROWS(w.write<std::uint8_t>(0), PdoAccessError);  // full
 }
