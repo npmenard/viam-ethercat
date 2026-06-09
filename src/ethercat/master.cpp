@@ -417,6 +417,30 @@ FieldLocation Master::tx_field(std::uint16_t slave, std::uint16_t index, std::ui
     return it->second;
 }
 
+FieldLocation Master::resolve_field(const std::map<std::uint32_t, FieldLocation>& table,
+                                    std::uint16_t index,
+                                    std::uint8_t sub,
+                                    std::size_t want_width,
+                                    std::uint16_t slave,
+                                    bool is_tx) const {
+    const char* const which = is_tx ? "TxPDO (feedback)" : "RxPDO (command)";
+    const auto it = table.find(field_key(index, sub));
+    if (it == table.end()) {
+        throw PdoAccessError("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
+                             " is not in the " + which + " map");
+    }
+    // #30 §5 width assertion: the Field's T must match the mapped object's width. Catches a
+    // silent wrong-width read (e.g. an int16 alias against a 32-bit-mapped object would read 2
+    // of 4 bytes in-bounds, no throw). Verified here (configure-time for the RT cached offsets,
+    // per-call for the off-RT throwing get/put); the runtime FieldLocation stays offset-only.
+    if (it->second.byte_width != want_width) {
+        throw PdoAccessError("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
+                             " width mismatch -- the Field type is " + std::to_string(want_width) + " byte(s) but the object is mapped " +
+                             std::to_string(it->second.byte_width) + " byte(s)");
+    }
+    return it->second;
+}
+
 Rpdo Master::read_rpdo(std::uint16_t slave) const {
     (void)runtime_for(slave);                      // validate the slave id (throws ConfigError, clear text)
     return Rpdo(read_inputs(slave), this, slave);  // ONE seqlock read, copied into the frame-consistent snapshot

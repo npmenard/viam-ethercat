@@ -42,6 +42,21 @@ struct FieldLocation {
     std::size_t byte_width = 0;
 };
 
+// RT cached-offset accessors (#30 §4): read/write sizeof(T) little-endian at a resolved
+// FieldLocation on a live process image. noexcept + NO bounds-check -- PRECONDITION: `loc`
+// came from Master::resolve_rx/resolve_tx<F>() (width-checked + in-image) at configure, so
+// offset + sizeof(T) is valid. This is the RT hot-path form (cached loc + these free fns);
+// the THROWING resolve/bounds surface lives ONLY on Rpdo/Tpdo (the copy types), so the 1 kHz
+// path physically can't throw/resolve/alloc. (Overloads the span forms in pdo_buffer.hpp.)
+template <PdoScalar T>
+T load_le(std::span<const std::byte> image, FieldLocation loc) noexcept {
+    return load_le<T>(image.subspan(loc.byte_offset, sizeof(T)));
+}
+template <PdoScalar T>
+void store_le(std::span<std::byte> image, FieldLocation loc, T value) noexcept {
+    store_le<T>(image.subspan(loc.byte_offset, sizeof(T)), value);
+}
+
 // PDO access types (#30), defined in full after Master (they hold a Master* and
 // call its resolve/cache surface). read_rpdo()/make_tpdo() return them.
 class Rpdo;
@@ -187,6 +202,22 @@ class Master {
     // path stays CommandQueue+FSM). Throws ConfigError on an unknown slave.
     Tpdo make_tpdo(std::uint16_t slave);
 
+    // Resolve a Field<> to its byte location in the slave's command (rx) / feedback (tx) image
+    // (#30 §5). Templated so it knows sizeof(F::type): asserts the Field's width matches the
+    // mapped object -- throws PdoAccessError (clear text) if the object isn't mapped OR if
+    // sizeof(F::type)*8 != the mapped object's bit_length (catches a silent wrong-width read,
+    // e.g. an int16 alias on a 32-bit-mapped object). This is the resolution used by Rpdo/Tpdo
+    // per-call AND the one the RT path calls ONCE at configure to cache a FieldLocation (then
+    // the noexcept load_le/store_le(image, loc) free fns run per cycle -- no per-cycle resolve).
+    template <class F>
+    FieldLocation resolve_rx(std::uint16_t slave) const {
+        return resolve_field(runtime_for(slave).rx_fields, F::index, F::sub, sizeof(typename F::type), slave, /*is_tx=*/false);
+    }
+    template <class F>
+    FieldLocation resolve_tx(std::uint16_t slave) const {
+        return resolve_field(runtime_for(slave).tx_fields, F::index, F::sub, sizeof(typename F::type), slave, /*is_tx=*/true);
+    }
+
     // NOTE: there is intentionally NO public typed CoE SDO accessor on Master. CoE object
     // access is the LIBRARY's responsibility -- Master::configure() does the PDO-remap /
     // 0x6060 / fault-reset writes internally via the backend, and identity is read through
@@ -211,6 +242,16 @@ class Master {
     const SlaveRuntime& runtime_for(std::uint16_t slave) const;
 
     static std::map<std::uint32_t, FieldLocation> build_field_table(std::uint16_t slave, const PdoMap& map);
+
+    // Shared resolution body for resolve_rx/resolve_tx (#30 §5): look the object up in `table`,
+    // throw PdoAccessError (clear text) if it isn't mapped or its mapped width != want_width
+    // (the templated callers pass sizeof(F::type) so the width-vs-T check happens at resolve).
+    FieldLocation resolve_field(const std::map<std::uint32_t, FieldLocation>& table,
+                                std::uint16_t index,
+                                std::uint8_t sub,
+                                std::size_t want_width,
+                                std::uint16_t slave,
+                                bool is_tx) const;
 
     // Internal phases of the bring-up state machine (bringup_step). SYNC0 is armed in
     // configure() (PRE-OP, per ec_sample). SETTLE pumps phase-locked PD a bounded settle
@@ -255,7 +296,8 @@ class Rpdo {
     // width comes from F::type -- per-field width-vs-T is the caller's contract (§1).
     template <class F>
     typename F::type get() const {
-        const FieldLocation loc = master_->tx_field(slave_, F::index, F::sub);  // throws if not mapped
+        // resolve_tx throws PdoAccessError on not-in-map OR width-mismatch (#30 §5).
+        const FieldLocation loc = master_->template resolve_tx<F>(slave_);
         if (loc.byte_offset + sizeof(typename F::type) > snap_.size) {
             throw PdoAccessError("Rpdo::get object " + std::to_string(F::index) + ":" + std::to_string(F::sub) + " reads " +
                                  std::to_string(sizeof(typename F::type)) + " byte(s) at offset " + std::to_string(loc.byte_offset) +
@@ -289,10 +331,11 @@ class Tpdo {
    public:
     // Resolve F's index:sub in the slave's RxPDO (command) field table and write
     // sizeof(F::type) little-endian at that offset into the staged copy. Throws
-    // PdoMappingError if not mapped / PdoAccessError if past the frame.
+    // PdoAccessError if not mapped / width-mismatch / past the frame.
     template <class F>
     void put(typename F::type v) {
-        const FieldLocation loc = master_->rx_field(slave_, F::index, F::sub);  // throws if not mapped
+        // resolve_rx throws PdoAccessError on not-in-map OR width-mismatch (#30 §5).
+        const FieldLocation loc = master_->template resolve_rx<F>(slave_);
         if (loc.byte_offset + sizeof(typename F::type) > size_) {
             throw PdoAccessError("Tpdo::put object " + std::to_string(F::index) + ":" + std::to_string(F::sub) + " writes " +
                                  std::to_string(sizeof(typename F::type)) + " byte(s) at offset " + std::to_string(loc.byte_offset) +

@@ -203,29 +203,30 @@ TEST("#30 P2a.1: an Rpdo is a frozen, frame-consistent snapshot") {
     CHECK(fresh.get<cia402::Statusword>() != sw_mid);  // ladder advanced past SwitchedOn
 }
 
-// (5) resolve-throw on not-in-map (clear-text PdoMappingError), both directions.
-TEST("#30 P2a.5: get/put of an unmapped object throws PdoMappingError") {
+// (5) resolve-throw on not-in-map -> PdoAccessError (a field-resolution miss is a
+// logic/config error, not a BusError/WKC fault, per DA's #32-#1 semantics), both directions.
+TEST("#30 P2a.5: get/put of an unmapped object throws PdoAccessError") {
     Master m{make_config(), std::make_unique<SimBackend>(make_models())};
     m.init();
     m.configure();  // field tables are built here; OP not required for resolution
 
     const Rpdo r = m.read_rpdo(1);
-    CHECK_THROWS(r.get<cia402::FaultCode>(), ethercat::PdoMappingError);  // 0x603F not in this TxPDO
+    CHECK_THROWS(r.get<cia402::FaultCode>(), ethercat::PdoAccessError);  // 0x603F not in this TxPDO
 
     Tpdo t = m.make_tpdo(1);
-    CHECK_THROWS(t.put<cia402::ProfileVelocity>(std::uint32_t{5}), ethercat::PdoMappingError);  // 0x6081 not in this RxPDO
+    CHECK_THROWS(t.put<cia402::ProfileVelocity>(std::uint32_t{5}), ethercat::PdoAccessError);  // 0x6081 not in this RxPDO
 }
 
-// (6) bounds-throw when offset + sizeof(T) runs past the frame (a deliberately
-// oversized T on a mapped object) -> PdoAccessError, clear text.
-TEST("#30 P2a.6: a read/write past the frame end throws PdoAccessError") {
+// (6) an over-wide T on a mapped object -> PdoAccessError. (With the §5 width assert this trips
+// at RESOLVE -- sizeof(T) != the mapped width -- before any read; the in-Rpdo/Tpdo offset+sizeof
+// bounds check is the defense-in-depth fallback if the provisional width assert is ever pulled.)
+TEST("#30 P2a.6: an over-wide Field on a mapped object throws PdoAccessError") {
     Master m{make_config(), std::make_unique<SimBackend>(make_models())};
     m.init();
     m.configure();
 
-    // Oversized-T fields on mapped objects (aliased: the CHECK_THROWS macro can't take the
-    // commas inside Field<...>). 0x6064 (actual) is at TxPDO offset 2 / 0x607A (target) at RxPDO
-    // offset 2, both in a 6-byte frame; an int64 read/write there spans [2,10) -- past the frame.
+    // Aliased (the CHECK_THROWS macro can't take the commas inside Field<...>). 0x6064/0x607A are
+    // 32-bit-mapped at offset 2 in a 6-byte frame; an int64 (8 B) is both wrong-width AND [2,10) past it.
     using ActualAsI64 = Field<0x6064, 0, std::int64_t>;
     using TargetAsI64 = Field<0x607A, 0, std::int64_t>;
 
@@ -234,6 +235,26 @@ TEST("#30 P2a.6: a read/write past the frame end throws PdoAccessError") {
 
     Tpdo t = m.make_tpdo(1);
     CHECK_THROWS(t.put<TargetAsI64>(std::int64_t{0}), ethercat::PdoAccessError);
+}
+
+// (8) width-mismatch resolve-throw (#30 §5): an UNDER-wide alias on a mapped object -- in
+// bounds, but the wrong number of bytes -- throws clear-text at RESOLVE, instead of silently
+// reading/writing 1 of 2 (or 2 of 4) bytes. This is the silent-wrong-read gap the width assert closes.
+TEST("#30 P2a.8: an under-wide Field on a mapped object throws PdoAccessError at resolve") {
+    Master m{make_config(), std::make_unique<SimBackend>(make_models())};
+    m.init();
+    m.configure();
+
+    // statusword (0x6041) and controlword (0x6040) are 16-bit mapped; a uint8 alias is 1 of 2 bytes
+    // -- IN bounds (offset 0, frame >= 1) but the wrong width, so it must throw at resolve, not read silently.
+    using StatusAsU8 = Field<0x6041, 0, std::uint8_t>;
+    using CtrlAsU8 = Field<0x6040, 0, std::uint8_t>;
+
+    const Rpdo r = m.read_rpdo(1);
+    CHECK_THROWS(r.get<StatusAsU8>(), ethercat::PdoAccessError);
+
+    Tpdo t = m.make_tpdo(1);
+    CHECK_THROWS(t.put<CtrlAsU8>(std::uint8_t{1}), ethercat::PdoAccessError);
 }
 
 TEST_MAIN()
