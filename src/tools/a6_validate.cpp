@@ -19,24 +19,16 @@
 // the real driver is the Viam module.
 
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
-#include <ctime>
 #include <iostream>
 #include <memory>
 #include <span>
 #include <string>
 #include <vector>
-
-#include <malloc.h>
-#include <pthread.h>
-#include <sched.h>
-#include <sys/mman.h>
 
 #include "ethercat/cia402.hpp"
 #include "ethercat/dc_sync.hpp"
@@ -44,6 +36,7 @@
 #include "ethercat/master.hpp"
 #include "ethercat/pdo_buffer.hpp"
 #include "ethercat/pdo_mapping.hpp"
+#include "ethercat/realtime.hpp"
 #include "ethercat/soem_backend.hpp"
 #include "tools/sine_move.hpp"
 
@@ -148,43 +141,10 @@ MasterConfig build_a6_config(const std::string& ifname, std::int32_t dc_sync0_sh
 // (only process() does), so read_rpdo would be STALE there -- Phase 1 reads the LIVE feedback
 // image with the noexcept load_le(image, loc) + a one-time resolve_tx<F> instead.
 
-// Lock memory + go SCHED_FIFO so the cyclic loop's jitter stays inside the DC
-// SYNC0 window. WITHOUT this, best-effort scheduling jitter makes the A6 miss the
-// sync window -> WKC drops to 0 and the drive faults out of OP. Best-effort: warns
-// and continues if it lacks CAP_IPC_LOCK / CAP_SYS_NICE (run under sudo for DC).
-bool setup_realtime(int priority) {
-    // These are process-global, called ONCE at startup before any cyclic work --
-    // the mt-unsafe lints (global locale/errno/heap state) are N/A here.
-    // NOLINTBEGIN(concurrency-mt-unsafe)
-    bool ok = true;
-    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-        std::cerr << "    [rt] mlockall failed (need CAP_IPC_LOCK): " << std::strerror(errno) << '\n';
-        ok = false;
-    }
-    (void)mallopt(M_TRIM_THRESHOLD, -1);  // keep the heap -- no page faults from trimming
-    (void)mallopt(M_MMAP_MAX, 0);
-    sched_param sp{};
-    sp.sched_priority = priority;
-    if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0) {
-        std::cerr << "    [rt] SCHED_FIFO(prio " << priority << ") failed (need CAP_SYS_NICE): " << std::strerror(errno) << '\n';
-        ok = false;
-    }
-    return ok;
-    // NOLINTEND(concurrency-mt-unsafe)
-}
-
-void sleep_until(struct timespec& next, long delta_ns) {
-    next.tv_nsec += delta_ns;
-    while (next.tv_nsec >= 1'000'000'000L) {
-        next.tv_nsec -= 1'000'000'000L;
-        next.tv_sec += 1;
-    }
-    while (next.tv_nsec < 0) {  // a DC phase correction can push the target slightly negative
-        next.tv_nsec += 1'000'000'000L;
-        next.tv_sec -= 1;
-    }
-    (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
-}
+// RT setup (lock memory + SCHED_FIFO + stack pre-fault) and the DC SYNC0
+// phase-locked cyclic pacer now live in ethercat::realtime (#31): realtime::setup()
+// replaces the old setup_realtime(), and realtime::DcPacer replaces the hand-rolled
+// sleep_until()/dc_off bookkeeping. See src/ethercat/realtime.hpp.
 
 struct Options {
     std::string ifname = "enp86s0";
@@ -299,8 +259,8 @@ int main(int argc, char** argv) {
 
     // DC sync is timing-critical: lock memory + SCHED_FIFO so jitter stays inside
     // the sync window. Without it the A6 drops WKC and faults out of OP.
-    if (setup_realtime(80)) {
-        std::cout << "[rt] SCHED_FIFO + mlockall engaged (DC-safe timing).\n\n";
+    if (realtime::setup(80)) {
+        std::cout << "[rt] SCHED_FIFO + mlockall + stack-prefault engaged (DC-safe timing).\n\n";
     } else {
         std::cerr << "    [rt] continuing best-effort -- DC SYNC0 may fault under jitter; run with sudo.\n\n";
     }
@@ -371,10 +331,10 @@ int main(int argc, char** argv) {
         return "?";
     };
 
-    struct timespec next{};
-    (void)clock_gettime(CLOCK_MONOTONIC, &next);
-    std::int64_t dc_integral = 0;
-    long dc_off = 0;
+    // ONE pacer across Phase 1 (bring-up) + Phase 2 (steady) + teardown -- it carries the
+    // absolute deadline + PI integral continuously, so the SAFE-OP->OP->steady handoff stays
+    // gapless + phase-locked. pace(dc_time) per cycle = the old sleep_until + dc_phase_correction.
+    realtime::DcPacer pacer(period_ns, dc_shift);
 
     // --- Phase 1: DC bring-up (#20). configure() armed SYNC0 in PRE-OP + left the bus at
     // SAFE-OP; the Master FSM runs SETTLE (phase-locked PD) -> request OP once -> AWAIT_OP
@@ -394,26 +354,28 @@ int main(int argc, char** argv) {
         } catch (const Error&) {  // 0x603F not mapped -> leave fc_loc unmapped
         }
         while (!g_stop.load()) {
-            sleep_until(next, static_cast<long>(period_ns) + dc_off);
             // Phase 1 reads the LIVE feedback image: bringup_step() does exchange() but does NOT
             // publish the seqlock snapshot (only process() does), so read_rpdo would be stale here.
             const std::span<const std::byte> in = master.input_image(slave);
             const std::uint16_t fc = fc_loc.mapped() ? load_le<cia402::FaultCode::type>(in, fc_loc) : 0;
             const BringupStatus bs = master.bringup_step(fc == 0x8700);
-            dc_off = dc_phase_correction(master.dc_time(), static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
             if (++btick % 200 == 0) {
                 std::cout << "[B] bring-up t=" << btick << " " << bringup_label(bs) << " wkc=" << master.last_wkc() << "/"
                           << master.expected_wkc() << " dcPhase=" << (master.dc_time() % static_cast<std::int64_t>(period_ns)) << "ns\n";
             }
             if (bs == BringupStatus::Operational) {
                 reached_op = true;
-                break;
-            }
-            if (bs == BringupStatus::Aborted) {
+            } else if (bs == BringupStatus::Aborted) {
                 std::cerr << "[B] !!! BRING-UP ABORTED: OP did not hold within the await window -- the drive did not reach\n"
                           << "    OP with WKC 3/3 + Er74.1 cleared (SYNC0 likely not truly established). OP was requested\n"
                           << "    ONCE + not re-requested (repeated Er74 OP-entry wedges the A6). Power-cycle + check DC\n"
                           << "    wiring/cycle; sweep --dc-shift-ns. last_error: " << master.last_error() << '\n';
+            }
+            // Pace EVERY step incl the terminal one (keeps PD phase-locked through the OP->steady
+            // handoff -- no frame gap), then leave on a terminal status. = the old sleep_until +
+            // dc_phase_correction, now via the shared DcPacer (which adds skip-catch-up).
+            pacer.pace(master.dc_time());
+            if (bs == BringupStatus::Operational || bs == BringupStatus::Aborted) {
                 break;
             }
         }
@@ -446,7 +408,6 @@ int main(int argc, char** argv) {
     bool safety_abort = false;  // CSP: bit13/0x603F tripped -> disable immediately (no hold)
 
     while (!g_stop.load()) {
-        sleep_until(next, static_cast<long>(period_ns) + dc_off);
         master.process();
         ++tick;
         const int raw_wkc = master.last_wkc();
@@ -454,7 +415,6 @@ int main(int argc, char** argv) {
             ++wkc_bad;
         }
         const std::int64_t dct = master.dc_time();
-        dc_off = dc_phase_correction(dct, static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
 
         // ONE frame-consistent feedback snapshot per cycle (process() published it above); every
         // get<> below reads the same frame. Typed cia402:: aliases resolve offset + width.
@@ -601,6 +561,10 @@ int main(int argc, char** argv) {
         if (opt.move_pp && move_done && tick % 500 == 0) {
             break;  // let it settle a moment, then finish
         }
+        // Phase-lock the next wakeup to DC SYNC0 off THIS cycle's dc_time + sleep (the old
+        // sleep_until + dc_phase_correction, now the shared DcPacer). pace() at loop-bottom
+        // applies this cycle's correction to the cycle->cycle sleep (== the prior top-sleep form).
+        pacer.pace(dct);
     }
 
     // --- graceful shutdown ---
@@ -611,13 +575,12 @@ int main(int argc, char** argv) {
     if (opt.move_sine && announced_op && !master.fault() && !safety_abort) {
         std::cout << "\n[B] sine stopped -- holding last commanded pos=" << last_sine_target << " for ~100ms, then disabling...\n";
         for (int i = 0; i < 100; ++i) {
-            sleep_until(next, static_cast<long>(period_ns) + dc_off);
             master.process();
-            dc_off = dc_phase_correction(master.dc_time(), static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
             Tpdo tpdo = master.make_tpdo(slave);
             tpdo.put<cia402::TargetPosition>(last_sine_target);
             tpdo.put<cia402::ControlWord>(ControlWord::enable_operation());
             tpdo.submit();
+            pacer.pace(master.dc_time());  // stay DC-phase-locked while still in OP (= old sleep_until + correction)
         }
     }
     std::cout << "\n[B] disabling drive (controlword -> 0x00) and closing...\n";
@@ -626,7 +589,7 @@ int main(int argc, char** argv) {
         Tpdo tpdo = master.make_tpdo(slave);
         tpdo.put<cia402::ControlWord>(ControlWord::disable_voltage());
         tpdo.submit();
-        sleep_until(next, static_cast<long>(period_ns));
+        pacer.pace(0);  // pure-period pacing (dc_time=0 -> no correction) -- matches the prior sleep_until(period) during shutdown
     }
     master.close();
 
