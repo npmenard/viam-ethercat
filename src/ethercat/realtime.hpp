@@ -90,28 +90,49 @@ class DcPacer {
         integral_ = 0;
     }
 
-    // Deterministic, sleep-FREE core: advance the deadline by one phase-corrected
-    // period, then phase-preservingly catch up past `now_ns` (add WHOLE periods --
-    // NEVER rebase) so a transient overrun realigns to the SYNC0 grid instead of
-    // firing an off-phase burst. Mutates the integral + deadline; returns the new
-    // absolute deadline. `dc_time_ns == 0` (no DC clock) yields a pure periodic
-    // advance (correction 0).
-    std::uint64_t step(std::int64_t dc_time_ns, std::uint64_t now_ns) noexcept {
+    // Advance the deadline by ONE phase-corrected period (no catch-up, no sleep).
+    // The correction CALLS dc_sync.hpp's dc_phase_correction -- the wrap / +/-clamp /
+    // anti-windup are NOT reimplemented here; only the pacing loop is deduped.
+    // `dc_time_ns == 0` (no DC clock) -> correction 0 -> a pure periodic advance.
+    // UNDERFLOW GUARD: corr is bounded by +/-max_correction_ns (dc_sync.hpp, 50us);
+    // at 1 kHz (period 1ms >> 50us) `period + corr` is always positive, so this is a
+    // no-op there (steady-state stays bit-identical to both current loops). At very
+    // high rates (period < the clamp, >~10 kHz) a negative corr could drive the delta
+    // <= 0 -- clamp to 1 so the absolute deadline NEVER moves backwards.
+    void advance(std::int64_t dc_time_ns) noexcept {
         const long corr = dc_phase_correction(dc_time_ns, static_cast<std::int64_t>(period_ns_), integral_, shift_ns_);
-        next_ += static_cast<std::uint64_t>(static_cast<long>(period_ns_) + corr);
+        long delta = static_cast<long>(period_ns_) + corr;
+        if (delta < 1) {
+            delta = 1;
+        }
+        next_ += static_cast<std::uint64_t>(delta);
+    }
+
+    // Deterministic, sleep-FREE testable core: advance one phase-corrected period, then
+    // phase-preservingly skip WHOLE missed periods past the INJECTED `now_ns` (never
+    // rebase) so a transient overrun realigns to the SYNC0 grid instead of firing an
+    // off-phase LRW burst. Mutates the integral + deadline; returns the new deadline.
+    // (pace() is the production form; this exposes the same math with an injected clock.)
+    std::uint64_t step(std::int64_t dc_time_ns, std::uint64_t now_ns) noexcept {
+        advance(dc_time_ns);
         while (next_ <= now_ns) {
             next_ += period_ns_;
         }
         return next_;
     }
 
-    // One cyclic iteration: compute the next phase-corrected deadline from the
-    // current DC time + clock, then sleep (CLOCK_MONOTONIC, TIMER_ABSTIME) to it.
+    // One cyclic iteration (production): advance one phase-corrected period, then the
+    // skip-catch-up RE-READING the clock each iteration -- byte-equivalent to the
+    // ServoController RT loop's `for (now=monotonic_ns(); next<=now; now=monotonic_ns())`
+    // -- then sleep (CLOCK_MONOTONIC, TIMER_ABSTIME) to the absolute deadline.
     void pace(std::int64_t dc_time_ns) noexcept {
-        const std::uint64_t deadline = step(dc_time_ns, monotonic_ns());
+        advance(dc_time_ns);
+        for (std::uint64_t now = monotonic_ns(); next_ <= now; now = monotonic_ns()) {
+            next_ += period_ns_;
+        }
         timespec ts{};
-        ts.tv_sec = static_cast<std::time_t>(deadline / kNsPerSec);
-        ts.tv_nsec = static_cast<long>(deadline % kNsPerSec);
+        ts.tv_sec = static_cast<std::time_t>(next_ / kNsPerSec);
+        ts.tv_nsec = static_cast<long>(next_ % kNsPerSec);
         (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
     }
 

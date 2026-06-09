@@ -84,6 +84,24 @@ TEST("DcPacer::step applies one correction without catch-up when on time") {
     CHECK_EQ(dl, 10 * kPeriod + static_cast<std::uint64_t>(static_cast<long>(kPeriod) + corr));
 }
 
+// Underflow guard: at a rate where the period is BELOW the +/-50us correction clamp
+// (here 20us << 50us), a negative correction could drive `period + corr` <= 0. The
+// deadline must NEVER move backwards -- assert it strictly increases across a phase
+// ramp that drives corrections negative.
+TEST("DcPacer::step never moves the deadline backwards (high-rate underflow guard)") {
+    constexpr std::uint64_t fast_period = 20'000;  // 50 kHz, < the 50us correction clamp
+    realtime::DcPacer pacer(fast_period, static_cast<std::int64_t>(fast_period) / 2);
+    pacer.reset(0);
+    std::uint64_t prev = 0;
+    for (int i = 0; i < 400; ++i) {
+        // A phase ramp well ahead of the mid-cycle target -> negative corrections.
+        const std::int64_t dc = (static_cast<std::int64_t>(i) * 4096) % static_cast<std::int64_t>(fast_period);
+        const std::uint64_t dl = pacer.step(dc, /*now=*/0);
+        CHECK(dl > prev);  // strictly forward every step, guard holds even when period+corr<=0
+        prev = dl;
+    }
+}
+
 // setup()/lock_current() must be callable + noexcept offline. SCHED_FIFO needs
 // CAP_SYS_NICE (returns false without it; may succeed under sudo) -- we don't assert
 // the value, only that it doesn't throw/crash. setup() runs in a short-lived thread so
