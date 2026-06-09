@@ -58,8 +58,8 @@ void Master::init() {
     }
 }
 
-std::map<std::uint32_t, FieldLocation> Master::build_field_table(std::uint16_t slave, const PdoMap& map) {
-    std::map<std::uint32_t, FieldLocation> fields;
+std::map<std::uint32_t, Master::MappedField> Master::build_field_table(std::uint16_t slave, const PdoMap& map) {
+    std::map<std::uint32_t, MappedField> fields;
     std::size_t bit = 0;
     for (const std::uint16_t pdo : map.pdo_indices) {
         const auto it = map.entries.find(pdo);
@@ -76,7 +76,7 @@ std::map<std::uint32_t, FieldLocation> Master::build_field_table(std::uint16_t s
                     throw PdoMappingError("slave " + std::to_string(slave) + ": mapped object width " + std::to_string(e.bit_length) +
                                           " bits is not a whole number of bytes");
                 }
-                fields[field_key(e.index, e.subindex)] = FieldLocation{bit / 8, e.bit_length / 8U};
+                fields[field_key(e.index, e.subindex)] = MappedField{bit / 8, e.bit_length};
             }
             bit += e.bit_length;
         }
@@ -405,7 +405,7 @@ FieldLocation Master::rx_field(std::uint16_t slave, std::uint16_t index, std::ui
     if (it == rt.rx_fields.end()) {
         throw PdoMappingError("slave " + std::to_string(slave) + ": object not in the RxPDO (command) map");
     }
-    return it->second;
+    return FieldLocation{it->second.byte_offset, /*present=*/true};
 }
 
 FieldLocation Master::tx_field(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const {
@@ -414,10 +414,10 @@ FieldLocation Master::tx_field(std::uint16_t slave, std::uint16_t index, std::ui
     if (it == rt.tx_fields.end()) {
         throw PdoMappingError("slave " + std::to_string(slave) + ": object not in the TxPDO (feedback) map");
     }
-    return it->second;
+    return FieldLocation{it->second.byte_offset, /*present=*/true};
 }
 
-FieldLocation Master::resolve_field(const std::map<std::uint32_t, FieldLocation>& table,
+FieldLocation Master::resolve_field(const std::map<std::uint32_t, MappedField>& table,
                                     std::uint16_t index,
                                     std::uint8_t sub,
                                     std::size_t want_width,
@@ -436,14 +436,15 @@ FieldLocation Master::resolve_field(const std::map<std::uint32_t, FieldLocation>
     // #30 §5 width assertion (PROVISIONAL, pending the user's call via team-lead -- built but
     // trivially removable): the Field's T must match the mapped object's width. Catches a silent
     // wrong-width access (e.g. an int16 alias against a 32-bit-mapped object would read 2 of 4
-    // bytes in-bounds, no throw). Checked against the retained byte_width here; when byte_width
-    // drops in P2c this switches to the entry's bit_length.
-    if (it->second.byte_width != want_width) {
+    // bytes in-bounds, no throw). Checked against the INTERNAL table's bit_length (the public
+    // FieldLocation is offset-only post-P2c); build_field_table guarantees bit_length % 8 == 0.
+    const std::size_t mapped_width = it->second.bit_length / 8U;
+    if (mapped_width != want_width) {
         throw PdoAccessError("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
                              " width mismatch -- the Field type is " + std::to_string(want_width) + " byte(s) but the object is mapped " +
-                             std::to_string(it->second.byte_width) + " byte(s)");
+                             std::to_string(mapped_width) + " byte(s)");
     }
-    return it->second;
+    return FieldLocation{it->second.byte_offset, /*present=*/true};
 }
 
 Rpdo Master::read_rpdo(std::uint16_t slave) const {

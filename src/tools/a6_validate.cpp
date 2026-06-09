@@ -385,16 +385,20 @@ int main(int argc, char** argv) {
     bool reached_op = false;
     {
         std::uint64_t btick = 0;
+        // Resolve the FaultCode (0x603F) feedback location ONCE (it's stable for the run) instead
+        // of per cycle (#30 P2c carry-in -- FieldLocation::mapped() is the clean vehicle). If
+        // 0x603F isn't mapped, fc_loc stays unmapped -> every cycle treats it as no-sync-fault.
+        FieldLocation fc_loc;
+        try {
+            fc_loc = master.resolve_tx<cia402::FaultCode>(slave);
+        } catch (const Error&) {  // 0x603F not mapped -> leave fc_loc unmapped
+        }
         while (!g_stop.load()) {
             sleep_until(next, static_cast<long>(period_ns) + dc_off);
             // Phase 1 reads the LIVE feedback image: bringup_step() does exchange() but does NOT
             // publish the seqlock snapshot (only process() does), so read_rpdo would be stale here.
             const std::span<const std::byte> in = master.input_image(slave);
-            std::uint16_t fc = 0;
-            try {
-                fc = load_le<cia402::FaultCode::type>(in, master.resolve_tx<cia402::FaultCode>(slave));
-            } catch (const Error&) {  // 0x603F not mapped -> treat as no sync fault
-            }
+            const std::uint16_t fc = fc_loc.mapped() ? load_le<cia402::FaultCode::type>(in, fc_loc) : 0;
             const BringupStatus bs = master.bringup_step(fc == 0x8700);
             dc_off = dc_phase_correction(master.dc_time(), static_cast<std::int64_t>(period_ns), dc_integral, dc_shift);
             if (++btick % 200 == 0) {

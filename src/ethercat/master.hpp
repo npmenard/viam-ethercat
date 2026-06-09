@@ -31,21 +31,30 @@
 
 namespace ethercat {
 
-// Byte location of a mapped PDO object within a process-data image.
-// NOTE (#30 §5): byte_width is retained for the existing call sites
-// (servo_controller's optional-field "byte_width==0 => unmapped" sentinel +
-// a6_validate's load/store width). The new Field<>/Rpdo/Tpdo access path takes
-// the width from the Field's T (sizeof) and only reads byte_offset, so the
-// eventual offset-only drop is deferred to the P2b/P2c call-site migration.
+// Byte location of a mapped PDO object within a process-data image (#30 §5).
+// OFFSET-ONLY: every access derives its width from the Field's T (sizeof) at the
+// call site (the load_le/store_le free fns below, Rpdo::get/Tpdo::put), so the
+// location carries no width. The per-object mapped width (bit_length) lives in
+// the Master's INTERNAL field table (Master::MappedField), where the
+// configure-time width-assert in resolve_field verifies sizeof(F::type)*8 ==
+// bit_length -- it never needs to ride along on the RT-cached location.
+// `present` distinguishes a resolved location from a default-constructed
+// "not mapped" sentinel (the optional-feedback fields); mapped() is the read.
 struct FieldLocation {
     std::size_t byte_offset = 0;
-    std::size_t byte_width = 0;
+    bool present = false;  // false for a default-constructed (unmapped) sentinel
+    // True once resolved by Master::resolve_rx/resolve_tx / rx_field / tx_field.
+    // Optional fields cache a default FieldLocation{} when absent -> mapped()==false.
+    [[nodiscard]] constexpr bool mapped() const noexcept {
+        return present;
+    }
 };
 
 // RT cached-offset accessors (#30 §4): read/write sizeof(T) little-endian at a resolved
 // FieldLocation on a live process image. noexcept + NO bounds-check -- PRECONDITION: `loc`
-// came from Master::resolve_rx/resolve_tx<F>() (width-checked + in-image) at configure, so
-// offset + sizeof(T) is valid. This is the RT hot-path form (cached loc + these free fns);
+// came from Master::resolve_rx/resolve_tx<F>() (width-asserted vs the mapped bit_length +
+// in-image) at configure, so offset + sizeof(T) is valid. This is the RT hot-path form
+// (cached loc + these free fns);
 // the THROWING resolve/bounds surface lives ONLY on Rpdo/Tpdo (the copy types), so the 1 kHz
 // path physically can't throw/resolve/alloc. (Overloads the span forms in pdo_buffer.hpp.)
 template <PdoScalar T>
@@ -237,28 +246,39 @@ class Master {
     // sdo_read/sdo_write live at the EcatBackend level (library-internal) by design.
 
    private:
+    // INTERNAL per-object mapping record (#30 §5): byte offset + mapped width in bits.
+    // The public FieldLocation is offset-only; the width lives HERE so resolve_field's
+    // configure-time assert can check sizeof(F::type)*8 == bit_length without leaking
+    // width onto the RT-cached location. build_field_table populates it; resolve_field /
+    // rx_field / tx_field convert it to an offset-only FieldLocation (present=true).
+    struct MappedField {
+        std::size_t byte_offset = 0;
+        std::uint16_t bit_length = 0;
+    };
+
     // Per-slave runtime state. Holds a (non-movable) PdoCache, so it lives in a
     // std::deque (stable addresses, never moved) rather than a vector.
     struct SlaveRuntime {
         SlaveRuntime(std::uint16_t id, std::size_t rx_feedback_bytes, std::size_t tx_command_bytes)
             : slave_id(id), cache(rx_feedback_bytes, tx_command_bytes) {}
         std::uint16_t slave_id;
-        SlaveIo io;                                        // spans into backend storage (valid after map_process_data)
-        std::map<std::uint32_t, FieldLocation> rx_fields;  // command image (RxPDO/outputs)
-        std::map<std::uint32_t, FieldLocation> tx_fields;  // feedback image (TxPDO/inputs)
-        PdoCache cache;                                    // NOTE: rx snapshot = FEEDBACK (TxPDO), tx staging = COMMAND (RxPDO)
+        SlaveIo io;                                      // spans into backend storage (valid after map_process_data)
+        std::map<std::uint32_t, MappedField> rx_fields;  // command image (RxPDO/outputs)
+        std::map<std::uint32_t, MappedField> tx_fields;  // feedback image (TxPDO/inputs)
+        PdoCache cache;                                  // NOTE: rx snapshot = FEEDBACK (TxPDO), tx staging = COMMAND (RxPDO)
     };
 
     SlaveRuntime& runtime_for(std::uint16_t slave);
     const SlaveRuntime& runtime_for(std::uint16_t slave) const;
 
-    static std::map<std::uint32_t, FieldLocation> build_field_table(std::uint16_t slave, const PdoMap& map);
+    static std::map<std::uint32_t, MappedField> build_field_table(std::uint16_t slave, const PdoMap& map);
 
     // Shared resolution body for resolve_rx/resolve_tx (#30 §5): look the object up in `table`,
     // clear-text throw PdoMappingError if it isn't mapped (map-membership) or PdoAccessError if
-    // its mapped width != want_width (malformed access; the templated callers pass sizeof(F::type)
-    // so the width-vs-T check happens at resolve).
-    FieldLocation resolve_field(const std::map<std::uint32_t, FieldLocation>& table,
+    // its mapped bit_length/8 != want_width (malformed access; the templated callers pass
+    // sizeof(F::type) so the width-vs-T check happens at resolve). Returns an offset-only
+    // FieldLocation (present=true).
+    FieldLocation resolve_field(const std::map<std::uint32_t, MappedField>& table,
                                 std::uint16_t index,
                                 std::uint8_t sub,
                                 std::size_t want_width,

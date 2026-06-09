@@ -193,8 +193,8 @@ class ServoController {
     FieldLocation f_target_;
     FieldLocation f_actual_;
     FieldLocation f_velocity_;
-    FieldLocation f_profile_velocity_;  // 0x6081 PP move speed; byte_width==0 if not mapped (optional)
-    // TxPDO feedback fields (spec #16). Both OPTIONAL (byte_width==0 => unmapped):
+    FieldLocation f_profile_velocity_;  // 0x6081 PP move speed; !mapped() if not in the map (optional)
+    // TxPDO feedback fields (spec #16). Both OPTIONAL (!mapped() => not in the map):
     FieldLocation f_fault_code_;       // 0x603F U16 drive error code (last_error gloss)
     FieldLocation f_velocity_actual_;  // 0x606C S32 velocity-actual (wire velocity; else estimate)
 

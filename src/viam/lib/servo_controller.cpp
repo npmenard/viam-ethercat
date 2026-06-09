@@ -22,11 +22,9 @@ namespace ethercat::servo {
 
 namespace {
 
-constexpr std::uint16_t kCtrlword = 0x6040;
-constexpr std::uint16_t kStatusword = 0x6041;
-constexpr std::uint16_t kTargetPos = 0x607A;
-constexpr std::uint16_t kActualPos = 0x6064;
-constexpr std::uint16_t kTargetVel = 0x60FF;
+// The mandatory fields (controlword/statusword/target/actual/target-velocity) resolve via
+// their typed cia402:: Field aliases in resolve_fields(); only the OPTIONAL-field probes
+// (rxpdo_has/txpdo_has) and the Er74 sentinel still need bare index constants here.
 constexpr std::uint16_t kProfileVel = 0x6081;     // PP move speed (carries the GoTo/GoFor rpm); optional in the map
 constexpr std::uint16_t kFaultCode = 0x603F;      // drive error code (TxPDO, optional feedback)
 constexpr std::uint16_t kEr74SyncFault = 0x8700;  // 0x603F value for Er74.1 "no SYNC0" -- the DC bring-up abort signal
@@ -219,23 +217,29 @@ void ServoController::reconfigure(ServoConfig config) {
 }
 
 void ServoController::resolve_fields() {
+    // Resolve each RT field ONCE here (non-RT, at start) via the typed Field API, caching an
+    // offset-only FieldLocation. The RT loop then does cached-offset load_le/store_le(image, loc)
+    // only -- NO per-cycle resolve, throw, or map-walk (#30 P2c (i)). resolve_rx/resolve_tx<F>
+    // also width-assert sizeof(F::type)*8 == the mapped bit_length, so a wrong-width map is
+    // caught HERE at configure, not silently mis-read on the wire.
     const std::uint16_t s = config_.slave_id;
-    f_ctrlword_ = master_->rx_field(s, kCtrlword, 0);
-    f_statusword_ = master_->tx_field(s, kStatusword, 0);
-    f_actual_ = master_->tx_field(s, kActualPos, 0);
+    f_ctrlword_ = master_->resolve_rx<cia402::ControlWord>(s);
+    f_statusword_ = master_->resolve_tx<cia402::Statusword>(s);
+    f_actual_ = master_->resolve_tx<cia402::PositionActual>(s);
     if (config_.mode == ControlMode::ProfilePosition) {
-        f_target_ = master_->rx_field(s, kTargetPos, 0);
+        f_target_ = master_->resolve_rx<cia402::TargetPosition>(s);
         // Profile velocity (0x6081) is OPTIONAL in the map. If the drive maps it
         // (the A6 does), the RT loop must write the commanded speed there every
         // cycle -- else the move runs at the drive's default speed (rpm ignored).
-        f_profile_velocity_ = rxpdo_has(kProfileVel) ? master_->rx_field(s, kProfileVel, 0) : FieldLocation{};
+        f_profile_velocity_ = rxpdo_has(kProfileVel) ? master_->resolve_rx<cia402::ProfileVelocity>(s) : FieldLocation{};
     } else {
-        f_velocity_ = master_->rx_field(s, kTargetVel, 0);
+        f_velocity_ = master_->resolve_rx<cia402::TargetVelocity>(s);
     }
-    // OPTIONAL TxPDO feedback (spec #16) -- both modes. byte_width==0 => unmapped, so
-    // the RT loop falls back (velocity estimate) / omits the tier (fault code).
-    f_fault_code_ = txpdo_has(kFaultCode) ? master_->tx_field(s, kFaultCode, 0) : FieldLocation{};
-    f_velocity_actual_ = txpdo_has(kVelActual) ? master_->tx_field(s, kVelActual, 0) : FieldLocation{};
+    // OPTIONAL TxPDO feedback (spec #16) -- both modes. An absent field caches a default
+    // FieldLocation{} (mapped()==false), so the RT loop falls back (velocity estimate) /
+    // omits the tier (fault code).
+    f_fault_code_ = txpdo_has(kFaultCode) ? master_->resolve_tx<cia402::FaultCode>(s) : FieldLocation{};
+    f_velocity_actual_ = txpdo_has(kVelActual) ? master_->resolve_tx<cia402::VelocityActual>(s) : FieldLocation{};
 }
 
 bool ServoController::rxpdo_has(std::uint16_t index) const noexcept {
@@ -315,7 +319,7 @@ std::uint16_t ServoController::step_handshake(std::uint16_t base_cw, Status stat
         case Handshake::Idle:
             return base_cw;
         case Handshake::WriteTarget:
-            store_le<std::int32_t>(master_->outputs(s).subspan(f_target_.byte_offset, 4), target_counts_);
+            store_le<std::int32_t>(master_->outputs(s), f_target_, target_counts_);
             handshake_ = Handshake::AwaitAck;
             handshake_cycles_remaining_ = config_.handshake_timeout_cycles;
             return ControlWord::with_new_setpoint(base_cw, true);  // raise bit4
@@ -414,11 +418,11 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
             // Write the commanded move speed to profile velocity (0x6081) every cycle
             // when it's mapped -- else the drive uses its default speed and the rpm
             // passed to go_to/go_for is silently ignored on hardware.
-            if (f_profile_velocity_.byte_width != 0) {
-                store_le<std::uint32_t>(master_->outputs(config_.slave_id).subspan(f_profile_velocity_.byte_offset, 4), profile_vel_);
+            if (f_profile_velocity_.mapped()) {
+                store_le<std::uint32_t>(master_->outputs(config_.slave_id), f_profile_velocity_, profile_vel_);
             }
-        } else if (f_velocity_.byte_width != 0) {
-            store_le<std::int32_t>(master_->outputs(config_.slave_id).subspan(f_velocity_.byte_offset, 4), pv_velocity_);
+        } else if (f_velocity_.mapped()) {
+            store_le<std::int32_t>(master_->outputs(config_.slave_id), f_velocity_, pv_velocity_);
         }
         if (halted_) {
             cw = ControlWord::with_halt(cw, true);  // Stop = Halt (bit8, sticky), NOT QuickStop
@@ -543,7 +547,7 @@ void ServoController::publish_state(Status status, std::int32_t actual, std::int
     // DRIVE tier: live-read 0x603F from THIS cycle's snapshot EVERY faulted cycle (not
     // edge-captured) so a code the drive latches a frame or two after it sets bit3 is
     // still picked up ("code pending" collapses to the rare hard-drop race only).
-    const std::uint16_t drive_code = f_fault_code_.byte_width != 0 ? load_le<std::uint16_t>(in.subspan(f_fault_code_.byte_offset, 2)) : 0;
+    const std::uint16_t drive_code = f_fault_code_.mapped() ? load_le<std::uint16_t>(in, f_fault_code_) : 0;
     state_.drive_fault_code.store(drive_code, std::memory_order_relaxed);
     state_.drive_faulted.store(status.fault(), std::memory_order_release);
     // CTRL tier: the published mirror of the latch (tracks abort, clears on fault_reset).
@@ -586,7 +590,7 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
     bool bringup_ok = false;
     while (!st.stop_requested()) {
         const std::span<const std::byte> bin = master_->input_image(slave);
-        const std::uint16_t code = f_fault_code_.byte_width != 0 ? load_le<std::uint16_t>(bin.subspan(f_fault_code_.byte_offset, 2)) : 0;
+        const std::uint16_t code = f_fault_code_.mapped() ? load_le<std::uint16_t>(bin, f_fault_code_) : 0;
         const ethercat::BringupStatus bs = master_->bringup_step(code == kEr74SyncFault);
         if (bs == ethercat::BringupStatus::Operational) {
             bringup_ok = true;
@@ -623,7 +627,7 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
         // Aborted, or stop requested during bring-up: leave the drive in a safe state
         // (disable voltage) and exit -- never enter the steady control loop un-operational.
         if (master_) {
-            store_le<std::uint16_t>(master_->outputs(slave).subspan(f_ctrlword_.byte_offset, 2), ControlWord::disable_voltage());
+            store_le<std::uint16_t>(master_->outputs(slave), f_ctrlword_, ControlWord::disable_voltage());
             master_->process();
         }
         return;
@@ -636,8 +640,8 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
         // 0x603F, 0x606C all slice from THIS span -- never a second input_image() call
         // -- so the fault code matches the fault state it is reported with structurally.
         const std::span<const std::byte> in = master_->input_image(slave);
-        const Status status{load_le<std::uint16_t>(in.subspan(f_statusword_.byte_offset, 2))};
-        const std::int32_t actual = load_le<std::int32_t>(in.subspan(f_actual_.byte_offset, 4));
+        const Status status{load_le<std::uint16_t>(in, f_statusword_)};
+        const std::int32_t actual = load_le<std::int32_t>(in, f_actual_);
         if (first_cycle_) {
             prev_actual_ = actual;  // avoid a spurious huge velocity on cycle 0
             first_cycle_ = false;
@@ -645,13 +649,13 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
         // Velocity from the wire (0x606C) when mapped, else the instantaneous estimate
         // (actual-delta * loop rate). One branch; identical fallback when unmapped.
         const std::int32_t velocity =
-            f_velocity_actual_.byte_width != 0
-                ? load_le<std::int32_t>(in.subspan(f_velocity_actual_.byte_offset, 4))
+            f_velocity_actual_.mapped()
+                ? load_le<std::int32_t>(in, f_velocity_actual_)
                 : static_cast<std::int32_t>(static_cast<std::int64_t>(actual - prev_actual_) * config_.target_loop_rate_hz);
         prev_actual_ = actual;
 
         const std::uint16_t cw = step_lifecycle(status, batch, actual);
-        store_le<std::uint16_t>(master_->outputs(slave).subspan(f_ctrlword_.byte_offset, 2), cw);
+        store_le<std::uint16_t>(master_->outputs(slave), f_ctrlword_, cw);
         last_cw_ = cw;
 
         master_->process();
@@ -676,7 +680,7 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
 
     // Leave the drive in a safe state and flush it out.
     if (master_) {
-        store_le<std::uint16_t>(master_->outputs(slave).subspan(f_ctrlword_.byte_offset, 2), ControlWord::disable_voltage());
+        store_le<std::uint16_t>(master_->outputs(slave), f_ctrlword_, ControlWord::disable_voltage());
         master_->process();
     }
 }
