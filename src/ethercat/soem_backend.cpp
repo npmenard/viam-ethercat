@@ -233,8 +233,8 @@ void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8
     // remap write, desyncing the map (the "OP did not hold" failure). A genuine CoE abort returns
     // WKC > 0 with an error pushed and is surfaced below; WKC 0 is now a real, reportable fault.
     if (slave < 1 || slave > impl_->slave_count) {
-        throw BusError("SoemBackend::sdo_write: slave " + std::to_string(slave) + " out of range (configured " +
-                       std::to_string(impl_->slave_count) + ")");
+        throw ConfigError("SoemBackend::sdo_write: slave " + std::to_string(slave) + " out of range (configured " +
+                          std::to_string(impl_->slave_count) + ")");
     }
     const int size = static_cast<int>(data.size());
     const int wkc = ecx_SDOwrite(&impl_->ctx, slave, index, sub, FALSE, size, data.data(), EC_TIMEOUTRXM);
@@ -251,8 +251,8 @@ void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8
 
 std::size_t SoemBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
     if (slave < 1 || slave > impl_->slave_count) {
-        throw BusError("SoemBackend::sdo_read: slave " + std::to_string(slave) + " out of range (configured " +
-                       std::to_string(impl_->slave_count) + ")");
+        throw ConfigError("SoemBackend::sdo_read: slave " + std::to_string(slave) + " out of range (configured " +
+                          std::to_string(impl_->slave_count) + ")");
     }
     int size = static_cast<int>(out.size());
     const int wkc = ecx_SDOread(&impl_->ctx, slave, index, sub, FALSE, &size, out.data(), EC_TIMEOUTRXM);

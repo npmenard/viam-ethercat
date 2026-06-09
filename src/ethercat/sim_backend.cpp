@@ -82,8 +82,8 @@ SlaveInfo SimBackend::slave_info(std::uint16_t slave) const {
 
 void SimBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
     if (slave < 1 || slave > slaves_.size()) {
-        throw BusError("SimBackend::sdo_write: slave " + std::to_string(slave) + " out of range (configured " +
-                       std::to_string(slaves_.size()) + ")");
+        throw ConfigError("SimBackend::sdo_write: slave " + std::to_string(slave) + " out of range (configured " +
+                          std::to_string(slaves_.size()) + ")");
     }
     Slave& s = slaves_[slave - 1];
     // Test injection (#32 note 14): simulate a drive CoE abort on this object. SdoError is the
@@ -103,8 +103,8 @@ void SimBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_
 
 std::size_t SimBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
     if (slave < 1 || slave > slaves_.size()) {
-        throw BusError("SimBackend::sdo_read: slave " + std::to_string(slave) + " out of range (configured " +
-                       std::to_string(slaves_.size()) + ")");
+        throw ConfigError("SimBackend::sdo_read: slave " + std::to_string(slave) + " out of range (configured " +
+                          std::to_string(slaves_.size()) + ")");
     }
     const Slave& s = slaves_[slave - 1];
     const auto it = s.dictionary.find(sdo_key(index, sub));
@@ -149,7 +149,8 @@ void SimBackend::request_state(std::uint16_t slave, EcatState target) {
         return;
     }
     if (slave > slaves_.size()) {
-        throw InitError("SimBackend::request_state: slave " + std::to_string(slave) + " out of range");
+        throw ConfigError("SimBackend::request_state: slave " + std::to_string(slave) + " out of range (configured " +
+                          std::to_string(slaves_.size()) + ")");
     }
     slaves_[slave - 1].state = target;
 }
@@ -476,8 +477,8 @@ std::int32_t SimBackend::configured_dc_sync0_shift_ns() const noexcept {
 
 void SimBackend::set_sdo_write_abort(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::uint32_t abort_code) {
     if (slave < 1 || slave > slaves_.size()) {
-        throw BusError("SimBackend::set_sdo_write_abort: slave " + std::to_string(slave) + " out of range (configured " +
-                       std::to_string(slaves_.size()) + ")");
+        throw ConfigError("SimBackend::set_sdo_write_abort: slave " + std::to_string(slave) + " out of range (configured " +
+                          std::to_string(slaves_.size()) + ")");
     }
     slaves_[slave - 1].sdo_write_aborts[sdo_key(index, sub)] = abort_code;
 }

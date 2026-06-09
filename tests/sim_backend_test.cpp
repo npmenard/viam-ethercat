@@ -193,14 +193,15 @@ TEST("SimBackend: double scan throws; short-WKC hook fires once") {
 // --- #32 hygiene fixes -------------------------------------------------------
 
 // #32.1: backend sdo_read/sdo_write bounds-check an out-of-range slave with a
-// clear-text BusError naming the configured count -- before touching the bus.
-TEST("#32.1: sdo bounds-check throws BusError naming the configured count") {
+// clear-text ConfigError (a precondition/programming error -- the SAME tier
+// slave_info throws, NOT a BusError/WKC fault) naming the configured count.
+TEST("#32.1: sdo bounds-check throws ConfigError naming the configured count") {
     SimBackend be(std::vector<SimSlaveModel>{a6_like_model()});  // exactly 1 slave
     (void)be.open("sim0");
     std::array<std::byte, 2> buf{};
-    CHECK_THROWS_MSG(be.sdo_read(99, 0x6041, 0, buf), ethercat::BusError, "configured 1");
-    CHECK_THROWS_MSG(be.sdo_write(99, 0x6040, 0, buf), ethercat::BusError, "configured 1");
-    CHECK_THROWS_MSG(be.sdo_read(0, 0x6041, 0, buf), ethercat::BusError, "out of range");  // 0 is not a 1-based id
+    CHECK_THROWS_MSG(be.sdo_read(99, 0x6041, 0, buf), ethercat::ConfigError, "configured 1");
+    CHECK_THROWS_MSG(be.sdo_write(99, 0x6040, 0, buf), ethercat::ConfigError, "configured 1");
+    CHECK_THROWS_MSG(be.sdo_read(0, 0x6041, 0, buf), ethercat::ConfigError, "out of range");  // 0 is not a 1-based id
     // In-range still works (no throw): write then read back the same object.
     const std::array<std::byte, 2> val{std::byte{0x34}, std::byte{0x12}};
     be.sdo_write(1, 0x6040, 0, val);
