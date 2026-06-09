@@ -471,6 +471,37 @@ if (ETHERCAT_SANITIZE_THREAD)
   viam_apply_wall_werror(controller_offline_test_tsan)
   add_test(NAME controller_offline_test_tsan COMMAND controller_offline_test_tsan)
   set_tests_properties(controller_offline_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
+
+  # ThreadSanitizer build of the PDO-access tests. The #30 note-11 case runs a
+  # Master::read_rpdo() reader concurrently with a process() publish writer -- the
+  # whole Master + PdoCache RxSnapshot seqlock stack is compiled directly under
+  # -fsanitize=thread so the cross-thread read-side handoff is instrumented.
+  add_executable(pdo_access_test_tsan
+    tests/pdo_access_test.cpp
+    src/ethercat/cia402.cpp
+    src/ethercat/pdo_cache.cpp
+    src/ethercat/pdo_mapping.cpp
+    src/ethercat/backend.cpp
+    src/ethercat/sim_backend.cpp
+    src/ethercat/soem_backend.cpp
+    src/ethercat/master.cpp
+  )
+  target_include_directories(pdo_access_test_tsan
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  )
+  target_link_libraries(pdo_access_test_tsan
+    PRIVATE
+      soem
+      Threads::Threads
+      Boost::headers
+  )
+  target_compile_options(pdo_access_test_tsan PRIVATE -fsanitize=thread -O1 -g)
+  target_link_options(pdo_access_test_tsan PRIVATE -fsanitize=thread)
+  viam_apply_wall_werror(pdo_access_test_tsan)
+  add_test(NAME pdo_access_test_tsan COMMAND pdo_access_test_tsan)
+  set_tests_properties(pdo_access_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
 endif()
 
 

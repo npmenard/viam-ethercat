@@ -8,8 +8,10 @@
 //   (3) unsubmitted never transmits  (7) round-trip via the cia402:: aliases
 //   (4) submit -> next-cycle transmit
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "ethercat/cia402.hpp"
@@ -256,6 +258,69 @@ TEST("#30 P2a.8: an under-wide Field on a mapped object throws PdoAccessError at
 
     Tpdo t = m.make_tpdo(1);
     CHECK_THROWS(t.put<CtrlAsU8>(std::uint8_t{1}), ethercat::PdoAccessError);
+}
+
+// (#30 note 11) Read-side seqlock exercise: a NON-RT reader calls Master::read_rpdo()
+// in a tight loop WHILE a writer thread publishes fresh feedback frames via process()
+// -- the production "RT publishes / non-RT reads" handoff. Under ThreadSanitizer
+// (pdo_access_test_tsan) this proves the read_rpdo() -> PdoCache RxSnapshot seqlock read
+// is race-free; it closes spec #30 note 11 WITHOUT routing the module's accessors through
+// read_rpdo (that path is HW-validated by a6_validate's P2b per-cycle reads).
+//
+// NON-VACUOUS, validated during dev (DA-reproducible): temporarily replacing the
+// RxSnapshot's atomic_ref seqlock publish in pdo_cache.cpp with a plain non-atomic store
+// makes TSan FIRE on this test -- so a clean run actually proves the seqlock, the test is
+// not vacuously-green. (The broken variant is NOT shipped; revert after validating.)
+TEST("#30 note 11: read_rpdo() is seqlock-race-free under a concurrent publish writer") {
+    Master m{make_config(), std::make_unique<SimBackend>(make_models())};
+    to_op(m);
+    for (int i = 0; i < 8; ++i) {  // climb to OperationEnabled so feedback is live
+        step_ladder(m);
+    }
+
+    constexpr int kIters = 20000;
+    std::atomic<bool> go{false};
+    std::atomic<std::uint64_t> valid_reads{0};
+    std::atomic<std::uint32_t> sink{0};  // defeat dead-read elimination
+
+    // WRITER: stream an advancing target + the enable controlword, then process() -- each
+    // process() publishes a NEW feedback frame into the seqlock-protected RxSnapshot.
+    std::thread writer([&] {
+        while (!go.load(std::memory_order_acquire)) {
+        }
+        for (int i = 0; i < kIters; ++i) {
+            Tpdo t = m.make_tpdo(1);
+            t.put<cia402::ControlWord>(ethercat::ControlWord::enable_operation());
+            t.put<cia402::TargetPosition>(static_cast<std::int32_t>(i));
+            t.submit();
+            m.process();
+        }
+    });
+    // READER: pull TWO fields from the SAME snapshot each iteration -- a torn seqlock read
+    // would mix frames (TSan catches the underlying data race regardless). Under this
+    // pathological tight-loop contention the seqlock read can retry-exhaust (snapshot
+    // valid=false) -- the production non-RT reader simply gets the previous frame next
+    // call; here we skip those and count the (overwhelming majority of) successful reads,
+    // matching pdo_cache_test's retry-exhaustion tolerance.
+    std::thread reader([&] {
+        while (!go.load(std::memory_order_acquire)) {
+        }
+        for (int i = 0; i < kIters; ++i) {
+            const Rpdo r = m.read_rpdo(1);
+            if (!r.snapshot().valid) {
+                continue;  // seqlock retry-exhausted under contention -- not a torn read
+            }
+            const auto sw = r.get<cia402::Statusword>();
+            const auto pos = r.get<cia402::PositionActual>();
+            sink.fetch_add(static_cast<std::uint32_t>(sw) ^ static_cast<std::uint32_t>(pos), std::memory_order_relaxed);
+            valid_reads.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    go.store(true, std::memory_order_release);
+    writer.join();
+    reader.join();
+    CHECK(valid_reads.load() > 1000);  // the vast majority of reads win the seqlock; some lose under load
+    (void)sink.load();
 }
 
 TEST_MAIN()
