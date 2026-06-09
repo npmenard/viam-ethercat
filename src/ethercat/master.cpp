@@ -302,6 +302,14 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted) noexcept {
 }
 
 void Master::process() noexcept {
+    // Drain any Tpdo-submitted frame into the live command image BEFORE the exchange, so a
+    // submit() lands on the very next process(). take_outputs is the RT-side lock-free take
+    // (this runs on the RT thread); it returns 0 and leaves the image untouched when nothing
+    // is staged -- so the direct-write path (servo module / a6_validate writing outputs()
+    // directly) is unaffected (#30 §3: "submit() -> transmitted next cycle, via TxStaging").
+    for (SlaveRuntime& rt : slaves_) {
+        (void)rt.cache.take_outputs(rt.io.outputs);
+    }
     const int wkc = backend_->exchange();
     last_wkc_.store(wkc, std::memory_order_relaxed);  // raw, every cycle (diagnostic)
     // Post-OP DC settle grace: while it lasts, fully clear the latch state every
@@ -407,6 +415,16 @@ FieldLocation Master::tx_field(std::uint16_t slave, std::uint16_t index, std::ui
         throw PdoMappingError("slave " + std::to_string(slave) + ": object not in the TxPDO (feedback) map");
     }
     return it->second;
+}
+
+Rpdo Master::read_rpdo(std::uint16_t slave) const {
+    (void)runtime_for(slave);                      // validate the slave id (throws ConfigError, clear text)
+    return Rpdo(read_inputs(slave), this, slave);  // ONE seqlock read, copied into the frame-consistent snapshot
+}
+
+Tpdo Master::make_tpdo(std::uint16_t slave) {
+    SlaveRuntime& rt = runtime_for(slave);               // validate + get the cache (throws ConfigError, clear text)
+    return Tpdo(rt.io.outputs, this, &rt.cache, slave);  // seed from the CURRENT command image
 }
 
 std::string Master::last_error() const {
