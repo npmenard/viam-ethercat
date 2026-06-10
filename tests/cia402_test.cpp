@@ -580,4 +580,41 @@ TEST("#38.14: first update adopts the current state; OE keeps 0x0F; nothing walk
     CHECK_EQ(oe.get_cw(), std::uint16_t{0x0F});  // T4 back toward the adopted OE goal
 }
 
+// (15, B3 -- DA gate) An UNCOMMANDED QuickStopActive entry (external estop wired to the
+// drive's quick-stop input; no quick_stop() intent from us) cancels the goal: after the
+// A6-default auto-T12 lands SOD, the FSM HOLDS (0x00, B1-inert) -- the motor must NOT
+// re-energize the instant the estop releases. Recovery = a fresh enable(). Mirror of
+// test 5 (fault-cancel). NON-VACUITY validated during dev: removing the B3 entry-edge
+// cancel makes this FAIL (the surviving goal=OE re-walks 0x06 from SOD) -- see commit.
+TEST("#38.15: uncommanded quick-stop entry cancels the goal (B3 -- no estop-release restart)") {
+    Cia402Fsm f;
+    Cia402State drive = Cia402State::SwitchOnDisabled;
+    f.update(sw_of(drive));
+    CHECK(f.enable().has_value());
+    for (int i = 0; i < 3; ++i) {  // walk to OE
+        drive = drive_step(drive, f.get_cw());
+        f.update(sw_of(drive));
+    }
+    CHECK(f.operation_enabled());
+    // EXTERNAL estop: the drive enters QSA on its own -- we never called quick_stop().
+    f.update(sw_of(Cia402State::QuickStopActive));
+    // A6 default: auto-T12 lands SOD. The goal must be GONE -- hold inert, never re-walk.
+    f.update(sw_of(Cia402State::SwitchOnDisabled));
+    for (int i = 0; i < 5; ++i) {
+        CHECK_EQ(f.get_cw(), std::uint16_t{0x00});  // estop released; motor stays OFF
+        f.update(sw_of(Cia402State::SwitchOnDisabled));
+        CHECK_EQ(f.state(), Cia402State::SwitchOnDisabled);
+    }
+    // Re-energizing is a fresh, deliberate caller decision:
+    CHECK(f.enable().has_value());
+    CHECK_EQ(f.get_cw(), std::uint16_t{0x06});
+    // And the T12-override stays intact: a goal issued DURING QSA is honored (it
+    // postdates the stop). External QSA, then an explicit post-stop enable():
+    Cia402Fsm g;
+    g.update(sw_of(Cia402State::OperationEnabled));                 // adopted OE
+    g.update(sw_of(Cia402State::QuickStopActive));                  // external stop -> goal cancelled
+    CHECK(g.set_state(Cia402State::OperationEnabled).has_value());  // fresh decision DURING QSA
+    CHECK_EQ(g.get_cw(), std::uint16_t{0x0F});                      // T16 honored (holding drives)
+}
+
 TEST_MAIN()

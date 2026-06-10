@@ -331,6 +331,17 @@ class Cia402Fsm {
         if (s == Cia402State::Fault || s == Cia402State::FaultReactionActive) {
             st_.has_goal = false;  // §5: fault cancels the goal -- no implicit re-energize
         }
+        // B3 (#38 gate): an UNCOMMANDED QuickStopActive ENTRY also cancels the goal. A
+        // drive can enter QSA externally (an estop input wired to its quick-stop
+        // function); without this, goal=OE would survive the stop, re-walk T2/T3/T4 from
+        // the auto-T12 SOD landing, and RE-ENERGIZE the instant the estop releases -- the
+        // exact §5 hazard class (no re-energize without a fresh caller decision).
+        // ENTRY-EDGE form: our own quick_stop() already cancelled at intent time (this is
+        // then a no-op), and a goal issued DURING QSA (set_state while decoded QSA) stays
+        // honored -- it is a fresh, deliberate post-stop caller decision (the T12-override).
+        if (s == Cia402State::QuickStopActive && st_.state != Cia402State::QuickStopActive) {
+            st_.has_goal = false;
+        }
         if (s != Cia402State::OperationEnabled) {
             st_.sp_phase = SetpointPhase::Idle;  // B2: any exit from OE aborts the handshake
             st_.qs_intent = false;               // quick-stop intent consumed-or-dropped (minor-b)

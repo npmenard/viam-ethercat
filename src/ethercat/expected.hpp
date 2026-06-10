@@ -13,9 +13,13 @@
 //
 // SUBSET ONLY -- exactly what the FSM API needs: trivially-copyable T/E, no
 // exceptions, no allocation, no monadic ops, everything constexpr/noexcept.
-// CONTRACT (mirrors std::expected's preconditions): error() is valid ONLY when
-// !has_value(); value()/operator* only when has_value(). Violations are
-// debug-asserted and undefined in release -- same as std::expected.
+// CONTRACT: error() is valid ONLY when !has_value(); value()/operator* only when
+// has_value(). Violations are debug-asserted, undefined in release. NOTE one
+// DELIBERATE divergence from std::expected: std::expected::value() THROWS
+// bad_expected_access on an error (only its operator* is UB) -- this shim's
+// value() asserts/UB instead, the right call for a noexcept RT FSM. FLIP NOTE:
+// after a future flip to std::expected, an unchecked .value() on an error stops
+// being UB and becomes a THROW -- audit value() call sites at that point.
 
 #include <cassert>
 
