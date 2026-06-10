@@ -10,12 +10,6 @@
 #include <exception>
 #include <memory>
 #include <thread>
-// <utility> must precede boost/asio.hpp at C++23 (#38): boost 1.74 (the CI image's
-// jammy system boost) uses std::exchange in asio/awaitable.hpp WITHOUT including
-// <utility>, relying on transitive includes that libstdc++-12's C++23 header cleanup
-// removed. Including it first declares std::exchange before boost needs it.
-// (Verified in the canonical image; remove when the image's boost is >= 1.80.)
-#include <utility>
 
 #include <boost/asio.hpp>
 

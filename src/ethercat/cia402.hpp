@@ -1,7 +1,8 @@
 #pragma once
 
 #include <cstdint>
-#include <expected>
+
+#include "ethercat/expected.hpp"
 
 namespace ethercat {
 
@@ -143,7 +144,7 @@ struct ControlWord {
 };
 
 // Errors returned by the goal-walking FSM's INTENT calls (#38 §9). update()/get_cw()
-// never error. Returned via std::expected at the intent call (immediate).
+// never error. Returned via Expected (the C++20 std::expected stand-in, expected.hpp) at the intent call (immediate).
 enum class FsmError : std::uint8_t {
     FaultActive,     // goal refused: a fault is present -- reset + re-issue the goal
     InvalidGoal,     // QSA/Fault/NotReady/FRA are not set_state goals (quick_stop is an intent)
@@ -201,7 +202,7 @@ constexpr std::uint16_t sustain_cw(Cia402State s) noexcept {
 // emit QSA's sustain 0x02 which actively SUSTAINS the stop, making those goals
 // unreachable on a holding drive. Any goal present during QSA was issued AFTER
 // quick_stop() cancelled the previous one = a fresh deliberate override -- honor it.
-constexpr std::expected<std::uint16_t, FsmError> next_cw(Cia402State current, Cia402State goal) noexcept {
+constexpr Expected<std::uint16_t, FsmError> next_cw(Cia402State current, Cia402State goal) noexcept {
     switch (goal) {
         case Cia402State::SwitchOnDisabled:
         case Cia402State::ReadyToSwitchOn:
@@ -212,7 +213,7 @@ constexpr std::expected<std::uint16_t, FsmError> next_cw(Cia402State current, Ci
         case Cia402State::QuickStopActive:
         case Cia402State::FaultReactionActive:
         case Cia402State::Fault:
-            return std::unexpected(FsmError::InvalidGoal);
+            return Unexpected(FsmError::InvalidGoal);
     }
     switch (current) {
         case Cia402State::NotReadyToSwitchOn:
@@ -260,13 +261,13 @@ constexpr std::expected<std::uint16_t, FsmError> next_cw(Cia402State current, Ci
             return std::uint16_t{0x0000};  // T12: land SOD, re-walk (incl. goal RTSO/SO -- the override)
         case Cia402State::FaultReactionActive:
             if (goal == Cia402State::OperationEnabled) {
-                return std::unexpected(FsmError::FaultActive);
+                return Unexpected(FsmError::FaultActive);
             }
             return sustain_cw(current);  // WAIT: T14 is auto; 0x06 is inert here
         case Cia402State::Fault:
-            return std::unexpected(FsmError::FaultActive);  // reset is the shell's job (§5)
+            return Unexpected(FsmError::FaultActive);  // reset is the shell's job (§5)
     }
-    return std::unexpected(FsmError::FaultActive);
+    return Unexpected(FsmError::FaultActive);
 }
 
 // Goal-walking CiA402 FSM (#38): statusword in -> intents -> controlword out.
@@ -292,7 +293,7 @@ constexpr std::expected<std::uint16_t, FsmError> next_cw(Cia402State current, Ci
 // other refs while bit7=1 anyway); the next cycle returns to base with bit7=0 -- that
 // FALLING edge re-arms the drive's rising-edge detector. Retry/give-up = caller policy.
 //
-// RT-resident: every method noexcept, no allocation, no exceptions (std::expected).
+// RT-resident: every method noexcept, no allocation, no exceptions (Expected, the std::expected stand-in).
 // No timeouts inside (caller policy via cycles_in_state() + remote() + setpoint_phase()).
 // Never touches 0x6060 (set_mode is intent-validation only). No vendor-fault knowledge
 // (Er74-class clears are consumer policy, #39/#22): after an ineffective reset pulse,
@@ -380,34 +381,34 @@ class Cia402Fsm {
     // Goal-driven walk toward one of the four stable goals. QSA/Fault/NotReady/FRA
     // are not goals (InvalidGoal -- quick_stop is an intent). Refused while a fault
     // is present (FaultActive): reset + re-issue once the drive clears (§5).
-    std::expected<void, FsmError> set_state(Cia402State goal) noexcept {
+    Expected<void, FsmError> set_state(Cia402State goal) noexcept {
         if (!is_goal(goal)) {
-            return std::unexpected(FsmError::InvalidGoal);
+            return Unexpected(FsmError::InvalidGoal);
         }
         if (st_.state == Cia402State::Fault || st_.state == Cia402State::FaultReactionActive) {
-            return std::unexpected(FsmError::FaultActive);
+            return Unexpected(FsmError::FaultActive);
         }
         st_.has_goal = true;
         st_.goal = goal;
         return {};
     }
-    std::expected<void, FsmError> enable() noexcept {
+    Expected<void, FsmError> enable() noexcept {
         return set_state(Cia402State::OperationEnabled);
     }
-    std::expected<void, FsmError> disable() noexcept {
+    Expected<void, FsmError> disable() noexcept {
         return set_state(Cia402State::SwitchOnDisabled);
     }
 
     // PP bit-4 new-set-point handshake (§7). bit6 (relative) rides with it if asked.
-    std::expected<void, FsmError> set_point(bool relative = false) noexcept {
+    Expected<void, FsmError> set_point(bool relative = false) noexcept {
         if (st_.mode != Cia402Mode::ProfilePosition) {
-            return std::unexpected(FsmError::WrongMode);
+            return Unexpected(FsmError::WrongMode);
         }
         if (st_.state != Cia402State::OperationEnabled) {
-            return std::unexpected(FsmError::NotOperational);
+            return Unexpected(FsmError::NotOperational);
         }
         if (st_.sp_phase != SetpointPhase::Idle) {
-            return std::unexpected(FsmError::Busy);
+            return Unexpected(FsmError::Busy);
         }
         st_.sp_phase = SetpointPhase::Arm;
         st_.sp_relative = relative;

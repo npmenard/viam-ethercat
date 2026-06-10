@@ -63,12 +63,8 @@ endif()
 
 
 # Enforce the C++ standard, and disable extensions.
-# C++23 (#38): the locked Cia402Fsm API returns std::expected<void, FsmError>
-# (C++23-only). Both pinned compilers (clang-19, GCC-14) build the full tree clean
-# at 23; verified clang+GCC -Werror + all tests at the bump. (If the module/SDK
-# docker build objects, the fallback is scoping 23 to the library targets.)
 if (NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 23)
+  set(CMAKE_CXX_STANDARD 20)
 endif()
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_CXX_EXTENSIONS OFF)
