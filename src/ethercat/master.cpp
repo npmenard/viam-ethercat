@@ -265,6 +265,8 @@ void Master::configure() {
     fault_.store(false, std::memory_order_relaxed);
     consecutive_wkc_errors_ = 0;
     settle_remaining_ = 0;
+    total_cycles_.store(0, std::memory_order_relaxed);
+    bad_cycles_.store(0, std::memory_order_relaxed);
     operational_.store(false, std::memory_order_relaxed);
 }
 
@@ -346,6 +348,13 @@ void Master::process() noexcept {
     }
     const int wkc = backend_->exchange();
     last_wkc_.store(wkc, std::memory_order_relaxed);  // raw, every cycle (diagnostic)
+    // WKC stats (#40 item 4): two relaxed increments per cycle (one conditional). Steady
+    // cycles only -- bringup_step's exchanges are deliberately excluded (partial WKC is
+    // NORMAL pre-OP and would pollute the bad count). Reset in configure().
+    total_cycles_.fetch_add(1, std::memory_order_relaxed);
+    if (wkc < 0 || wkc < expected_wkc_) {
+        bad_cycles_.fetch_add(1, std::memory_order_relaxed);
+    }
     // Post-OP DC settle grace: while it lasts, fully clear the latch state every
     // cycle, so NOTHING (not even a bad streak during the grace) can carry past the
     // grace boundary and trip a spurious latch the instant it ends. The DC phase PI

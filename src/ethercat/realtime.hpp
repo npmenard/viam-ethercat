@@ -90,6 +90,10 @@ class DcPacer {
         : period_ns_(period_ns), shift_ns_(shift_ns), next_(monotonic_ns() + period_ns) {
         assert(period_ns_ > 0 && "DcPacer: period_ns must be positive");
     }
+    // #40 item 1: the canonical DC phase target -- wake MID-CYCLE between SYNC0 edges
+    // (period/2; what every consumer passes) -- as the default. A delegating ctor, not a
+    // default argument (a default arg cannot reference a preceding parameter).
+    explicit DcPacer(std::uint64_t period_ns) noexcept : DcPacer(period_ns, static_cast<std::int64_t>(period_ns) / 2) {}
 
     // Re-arm the absolute deadline to `first_deadline_ns` and zero the integral.
     // (Production: align to a known epoch; tests: set a deterministic base.)
@@ -174,12 +178,21 @@ class DcPacer {
 // bring-up reaches Operational or Aborted, or BringupStatus::Aborted if `timeout`
 // elapses first (a bounded give-up -- repeated Er74 OP-entry wedges the A6).
 //
-// For the SIMPLE consumers (#21, a6_validate). The ServoController KEEPS its inline
-// prelude (it publishes the drive-fault tier on abort, which this thin pump does not).
+// OPTIONAL `observer` (#40 item 2): a lightweight callable invoked once per pump cycle
+// with (status-this-cycle, cycle-counter) -- the diagnostics seam that let a6_validate
+// migrate here without losing its per-N-tick dcPhase prints (the caller's lambda
+// captures &master for dc_time(); the observer runs ON THE PUMP THREAD, so that capture
+// is same-thread safe). Returning FALSE stops the pump -> BringupStatus::Aborted (one
+// defined return; doubles as the caller's stop channel, e.g. a SIGINT flag).
+// Default-empty = zero cost: the bare consumer (#21) stays a one-liner.
+//
+// The ServoController KEEPS its inline prelude (it publishes the drive-fault tier on
+// abort, which this thin pump does not) -- per the locked P3c scope.
 BringupStatus run_to_operational(Master& master,
                                  DcPacer& pacer,
                                  const std::function<bool()>& sync_faulted,
-                                 std::chrono::milliseconds timeout);
+                                 std::chrono::milliseconds timeout,
+                                 const std::function<bool(BringupStatus, std::uint64_t)>& observer = {});
 
 }  // namespace realtime
 }  // namespace ethercat

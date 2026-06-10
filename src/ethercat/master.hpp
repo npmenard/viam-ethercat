@@ -71,6 +71,15 @@ void store_le(std::span<std::byte> image, FieldLocation loc, T value) noexcept {
 class Rpdo;
 class Tpdo;
 
+// Cyclic WKC health counters (#40 item 4), published RT -> non-RT. Consolidates the
+// per-tool tallying (a6_validate's raw/badWKC counters) into the library.
+struct WkcStats {
+    int expected = 0;                // the bus's full working counter (constant post-configure)
+    int last = 0;                    // raw WKC of the most recent exchange (good or bad)
+    std::uint64_t total_cycles = 0;  // process() cycles since configure()
+    std::uint64_t bad_cycles = 0;    // cycles whose WKC was short/abnormal
+};
+
 // Status of the DC bring-up state machine (Master::bringup_step). The caller drives
 // one step per cyclic exchange until it sees Operational (switch to the steady loop)
 // or Aborted (surface the fault; do NOT immediately re-enter bring-up -- repeated
@@ -172,6 +181,16 @@ class Master {
     // flap the reported WKC). Use this to actually SEE per-cycle short WKC.
     int last_wkc() const noexcept {
         return last_wkc_.load(std::memory_order_relaxed);
+    }
+    // Snapshot of the cyclic WKC health counters (#40). FIELDS ARE INDIVIDUALLY RELAXED:
+    // a reader may observe total/bad mutually inconsistent by +/-1 cycle. That is FINE
+    // for diagnostics and BY DESIGN -- do NOT "fix" it with a lock later (this is read
+    // on cold paths against counters the RT loop bumps every cycle).
+    WkcStats wkc_stats() const noexcept {
+        return WkcStats{expected_wkc_,
+                        last_wkc_.load(std::memory_order_relaxed),
+                        total_cycles_.load(std::memory_order_relaxed),
+                        bad_cycles_.load(std::memory_order_relaxed)};
     }
     int expected_wkc() const noexcept {
         return expected_wkc_;
@@ -340,6 +359,8 @@ class Master {
     std::atomic<int> fault_wkc_{0};
     std::atomic<bool> fault_{false};
     std::atomic<bool> operational_{false};
+    std::atomic<std::uint64_t> total_cycles_{0};  // #40 WkcStats: process() cycles since configure()
+    std::atomic<std::uint64_t> bad_cycles_{0};    // #40 WkcStats: short/abnormal-WKC cycles
     // Consumer-declared RT phase (#39): while true, the public sdo_read/sdo_write throw
     // (port-ownership guard). Set/cleared by the consumer around its RT thread spawn/join.
     std::atomic<bool> rt_active_{false};

@@ -411,6 +411,38 @@ TEST("Master(#44): a declared SYNC0 cycle granularity rejects a non-multiple loo
     Master m_nodc{no_dc, std::make_unique<SimBackend>(make_models())};
 }
 
+TEST("Master(#40): wkc_stats counts steady cycles + bad WKC; bring-up excluded; configure resets") {
+    auto sim = std::make_unique<SimBackend>(make_models());
+    SimBackend* sim_ptr = sim.get();
+    Master m2{make_config(), std::move(sim)};
+    m2.init();
+    m2.configure();
+    // Bring-up exchanges must NOT count (partial WKC is normal pre-OP).
+    for (int c = 0; c < 200; ++c) {
+        if (m2.bringup_step(false) == ethercat::BringupStatus::Operational) {
+            break;
+        }
+    }
+    CHECK_EQ(m2.wkc_stats().total_cycles, std::uint64_t{0});
+    // Steady cycles: 10 good + 3 forced-short.
+    for (int i = 0; i < 10; ++i) {
+        m2.process();
+    }
+    sim_ptr->force_short_wkc(true);
+    for (int i = 0; i < 3; ++i) {
+        m2.process();
+    }
+    sim_ptr->force_short_wkc(false);
+    const ethercat::WkcStats st = m2.wkc_stats();
+    CHECK_EQ(st.total_cycles, std::uint64_t{13});
+    CHECK_EQ(st.bad_cycles, std::uint64_t{3});
+    CHECK_EQ(st.expected, m2.expected_wkc());
+    // configure() resets the counters (per-power-on stats).
+    m2.configure();
+    CHECK_EQ(m2.wkc_stats().total_cycles, std::uint64_t{0});
+    CHECK_EQ(m2.wkc_stats().bad_cycles, std::uint64_t{0});
+}
+
 TEST("Master(#39): configure() fires ZERO vendor SDO traffic -- only map/assign/mode objects") {
     // The vendor fault-reset that used to fire in configure() is consumer-side now.
     // Assert the library bring-up writes touch ONLY the PDO mapping sub-protocol

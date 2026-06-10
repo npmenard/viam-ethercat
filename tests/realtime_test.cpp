@@ -218,4 +218,63 @@ TEST("realtime::run_to_operational gives up (Aborted) on a never-syncing drive -
     CHECK(elapsed < std::chrono::seconds(5));  // bounded give-up, not the 30 s Master window
 }
 
+// (#40 item 1) The delegating ctor defaults the phase target to period/2 -- identical
+// math to the explicit two-arg form.
+TEST("DcPacer(period) defaults the shift to period/2 (delegating ctor)") {
+    realtime::DcPacer defaulted(kPeriod);
+    realtime::DcPacer explicit_shift(kPeriod, kShift);
+    defaulted.reset(0);
+    explicit_shift.reset(0);
+    for (int i = 0; i < 32; ++i) {
+        const std::int64_t dc = 700'000 + i * 311;
+        CHECK_EQ(defaulted.step(dc, 0), explicit_shift.step(dc, 0));  // identical corrections
+    }
+    CHECK_EQ(defaulted.integral(), explicit_shift.integral());
+}
+
+// (#40 item 2) The observer hook: called once per pump cycle with an advancing counter;
+// returning false stops the pump -> Aborted; the default-empty path stays the bare
+// one-liner (#21) and is already covered by the two run_to_operational tests above.
+TEST("run_to_operational observer: per-cycle calls; observer-false aborts the pump") {
+    {  // observer sees every cycle and the terminal status; counter advances 1..N
+        Master m{make_config(), std::make_unique<SimBackend>(make_models())};
+        m.init();
+        m.configure();
+        realtime::DcPacer pacer(kPeriod);
+        std::uint64_t calls = 0;
+        std::uint64_t last_cycle = 0;
+        bool saw_operational = false;
+        const BringupStatus bs = realtime::run_to_operational(
+            m,
+            pacer,
+            [] { return false; },
+            std::chrono::milliseconds(2000),
+            [&](BringupStatus st, std::uint64_t cycle) {
+                ++calls;
+                CHECK_EQ(cycle, last_cycle + 1);  // once per cycle, monotonically
+                last_cycle = cycle;
+                saw_operational = saw_operational || st == BringupStatus::Operational;
+                return true;
+            });
+        CHECK(bs == BringupStatus::Operational);
+        CHECK(saw_operational);       // the observer saw the terminal status too
+        CHECK_EQ(calls, last_cycle);  // no skipped/duplicated cycles
+        CHECK(calls >= 3);            // settle(2) + confirm
+    }
+    {  // observer-false -> Aborted (the caller stop channel, e.g. SIGINT)
+        Master m{make_config(), std::make_unique<SimBackend>(make_models())};
+        m.init();
+        m.configure();
+        realtime::DcPacer pacer(kPeriod);
+        const BringupStatus bs = realtime::run_to_operational(
+            m,
+            pacer,
+            [] { return false; },
+            std::chrono::milliseconds(2000),
+            [&](BringupStatus, std::uint64_t cycle) { return cycle < 2; });  // stop on cycle 2
+        CHECK(bs == BringupStatus::Aborted);
+        CHECK(!m.all_operational());
+    }
+}
+
 TEST_MAIN()

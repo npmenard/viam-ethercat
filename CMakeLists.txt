@@ -384,7 +384,16 @@ viam_add_test(teardown_under_load_test tests/teardown_under_load_test.cpp)
 # ThreadSanitizer build of the RT-boundary test. Compiles the pdo_cache TU
 # directly (with -fsanitize=thread) so the seqlock / lock-free handoff code is
 # instrumented, rather than linking the un-instrumented libethercat.
-if (ETHERCAT_SANITIZE_THREAD)
+# #40 item 6: the TSan lane is CLANG-ONLY by policy -- gcc-14 cannot build it
+# (`atomic_thread_fence not supported with -fsanitize=thread` -Werror=tsan, hit in
+# pdo_cache.cpp's LOAD-BEARING seqlock fences, which must not be weakened). Gate it
+# so nobody burns an hour rediscovering that.
+if (ETHERCAT_SANITIZE_THREAD AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  message(STATUS "ETHERCAT_SANITIZE_THREAD: skipped -- the TSan lane requires clang "
+                 "(gcc rejects atomic_thread_fence under -fsanitize=thread; the pdo_cache "
+                 "seqlock fences are load-bearing). Configure with clang to build it.")
+endif()
+if (ETHERCAT_SANITIZE_THREAD AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_executable(pdo_cache_test_tsan
     tests/pdo_cache_test.cpp
     src/ethercat/pdo_cache.cpp

@@ -63,14 +63,23 @@ void lock_current() noexcept {
 BringupStatus run_to_operational(Master& master,
                                  DcPacer& pacer,
                                  const std::function<bool()>& sync_faulted,
-                                 std::chrono::milliseconds timeout) {
+                                 std::chrono::milliseconds timeout,
+                                 const std::function<bool(BringupStatus, std::uint64_t)>& observer) {
     const auto timeout_ns = static_cast<std::uint64_t>(timeout.count()) * 1'000'000ULL;
     const std::uint64_t give_up_at = monotonic_ns() + timeout_ns;
+    std::uint64_t cycle = 0;
     for (;;) {
         // Order mirrors the hand-rolled bring-up loops: read the prior step's sync
         // state, advance the bring-up (this does the exchange), then pace the cycle
         // off THIS exchange's DC time -- so PD stays gapless + phase-locked.
         const BringupStatus bs = master.bringup_step(sync_faulted());
+        ++cycle;
+        // The observer (diagnostics + caller stop channel) runs BEFORE the pace so its
+        // view is the freshest exchange; false -> stop the pump (Aborted). It executes
+        // on this (the pump) thread -- callers may capture &master safely.
+        if (observer && !observer(bs, cycle)) {
+            return BringupStatus::Aborted;
+        }
         pacer.pace(master.dc_time());
         if (bs == BringupStatus::Operational || bs == BringupStatus::Aborted) {
             return bs;

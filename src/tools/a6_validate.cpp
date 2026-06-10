@@ -83,13 +83,15 @@ extern "C" void on_sigint(int) {
 // bit4-handshake --move-pp) or CyclicSyncPosition (the streamed --move-sine). Both
 // reuse the SAME PDO map -- 0x607A serves the PP target AND the CSP streamed target --
 // so one builder covers both; only the post-enable control semantics differ.
-MasterConfig build_a6_config(const std::string& ifname, std::int32_t dc_sync0_shift_ns, Cia402Mode mode) {
+MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
     MasterConfig cfg;
     cfg.ifname = ifname;
-    cfg.target_loop_rate_hz = 1000;             // 1 ms SYNC0 = 4 x 250 us (A6-legal)
-    cfg.use_distributed_clocks = true;          // A6 supports ONLY DC sync
-    cfg.dc_sync0_shift_ns = dc_sync0_shift_ns;  // SYNC0 CyclShift; --dc-shift-ns sweep
-    cfg.dc_settle_cycles = 1000;                // ~1 s post-OP grace while the phase finishes locking
+    cfg.target_loop_rate_hz = 1000;     // 1 ms SYNC0 = 4 x 250 us (A6-legal)
+    cfg.use_distributed_clocks = true;  // A6 supports ONLY DC sync
+    // #40 item 3: MasterConfig::dc_sync0_shift_ns (the ecx_dcsync0 CyclShift) STAYS as the
+    // future-drive SM-event knob, default 0 -- first light ran at 0 and the CLI sweep flag
+    // (--dc-shift-ns) was never used off-default, so the flag is gone (config-reachable only).
+    cfg.dc_settle_cycles = 1000;  // ~1 s post-OP grace while the phase finishes locking
     cfg.max_consecutive_wkc_errors = 5;
     // The bring-up SETTLE bound uses MasterConfig's default (dc_op_gate_cycles). SYNC0 is
     // armed in PRE-OP inside configure() (before config_map_group); the cyclic loop then
@@ -162,7 +164,6 @@ struct Options {
     double sine_period = 4.0;              // seconds; --sine-period
     std::int32_t follow_err_limit = 5000;  // counts; CSP tool-level following-error abort; --follow-err-limit
     int seconds = 6;
-    std::int32_t dc_sync0_shift_ns = 0;  // SYNC0 CyclShift passed to ecx_dcsync0; sweep with --dc-shift-ns
 };
 
 }  // namespace
@@ -194,14 +195,12 @@ int main(int argc, char** argv) {
             opt.follow_err_limit = std::stoi(args[++i]);
         } else if (a == "--seconds" && i + 1 < args.size()) {
             opt.seconds = std::stoi(args[++i]);
-        } else if (a == "--dc-shift-ns" && i + 1 < args.size()) {
-            opt.dc_sync0_shift_ns = std::stoi(args[++i]);  // SYNC0 CyclShift passed to ecx_dcsync0
         } else if (a.rfind("--", 0) != 0) {
             opt.ifname = a;
         } else {
             std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]]\n"
                       << "                   [--move-sine [--sine-amplitude N] [--sine-period S]] [--csp-probe] [--seconds N] "
-                         "[--dc-shift-ns NS]\n"
+                         ""
                       << "  The DC bring-up (#20) is automatic: configure() arms SYNC0 in PRE-OP + reaches SAFE-OP,\n"
                       << "  then the cyclic loop runs SETTLE (phase-locked PD) -> request OP once -> AWAIT_OP (hold\n"
                       << "  for OP + sync), all gapless. Er74.1 in SAFE-OP is normal pre-sync, clears at OP.\n"
@@ -216,7 +215,6 @@ int main(int argc, char** argv) {
                       << "  --csp-probe: NON-energizing diagnostic -- bring up in CSP mode (0x6060=8), hold at\n"
                       << "               ReadyToSwitchOn (NO enable), print feedback. Confirms whether the read path returns\n"
                       << "               valid sw/pos in CSP without energizing (isolates CSP-feedback vs a wedged drive).\n"
-                      << "  --dc-shift-ns: SYNC0 pulse CyclShift (ecx_dcsync0) -- sweep to move the SYNC0 edge if needed.\n"
                       << "  --reset-fault: clear a latent drive fault at bring-up via the A6 vendor SDO 0x2031:01=1.\n";
             return 2;
         }
@@ -265,10 +263,10 @@ int main(int argc, char** argv) {
         std::cerr << "    [rt] continuing best-effort -- DC SYNC0 may fault under jitter; run with sudo.\n\n";
     }
 
-    std::cout << "[dc] phase-lock target = auto(mid-cycle) | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns"
+    std::cout << "[dc] phase-lock target = auto(mid-cycle) | SYNC0 CyclShift = 0ns (config knob; no CLI flag)"
               << " | fault-reset at bring-up = " << (opt.reset_fault ? "ON (vendor 0x2031:01=1)" : "off") << "\n\n";
 
-    Master master(build_a6_config(opt.ifname, opt.dc_sync0_shift_ns, mode), std::make_unique<SoemBackend>());
+    Master master(build_a6_config(opt.ifname, mode), std::make_unique<SoemBackend>());
 
     // --- Stage A: open + enumerate + read-only SDO identity (PRE-OP) ---
     try {
@@ -334,10 +332,6 @@ int main(int argc, char** argv) {
     const Cia402State goal = opt.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
     constexpr std::uint32_t kLoopHz = 1000;
     const std::uint32_t period_ns = 1'000'000'000U / kLoopHz;
-    // Phase-lock TARGET: mid-cycle (period/2 from the DC base) -- locking on the SYNC0
-    // edge leaves no jitter margin. The single DC phase knob is the ecx_dcsync0 CyclShift
-    // (--dc-shift-ns); the PI send-phase target is derived here (#20 consolidated).
-    const std::int64_t dc_shift = static_cast<std::int64_t>(period_ns) / 2;
 
     const auto bringup_label = [](BringupStatus s) -> const char* {
         switch (s) {
@@ -355,8 +349,9 @@ int main(int argc, char** argv) {
 
     // ONE pacer across Phase 1 (bring-up) + Phase 2 (steady) + teardown -- it carries the
     // absolute deadline + PI integral continuously, so the SAFE-OP->OP->steady handoff stays
-    // gapless + phase-locked. pace(dc_time) per cycle = the old sleep_until + dc_phase_correction.
-    realtime::DcPacer pacer(period_ns, dc_shift);
+    // gapless + phase-locked. #40 item 1: the mid-cycle phase target (period/2) is the
+    // delegating-ctor default now.
+    realtime::DcPacer pacer(period_ns);
 
     // --- Phase 1: DC bring-up (#20). configure() armed SYNC0 in PRE-OP + left the bus at
     // SAFE-OP; the Master FSM runs SETTLE (phase-locked PD) -> request OP once -> AWAIT_OP
@@ -364,43 +359,41 @@ int main(int argc, char** argv) {
     // cadence. drive_sync_faulted = our read of 0x603F == 0x8700 (Er74.1) from the prior
     // cycle; it's the NORMAL pre-sync state in SAFE-OP (clears at OP), so it gates the
     // post-OP hold, not the request -- see bringup_step.
+    // #40 item 2 (supersedes the P3b keep-explicit ruling, user's call): Phase 1 runs via
+    // realtime::run_to_operational; the per-200-tick dcPhase diagnostics + the SIGINT stop
+    // survive through the OBSERVER hook (runs on this thread -- the &master capture is
+    // same-thread safe). Resolve the FaultCode (0x603F) location ONCE; bring-up reads the
+    // LIVE image (bringup_step exchanges but does not publish the snapshot). The pump's
+    // wall timeout is set ABOVE the Master's own ~30 s give-up so the Master's verdict
+    // (not the pump's) decides, exactly as before.
     bool reached_op = false;
     {
-        std::uint64_t btick = 0;
-        // Resolve the FaultCode (0x603F) feedback location ONCE (it's stable for the run) instead
-        // of per cycle (#30 P2c carry-in -- FieldLocation::mapped() is the clean vehicle). If
-        // 0x603F isn't mapped, fc_loc stays unmapped -> every cycle treats it as no-sync-fault.
         FieldLocation fc_loc;
         try {
             fc_loc = master.resolve_tx<cia402::FaultCode>(slave);
         } catch (const Error&) {  // 0x603F not mapped -> leave fc_loc unmapped
         }
-        while (!g_stop.load()) {
-            // Phase 1 reads the LIVE feedback image: bringup_step() does exchange() but does NOT
-            // publish the seqlock snapshot (only process() does), so read_rpdo would be stale here.
+        const auto sync_faulted = [&]() {
             const std::span<const std::byte> in = master.input_image(slave);
             const std::uint16_t fc = fc_loc.mapped() ? load_le<cia402::FaultCode::type>(in, fc_loc) : 0;
-            const BringupStatus bs = master.bringup_step(fc == 0x8700);
-            if (++btick % 200 == 0) {
-                std::cout << "[B] bring-up t=" << btick << " " << bringup_label(bs) << " wkc=" << master.last_wkc() << "/"
+            return fc == 0x8700;
+        };
+        const auto observer = [&](BringupStatus bs, std::uint64_t cycle) {
+            if (cycle % 200 == 0) {
+                std::cout << "[B] bring-up t=" << cycle << " " << bringup_label(bs) << " wkc=" << master.last_wkc() << "/"
                           << master.expected_wkc() << " dcPhase=" << (master.dc_time() % static_cast<std::int64_t>(period_ns)) << "ns\n";
             }
-            if (bs == BringupStatus::Operational) {
-                reached_op = true;
-            } else if (bs == BringupStatus::Aborted) {
+            if (bs == BringupStatus::Aborted) {
                 std::cerr << "[B] !!! BRING-UP ABORTED: OP did not hold within the await window -- the drive did not reach\n"
                           << "    OP with WKC 3/3 + Er74.1 cleared (SYNC0 likely not truly established). OP was requested\n"
                           << "    ONCE + not re-requested (repeated Er74 OP-entry wedges the A6). Power-cycle + check DC\n"
-                          << "    wiring/cycle; sweep --dc-shift-ns. last_error: " << master.last_error() << '\n';
+                          << "    wiring/cycle. last_error: " << master.last_error() << '\n';
             }
-            // Pace EVERY step incl the terminal one (keeps PD phase-locked through the OP->steady
-            // handoff -- no frame gap), then leave on a terminal status. = the old sleep_until +
-            // dc_phase_correction, now via the shared DcPacer (which adds skip-catch-up).
-            pacer.pace(master.dc_time());
-            if (bs == BringupStatus::Operational || bs == BringupStatus::Aborted) {
-                break;
-            }
-        }
+            return !g_stop.load();  // observer-false -> the pump returns Aborted (SIGINT path)
+        };
+        const BringupStatus result =
+            realtime::run_to_operational(master, pacer, sync_faulted, std::chrono::milliseconds(120'000), observer);
+        reached_op = (result == BringupStatus::Operational);
     }
     if (!reached_op) {
         std::cout << "\n[B] bring-up did not reach OP; closing. (last_error: " << master.last_error() << ")\n";
@@ -421,7 +414,6 @@ int main(int argc, char** argv) {
     std::int32_t hold_pos = 0;
     std::int32_t target = 0;
     std::uint64_t tick = 0;
-    int wkc_bad = 0;
     // CSP sine state: pos_enable (origin captured at OperationEnabled), enable_tick (t=0
     // reference), last_sine_target (held during graceful shutdown so the shaft isn't yanked).
     std::int32_t pos_enable = 0;
@@ -432,10 +424,6 @@ int main(int argc, char** argv) {
     while (!g_stop.load()) {
         master.process();
         ++tick;
-        const int raw_wkc = master.last_wkc();
-        if (raw_wkc != master.expected_wkc()) {
-            ++wkc_bad;
-        }
         const std::int64_t dct = master.dc_time();
 
         // ONE frame-consistent feedback snapshot per cycle (process() published it above); every
@@ -568,9 +556,9 @@ int main(int argc, char** argv) {
             std::cout << "    t=" << tick / kLoopHz << "s " << to_string(status.decode()) << " sw=0x" << std::hex << status.raw
                       << " 0x603F=0x" << fc << std::dec << " mode=" << static_cast<int>(mode_now) << " Rx.cw=0x" << std::hex << cw
                       << std::dec << " cmdTarget=" << target << " pos=" << pos << " followErr=" << follow_err << " vel=" << vel
-                      << " wkc=" << raw_wkc << "/" << master.expected_wkc() << " badWKC=" << wkc_bad
-                      << " dcPhase=" << (dct % static_cast<std::int64_t>(period_ns)) << "ns" << (master.fault() ? " [BUS FAULT]" : "")
-                      << '\n';
+                      << " wkc=" << master.wkc_stats().last << "/" << master.wkc_stats().expected
+                      << " badWKC=" << master.wkc_stats().bad_cycles << " dcPhase=" << (dct % static_cast<std::int64_t>(period_ns)) << "ns"
+                      << (master.fault() ? " [BUS FAULT]" : "") << '\n';
         }
 
         if (master.fault()) {
@@ -615,6 +603,8 @@ int main(int argc, char** argv) {
     }
     master.close();
 
-    std::cout << "=== done. bad-WKC cycles: " << wkc_bad << " / " << tick << " (raw per-cycle, not the masked working_counter) ===\n";
+    const WkcStats stats = master.wkc_stats();  // #40 item 4: library-side tally (incl. teardown cycles)
+    std::cout << "=== done. bad-WKC cycles: " << stats.bad_cycles << " / " << stats.total_cycles
+              << " (raw per-cycle, not the masked working_counter) ===\n";
     return 0;
 }

@@ -40,11 +40,9 @@ std::string to_hex16(std::uint16_t v) {
     return s;
 }
 
-std::uint64_t monotonic_ns() noexcept {
-    timespec ts{};
-    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (static_cast<std::uint64_t>(ts.tv_sec) * kNsPerSec) + static_cast<std::uint64_t>(ts.tv_nsec);
-}
+// #40 item 7: ONE clock helper -- alias the shared realtime::monotonic_ns (the local
+// duplicate is gone; watchdog + last_cycle_time are the users).
+using realtime::monotonic_ns;
 
 Cia402Mode to_cia402_mode(ControlMode mode) noexcept {
     return mode == ControlMode::ProfileVelocity ? Cia402Mode::ProfileVelocity : Cia402Mode::ProfilePosition;
