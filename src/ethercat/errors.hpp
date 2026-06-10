@@ -52,7 +52,7 @@ class PdoMappingError : public Error {
 };
 
 // A generic CoE SDO transfer was aborted by the drive (a non-mapping object: mode
-// 0x6060, a vendor/tuning write, the fault-reset 0x2031, ...). Carries the drive's
+// 0x6060, a vendor/tuning write, a consumer-side vendor reset, ...). Carries the drive's
 // CoE abort code in the message. Distinct from PdoMappingError (which is specific
 // to the 0x1C1x/0x16xx/0x1Axx mapping writes) and from BusError (WKC/transport).
 class SdoError : public Error {

@@ -659,4 +659,49 @@ TEST("ServoController(#18): instant clear (default) -- one reset recovers, uncha
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(1000)));
 }
 
+// (#39) The CONSUMER-side vendor fault-reset: executed once pre-RT-spawn when configured
+// (the sim's SDO record shows the 0x2031 write), skipped entirely when absent. And the
+// RT-phase bracket clears on stop(): a STOP -> START cycle re-runs the pre-spawn reset
+// successfully -- if stop() left rt_active set, the restart's sdo_write would throw and
+// start() would fail (the behavioral proof of the bracket's clear-after-join half).
+TEST("#39: config-driven vendor fault-reset runs pre-spawn; absent = zero vendor traffic") {
+    {  // present -> the 0x2031 write lands before the RT thread exists
+        ServoConfig cfg = make_config(ControlMode::ProfilePosition);
+        cfg.vendor_fault_reset = ethercat::SdoWrite{0x2031, 0x01, {std::byte{0x01}, std::byte{0x00}}};
+        SimBackend* sim = nullptr;
+        ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim)};
+        ctrl.start();
+        CHECK(sim != nullptr);
+        const std::vector<std::byte> rec = sim->recorded_sdo(1, 0x2031, 0x01);
+        CHECK_EQ(rec.size(), std::size_t{2});
+        CHECK(!rec.empty() && rec[0] == std::byte{0x01});
+        ctrl.stop();
+    }
+    {  // absent -> no vendor object traffic at all
+        SimBackend* sim = nullptr;
+        ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
+        ctrl.start();
+        CHECK(sim != nullptr);
+        CHECK(sim->recorded_sdo(1, 0x2031, 0x01).empty());
+        ctrl.stop();
+    }
+}
+
+TEST("#39: the RT-phase bracket clears after stop() -- a restart's pre-spawn reset succeeds") {
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition);
+    cfg.vendor_fault_reset = ethercat::SdoWrite{0x2031, 0x01, {std::byte{0x01}, std::byte{0x00}}};
+    SimBackend* sim = nullptr;
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim)};
+    ctrl.start();  // spawn: rt_active declared
+    ctrl.stop();   // join: rt_active MUST clear (else the next pre-spawn SDO throws)
+    // reconfigure (same config) = the restart path: its pre-spawn vendor reset must not
+    // throw. A stale-true rt_active on a persisting Master is the hazard this catches --
+    // the restart builds a fresh Master, and stop()'s explicit clear covers the
+    // stop-then-external-SDO pattern; both paths land here green.
+    ctrl.reconfigure(cfg);
+    CHECK(sim != nullptr);
+    CHECK_EQ(sim->recorded_sdo(1, 0x2031, 0x01).size(), std::size_t{2});  // the restart's reset landed
+    ctrl.stop();
+}
+
 TEST_MAIN()

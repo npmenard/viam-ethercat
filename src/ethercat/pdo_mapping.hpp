@@ -74,14 +74,11 @@ struct SlaveConfig {
     // RE-DEFAULT 0x1C32 when the PDO assignment changes -- so a sync-type write done
     // before the assignment gets clobbered back to its default. Empty for most slaves.
     std::vector<SdoWrite> postremap_sdo_writes;
-    // OPTIONAL drive-specific fault-reset SDO, cleared once in configure() AFTER SAFE-OP
-    // (single port owner, before the RT thread spawns -- so it's a plain blocking SDO, no
-    // queue). The A6's fault-reset is a VENDOR SDO write `1` to 0x2031:01, NOT CiA402
-    // controlword bit7 (CLAUDE.md). Config DATA: present ⇒ that SDO is the bring-up clear;
-    // absent ⇒ no vendor reset (a generic CiA402 drive uses the controlword bit7 path the
-    // controller already drives). The steady-state operator reset is a separate concern
-    // (#22). `data` is the raw little-endian value (A6: a single 0x01 byte).
-    std::optional<SdoWrite> fault_reset;
+    // NOTE (#39): the per-slave vendor fault-reset (`fault_reset`) is GONE -- vendor
+    // policy is consumer-side. Consumers run their reset via Master::sdo_write() while
+    // still the single port owner (pre-RT-spawn): see the servo module's
+    // vendor_fault_reset config and a6_validate's --reset-fault. Steady-state operator
+    // reset (RT running) is #22's queue.
     // OPTIONAL SYNC0 cycle granularity this slave accepts, in ns (#44). Some drives only
     // accept SYNC0 cycles that are an integer multiple of a base tick -- the A6 requires a
     // 250 us multiple and otherwise faults AT OP ENTRY (Er74.0 "cycle error"), a cryptic

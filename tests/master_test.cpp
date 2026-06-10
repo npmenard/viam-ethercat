@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
@@ -410,27 +411,51 @@ TEST("Master(#44): a declared SYNC0 cycle granularity rejects a non-multiple loo
     Master m_nodc{no_dc, std::make_unique<SimBackend>(make_models())};
 }
 
-TEST("Master(#20): configure() issues the vendor fault-reset SDO when configured (else not)") {
-    {  // configured -> the vendor SDO (A6 0x2031:01 = 1) is written once at bring-up
-        MasterConfig cfg = make_config();
-        cfg.slaves[0].fault_reset = ethercat::SdoWrite{0x2031, 0x01, {std::byte{0x01}}};
-        auto sim = std::make_unique<SimBackend>(make_models());
-        SimBackend* sim_ptr = sim.get();
-        Master master{cfg, std::move(sim)};
-        master.init();
-        master.configure();
-        const std::vector<std::byte> rec = sim_ptr->recorded_sdo(1, 0x2031, 0x01);
-        CHECK_EQ(rec.size(), std::size_t{1});
-        CHECK(!rec.empty() && rec[0] == std::byte{0x01});
+TEST("Master(#39): configure() fires ZERO vendor SDO traffic -- only map/assign/mode objects") {
+    // The vendor fault-reset that used to fire in configure() is consumer-side now.
+    // Assert the library bring-up writes touch ONLY the PDO mapping sub-protocol
+    // (0x1C12/0x1C13 assigns, 0x1600/0x1A00 entries) and modes-of-operation (0x6060)
+    // -- in particular, no 0x2031-class vendor object, ever (#41 lens).
+    auto sim = std::make_unique<SimBackend>(make_models());
+    SimBackend* sim_ptr = sim.get();
+    Master master{make_config(), std::move(sim)};
+    master.init();
+    master.configure();
+    CHECK(sim_ptr->recorded_sdo(1, 0x2031, 0x01).empty());
+    for (const std::uint32_t key : sim_ptr->sdo_log(1)) {
+        const auto index = static_cast<std::uint16_t>(key >> 8U);
+        const bool mapping_or_mode = index == 0x1C12 || index == 0x1C13 || index == 0x1600 || index == 0x1A00 || index == 0x6060;
+        CHECK(mapping_or_mode);  // any other object = a library vendor-leak
     }
-    {  // absent -> no vendor reset write (generic CiA402 bit7 path is used instead)
-        auto sim = std::make_unique<SimBackend>(make_models());
-        SimBackend* sim_ptr = sim.get();
-        Master master{make_config(), std::move(sim)};
-        master.init();
-        master.configure();
-        CHECK(sim_ptr->recorded_sdo(1, 0x2031, 0x01).empty());
-    }
+}
+
+TEST("Master(#39): public sdo_write/sdo_read forward to the backend; the RT-phase guard throws") {
+    auto sim = std::make_unique<SimBackend>(make_models());
+    SimBackend* sim_ptr = sim.get();
+    Master master{make_config(), std::move(sim)};
+    master.init();
+    master.configure();
+
+    // Pre-RT (no declared phase): the consumer-side write goes through...
+    const std::array<std::byte, 2> one{std::byte{0x01}, std::byte{0x00}};
+    master.sdo_write(1, 0x2031, 0x01, one);
+    const std::vector<std::byte> rec = sim_ptr->recorded_sdo(1, 0x2031, 0x01);
+    CHECK_EQ(rec.size(), std::size_t{2});
+    CHECK(!rec.empty() && rec[0] == std::byte{0x01});
+    // ...and reads back through sdo_read.
+    std::array<std::byte, 2> back{};
+    CHECK_EQ(master.sdo_read(1, 0x2031, 0x01, back), std::size_t{2});
+    CHECK(back[0] == std::byte{0x01});
+
+    // Declared RT phase: BOTH throw ConfigError (port-ownership guard) -- a blocking
+    // mailbox transfer concurrent with cyclic LRW is the ec_sample 0x001B lesson.
+    master.set_rt_active(true);
+    CHECK_THROWS(master.sdo_write(1, 0x2031, 0x01, one), ethercat::ConfigError);
+    CHECK_THROWS(master.sdo_read(1, 0x2031, 0x01, back), ethercat::ConfigError);
+    // Cleared (post-join): proceeds again.
+    master.set_rt_active(false);
+    master.sdo_write(1, 0x2031, 0x01, one);
+    CHECK_EQ(master.sdo_read(1, 0x2031, 0x01, back), std::size_t{2});
 }
 
 TEST("Master: configure() re-applies the PDO map every call (power-cycle safe)") {

@@ -192,6 +192,37 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     // instead of the drive rejecting the cycle cryptically at OP entry.
     c.sync_cycle_granularity_ns = static_cast<std::uint32_t>(opt_num(attrs, "sync_cycle_granularity_ns", 0.0));
 
+    // #39: optional CONSUMER-side vendor fault-reset, executed once pre-RT-spawn (A6:
+    // {"index": 8241 /*0x2031*/, "subindex": 1, "value": 1, "value_bytes": 2}). The vendor
+    // datum lives HERE in config, never library code. value is little-endian encoded into
+    // value_bytes (default 2 -- a U16 object).
+    if (const ProtoValue* const vfr = find_attr(attrs, "vendor_fault_reset"); vfr != nullptr) {
+        const ProtoStruct* const obj = vfr->get<ProtoStruct>();
+        if (obj == nullptr) {
+            throw ConfigError("vendor_fault_reset must be an object {index, subindex, value[, value_bytes]}");
+        }
+        ethercat::SdoWrite w;
+        w.index = static_cast<std::uint16_t>(struct_num(*obj, "index", "vendor_fault_reset"));
+        w.subindex = static_cast<std::uint8_t>(struct_num_or(*obj, "subindex", 0.0));
+        const auto value = static_cast<std::uint64_t>(struct_num(*obj, "value", "vendor_fault_reset"));
+        const auto nbytes = static_cast<std::size_t>(struct_num_or(*obj, "value_bytes", 2.0));
+        if (nbytes == 0 || nbytes > 8) {
+            throw ConfigError("vendor_fault_reset: 'value_bytes' must be 1..8");
+        }
+        w.data.resize(nbytes);
+        for (std::size_t i = 0; i < nbytes; ++i) {
+            w.data[i] = static_cast<std::byte>((value >> (8U * i)) & 0xFFU);  // little-endian
+        }
+        c.vendor_fault_reset = std::move(w);
+    }
+    // #39 migration guard: the pre-#39 "fault_reset" config attribute must NOT be silently
+    // ignored -- a deployed config silently losing its reset is a silent behavior change.
+    if (find_attr(attrs, "fault_reset") != nullptr) {
+        throw ConfigError(
+            "config attribute 'fault_reset' is obsolete (#39): the vendor fault-reset moved to "
+            "'vendor_fault_reset' {index, subindex, value[, value_bytes]} -- update the config");
+    }
+
     c.max_consecutive_wkc_errors = static_cast<int>(opt_num(attrs, "max_consecutive_wkc_errors", 5.0));
     c.stall_threshold_cycles = static_cast<std::uint64_t>(opt_num(attrs, "stall_threshold_cycles", 10.0));
     c.command_queue_capacity = static_cast<std::size_t>(opt_num(attrs, "command_queue_capacity", 64.0));

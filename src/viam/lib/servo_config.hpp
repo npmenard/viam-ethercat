@@ -62,12 +62,16 @@ struct ServoConfig {
     // loop rate against it AT CONFIG TIME with clear text + nearest valid rates, instead
     // of the drive rejecting the cycle cryptically at OP entry (A6 Er74.0). 0 = none.
     std::uint32_t sync_cycle_granularity_ns = 0;
-    // OPTIONAL vendor fault-reset SDO, cleared once at bring-up (Master::configure(),
-    // after SAFE-OP, pre-spawn). The A6's fault-reset is a vendor SDO write 1 to
-    // 0x2031:01, NOT CiA402 controlword bit7 (CLAUDE.md). CONFIG DATA from the hardware
-    // JSON: present ⇒ that SDO clears a latent fault at bring-up; absent ⇒ a generic
-    // CiA402 drive uses the controlword bit7 path the controller already drives.
-    std::optional<ethercat::SdoWrite> fault_reset;
+    // OPTIONAL vendor fault-reset SDO (#39: CONSUMER-side policy -- the library's
+    // configure() carries zero vendor knowledge now). Executed ONCE by ServoController
+    // at start()/reconfigure() AFTER Master::configure(), BEFORE the RT thread spawns
+    // (single port owner -> a plain blocking Master::sdo_write; best-effort, logged).
+    // The A6's reset is a vendor SDO write 1 to 0x2031:01, NOT CiA402 controlword bit7
+    // (CLAUDE.md) -- that datum lives in the hardware JSON ("vendor_fault_reset"), never
+    // in code. Present ⇒ clear a latent fault at bring-up; absent ⇒ no vendor reset (a
+    // generic CiA402 drive uses the bit7 path the controller already drives).
+    // Steady-state operator reset (RT running) is #22's queue, not this.
+    std::optional<ethercat::SdoWrite> vendor_fault_reset;
 
     // --- health / boundary ---
     int max_consecutive_wkc_errors = 5;            // WKC latch threshold (passed to Master)

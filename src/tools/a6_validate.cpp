@@ -18,6 +18,7 @@
 // best-effort (no SCHED_FIFO) -- fine for validation. NOT a production path;
 // the real driver is the Viam module.
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -82,7 +83,7 @@ extern "C" void on_sigint(int) {
 // bit4-handshake --move-pp) or CyclicSyncPosition (the streamed --move-sine). Both
 // reuse the SAME PDO map -- 0x607A serves the PP target AND the CSP streamed target --
 // so one builder covers both; only the post-enable control semantics differ.
-MasterConfig build_a6_config(const std::string& ifname, std::int32_t dc_sync0_shift_ns, bool reset_fault, Cia402Mode mode) {
+MasterConfig build_a6_config(const std::string& ifname, std::int32_t dc_sync0_shift_ns, Cia402Mode mode) {
     MasterConfig cfg;
     cfg.ifname = ifname;
     cfg.target_loop_rate_hz = 1000;             // 1 ms SYNC0 = 4 x 250 us (A6-legal)
@@ -101,13 +102,9 @@ MasterConfig build_a6_config(const std::string& ifname, std::int32_t dc_sync0_sh
     // #44: the A6 accepts only 250 us-multiple SYNC0 cycles (else Er74.0 at OP entry);
     // declaring it lets the Master reject a bad loop rate at config time, with the fix.
     a6.sync_cycle_granularity_ns = 250'000;
-    // The A6's fault-reset is the VENDOR SDO 0x2031:01 = 1 (NOT CiA402 bit7, CLAUDE.md).
-    // --reset-fault clears a latent fault ONCE at bring-up (configure(), after SAFE-OP,
-    // single port owner). Width per the A6 OD (U16 assumed); a wrong width just logs a
-    // length abort (best-effort) -- adjust if first light shows one.
-    if (reset_fault) {
-        a6.fault_reset = SdoWrite{0x2031, 0x01, sdo_value<std::uint16_t>(1)};
-    }
+    // #39: the vendor fault-reset is CONSUMER policy now -- this tool runs it itself
+    // post-configure via Master::sdo_write (see --reset-fault in main), while it is
+    // still the single port owner. No vendor object rides in the library config.
     // #20: we DELIBERATELY do NOT write 0x1C32:01 (SM sync-type). v2's config_map_group
     // lets the A6 self-select DC SYNC0; forcing it was the self-inflicted AL 0x0030
     // (CLAUDE.md). The generic preop/postremap SDO mechanisms remain for drives that
@@ -271,7 +268,7 @@ int main(int argc, char** argv) {
     std::cout << "[dc] phase-lock target = auto(mid-cycle) | SYNC0 CyclShift = " << opt.dc_sync0_shift_ns << "ns"
               << " | fault-reset at bring-up = " << (opt.reset_fault ? "ON (vendor 0x2031:01=1)" : "off") << "\n\n";
 
-    Master master(build_a6_config(opt.ifname, opt.dc_sync0_shift_ns, opt.reset_fault, mode), std::make_unique<SoemBackend>());
+    Master master(build_a6_config(opt.ifname, opt.dc_sync0_shift_ns, mode), std::make_unique<SoemBackend>());
 
     // --- Stage A: open + enumerate + read-only SDO identity (PRE-OP) ---
     try {
@@ -309,6 +306,28 @@ int main(int argc, char** argv) {
     }
     std::cout << "[B] configured to SAFE-OP, DC enabled (expected WKC=" << master.expected_wkc()
               << "); running the bring-up FSM (SETTLE -> request OP -> AWAIT_OP), gapless + phase-locked...\n";
+
+    // #39 consumer-side vendor fault-reset: this tool IS the single port owner here
+    // (single-threaded, pre-Phase-1), so a plain blocking SDO is safe. Read 0x603F; if a
+    // latent fault is present, clear it via the A6 VENDOR SDO 0x2031:01 = 1 (NOT CiA402
+    // bit7, CLAUDE.md). Width per the A6 OD (U16 assumed); best-effort -- a failed clear
+    // is logged and the bring-up gate still guards OP entry.
+    if (opt.reset_fault) {
+        try {
+            std::array<std::byte, 2> fc_raw{};
+            const std::size_t n = master.sdo_read(slave, kFaultCode, 0, fc_raw);
+            const std::uint16_t fc0 = n >= 2 ? load_le<std::uint16_t>(fc_raw) : 0;
+            if (fc0 != 0) {
+                std::cout << "[B] latent drive fault 0x" << std::hex << fc0 << std::dec
+                          << " -- clearing via vendor SDO 0x2031:01=1 (consumer-side, #39)...\n";
+                master.sdo_write(slave, 0x2031, 0x01, sdo_value<std::uint16_t>(1));
+            } else {
+                std::cout << "[B] --reset-fault: no latent fault (0x603F=0), nothing to clear.\n";
+            }
+        } catch (const Error& e) {
+            std::cerr << "[B] --reset-fault SDO failed (continuing; the bring-up gate still guards OP): " << e.what() << '\n';
+        }
+    }
 
     const auto profile_vel = static_cast<std::uint32_t>(opt.move_rpm / 60.0 * kCountsPerRev);
     const Cia402Fsm fsm;

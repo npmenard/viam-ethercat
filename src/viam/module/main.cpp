@@ -10,6 +10,11 @@
 #include <exception>
 #include <memory>
 #include <thread>
+// <utility> must precede boost/asio.hpp on libstdc++ >= 12 (ANY C++ standard): boost
+// 1.74 (jammy's system boost) uses std::exchange in asio/awaitable.hpp without
+// including <utility>, relying on a transitive include that libstdc++-12's header
+// cleanup removed. Harmless everywhere else. Drop when the image's boost is >= 1.80.
+#include <utility>
 
 #include <boost/asio.hpp>
 

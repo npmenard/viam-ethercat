@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <utility>
@@ -54,13 +55,35 @@ ServoConfig validated(ServoConfig config) {
     return config;
 }
 
+// #39: CONSUMER-side vendor fault-reset, run while this thread is still the SINGLE
+// port owner (after Master::configure(), before the RT thread spawns). The vendor
+// datum (A6: 0x2031:01 = 1) comes from the hardware JSON, never code. Best-effort:
+// a failed clear is logged, not fatal -- the bring-up gate still guards OP entry.
+void run_vendor_fault_reset(Master& m, const ServoConfig& c) {
+    if (!c.vendor_fault_reset.has_value()) {
+        return;
+    }
+    const SdoWrite& fr = *c.vendor_fault_reset;
+    try {
+        m.sdo_write(c.slave_id, fr.index, fr.subindex, fr.data);
+    } catch (const Error& e) {
+        (void)std::fprintf(stderr,
+                           "[servo] vendor fault-reset SDO (slave %u 0x%04X:%02X) failed (continuing): %s\n",
+                           static_cast<unsigned>(c.slave_id),
+                           static_cast<unsigned>(fr.index),
+                           static_cast<unsigned>(fr.subindex),
+                           e.what());
+    }
+}
+
 MasterConfig build_master_config(const ServoConfig& c) {
     SlaveConfig slave;
     slave.slave_id = c.slave_id;
     slave.rxpdo = c.rxpdo;
     slave.txpdo = c.txpdo;
     slave.default_mode = to_cia402_mode(c.mode);
-    slave.fault_reset = c.fault_reset;                              // vendor SDO fault-reset (A6: 0x2031:01=1), cleared at bring-up
+    // #39: NO slave.fault_reset -- the vendor reset is consumer-side now (see
+    // run_vendor_fault_reset above; executed pre-RT-spawn in start()/reconfigure()).
     slave.sync_cycle_granularity_ns = c.sync_cycle_granularity_ns;  // #44: Master validates rate vs granularity up front
 
     MasterConfig mc;
@@ -106,6 +129,7 @@ void ServoController::start() {
     master_->init();
     master_->configure();
     resolve_fields();
+    run_vendor_fault_reset(*master_, config_);  // #39: consumer-side, single port owner (pre-spawn)
 
     // Reset per-run state.
     stopping_.store(false, std::memory_order_release);
@@ -134,6 +158,10 @@ void ServoController::start() {
 
     std::promise<void> started;
     std::future<void> ready = started.get_future();
+    // #39 RT-phase bracket: declared active EXACTLY across the RT thread's lifetime --
+    // Master's public SDO surface throws while set (port-ownership guard). Cleared
+    // after EVERY join (including failure paths) so a later pre-spawn SDO works.
+    master_->set_rt_active(true);
     rt_thread_ =
         std::jthread([this](const std::stop_token& st, std::promise<void> p) { run_rt_loop(st, std::move(p)); }, std::move(started));
 
@@ -145,6 +173,7 @@ void ServoController::start() {
         if (rt_thread_.joinable()) {
             rt_thread_.join();
         }
+        master_->set_rt_active(false);  // joined -- single port owner again
         throw InitError("ServoController: RT thread failed to start within 2s");
     }
     ready.get();  // rethrows the InitError set by setup_realtime() failure
@@ -157,6 +186,9 @@ void ServoController::stop() noexcept {
     rt_thread_.request_stop();
     if (rt_thread_.joinable()) {
         rt_thread_.join();
+    }
+    if (master_) {
+        master_->set_rt_active(false);  // #39: joined -- single port owner again
     }
 }
 
@@ -178,6 +210,7 @@ void ServoController::reconfigure(ServoConfig config) {
     master_->init();
     master_->configure();
     resolve_fields();
+    run_vendor_fault_reset(*master_, config_);  // #39: consumer-side, single port owner (pre-spawn)
     stopping_.store(false, std::memory_order_release);
     rt_error_.store(RtError::None, std::memory_order_relaxed);
     state_.faulted.store(false, std::memory_order_relaxed);
@@ -201,6 +234,7 @@ void ServoController::reconfigure(ServoConfig config) {
     watchdog_ns_.store(std::max<std::uint64_t>(config_.stall_threshold_cycles * period_ns, 20'000'000ULL), std::memory_order_release);
     std::promise<void> started;
     std::future<void> ready = started.get_future();
+    master_->set_rt_active(true);  // #39 RT-phase bracket (see start())
     rt_thread_ =
         std::jthread([this](const std::stop_token& st, std::promise<void> p) { run_rt_loop(st, std::move(p)); }, std::move(started));
     if (ready.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
@@ -209,6 +243,7 @@ void ServoController::reconfigure(ServoConfig config) {
         if (rt_thread_.joinable()) {
             rt_thread_.join();
         }
+        master_->set_rt_active(false);  // joined -- single port owner again
         throw InitError("ServoController: RT thread failed to restart within 2s");
     }
     ready.get();

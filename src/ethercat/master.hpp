@@ -238,12 +238,35 @@ class Master {
         return resolve_field(runtime_for(slave).tx_fields, F::index, F::sub, sizeof(typename F::type), slave, /*is_tx=*/true);
     }
 
-    // NOTE: there is intentionally NO public typed CoE SDO accessor on Master. CoE object
-    // access is the LIBRARY's responsibility -- Master::configure() does the PDO-remap /
-    // 0x6060 / fault-reset writes internally via the backend, and identity is read through
-    // slave_info(). Tools/callers must NOT poke raw objects; they consume the typed API
-    // (slave_info / configure / bringup_step / process / input_image / outputs). The raw
-    // sdo_read/sdo_write live at the EcatBackend level (library-internal) by design.
+    // --- narrow public SDO primitive (#39: vendor POLICY is consumer-side) -------------
+    // #23 removed the public SDO surface to stop ad-hoc CoE poking; #39 partially reverses
+    // that BY USER DIRECTION: vendor fault-reset (and vendor policy generally) belongs to
+    // CONSUMERS, which requires a consumer-reachable primitive. The boundary moved from
+    // "no public SDO" to "public SDO with an explicit PORT-OWNERSHIP contract":
+    //
+    // CONTRACT: callable ONLY while the caller is the SINGLE port owner -- pre-RT-spawn
+    // (after init()/configure(), before any cyclic thread) or post-RT-join. NEVER
+    // concurrently with a running RT loop: SOEM's port is not thread-safe, and a blocking
+    // mailbox transfer interleaved with cyclic LRW starves process data (the ec_sample
+    // 0x001B SM-watchdog lesson). Steady-state (RT running) SDO access is NOT this
+    // primitive -- that is #22's RT-serviced request queue.
+    //
+    // STRUCTURAL GUARD: Master cannot self-detect RT activity (consumers own their loop
+    // threads and call process()), so the enforceable form is the consumer-DECLARED RT
+    // phase: bracket set_rt_active(true/false) EXACTLY around the RT thread spawn/join
+    // (ServoController does). While declared active, sdo_read/sdo_write THROW ConfigError
+    // (a release-mode throw, not a debug assert -- the module ships release). For external
+    // library users the flag is part of the documented contract; the doc-contract stays
+    // primary. Single-threaded tools (a6_validate) never set it.
+    void set_rt_active(bool active) noexcept {
+        rt_active_.store(active, std::memory_order_release);
+    }
+    // Write/read one CoE object via the backend (blocking mailbox transfer). Throws
+    // ConfigError while a consumer-declared RT phase is active (the guard above); the
+    // backend's own error tiers (SdoError on a CoE abort, ConfigError on a bad slave id)
+    // pass through unchanged. sdo_read returns the number of bytes read into `out`.
+    void sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data);
+    std::size_t sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out);
 
    private:
     // INTERNAL per-object mapping record (#30 §5): byte offset + mapped width in bits.
@@ -317,6 +340,9 @@ class Master {
     std::atomic<int> fault_wkc_{0};
     std::atomic<bool> fault_{false};
     std::atomic<bool> operational_{false};
+    // Consumer-declared RT phase (#39): while true, the public sdo_read/sdo_write throw
+    // (port-ownership guard). Set/cleared by the consumer around its RT thread spawn/join.
+    std::atomic<bool> rt_active_{false};
 };
 
 // ---------------------------------------------------------------------------

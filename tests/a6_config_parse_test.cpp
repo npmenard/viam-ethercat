@@ -59,6 +59,21 @@ TEST("a6-hardware.example.json: PP config parses through the real parser + valid
     CHECK(c.require_realtime);
     CHECK(c.rxpdo.entries.at(0x1600).size() == 3);  // controlword + target position + profile velocity
     CHECK(c.txpdo.entries.at(0x1A00).size() == 6);  // fault, status, mode-display, pos, vel, torque
+    // #39: the consumer-side vendor fault-reset rides in the example (A6 0x2031:01 = 1, U16 LE).
+    CHECK(c.vendor_fault_reset.has_value());
+    CHECK(c.vendor_fault_reset->index == 0x2031);
+    CHECK(c.vendor_fault_reset->subindex == 0x01);
+    CHECK(c.vendor_fault_reset->data.size() == 2);
+    CHECK(c.vendor_fault_reset->data[0] == std::byte{0x01});
+    CHECK(c.vendor_fault_reset->data[1] == std::byte{0x00});
+}
+
+TEST("#39: the obsolete 'fault_reset' config key is REJECTED, never silently ignored") {
+    // A deployed config silently losing its reset would be a silent behavior change --
+    // the parser must fail loudly with the migration path in the message.
+    ProtoStruct attrs = load_attributes(A6_HW_CONFIG_PATH);
+    attrs["fault_reset"] = viam::sdk::ProtoValue(true);  // the pre-#39 key, any shape
+    CHECK_THROWS(parse_servo_config(attrs), ethercat::ConfigError);
 }
 
 TEST("a6-hardware.example.json: PV variant parses + validates") {

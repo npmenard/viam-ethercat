@@ -249,26 +249,9 @@ void Master::configure() {
     // DC sync-type at this transition (SYNC0 already armed).
     backend_->request_state(0, EcatState::SafeOp);
 
-    // Clear a latent drive fault while still the SINGLE port owner (before the RT thread
-    // spawns) -- a direct blocking vendor SDO. The A6's fault-reset is 0x2031:01 = 1, NOT
-    // CiA402 controlword bit7 (CLAUDE.md); it is CONFIG DATA (absent ⇒ no vendor reset,
-    // a generic CiA402 drive uses the bit7 path the controller drives). Best-effort: a
-    // failed clear is logged, not fatal (the bring-up gate still guards OP entry).
-    for (const SlaveConfig& sc : config_.slaves) {
-        if (sc.fault_reset.has_value()) {
-            const SdoWrite& fr = *sc.fault_reset;
-            try {
-                backend_->sdo_write(sc.slave_id, fr.index, fr.subindex, fr.data);
-            } catch (const Error& e) {
-                (void)std::fprintf(stderr,
-                                   "[ethercat] bring-up fault-reset SDO (slave %u 0x%04X:%02X) failed (continuing): %s\n",
-                                   static_cast<unsigned>(sc.slave_id),
-                                   static_cast<unsigned>(fr.index),
-                                   static_cast<unsigned>(fr.subindex),
-                                   e.what());
-            }
-        }
-    }
+    // NOTE (#39): configure() carries ZERO vendor-object knowledge. The vendor fault-reset
+    // that used to fire here is CONSUMER policy now -- consumers run it themselves via the
+    // public sdo_write() while they are still the single port owner (pre-RT-spawn).
 
     // Hand off to the caller's RT loop at SAFE-OP with SYNC0 already armed. It runs
     // bringup_step() -- SETTLE (bounded phase-locked PD) -> request OP -> AWAIT_OP (hold
@@ -506,6 +489,27 @@ Rpdo Master::read_rpdo(std::uint16_t slave) const {
 Tpdo Master::make_tpdo(std::uint16_t slave) {
     SlaveRuntime& rt = runtime_for(slave);               // validate + get the cache (throws ConfigError, clear text)
     return Tpdo(rt.io.outputs, this, &rt.cache, slave);  // seed from the CURRENT command image
+}
+
+void Master::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
+    // Port-ownership guard (#39): a blocking mailbox transfer concurrent with a running
+    // RT loop starves cyclic LRW (the ec_sample 0x001B lesson). rt_active_ is the
+    // consumer-DECLARED RT phase; while set, refuse loudly instead of corrupting timing.
+    if (rt_active_.load(std::memory_order_acquire)) {
+        throw ConfigError("Master::sdo_write: refused during a declared RT phase (slave " + std::to_string(slave) + " object " +
+                          std::to_string(index) + ":" + std::to_string(sub) +
+                          ") -- SDO is pre-RT-spawn/post-RT-join only; steady-state access is the #22 queue");
+    }
+    backend_->sdo_write(slave, index, sub, data);
+}
+
+std::size_t Master::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
+    if (rt_active_.load(std::memory_order_acquire)) {
+        throw ConfigError("Master::sdo_read: refused during a declared RT phase (slave " + std::to_string(slave) + " object " +
+                          std::to_string(index) + ":" + std::to_string(sub) +
+                          ") -- SDO is pre-RT-spawn/post-RT-join only; steady-state access is the #22 queue");
+    }
+    return backend_->sdo_read(slave, index, sub, out);
 }
 
 std::string Master::last_error() const {
