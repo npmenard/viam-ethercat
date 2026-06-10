@@ -7,14 +7,9 @@
 #include <ctime>
 #include <utility>
 
-#include <malloc.h>
-#include <pthread.h>
-#include <sched.h>
-#include <sys/mman.h>
-
-#include "ethercat/dc_sync.hpp"
 #include "ethercat/errors.hpp"
 #include "ethercat/pdo_buffer.hpp"
+#include "ethercat/realtime.hpp"
 #include "ethercat/soem_backend.hpp"
 #include "viam/lib/motion_profile.hpp"
 
@@ -266,17 +261,10 @@ bool ServoController::txpdo_has(std::uint16_t index) const noexcept {
 }
 
 bool ServoController::setup_realtime() const noexcept {
-    // These are process-global, called ONCE in the RT thread prelude -- the
-    // concurrency-mt-unsafe lints are about global locale/env state, N/A here.
-    // NOLINTBEGIN(concurrency-mt-unsafe)
-    (void)mlockall(MCL_CURRENT | MCL_FUTURE);
-    (void)mallopt(M_TRIM_THRESHOLD, -1);
-    (void)mallopt(M_MMAP_MAX, 0);
-    // NOLINTEND(concurrency-mt-unsafe)
-
-    sched_param param{};
-    param.sched_priority = config_.rt_priority;
-    return pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == 0;
+    // P3c (#31): the hand-rolled mlockall+mallopt+SCHED_FIFO body moved to the shared
+    // realtime::setup() (which also adds the stack pre-fault). Same contract: the return
+    // is the SCHED_FIFO result ONLY (the require_realtime gate); the rest is best-effort.
+    return realtime::setup(config_.rt_priority);
 }
 
 bool ServoController::watchdog_expired() const noexcept {
@@ -575,12 +563,16 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
     const std::uint16_t slave = config_.slave_id;
     const std::uint64_t period_ns = kNsPerSec / config_.target_loop_rate_hz;
     const bool dc = config_.use_distributed_clocks;
+    // ONE pacer across the bring-up prelude + the steady loop (P3c, #31): it owns the
+    // absolute deadline + PI integral (armed now+period at construction, exactly the old
+    // `next` init) so the SAFE-OP->OP->steady handoff stays gapless + phase-locked.
     // Phase-lock TARGET: mid-cycle (period/2) from the DC base -- locking on the SYNC0
-    // edge (0) leaves no jitter margin (#20 consolidated the shift to one knob; the PI
-    // target is derived as cycle/2). Only applied when DC is on.
-    const std::int64_t dc_target_shift = static_cast<std::int64_t>(period_ns) / 2;
-    std::int64_t dc_integral = 0;
-    std::uint64_t next = monotonic_ns() + period_ns;
+    // edge (0) leaves no jitter margin (#20 consolidated the shift to one knob). pace(0)
+    // when DC is off = pure periodic (correction 0), matching the old corr=0 branch.
+    // pace() == the old corr/next/catch-up/TIMER_ABSTIME block byte-for-byte: same
+    // dc_phase_correction, same `next += period + corr`, same re-read whole-period
+    // catch-up, same absolute-deadline sleep.
+    realtime::DcPacer pacer(period_ns, static_cast<std::int64_t>(period_ns) / 2);
 
     // DC bring-up prelude (#20): configure() left the bus at SAFE-OP; drive the Master
     // bring-up FSM to OPERATIONAL here, in the single RT loop, so process data flows
@@ -606,20 +598,9 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
             state_.faulted.store(true, std::memory_order_release);
         }
         // Maintain the phase-locked cadence even on the terminal step, so the steady loop
-        // picks up one clean period later (no gap).
-        const long corr =
-            dc ? dc_phase_correction(master_->dc_time(), static_cast<std::int64_t>(period_ns), dc_integral, dc_target_shift) : 0;
-        next += static_cast<std::uint64_t>(static_cast<long>(period_ns) + corr);
-        // Phase-preserving overrun catch-up: on a multi-period overrun, skip the missed
-        // whole periods (realign to the SYNC0 grid) instead of firing a back-to-back
-        // off-phase burst. Adding whole periods preserves the sub-period (corrected) phase.
-        for (std::uint64_t now = monotonic_ns(); next <= now; now = monotonic_ns()) {
-            next += period_ns;
-        }
-        timespec bdl{};
-        bdl.tv_sec = static_cast<std::time_t>(next / kNsPerSec);
-        bdl.tv_nsec = static_cast<long>(next % kNsPerSec);
-        (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &bdl, nullptr);
+        // picks up one clean period later (no gap). pace() = phase-corrected advance +
+        // phase-preserving whole-period catch-up + absolute-deadline sleep (DcPacer).
+        pacer.pace(dc ? master_->dc_time() : 0);
         if (bs == ethercat::BringupStatus::Operational || bs == ethercat::BringupStatus::Aborted) {
             break;
         }
@@ -664,19 +645,9 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
 
         // Keep the cyclic wakeup phase-locked to DC SYNC0 (ec_sync PI) every cycle when
         // DC is on, so the master's send holds its phase relative to the drive's pulse
-        // (no slow drift out of lock). No-op (corr 0) on non-DC backends.
-        const long corr =
-            dc ? dc_phase_correction(master_->dc_time(), static_cast<std::int64_t>(period_ns), dc_integral, dc_target_shift) : 0;
-        next += static_cast<std::uint64_t>(static_cast<long>(period_ns) + corr);
-        // Phase-preserving overrun catch-up (see the bring-up loop): skip missed whole
-        // periods on a multi-period overrun rather than bursting off-phase.
-        for (std::uint64_t now = monotonic_ns(); next <= now; now = monotonic_ns()) {
-            next += period_ns;
-        }
-        timespec deadline{};
-        deadline.tv_sec = static_cast<std::time_t>(next / kNsPerSec);
-        deadline.tv_nsec = static_cast<long>(next % kNsPerSec);
-        (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr);
+        // (no slow drift out of lock). No-op (correction 0) on non-DC backends. pace() =
+        // the old corr/next/catch-up/TIMER_ABSTIME block, via the shared DcPacer (P3c).
+        pacer.pace(dc ? master_->dc_time() : 0);
     }
 
     // Leave the drive in a safe state and flush it out.

@@ -419,6 +419,7 @@ if (ETHERCAT_SANITIZE_THREAD)
     src/ethercat/sim_backend.cpp
     src/ethercat/soem_backend.cpp
     src/ethercat/master.cpp
+    src/ethercat/realtime.cpp
     src/viam/lib/motion_profile.cpp
     src/viam/lib/servo_config.cpp
     src/viam/lib/servo_controller.cpp
@@ -453,6 +454,7 @@ if (ETHERCAT_SANITIZE_THREAD)
     src/ethercat/sim_backend.cpp
     src/ethercat/soem_backend.cpp
     src/ethercat/master.cpp
+    src/ethercat/realtime.cpp
     src/viam/lib/motion_profile.cpp
     src/viam/lib/servo_config.cpp
     src/viam/lib/servo_controller.cpp

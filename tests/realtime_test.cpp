@@ -7,19 +7,62 @@
 
 #include <sys/mman.h>  // munlockall (test cleanup)
 
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <thread>
 
 #include "ethercat/dc_sync.hpp"
+#include "ethercat/master.hpp"
 #include "ethercat/realtime.hpp"
+#include "ethercat/sim_backend.hpp"
 #include "test_harness.hpp"
 
 namespace realtime = ethercat::realtime;
+using ethercat::BringupStatus;
+using ethercat::Cia402Mode;
 using ethercat::dc_phase_correction;
+using ethercat::Master;
+using ethercat::MasterConfig;
+using ethercat::SimBackend;
+using ethercat::SimSlaveModel;
+using ethercat::SlaveConfig;
 
 namespace {
 constexpr std::uint64_t kPeriod = 1'000'000;  // 1 ms
 constexpr std::int64_t kShift = static_cast<std::int64_t>(kPeriod) / 2;
+
+// A6-ish single-slave sim rig (the pdo_access_test shape) for run_to_operational.
+MasterConfig make_config() {
+    SlaveConfig sc;
+    sc.slave_id = 1;
+    sc.rxpdo.assign_index = 0x1C12;
+    sc.rxpdo.pdo_indices = {0x1600};
+    sc.rxpdo.entries[0x1600] = {{0x6040, 0, 16}, {0x607A, 0, 32}};
+    sc.txpdo.assign_index = 0x1C13;
+    sc.txpdo.pdo_indices = {0x1A00};
+    sc.txpdo.entries[0x1A00] = {{0x6041, 0, 16}, {0x6064, 0, 32}};
+    sc.default_mode = Cia402Mode::ProfilePosition;
+
+    MasterConfig cfg;
+    cfg.ifname = "sim0";
+    cfg.use_distributed_clocks = true;  // SYNC0 framing: the bring-up path this pump exists for
+    cfg.dc_op_gate_cycles = 2;          // short SETTLE so the test runs in tens of ms
+    cfg.slaves = {sc};
+    return cfg;
+}
+
+std::vector<SimSlaveModel> make_models() {
+    SimSlaveModel m;
+    m.output_bytes = 6;
+    m.input_bytes = 6;
+    m.ctrlword_off = 0;
+    m.target_off = 2;
+    m.statusword_off = 0;
+    m.actual_off = 2;
+    m.mode = Cia402Mode::ProfilePosition;
+    return {m};
+}
 }  // namespace
 
 // monotonic_ns is the clock the pacer sleeps against; must be monotone non-decreasing.
@@ -142,6 +185,37 @@ TEST("realtime::setup + lock_current are noexcept + callable offline") {
     (void)sched_ok;        // env-dependent: false without CAP_SYS_NICE, true under sudo
     (void)::munlockall();  // cleanup: undo any locks setup()/lock_current() took
     CHECK(true);           // reaching here = no throw/crash
+}
+
+// (#31 P3c) run_to_operational pump: a healthy sim bring-up reaches Operational, and the
+// bounded give-up returns Aborted (does not hang) when sync never establishes. This was
+// defined-but-unconsumed after P3b kept a6_validate's diagnostic loop explicit (its
+// production consumer is the thin #21 program) -- verified here so it never ships dead.
+TEST("realtime::run_to_operational drives a healthy sim Master to Operational") {
+    Master m{make_config(), std::make_unique<SimBackend>(make_models())};
+    m.init();
+    m.configure();
+    realtime::DcPacer pacer(kPeriod, kShift);
+    const BringupStatus bs = realtime::run_to_operational(m, pacer, /*sync_faulted=*/[] { return false; }, std::chrono::milliseconds(2000));
+    CHECK(bs == BringupStatus::Operational);
+    CHECK(m.all_operational());
+}
+
+TEST("realtime::run_to_operational gives up (Aborted) on a never-syncing drive -- no hang") {
+    Master m{make_config(), std::make_unique<SimBackend>(make_models())};
+    m.init();
+    m.configure();
+    realtime::DcPacer pacer(kPeriod, kShift);
+    const auto t0 = std::chrono::steady_clock::now();
+    // sync_faulted held TRUE: the held-synced confirm can never be met, and the Master's
+    // own give-up (~30 s default) is far beyond the pump's 100 ms timeout -- so the
+    // BOUNDED give-up path is what returns. Returning AT ALL (vs hanging) is the proof;
+    // the elapsed bound keeps it honest.
+    const BringupStatus bs = realtime::run_to_operational(m, pacer, /*sync_faulted=*/[] { return true; }, std::chrono::milliseconds(100));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(bs == BringupStatus::Aborted);
+    CHECK(!m.all_operational());
+    CHECK(elapsed < std::chrono::seconds(5));  // bounded give-up, not the 30 s Master window
 }
 
 TEST_MAIN()
