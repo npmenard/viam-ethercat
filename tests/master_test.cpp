@@ -57,6 +57,7 @@ std::vector<SimSlaveModel> make_models() {
     m.actual_off = 2;
     m.mode = Cia402Mode::ProfilePosition;
     m.counts_per_step = 1000;
+    m.target_reached_always_set = true;  // A6-shaped model: the bit10 quirk is model DATA (#43)
     return {m};
 }
 

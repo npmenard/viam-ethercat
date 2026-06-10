@@ -343,7 +343,9 @@ void SimBackend::step_device(Slave& s) noexcept {
     // Compose the statusword.
     unsigned sw = statusword_base(s.device_state);
     sw |= 0x0200U;  // bit9 remote
-    sw |= 0x0400U;  // bit10 ALWAYS 1 -- A6 quirk (never usable for move-complete)
+    if (s.model.target_reached_always_set) {
+        sw |= 0x0400U;  // bit10 ALWAYS 1 -- the A6 quirk, modeled per-slave (#43); default = conformant (not forced)
+    }
     if (s.device_state != St::SwitchOnDisabled && s.device_state != St::NotReadyToSwitchOn) {
         sw |= 0x0010U;  // bit4 voltage enabled
     }

@@ -48,6 +48,14 @@ struct SimSlaveModel {
     std::int32_t fault_code_off = -1;       // 0x603F drive error code (u16) in inputs
     std::int32_t velocity_actual_off = -1;  // 0x606C velocity-actual (i32) in inputs
 
+    // Statusword bit10 (target_reached) quirk knob (#43): some drives -- the A6 -- hold
+    // bit10 ALWAYS SET, so it can never signal move-complete (the reason the controller's
+    // move-complete predicate is |target-actual|<=tol && |vel|<=thresh, NEVER bit10).
+    // Default models a CONFORMANT drive (bit10 not forced); A6-shaped test models set it
+    // true. Quirk DATA lives here in the model, never hardcoded in the sim (per this
+    // header's own principle above).
+    bool target_reached_always_set = false;
+
     std::uint32_t vendor_id = 0;
     std::uint32_t product_code = 0;
     std::string name = "sim-slave";

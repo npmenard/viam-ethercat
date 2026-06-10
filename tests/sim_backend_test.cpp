@@ -33,6 +33,7 @@ SimSlaveModel a6_like_model() {
     m.actual_off = 2;
     m.mode = Cia402Mode::ProfilePosition;
     m.counts_per_step = 1000;
+    m.target_reached_always_set = true;  // the A6 bit10 quirk -- model DATA, not sim code (#43)
     return m;
 }
 
