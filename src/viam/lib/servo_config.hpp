@@ -57,6 +57,11 @@ struct ServoConfig {
     // The SYNC0 cycle = 1e9 / target_loop_rate_hz; that period MUST be a value the
     // drive accepts (A6: an integer multiple of 250 us -> use 1000/500/250 Hz).
     bool use_distributed_clocks = false;
+    // OPTIONAL SYNC0 cycle granularity the drive accepts, in ns (#44; CONFIG DATA from
+    // the hardware JSON -- A6: 250000). When set (and DC is on), the Master validates the
+    // loop rate against it AT CONFIG TIME with clear text + nearest valid rates, instead
+    // of the drive rejecting the cycle cryptically at OP entry (A6 Er74.0). 0 = none.
+    std::uint32_t sync_cycle_granularity_ns = 0;
     // OPTIONAL vendor fault-reset SDO, cleared once at bring-up (Master::configure(),
     // after SAFE-OP, pre-spawn). The A6's fault-reset is a vendor SDO write 1 to
     // 0x2031:01, NOT CiA402 controlword bit7 (CLAUDE.md). CONFIG DATA from the hardware

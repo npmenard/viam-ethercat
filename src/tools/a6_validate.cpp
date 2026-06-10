@@ -98,6 +98,9 @@ MasterConfig build_a6_config(const std::string& ifname, std::int32_t dc_sync0_sh
     SlaveConfig a6;
     a6.slave_id = 1;
     a6.default_mode = mode;  // 0x6060 set in configure(); PP=1 (handshake) or CSP=8 (streamed sine)
+    // #44: the A6 accepts only 250 us-multiple SYNC0 cycles (else Er74.0 at OP entry);
+    // declaring it lets the Master reject a bad loop rate at config time, with the fix.
+    a6.sync_cycle_granularity_ns = 250'000;
     // The A6's fault-reset is the VENDOR SDO 0x2031:01 = 1 (NOT CiA402 bit7, CLAUDE.md).
     // --reset-fault clears a latent fault ONCE at bring-up (configure(), after SAFE-OP,
     // single port owner). Width per the A6 OD (U16 assumed); a wrong width just logs a

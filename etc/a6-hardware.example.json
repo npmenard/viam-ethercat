@@ -56,11 +56,12 @@
     "counts_per_rev": 131072.0,
     "gear_ratio": 1.0,
 
-    "_comment_rt": "require_realtime=true: hard-fail if SCHED_FIFO is unavailable (a real drive must run RT). loop_rate_hz <= 1000. rt_priority 1..99. use_distributed_clocks=true is REQUIRED for the A6 (it supports ONLY DC sync; without SYNC0 it faults out of OP -- Er74.1, WKC->0). The SYNC0 cycle = 1e9/loop_rate_hz MUST be an integer multiple of 250us for the A6 -> loop_rate_hz in {1000,500,250,...}; 1000 Hz = 1 ms = 4x250us.",
+    "_comment_rt": "require_realtime=true: hard-fail if SCHED_FIFO is unavailable (a real drive must run RT). loop_rate_hz <= 1000. rt_priority 1..99. use_distributed_clocks=true is REQUIRED for the A6 (it supports ONLY DC sync; without SYNC0 it faults out of OP -- Er74.1, WKC->0). The SYNC0 cycle = 1e9/loop_rate_hz MUST be an integer multiple of 250us for the A6 -> loop_rate_hz in {1000,500,250,...}; 1000 Hz = 1 ms = 4x250us. sync_cycle_granularity_ns=250000 DECLARES that 250us granularity so a bad rate is rejected at CONFIG time with the valid alternatives, instead of the drive faulting cryptically at OP entry (Er74.0).",
     "require_realtime": true,
     "rt_priority": 80,
-    "target_loop_rate_hz": 1000,
+    "loop_rate_hz": 1000,
     "use_distributed_clocks": true,
+    "sync_cycle_granularity_ns": 250000,
 
     "_comment_tuning": "Move-complete + watchdog tuning -- CONFIRM/tune on the bench. velocity_threshold is in device velocity units (counts/s).",
     "position_tolerance_counts": 200,

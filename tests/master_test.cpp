@@ -381,6 +381,35 @@ TEST("Master(#42): AWAIT_OP bounds are MasterConfig fields; the give-up window i
     CHECK(bs == BringupStatus::Operational);  // healthy drive: confirms within the clamped 1-cycle hold
 }
 
+TEST("Master(#44): a declared SYNC0 cycle granularity rejects a non-multiple loop rate at config time") {
+    // 600 Hz -> 1'666'666 ns cycle: NOT a 250 us multiple -> ConfigError naming the slave,
+    // the granularity, the cycle, and the nearest valid rates -- instead of the drive
+    // faulting cryptically at OP entry (the A6 Er74.0 failure mode this prevents).
+    MasterConfig bad = make_config();
+    bad.use_distributed_clocks = true;
+    bad.target_loop_rate_hz = 600;
+    bad.slaves[0].sync_cycle_granularity_ns = 250'000;
+    CHECK_THROWS(Master(bad, std::make_unique<SimBackend>(make_models())), ethercat::ConfigError);
+
+    // Valid multiples pass (1 kHz = 4 x 250 us), as does the same bad rate when the slave
+    // declares NO granularity (0 = no constraint) or DC is off (no SYNC0 in play).
+    MasterConfig ok = make_config();
+    ok.use_distributed_clocks = true;
+    ok.target_loop_rate_hz = 1000;
+    ok.slaves[0].sync_cycle_granularity_ns = 250'000;
+    Master m_ok{ok, std::make_unique<SimBackend>(make_models())};
+
+    MasterConfig no_decl = make_config();
+    no_decl.use_distributed_clocks = true;
+    no_decl.target_loop_rate_hz = 600;  // bad rate, but nothing declared -> no check
+    Master m_nodecl{no_decl, std::make_unique<SimBackend>(make_models())};
+
+    MasterConfig no_dc = make_config();
+    no_dc.target_loop_rate_hz = 600;  // DC off -> no SYNC0 -> granularity moot
+    no_dc.slaves[0].sync_cycle_granularity_ns = 250'000;
+    Master m_nodc{no_dc, std::make_unique<SimBackend>(make_models())};
+}
+
 TEST("Master(#20): configure() issues the vendor fault-reset SDO when configured (else not)") {
     {  // configured -> the vendor SDO (A6 0x2031:01 = 1) is written once at bring-up
         MasterConfig cfg = make_config();

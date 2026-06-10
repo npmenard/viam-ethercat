@@ -52,6 +52,52 @@ Master::Master(MasterConfig config, std::unique_ptr<EcatBackend> backend) : conf
     op_nudge_interval_cycles_ = std::max(config_.op_nudge_interval_cycles, 1U);
     const std::uint64_t await_cycles = (static_cast<std::uint64_t>(config_.op_await_timeout_ms) * config_.target_loop_rate_hz) / 1000ULL;
     op_await_bound_cycles_ = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(await_cycles, 1, UINT32_MAX));
+
+    // #44: validate the loop rate against each slave's declared SYNC0 cycle granularity
+    // UP FRONT -- a non-multiple cycle otherwise surfaces only as a cryptic fault AT OP
+    // ENTRY (the A6 Er74.0 "cycle error"), the worst place to debug a config mistake.
+    // Uses the SAME truncated-cycle arithmetic configure() arms SYNC0 with, so the value
+    // checked is the value the drive sees. Granularity is per-slave config DATA (0 = no
+    // constraint); only meaningful when DC/SYNC0 is in play.
+    if (config_.use_distributed_clocks) {
+        const std::uint64_t cycle_ns = static_cast<std::uint64_t>(kNsPerSec) / config_.target_loop_rate_hz;
+        for (const SlaveConfig& sc : config_.slaves) {
+            const std::uint32_t g = sc.sync_cycle_granularity_ns;
+            if (g == 0 || cycle_ns % g == 0) {
+                continue;
+            }
+            // Suggest the nearest rates (within the validated 1..1000 Hz range) whose
+            // truncated cycle IS a multiple -- scanned with the same arithmetic as the check.
+            const auto rate_ok = [&](std::uint32_t r) { return (static_cast<std::uint64_t>(kNsPerSec) / r) % g == 0; };
+            std::uint32_t lower = 0;
+            for (std::uint32_t r = config_.target_loop_rate_hz; r >= 1; --r) {
+                if (rate_ok(r)) {
+                    lower = r;
+                    break;
+                }
+            }
+            std::uint32_t higher = 0;
+            for (std::uint32_t r = config_.target_loop_rate_hz; r <= 1000; ++r) {
+                if (rate_ok(r)) {
+                    higher = r;
+                    break;
+                }
+            }
+            std::string nearest;
+            if (lower != 0) {
+                nearest += " " + std::to_string(lower) + " Hz";
+            }
+            if (higher != 0) {
+                nearest += std::string(lower != 0 ? " /" : "") + " " + std::to_string(higher) + " Hz";
+            }
+            throw ConfigError("Master: slave " + std::to_string(sc.slave_id) + " declares sync_cycle_granularity_ns=" + std::to_string(g) +
+                              " but target_loop_rate_hz=" + std::to_string(config_.target_loop_rate_hz) + " gives a " +
+                              std::to_string(cycle_ns) +
+                              " ns SYNC0 cycle that is not a multiple -- the drive would reject it at OP entry. Nearest valid"
+                              " rates:" +
+                              (nearest.empty() ? " none in 1..1000 Hz" : nearest));
+        }
+    }
 }
 
 void Master::init() {

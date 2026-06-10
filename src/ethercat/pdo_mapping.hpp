@@ -82,6 +82,14 @@ struct SlaveConfig {
     // controller already drives). The steady-state operator reset is a separate concern
     // (#22). `data` is the raw little-endian value (A6: a single 0x01 byte).
     std::optional<SdoWrite> fault_reset;
+    // OPTIONAL SYNC0 cycle granularity this slave accepts, in ns (#44). Some drives only
+    // accept SYNC0 cycles that are an integer multiple of a base tick -- the A6 requires a
+    // 250 us multiple and otherwise faults AT OP ENTRY (Er74.0 "cycle error"), a cryptic
+    // failure far from its cause. Declare it here (config DATA -- the 250'000 lives in the
+    // drive's config, never in library code) and the Master ctor validates the configured
+    // loop rate against it UP FRONT with clear text + nearest valid rates. 0 = no
+    // constraint declared (no check). Only meaningful with use_distributed_clocks.
+    std::uint32_t sync_cycle_granularity_ns = 0;
 };
 
 // Master-level configuration.

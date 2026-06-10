@@ -65,7 +65,8 @@ MasterConfig build_master_config(const ServoConfig& c) {
     slave.rxpdo = c.rxpdo;
     slave.txpdo = c.txpdo;
     slave.default_mode = to_cia402_mode(c.mode);
-    slave.fault_reset = c.fault_reset;  // vendor SDO fault-reset (A6: 0x2031:01=1), cleared at bring-up
+    slave.fault_reset = c.fault_reset;                              // vendor SDO fault-reset (A6: 0x2031:01=1), cleared at bring-up
+    slave.sync_cycle_granularity_ns = c.sync_cycle_granularity_ns;  // #44: Master validates rate vs granularity up front
 
     MasterConfig mc;
     mc.ifname = c.ifname;
