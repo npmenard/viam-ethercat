@@ -145,6 +145,15 @@ class ServoController {
     // For tests that need a CYCLE-based bound (e.g. #18: assert a give-up happens within
     // N loop-cycles, robust to the async loop's wall-clock rate under TSan/SCHED_OTHER).
     std::uint64_t loop_cycle() const noexcept;
+    // #39: the underlying Master, for SINGLE-PORT-OWNER SDO use ONLY (an operator/tool
+    // doing ad-hoc CoE pre-start()/post-stop() -- and the DA-required bracket test).
+    // NOT part of the master_-free accessor contract: callers MUST NOT touch it
+    // concurrently with start()/stop()/reconfigure() (those reset it under the exclusive
+    // lock); during a running RT phase Master's own rt_active guard makes SDO throw.
+    // nullptr before the first start(). Steady-state SDO is #22's queue, not this.
+    Master* master_for_sdo() noexcept {
+        return master_.get();
+    }
 
    private:
     // --- lifecycle FSM (std::variant; each state's step() in the .cpp) ---

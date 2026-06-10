@@ -200,6 +200,10 @@ void ServoController::reconfigure(ServoConfig config) {
     if (rt_thread_.joinable()) {
         rt_thread_.join();
     }
+    // #39 NOTE: no set_rt_active(false) at THIS join -- deliberately. The flagged Master
+    // is destroyed on the next line and its replacement constructs rt_active_=false, so a
+    // stale-true is moot BY OBJECT LIFETIME. A future refactor that REUSES the Master
+    // across reconfigure() must add the explicit clear here.
     master_.reset();  // safe: RT thread (its only cyclic user) is joined
     config_ = std::move(next);
 

@@ -2,6 +2,7 @@
 // full RT loop -- no Viam SDK, no hardware. require_realtime=false so the RT
 // thread runs SCHED_OTHER (CI has no CAP_SYS_NICE).
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -702,6 +703,26 @@ TEST("#39: the RT-phase bracket clears after stop() -- a restart's pre-spawn res
     CHECK(sim != nullptr);
     CHECK_EQ(sim->recorded_sdo(1, 0x2031, 0x01).size(), std::size_t{2});  // the restart's reset landed
     ctrl.stop();
+}
+
+// (#39, DA-required) The bracket's SET-TRUE half, end-to-end: while the controller's RT
+// phase is running, the Master's public SDO surface REFUSES (ConfigError) -- the failure
+// mode of a missing set(true) fails-OPEN (silently back to doc-contract-only), so it
+// must be pinned by test, not review. After stop() (joined), SDO proceeds again.
+// master_for_sdo() is the single-port-owner seam: used here pre/post the RT phase and
+// AROUND lifecycle calls only (never concurrently with them).
+TEST("#39: SDO refused while the controller's RT phase is declared; allowed after stop") {
+    SimBackend* sim = nullptr;
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
+    CHECK(ctrl.master_for_sdo() == nullptr);  // pre-first-start: no Master yet
+    ctrl.start();
+    CHECK(ctrl.master_for_sdo() != nullptr);
+    const std::array<std::byte, 2> one{std::byte{0x01}, std::byte{0x00}};
+    CHECK_THROWS(ctrl.master_for_sdo()->sdo_write(1, 0x2031, 0x01, one), ethercat::ConfigError);  // RT declared
+    ctrl.stop();  // joined -> the bracket cleared -> single port owner again
+    ctrl.master_for_sdo()->sdo_write(1, 0x2031, 0x01, one);
+    CHECK(sim != nullptr);
+    CHECK_EQ(sim->recorded_sdo(1, 0x2031, 0x01).size(), std::size_t{2});
 }
 
 TEST_MAIN()
