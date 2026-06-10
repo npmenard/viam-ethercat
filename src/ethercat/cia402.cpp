@@ -24,6 +24,22 @@ const char* to_string(Cia402State state) noexcept {
     return "Unknown";
 }
 
+const char* to_string(FsmError e) noexcept {
+    switch (e) {
+        case FsmError::FaultActive:
+            return "FaultActive";
+        case FsmError::InvalidGoal:
+            return "InvalidGoal";
+        case FsmError::WrongMode:
+            return "WrongMode";
+        case FsmError::NotOperational:
+            return "NotOperational";
+        case FsmError::Busy:
+            return "Busy";
+    }
+    return "Unknown";
+}
+
 const char* to_string(Cia402Mode mode) noexcept {
     switch (mode) {
         case Cia402Mode::None:
