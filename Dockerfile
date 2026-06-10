@@ -43,6 +43,17 @@ RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/nul
     apt-get install -y --no-install-recommends cmake=3.30.* cmake-data=3.30.*
 
 
+# C++23 toolchain (#38): the library's Cia402Fsm API uses std::expected, which
+# needs libstdc++ >= 12 -- jammy's default g++-11 has no <expected> header at
+# all (empirically probed). g++-12 is in-distro on jammy; make it the default
+# c++/g++ so `make build` (CI) and the SDK build use it, and clang-19 below
+# picks up libstdc++-12's headers automatically (it selects the newest GCC dir).
+RUN apt-get -y --no-install-recommends install g++-12 && \
+    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 && \
+    update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100 && \
+    update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-12 100 && \
+    update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-12 100
+
 RUN bash -c 'wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key|apt-key add -'
 RUN apt-add-repository -y 'deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main'
 RUN apt-get update
