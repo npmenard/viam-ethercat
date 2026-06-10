@@ -295,7 +295,13 @@ class Master {
     std::uint32_t bringup_settle_count_ = 0;             // RT-only: SETTLE cycles elapsed before requesting OP
     std::uint32_t bringup_await_count_ = 0;              // RT-only: AWAIT_OP cycles since requesting OP
     std::uint32_t bringup_op_hold_streak_ = 0;           // RT-only: consecutive (full-WKC && !Er74.1) cycles at OP
-    bool dc_enabled_ = false;                            // set in configure(): is SYNC0 in play? (gates the post-OP settle grace)
+    // AWAIT_OP bounds derived ONCE from MasterConfig in the ctor (#42): pre-clamped cycle
+    // counts the bring-up FSM compares against (the counts clamp 0->1; the give-up bound
+    // is op_await_timeout_ms converted at target_loop_rate_hz -- rate-independent patience).
+    std::uint32_t op_hold_confirm_cycles_ = 5;
+    std::uint32_t op_nudge_interval_cycles_ = 10;
+    std::uint32_t op_await_bound_cycles_ = 30'000;
+    bool dc_enabled_ = false;  // set in configure(): is SYNC0 in play? (gates the post-OP settle grace)
 
     MasterConfig config_;
     std::unique_ptr<EcatBackend> backend_;

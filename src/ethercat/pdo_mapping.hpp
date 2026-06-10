@@ -117,6 +117,27 @@ struct MasterConfig {
     // cycles (a single transient bad cycle should not hard-fault). Reset on any
     // good cycle.
     std::uint32_t max_consecutive_wkc_errors = 5;
+    // --- AWAIT_OP bounds (bringup_step's OP-await phase; #42 -- previously hardcoded) ---
+    // Defaults carry the ec_sample/A6 bring-up rationale: the A6's SAFE-OP->OP is SLOW
+    // (wire-measured >11 s, up to ~24 s) and ec_sample reaches OP by WAITING IT OUT with
+    // PD flowing + periodic SAFE-OP recovery nudges. Aborting early was the bug that
+    // failed bring-up ~20x too early. These are give-up/confirm bounds with early-exit:
+    // a conformant drive confirms OP in ~op_hold_confirm_cycles, so fast drives are
+    // unaffected; tune them for OTHER slow drives or non-default loop rates.
+    //
+    // Declare Operational only after this many CONSECUTIVE (full-WKC && !sync-faulted)
+    // cycles -- filters a transient good cycle. Cycle-semantic (consecutive clean
+    // exchanges), so a count like dc_op_gate_cycles. 0 => 1.
+    std::uint32_t op_hold_confirm_cycles = 5;
+    // While awaiting OP, run the backend's reack_op() (ec_sample's SAFE-OP recovery:
+    // ACK SAFE_OP+ERROR / re-request OP; self-gating no-op once in OP) every this many
+    // cycles. 0 => 1.
+    std::uint32_t op_nudge_interval_cycles = 10;
+    // Give up (Aborted) after this much WALL TIME awaiting OP. Converted to a cycle
+    // bound against target_loop_rate_hz in the Master ctor, so the give-up patience is
+    // RATE-INDEPENDENT (the old 30'000-cycle constant silently meant 30 s only at
+    // 1 kHz -- 2 minutes at 250 Hz). Floor of 1 cycle.
+    std::uint32_t op_await_timeout_ms = 30'000;
 };
 
 // Apply a PDO map to a slave via the CoE SDO sub-protocol. The slave MUST be in

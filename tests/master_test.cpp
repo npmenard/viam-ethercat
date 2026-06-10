@@ -334,6 +334,52 @@ TEST("Master(#20): bringup_step waits out OP (ec_sample patience) and aborts onl
     CHECK(!master.all_operational());
 }
 
+TEST("Master(#42): AWAIT_OP bounds are MasterConfig fields; the give-up window is wall-time, rate-independent") {
+    // The give-up bound is op_await_timeout_ms converted at target_loop_rate_hz (the old
+    // 30'000-cycle constant silently meant 30 s only at 1 kHz). Same 100 ms timeout at two
+    // rates -> proportionally different CYCLE budgets, same wall-clock patience.
+    const auto cycles_to_abort = [](std::uint32_t rate_hz, std::uint32_t timeout_ms) -> int {
+        MasterConfig cfg = make_config();
+        cfg.use_distributed_clocks = true;
+        cfg.dc_op_gate_cycles = 2;  // short SETTLE
+        cfg.target_loop_rate_hz = rate_hz;
+        cfg.op_await_timeout_ms = timeout_ms;
+        Master master{cfg, std::make_unique<SimBackend>(make_models())};
+        master.init();
+        master.configure();
+        int cycles = 0;
+        BringupStatus bs = BringupStatus::Gating;
+        while (bs != BringupStatus::Aborted && cycles < 10'000) {  // Er74.1 never clears -> must give up
+            bs = master.bringup_step(/*drive_sync_faulted=*/true);
+            ++cycles;
+        }
+        CHECK(bs == BringupStatus::Aborted);
+        return cycles;
+    };
+    const int at_1khz = cycles_to_abort(1000, 100);  // 100 ms @ 1 kHz -> ~100 await cycles (+2 settle)
+    const int at_250hz = cycles_to_abort(250, 100);  // 100 ms @ 250 Hz -> ~25 await cycles (+2 settle)
+    CHECK(at_1khz >= 100);
+    CHECK(at_1khz <= 110);
+    CHECK(at_250hz >= 25);
+    CHECK(at_250hz <= 35);  // SAME wall-time patience, quarter the cycles -- not 4x the wall time
+
+    // Degenerate values are safe: 0-count fields clamp to 1 (no div-by-zero nudge, no
+    // zero-evidence hold-confirm) and a 0 ms timeout still leaves a >= 1-cycle window --
+    // a healthy sim drive still reaches Operational.
+    MasterConfig cfg = make_config();
+    cfg.op_hold_confirm_cycles = 0;
+    cfg.op_nudge_interval_cycles = 0;
+    cfg.op_await_timeout_ms = 0;
+    Master master{cfg, std::make_unique<SimBackend>(make_models())};
+    master.init();
+    master.configure();
+    BringupStatus bs = BringupStatus::Gating;
+    for (int cycle = 0; cycle < 50 && bs != BringupStatus::Operational && bs != BringupStatus::Aborted; ++cycle) {
+        bs = master.bringup_step(/*drive_sync_faulted=*/false);
+    }
+    CHECK(bs == BringupStatus::Operational);  // healthy drive: confirms within the clamped 1-cycle hold
+}
+
 TEST("Master(#20): configure() issues the vendor fault-reset SDO when configured (else not)") {
     {  // configured -> the vendor SDO (A6 0x2031:01 = 1) is written once at bring-up
         MasterConfig cfg = make_config();

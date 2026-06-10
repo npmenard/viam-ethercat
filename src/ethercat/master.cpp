@@ -1,5 +1,6 @@
 #include "ethercat/master.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
@@ -18,16 +19,9 @@ namespace {
 
 constexpr std::uint16_t kModesOfOp = 0x6060;  // CiA402 modes-of-operation (U8): PP=1, PV=3; SDO-set in PRE-OP
 constexpr long kNsPerSec = 1'000'000'000L;
-// AWAIT_OP bounds (bringup_step): require this many consecutive (full-WKC && no-Er74.1) cycles
-// to confirm OP is reached + synced (not a transient), and give up only after a GENEROUS window.
-// The A6's SAFE-OP->OP is SLOW in some states -- wire-measured >11s (up to ~24s) on this drive --
-// and ec_sample reaches OP by WAITING IT OUT with PD flowing + repeated SAFE-OP recovery nudges
-// (it is NOT a single-request/no-hammer transition; that earlier assumption was the bug that
-// made us abort ~20x too early). So: wide bound, and re-ack/re-request OP every kOpNudgeInterval
-// cycles via backend reack_op() (ec_sample's check-thread recovery) while PD keeps flowing.
-constexpr std::uint32_t kOpHoldConfirm = 5;      // ~5 ms @ 1 kHz of held sync -> Operational
-constexpr std::uint32_t kAwaitOpBound = 30'000;  // ~30 s @ 1 kHz to reach OP (ec_sample patience), else Aborted
-constexpr std::uint32_t kOpNudgeInterval = 10;   // re-ack/re-request OP every ~10 ms (ec_sample check cadence)
+// The AWAIT_OP bounds (hold-confirm / nudge-interval / give-up) moved into MasterConfig
+// (#42): they carry A6/ec_sample-derived magnitudes + a wall-time meaning that depends on
+// the loop rate, so they are config (with the same defaults), derived once in the ctor.
 
 std::uint32_t field_key(std::uint16_t index, std::uint8_t sub) noexcept {
     return (static_cast<std::uint32_t>(index) << 8U) | sub;
@@ -48,6 +42,16 @@ Master::Master(MasterConfig config, std::unique_ptr<EcatBackend> backend) : conf
     if (config_.target_loop_rate_hz == 0 || config_.target_loop_rate_hz > 1000) {
         throw ConfigError("Master: target_loop_rate_hz " + std::to_string(config_.target_loop_rate_hz) + " out of range (1..1000)");
     }
+    // Derive the AWAIT_OP bounds ONCE from config (#42) -- no per-cycle math/clamping on
+    // the bring-up path. The counts clamp 0 -> 1 (a zero hold-confirm would declare OP on
+    // no held evidence; a zero nudge interval would divide by zero). The give-up bound is
+    // configured in WALL TIME and converted at the configured rate, so the ec_sample
+    // patience window is rate-independent (e.g. 30 s at 250 Hz = 7'500 cycles, not the
+    // 2 minutes the old fixed 30'000-cycle constant would have meant).
+    op_hold_confirm_cycles_ = std::max(config_.op_hold_confirm_cycles, 1U);
+    op_nudge_interval_cycles_ = std::max(config_.op_nudge_interval_cycles, 1U);
+    const std::uint64_t await_cycles = (static_cast<std::uint64_t>(config_.op_await_timeout_ms) * config_.target_loop_rate_hz) / 1000ULL;
+    op_await_bound_cycles_ = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(await_cycles, 1, UINT32_MAX));
 }
 
 void Master::init() {
@@ -263,15 +267,16 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted) noexcept {
             return BringupStatus::Gating;
         }
         case BringupPhase::AwaitOp: {
-            // Pump the gapless transition while WAITING OUT the A6's slow SAFE-OP->OP (seconds).
-            // Success = full WKC AND no Er74.1 held kOpHoldConfirm cycles -- i.e. the drive reached
-            // OP, SYNC0 aligned (Er74.1 cleared), and PD is exchanging cleanly. Every
-            // kOpNudgeInterval cycles, run ec_sample's SAFE-OP recovery (reack_op): ACK a
+            // Pump the gapless transition while WAITING OUT a slow SAFE-OP->OP (the A6 takes
+            // seconds). Success = full WKC AND no Er74.1 held op_hold_confirm_cycles -- i.e. the
+            // drive reached OP, SYNC0 aligned (Er74.1 cleared), and PD is exchanging cleanly.
+            // Every op_nudge_interval_cycles, run ec_sample's SAFE-OP recovery (reack_op): ACK a
             // SAFE_OP+ERROR / re-request OP from SAFE_OP. This is self-gating -- once the drive is
             // in OP, reack_op is a no-op -- and PD keeps flowing (no watchdog starve). Only after
-            // the generous kAwaitOpBound without the held-synced state do we give up.
+            // the generous wall-time give-up window (op_await_timeout_ms, converted to cycles in
+            // the ctor) without the held-synced state do we give up. Bounds are MasterConfig (#42).
             ++bringup_await_count_;
-            if (bringup_await_count_ % kOpNudgeInterval == 0) {
+            if (bringup_await_count_ % op_nudge_interval_cycles_ == 0) {
                 backend_->reack_op(0);
             }
             if (wkc == expected_wkc_ && !drive_sync_faulted) {
@@ -279,7 +284,7 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted) noexcept {
             } else {
                 bringup_op_hold_streak_ = 0;
             }
-            if (bringup_op_hold_streak_ >= kOpHoldConfirm) {
+            if (bringup_op_hold_streak_ >= op_hold_confirm_cycles_) {
                 operational_.store(true, std::memory_order_relaxed);
                 settle_remaining_ = dc_enabled_ ? config_.dc_settle_cycles : 0;
                 fault_.store(false, std::memory_order_relaxed);
@@ -287,7 +292,7 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted) noexcept {
                 bringup_phase_ = BringupPhase::Done;
                 return BringupStatus::Operational;
             }
-            if (bringup_await_count_ >= kAwaitOpBound) {
+            if (bringup_await_count_ >= op_await_bound_cycles_) {
                 bringup_phase_ = BringupPhase::Aborted;
                 return BringupStatus::Aborted;
             }
