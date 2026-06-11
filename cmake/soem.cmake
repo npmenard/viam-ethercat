@@ -34,8 +34,18 @@ include(FetchContent)
 # This is the EXACT commit our known-good reference ~/SOEM/samples/ec_sample
 # (which brings the A6-EC to OP in DC mode) is validated against, so any
 # behaviour difference on the bench is OUR code, not a SOEM version delta.
-set(ETHERCAT_SOEM_GIT_TAG "b410bf6ef599d5c85302ea45cae5f55f8e9aa394"
-    CACHE STRING "SOEM git commit SHA to build against (== v2.0.0+10, ec_sample parity)")
+#
+# DELIBERATELY NOT a CACHE variable (#35 root cause): a `CACHE STRING` never
+# self-updates, so a build dir configured under an OLD pin keeps fetching the
+# old SOEM forever -- that stale-cache path is exactly how a build dir ended up
+# on v1.4.0 (abbf0d4) after the v2 migration. The in-file pin is authoritative
+# on every configure. To build against a DIFFERENT SOEM tree, use the explicit
+# dev override -DFETCHCONTENT_SOURCE_DIR_SOEM=<path> (the pin check below
+# permits it with a loud warning).
+set(ETHERCAT_SOEM_GIT_TAG "b410bf6ef599d5c85302ea45cae5f55f8e9aa394")
+# Scrub the stale cache entry from dirs configured under the old CACHE form, so
+# it cannot shadow anything that still reads the cache.
+unset(ETHERCAT_SOEM_GIT_TAG CACHE)
 
 FetchContent_Declare(
   soem
@@ -46,6 +56,57 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(soem)
+
+# --- #35: pin assertion -- fail LOUD at configure on a stale checkout -----------
+# The incident this guards: a fresh build dir once resolved the FetchContent step
+# to a STALE SOEM v1.4.0 tree (abbf0d4) instead of the pin above. The v1 layout has
+# no include/soem/soem.h, so the failure surfaced as a cryptic `'soem/soem.h' file
+# not found` deep in the build -- and on a bench machine that wastes a hardware
+# session. Diagnose it HERE, with the fix in the message.
+if(NOT DEFINED soem_SOURCE_DIR OR NOT EXISTS "${soem_SOURCE_DIR}")
+  message(FATAL_ERROR
+      "SOEM pin check: soem_SOURCE_DIR is unset/missing after FetchContent_MakeAvailable "
+      "-- the fetch failed; check network access / the GIT_REPOSITORY URL.")
+endif()
+
+# Tier 1 (layout; always runs): the v2 umbrella header must exist. Any v1-era tree
+# fails this regardless of how it got there.
+if(NOT EXISTS "${soem_SOURCE_DIR}/include/soem/soem.h")
+  message(FATAL_ERROR
+      "SOEM pin check FAILED: '${soem_SOURCE_DIR}' is NOT a SOEM v2 tree "
+      "(missing include/soem/soem.h; a v1.4.0-era checkout has the old header layout). "
+      "This is the stale-FetchContent failure mode. Fix: delete this build dir's "
+      "_deps (soem-src/soem-build/soem-subbuild) and re-configure, or set "
+      "-DFETCHCONTENT_SOURCE_DIR_SOEM=<path to a checkout of ${ETHERCAT_SOEM_GIT_TAG}>.")
+endif()
+
+# Tier 2 (exact SHA; when the tree is a git checkout): HEAD must equal the pin.
+# An explicit FETCHCONTENT_SOURCE_DIR_SOEM dev override at a different commit is
+# permitted -- but loudly, because bench results are only comparable at the pin.
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${soem_SOURCE_DIR}/.git")
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" -C "${soem_SOURCE_DIR}" rev-parse HEAD
+    OUTPUT_VARIABLE _soem_head
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _soem_git_rc
+    ERROR_QUIET)
+  if(_soem_git_rc EQUAL 0 AND NOT _soem_head STREQUAL "${ETHERCAT_SOEM_GIT_TAG}")
+    if(DEFINED FETCHCONTENT_SOURCE_DIR_SOEM AND FETCHCONTENT_SOURCE_DIR_SOEM)
+      message(WARNING
+          "SOEM pin check: the FETCHCONTENT_SOURCE_DIR_SOEM override tree is at "
+          "${_soem_head}, not the pinned ${ETHERCAT_SOEM_GIT_TAG} (v2.0.0+10, ec_sample "
+          "parity). Building anyway (explicit override), but bench behaviour is only "
+          "comparable against the pin.")
+    else()
+      message(FATAL_ERROR
+          "SOEM pin check FAILED: the FetchContent checkout at '${soem_SOURCE_DIR}' is at "
+          "${_soem_head}, expected ${ETHERCAT_SOEM_GIT_TAG}. Stale _deps state. Fix: delete "
+          "this build dir's _deps (soem-src/soem-build/soem-subbuild) and re-configure.")
+    endif()
+  endif()
+endif()
+message(STATUS "SOEM pin check OK: v2 layout at ${soem_SOURCE_DIR}")
 
 if(TARGET soem)
   # `libethercat` ends up as a SHARED library when a transitive dep
