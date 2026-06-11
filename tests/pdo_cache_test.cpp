@@ -283,10 +283,27 @@ TEST("RxSnapshot stress: no torn frames, cycle monotone (1 writer, 4 readers)") 
         readers.emplace_back(reader);
     }
 
+    // #36 de-flake: the old fixed-length burst raced DESCHEDULED readers -- under TSan
+    // instrumentation + a loaded machine (parallel builds) the readers could observe
+    // <1000 valid frames before the writer finished, failing the non-vacuity guard
+    // spuriously. LOAD-INDEPENDENT form: publish the full stress burst, then KEEP
+    // publishing (yielding, so the readers actually get cycles) until they reach the
+    // observation goal. The ceiling keeps a genuinely-broken read() (never valid) from
+    // looping forever -- it then exits and the valid_reads CHECK fails meaningfully.
+    constexpr std::uint64_t kReadGoal = 1000;
     std::array<std::byte, kPayload> frame{};
-    for (std::uint64_t c = 1; c <= kStressIters; ++c) {
+    std::uint64_t c = 0;
+    const std::uint64_t ceiling = kStressIters * 100;
+    while (c < kStressIters || valid_reads.load(std::memory_order_relaxed) < kReadGoal) {
+        if (c >= ceiling) {
+            break;  // broken read(): let the CHECK below report it
+        }
+        ++c;
         fill_uniform(frame, static_cast<std::uint8_t>(c & 0xFFU));
         rx.publish(frame, static_cast<std::uint16_t>(c & 0xFFFFU), c);
+        if (c >= kStressIters) {
+            std::this_thread::yield();  // extension phase: cede the CPU to the readers
+        }
     }
     stop.store(true, std::memory_order_relaxed);
     for (auto& t : readers) {
@@ -297,8 +314,8 @@ TEST("RxSnapshot stress: no torn frames, cycle monotone (1 writer, 4 readers)") 
     CHECK_EQ(regressions.load(), 0);
     // Guard against a vacuous pass: if read() always exhausted (e.g. a parity
     // bug), tears would be 0 trivially. Require that readers actually observed
-    // many valid frames.
-    CHECK(valid_reads.load() > 1000);
+    // many valid frames (load-independent: the writer extended until they did).
+    CHECK(valid_reads.load() >= kReadGoal);
 }
 
 // ---------------------------------------------------------------------------
