@@ -226,11 +226,18 @@ TEST("#47.3: (phase,event) matrix -- steady fault, steady request, bring-up stop
         r.attach(1, c);
         r.start();
         std::this_thread::sleep_for(std::chrono::milliseconds(20));  // a few bring-up cycles
+        const auto stop_t0 = std::chrono::steady_clock::now();
         r.stop();
+        const auto stop_elapsed = std::chrono::steady_clock::now() - stop_t0;
         CHECK_EQ(c.steps, std::uint64_t{0});
         CHECK_EQ(c.stopping_steps, std::uint64_t{0});  // no stopping window pre-OP
         CHECK(c.stop_reason == StopReason::Requested);
         CHECK(r.status().phase == RunnerPhase::Stopped);
+        // PROMPTNESS pinned (architect's P2 cell-check): the pump must exit on the stop
+        // FLAG -- a flag-ignoring pump reaching the same end-state via its give-up bound
+        // (5s in this cfg) is a DIFFERENT exit path with identical values; only the
+        // join wall-time betrays it, so assert it (1s << the 5s bound, >> a real join).
+        CHECK(stop_elapsed < std::chrono::seconds(1));
     }
 }
 

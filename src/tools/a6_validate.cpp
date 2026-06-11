@@ -205,8 +205,10 @@ class A6Control final : public SlaveControl {
 
     // RT, every bring-up cycle: the old run_to_operational gate, verbatim -- Er74.1
     // pending == 0x603F reads 0x8700. A6 knowledge lives HERE (consumer), keeping the
-    // Runner vendor-free (#41). Also stashes the DC phase so main's printer can show
-    // bring-up phase-lock progress without touching the master (single port owner).
+    // Runner vendor-free (#41). NOTE const-with-side-effect: the dc_phase store below
+    // is a deliberate TELEMETRY SIDE-CHANNEL (an atomic in the referenced Telemetry,
+    // not logical state of this control) -- it's how main's printer shows bring-up
+    // phase-lock progress without touching the master (single port owner).
     bool sync_faulted(const CycleContext& ctx) const noexcept override {
         tel_.dc_phase_ns.store(ctx.dc_time_ns() % static_cast<std::int64_t>(1'000'000'000ULL / kLoopHz), std::memory_order_relaxed);
         return ctx.load<cia402::FaultCode::type>(fc_loc_) == kErr741NoSync;
