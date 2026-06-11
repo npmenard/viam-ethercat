@@ -237,23 +237,49 @@ TEST("#47.3: (phase,event) matrix -- steady fault, steady request, bring-up stop
 // (4) request_stop latches FIRST-CAUSE-WINS + on_stop carries the right reason per cause.
 // Baseline (declared): replace the CAS latch with a plain overwrite -> fails.
 TEST("#47.4: stop-reason latch is first-cause-wins across causes") {
-    auto sim = std::make_unique<SimBackend>(make_models());
-    SimBackend* simp = sim.get();
-    Master m{make_config(), std::move(sim)};
-    m.init();
-    m.configure();
-    Runner r{m, fast_runner_cfg()};
-    TestControl c;
-    c.on_step = [&](CycleContext& ctx) {
-        if (ctx.cycle() == 6) {
-            ctx.request_stop();           // FIRST cause: Requested
-            simp->force_short_wkc(true);  // a bus fault follows immediately...
-        }
-    };
-    r.attach(1, c);
-    r.run();
-    CHECK(c.stop_reason == StopReason::Requested);  // ...but the first cause won
-    CHECK(r.status().reason == StopReason::Requested);
+    {  // Requested, with a bus fault chasing it into the stopping entry.
+        auto sim = std::make_unique<SimBackend>(make_models());
+        SimBackend* simp = sim.get();
+        Master m{make_config(), std::move(sim)};
+        m.init();
+        m.configure();
+        Runner r{m, fast_runner_cfg()};
+        TestControl c;
+        c.on_step = [&](CycleContext& ctx) {
+            if (ctx.cycle() == 6) {
+                ctx.request_stop();           // FIRST cause: Requested
+                simp->force_short_wkc(true);  // a bus fault follows immediately...
+            }
+        };
+        r.attach(1, c);
+        r.run();
+        CHECK(c.stop_reason == StopReason::Requested);  // ...but the first cause won
+        CHECK(r.status().reason == StopReason::Requested);
+    }
+    {  // BusFault first, then a Requested latch attempt MID-WINDOW. This attempt
+       // PROVABLY reaches the latch (request_stop is legal from the window and
+       // always calls it) -- so this block is the one that exercises the CAS:
+       // an overwrite latch flips status().reason to Requested here.
+        auto sim = std::make_unique<SimBackend>(make_models());
+        SimBackend* simp = sim.get();
+        Master m{make_config(), std::move(sim)};
+        m.init();
+        m.configure();
+        Runner r{m, fast_runner_cfg()};
+        TestControl c;
+        c.on_step = [&](CycleContext& ctx) {
+            if (!ctx.stopping() && ctx.cycle() == 4) {
+                simp->force_short_wkc(true);  // FIRST cause: BusFault (latches a few cycles on)
+            }
+            if (ctx.stopping() && c.stopping_steps == 2) {
+                ctx.request_stop();  // SECOND cause, mid-window: must NOT displace BusFault
+            }
+        };
+        r.attach(1, c);
+        r.run();
+        CHECK(c.stop_reason == StopReason::BusFault);      // on_stop carried the first cause
+        CHECK(r.status().reason == StopReason::BusFault);  // and the latch HELD it
+    }
 }
 
 // (5) NO-HAMMER: exactly ONE OP request per start(), across the normal AND abort paths.

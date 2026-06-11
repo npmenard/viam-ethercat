@@ -168,9 +168,10 @@ class SlaveControl {
     // the Runner owns the only call site.)
     virtual void step(CycleContext& ctx) noexcept = 0;
     // RT, every BRING-UP cycle: "is the drive reporting a sync fault?" -- the
-    // Er74.1-class gate signal for bringup_step. DEFAULT false; the CiA402-aware
-    // control implements it (e.g. mapped 0x603F == its no-sync code). This hook is
-    // what keeps Master AND Runner vendor/CiA402-free (the #20 layering, preserved).
+    // no-sync-fault-class gate signal for bringup_step. DEFAULT false; the
+    // device-aware control implements it (e.g. a mapped error-code field equals
+    // its drive's no-sync code). This hook is what keeps Master AND Runner free
+    // of vendor AND CiA402 knowledge (the layering audit's rule, preserved).
     virtual bool sync_faulted(const CycleContext& ctx) const noexcept {
         (void)ctx;
         return false;
