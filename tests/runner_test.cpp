@@ -235,9 +235,15 @@ TEST("#47.3: (phase,event) matrix -- steady fault, steady request, bring-up stop
         CHECK(r.status().phase == RunnerPhase::Stopped);
         // PROMPTNESS pinned (architect's P2 cell-check): the pump must exit on the stop
         // FLAG -- a flag-ignoring pump reaching the same end-state via its give-up bound
-        // (5s in this cfg) is a DIFFERENT exit path with identical values; only the
-        // join wall-time betrays it, so assert it (1s << the 5s bound, >> a real join).
-        CHECK(stop_elapsed < std::chrono::seconds(1));
+        // (bringup_timeout) is a DIFFERENT exit path with identical values; only the
+        // join wall-time betrays it. The bound is ~3 orders over a real join (CI-jitter
+        // headroom) and discriminates ONLY while bound << bringup_timeout -- that
+        // inequality is MACHINE-CHECKED below (DA's construction rule): shrinking the
+        // cfg's timeout for test speed must fail HERE, loudly, instead of silently
+        // vacuating the elapsed assert.
+        constexpr auto kStopPromptBound = std::chrono::seconds(1);
+        CHECK(fast_runner_cfg().bringup_timeout >= 5 * kStopPromptBound);  // the discriminator guard
+        CHECK(stop_elapsed < kStopPromptBound);
     }
 }
 
