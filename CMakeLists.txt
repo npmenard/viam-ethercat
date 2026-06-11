@@ -517,6 +517,41 @@ if (ETHERCAT_SANITIZE_THREAD AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   viam_apply_wall_werror(pdo_access_test_tsan)
   add_test(NAME pdo_access_test_tsan COMMAND pdo_access_test_tsan)
   set_tests_properties(pdo_access_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
+
+  # ThreadSanitizer build of the #47 Runner tests. The Runner spawns the RT thread
+  # while the test thread calls status()/stop()/request_stop()/contract_violations()
+  # concurrently (run()'s phase polling, test 3's start+sleep+stop, test 10's
+  # deliberate cross-thread misbehavior) -- the whole Runner + Master + sim stack is
+  # compiled directly under -fsanitize=thread so the spawn/join/atomics handoff and
+  # the #47 violation counter are instrumented. SOEM referenced, never executed.
+  add_executable(runner_test_tsan
+    tests/runner_test.cpp
+    src/ethercat/cia402.cpp
+    src/ethercat/pdo_cache.cpp
+    src/ethercat/pdo_mapping.cpp
+    src/ethercat/backend.cpp
+    src/ethercat/sim_backend.cpp
+    src/ethercat/soem_backend.cpp
+    src/ethercat/master.cpp
+    src/ethercat/realtime.cpp
+    src/ethercat/runner.cpp
+  )
+  target_include_directories(runner_test_tsan
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  )
+  target_link_libraries(runner_test_tsan
+    PRIVATE
+      soem
+      Threads::Threads
+      Boost::headers
+  )
+  target_compile_options(runner_test_tsan PRIVATE -fsanitize=thread -O1 -g)
+  target_link_options(runner_test_tsan PRIVATE -fsanitize=thread)
+  viam_apply_wall_werror(runner_test_tsan)
+  add_test(NAME runner_test_tsan COMMAND runner_test_tsan)
+  set_tests_properties(runner_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
 endif()
 
 
