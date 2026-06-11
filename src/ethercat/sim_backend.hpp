@@ -141,6 +141,11 @@ class SimBackend final : public EcatBackend {
     // Lets an offline test assert the config value threads through to the backend's DC arm call
     // (#32 note 4). TEST-ONLY: read after the controller is stopped/joined.
     std::int32_t configured_dc_sync0_shift_ns() const noexcept;
+    // #47 test hook: how many times set_state(_, Op) was requested (the no-hammer
+    // invariant metric -- the Runner/bring-up must request OP exactly once per start).
+    int op_requests() const noexcept {
+        return op_requests_;
+    }
     // Read back a recorded SDO value (latest write to that object).
     std::vector<std::byte> recorded_sdo(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const;
     // Ordered log of SDO write keys ((index<<8)|sub) for asserting the remap
@@ -200,7 +205,8 @@ class SimBackend final : public EcatBackend {
     std::int32_t dc_sync0_shift_ns_ = 0;  // last arm_dc_sync() SYNC0 CyclShift (config dc_sync0_shift_ns; #32 note 4)
     std::int64_t synthetic_dc_ns_ = 0;    // synthetic DC clock, advanced each exchange() (dc_time())
     bool open_ = false;
-    bool short_wkc_once_ = false;                // one-shot (master_test drives it synchronously; RT-only)
+    bool short_wkc_once_ = false;
+    int op_requests_ = 0;  // #47: set_state(_, Op) call count (no-hammer metric)                // one-shot (master_test drives it synchronously; RT-only)
     std::atomic<bool> short_wkc_sticky_{false};  // toggled non-RT while the RT loop reads it in exchange() -> atomic
 };
 

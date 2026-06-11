@@ -195,6 +195,14 @@ class Master {
     int expected_wkc() const noexcept {
         return expected_wkc_;
     }
+    // #47: read-only config facts the Runner derives its pacing from -- the loop rate
+    // (period = 1e9/rate) and whether DC/SYNC0 is in play (set in configure()).
+    std::uint32_t loop_rate_hz() const noexcept {
+        return config_.target_loop_rate_hz;
+    }
+    bool dc_enabled() const noexcept {
+        return dc_enabled_;
+    }
     // DC system time (ns) from the last process(); for phase-locking the cyclic
     // wakeup to SYNC0. 0 on non-DC backends.
     std::int64_t dc_time() const noexcept {

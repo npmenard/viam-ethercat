@@ -164,6 +164,7 @@ target_sources(ethercat
     src/ethercat/pdo_mapping.cpp
     src/ethercat/master.cpp
     src/ethercat/realtime.cpp
+    src/ethercat/runner.cpp
     src/ethercat/soem_backend.cpp
     src/viam/lib/motion_profile.cpp
     src/viam/lib/servo_config.cpp
@@ -376,6 +377,7 @@ viam_add_test(soem_backend_test tests/soem_backend_test.cpp)
 viam_add_test(conversion_test tests/conversion_test.cpp)
 viam_add_test(dc_sync_test tests/dc_sync_test.cpp)
 viam_add_test(realtime_test tests/realtime_test.cpp)
+viam_add_test(runner_test tests/runner_test.cpp)
 viam_add_test(sine_move_test tests/sine_move_test.cpp)
 viam_add_test(servo_config_test tests/servo_config_test.cpp)
 viam_add_test(controller_offline_test tests/controller_offline_test.cpp)
