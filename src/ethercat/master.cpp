@@ -2,14 +2,11 @@
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <span>
 #include <string>
 #include <utility>
-
-#include <sys/mman.h>
 
 #include "ethercat/cia402.hpp"
 
@@ -211,16 +208,13 @@ void Master::configure() {
     // write 0x1C32:01 (the drive self-selects DC from the armed SYNC0).
     if (config_.use_distributed_clocks) {
         backend_->configure_dc_configdc();
-        // Lock resident memory (IOmap + SOEM context) before the RT thread spawns and
-        // starts pacing SYNC0, so a page fault never spikes the phase. MCL_CURRENT only
-        // (NOT MCL_FUTURE: the RT jthread's stack alloc would otherwise hit
-        // RLIMIT_MEMLOCK -> EAGAIN).
-        if (mlockall(MCL_CURRENT) != 0) {
-            (void)std::fprintf(stderr,
-                               "[ethercat] mlockall(MCL_CURRENT) failed (errno=%d): grant CAP_IPC_LOCK / "
-                               "RLIMIT_MEMLOCK=infinity; the SYNC0 PLL lock may be unreliable.\n",
-                               errno);
-        }
+        // NOTE (#TODO-6): no mlockall here. Memory locking is an RT-SETUP concern, and
+        // realtime::setup() already does it (mlockall MCL_CURRENT|MCL_FUTURE) when the
+        // Runner's RT thread starts -- which is the only point the SYNC0 PLL cares about
+        // (pacing begins post-start, after configure() returns at SAFE-OP). A second
+        // mlockall here was redundant AND a layering leak: Master is thread-free bus
+        // policy (#31/#47); memory residency belongs to the RT-setup layer. The
+        // CAP_IPC_LOCK / RLIMIT_MEMLOCK errno guidance lives in realtime::setup's log.
     }
 
     // Stop at SAFE-OP. SYNC0 is armed (PRE-OP) but its first edge is ~100 ms out (stock

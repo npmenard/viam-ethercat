@@ -118,11 +118,15 @@ ServoController::~ServoController() {
 void ServoController::start() {
     const std::unique_lock<std::shared_mutex> lk(api_mutex_);
 
-    // NOTE: configure() reaches SAFE-OP and (for DC) mlockall(MCL_CURRENT)s resident
-    // memory before this thread spawns the RT jthread (MCL_CURRENT only, so it doesn't
-    // MCL_FUTURE-lock this thread's later allocations -> EAGAIN). The RT thread then runs
-    // the DC bring-up prelude (SETTLE -> request OP -> AWAIT_OP) to OPERATIONAL;
-    // setup_realtime() does the full MCL_CURRENT|MCL_FUTURE for the loop.
+    // NOTE: configure() reaches SAFE-OP and does NO memory lock (TODO-6: residency is
+    // RT-setup's job, not thread-free bus policy). The RT thread then runs the DC
+    // bring-up prelude (SETTLE -> request OP -> AWAIT_OP) to OPERATIONAL; its
+    // setup_realtime() = realtime::setup() does the full MCL_CURRENT|MCL_FUTURE
+    // IN-THREAD, post-spawn -- which is ALSO where the EAGAIN-avoidance now lives: an
+    // in-thread/post-spawn MCL_FUTURE never sees this thread's later jthread stack
+    // alloc (the trap the old pre-spawn MCL_CURRENT-only carve-out worked around), and
+    // nothing cyclic runs before that in-thread lock, so no SYNC0-critical page-fault
+    // window opens.
     master_ = std::make_unique<Master>(build_master_config(config_), backend_factory_());
     master_->init();
     master_->configure();
