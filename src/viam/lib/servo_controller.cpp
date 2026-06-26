@@ -23,13 +23,15 @@ constexpr std::uint16_t kStatusword = 0x6041;
 constexpr std::uint16_t kTargetPos = 0x607A;
 constexpr std::uint16_t kActualPos = 0x6064;
 constexpr std::uint16_t kTargetVel = 0x60FF;
-constexpr std::uint16_t kProfileVel = 0x6081;     // PP move speed (carries the GoTo/GoFor rpm); optional in the map
-constexpr std::uint16_t kFaultCode = 0x603F;      // drive error code (TxPDO, optional feedback)
-constexpr std::uint16_t kEr74SyncFault = 0x8700;  // 0x603F value for Er74.1 "no SYNC0" -- the DC bring-up abort signal
-constexpr std::uint16_t kVelActual = 0x606C;      // velocity actual value (TxPDO, optional feedback)
+constexpr std::uint16_t kProfileVel = 0x6081;  // PP move speed (carries the GoTo/GoFor rpm); optional in the map
+constexpr std::uint16_t kFaultCode = 0x603F;   // drive error code (TxPDO, optional feedback)
+// #TODO-4: the A6's "no-SYNC0" code (0x8700 / Er74.1) is NO LONGER a constant here --
+// it's CONFIG DATA (ServoConfig::sync_fault_code), so this generic core carries no
+// vendor value. The bring-up gate reads it from config (nullopt ⇒ no detection).
+constexpr std::uint16_t kVelActual = 0x606C;  // velocity actual value (TxPDO, optional feedback)
 constexpr std::uint64_t kNsPerSec = 1'000'000'000ULL;
 
-// 4-digit uppercase hex of a U16 (e.g. 0x8700 -> "8700"); for last_error()'s
+// 4-digit uppercase hex of a U16 (e.g. 0xABCD -> "ABCD"); for last_error()'s
 // "drive fault 0x...." line. Cold path; no iostream/locale.
 std::string to_hex16(std::uint16_t v) {
     static constexpr char kDigits[] = "0123456789ABCDEF";
@@ -618,14 +620,18 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
     // DC bring-up prelude (#20): configure() left the bus at SAFE-OP; drive the Master
     // bring-up FSM to OPERATIONAL here, in the single RT loop, so process data flows
     // continuously (gapless) and SYNC0 is armed only once PD is already flowing. The
-    // gate's drive_sync_faulted is THIS controller's read of 0x603F == Er74.1 ("no
-    // SYNC0", #16 reuse) from the prior step's feedback -- keeping Master free of CiA402
-    // semantics. The caller (here) owns the phase-locked cadence.
+    // gate's drive_sync_faulted is THIS controller's read of 0x603F == the configured
+    // sync_fault_code (#TODO-4 -- Er74.1/0x8700 for the A6; nullopt ⇒ always false) from
+    // the prior step's feedback -- keeping Master free of CiA402 semantics. The caller
+    // (here) owns the phase-locked cadence.
     bool bringup_ok = false;
     while (!st.stop_requested()) {
         const std::span<const std::byte> bin = master_->input_image(slave);
         const std::uint16_t code = f_fault_code_.mapped() ? load_le<std::uint16_t>(bin.subspan(f_fault_code_.byte_offset, 2)) : 0;
-        const ethercat::BringupStatus bs = master_->bringup_step(code == kEr74SyncFault);
+        // #TODO-4: drive-sync-faulted = mapped 0x603F == the configured no-sync code.
+        // nullopt (no vendor code declared) ⇒ always false (a generic non-DC-quirk drive).
+        const bool sync_faulted = config_.sync_fault_code.has_value() && code == *config_.sync_fault_code;
+        const ethercat::BringupStatus bs = master_->bringup_step(sync_faulted);
         if (bs == ethercat::BringupStatus::Operational) {
             bringup_ok = true;
         } else if (bs == ethercat::BringupStatus::Aborted) {
@@ -633,7 +639,9 @@ void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> 
             // symptom (not operational); do NOT auto-retry -- repeated Er74 OP-entry
             // wedges the A6 (NO-CARRIER -> control-power cycle), so a re-attempt needs an
             // explicit restart/reconfigure. Fall through to the safe-state exit below.
-            state_.drive_fault_code.store(code != 0 ? code : kEr74SyncFault, std::memory_order_relaxed);
+            // Report the read code; if the drive read 0 but we aborted on the sync gate,
+            // fall back to the configured no-sync code (0 if none declared) for diagnostics.
+            state_.drive_fault_code.store(code != 0 ? code : config_.sync_fault_code.value_or(0), std::memory_order_relaxed);
             state_.drive_faulted.store(true, std::memory_order_release);
             rt_error_.store(RtError::NotOperational, std::memory_order_release);
             state_.faulted.store(true, std::memory_order_release);

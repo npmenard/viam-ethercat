@@ -66,6 +66,10 @@ TEST("a6-hardware.example.json: PP config parses through the real parser + valid
     CHECK(c.vendor_fault_reset->data.size() == 2);
     CHECK(c.vendor_fault_reset->data[0] == std::byte{0x01});
     CHECK(c.vendor_fault_reset->data[1] == std::byte{0x00});
+    // #TODO-4: the A6 no-sync code rides in the example as CONFIG DATA (34560 = 0x8700,
+    // Er74.1), feeding the bring-up sync gate -- no longer a hardcoded constant in core.
+    CHECK(c.sync_fault_code.has_value());
+    CHECK(c.sync_fault_code.value() == std::uint16_t{0x8700});
 }
 
 TEST("#39: the obsolete 'fault_reset' config key is REJECTED, never silently ignored") {
@@ -95,6 +99,9 @@ TEST("a6-servo.example.json: sim config parses + validates") {
     const ServoConfig c = parse_servo_config(attrs);
     CHECK(c.mode == ControlMode::ProfilePosition);
     CHECK(c.counts_per_rev == 131072.0);
+    // #TODO-4: the sim example declares no sync_fault_code -> nullopt -> the bring-up
+    // gate's drive-sync-faulted signal is always false (a generic, non-DC-quirk drive).
+    CHECK(!c.sync_fault_code.has_value());
 }
 
 TEST_MAIN()

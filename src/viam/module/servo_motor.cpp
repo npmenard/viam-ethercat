@@ -195,6 +195,12 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     // When set, the Master validates loop rate vs granularity at config time (clear text)
     // instead of the drive rejecting the cycle cryptically at OP entry.
     c.sync_cycle_granularity_ns = static_cast<std::uint32_t>(opt_num(attrs, "sync_cycle_granularity_ns", 0.0));
+    // #TODO-4: optional drive "no-sync" 0x603F code (A6: 34560 = 0x8700, Er74.1). CONFIG
+    // DATA -- the bring-up sync gate reads it from here, never a hardcoded constant in the
+    // generic core. Absent ⇒ nullopt ⇒ no sync-fault detection (generic drive).
+    if (const auto sfc = opt_attr<double>(attrs, "sync_fault_code")) {
+        c.sync_fault_code = static_cast<std::uint16_t>(*sfc);
+    }
 
     // #39: optional CONSUMER-side vendor fault-reset, executed once pre-RT-spawn (A6:
     // {"index": 8241 /*0x2031*/, "subindex": 1, "value": 1, "value_bytes": 2}). The vendor

@@ -62,6 +62,15 @@ struct ServoConfig {
     // loop rate against it AT CONFIG TIME with clear text + nearest valid rates, instead
     // of the drive rejecting the cycle cryptically at OP entry (A6 Er74.0). 0 = none.
     std::uint32_t sync_cycle_granularity_ns = 0;
+    // OPTIONAL drive "no-sync" fault code (#TODO-4: CONFIG DATA, never a hardcoded
+    // constant in the generic servo core). The 0x603F value a DC drive reports while
+    // SYNC0 has not yet established -- the A6's is 0x8700 (Er74.1 "no SYNC0"). The
+    // bring-up gate feeds (mapped 0x603F == this) to Master::bringup_step as the
+    // drive-sync-faulted signal, keeping Master AND the generic servo core free of any
+    // vendor code. nullopt ⇒ no sync-fault detection (the gate signal is always false --
+    // a generic drive with no such code). Lives in the hardware JSON ("sync_fault_code"),
+    // like sync_cycle_granularity_ns (#44) and vendor_fault_reset (#39).
+    std::optional<std::uint16_t> sync_fault_code;
     // OPTIONAL vendor fault-reset SDO (#39: CONSUMER-side policy -- the library's
     // configure() carries zero vendor knowledge now). Executed ONCE by ServoController
     // at start()/reconfigure() AFTER Master::configure(), BEFORE the RT thread spawns

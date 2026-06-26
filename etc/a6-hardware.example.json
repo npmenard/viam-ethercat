@@ -62,6 +62,7 @@
     "loop_rate_hz": 1000,
     "use_distributed_clocks": true,
     "sync_cycle_granularity_ns": 250000,
+    "sync_fault_code": 34560,
 
     "_comment_vendor_reset": "#39 CONSUMER-side vendor fault-reset, run once pre-RT-spawn: the A6 clears a latent fault via vendor object 0x2031:01 = 1 (a U16; NOT CiA402 controlword bit7). index 8241 = 0x2031 in decimal. Remove this block for a drive with no vendor reset (the generic bit7 path still runs). NOTE: the old per-slave 'fault_reset' attribute is OBSOLETE and rejected.",
     "vendor_fault_reset": { "index": 8241, "subindex": 1, "value": 1, "value_bytes": 2 },
