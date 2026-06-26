@@ -112,7 +112,6 @@ MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
     // (CLAUDE.md). The generic preop/postremap SDO mechanisms remain for drives that
     // need them; the A6 needs none here.
 
-    a6.rxpdo.assign_index = 0x1C12;
     a6.rxpdo.pdo_indices = {0x1600};
     a6.rxpdo.entries[0x1600] = {
         {kControlword, 0, 16},
@@ -120,7 +119,6 @@ MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
         {kProfileVelocity, 0, 32},
     };
 
-    a6.txpdo.assign_index = 0x1C13;
     a6.txpdo.pdo_indices = {0x1A00};
     a6.txpdo.entries[0x1A00] = {
         {kFaultCode, 0, 16},

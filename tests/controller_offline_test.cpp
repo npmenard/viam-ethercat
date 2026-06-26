@@ -38,7 +38,6 @@ ServoConfig make_config(ControlMode mode, bool feedback = false) {
     c.ifname = "sim0";
     c.slave_id = 1;
     c.mode = mode;
-    c.rxpdo.assign_index = 0x1C12;
     c.rxpdo.pdo_indices = {0x1600};
     // Authoritative A6 maps per mode: PP = ctrl + target position + profile velocity
     // (10 B); PV = ctrl + target velocity (6 B).
@@ -47,7 +46,6 @@ ServoConfig make_config(ControlMode mode, bool feedback = false) {
     } else {
         c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6081, 0, 32}};
     }
-    c.txpdo.assign_index = 0x1C13;
     c.txpdo.pdo_indices = {0x1A00};
     // #16 feedback variant: add 0x603F (fault code) + 0x606C (velocity actual) to the
     // TxPDO so the controller resolves + reads them. status@0, actual@2, 603F@6, 606C@8.

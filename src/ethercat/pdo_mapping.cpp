@@ -48,19 +48,20 @@ std::size_t PdoMap::byte_size() const {
         }
     }
     if ((bits % 8) != 0) {
-        throw PdoMappingError("PDO map " + hex16(assign_index) + " size " + std::to_string(bits) + " bits is not byte-aligned");
+        throw PdoMappingError("PDO map size " + std::to_string(bits) + " bits is not byte-aligned");
     }
     return bits / 8;
 }
 
-void apply_pdo_map(EcatBackend& backend, std::uint16_t slave, const PdoMap& map) {
+void apply_pdo_map(EcatBackend& backend, std::uint16_t slave, const PdoMap& map, PdoDirection dir) {
+    const std::uint16_t assign_index = map.assign_index(dir);  // derived from direction (or override) #TODO-8
     // (a) Disable the SM PDO assignment (count := 0) so the entries are writable.
-    sdo_write_scalar<std::uint8_t>(backend, slave, map.assign_index, 0x00, 0);
+    sdo_write_scalar<std::uint8_t>(backend, slave, assign_index, 0x00, 0);
 
     for (const std::uint16_t pdo : map.pdo_indices) {
         const auto it = map.entries.find(pdo);
         if (it == map.entries.end()) {
-            throw PdoMappingError("slave " + std::to_string(slave) + ": PDO " + hex16(pdo) + " assigned to SM " + hex16(map.assign_index) +
+            throw PdoMappingError("slave " + std::to_string(slave) + ": PDO " + hex16(pdo) + " assigned to SM " + hex16(assign_index) +
                                   " has no entry list");
         }
         const std::vector<PdoEntry>& list = it->second;
@@ -82,17 +83,17 @@ void apply_pdo_map(EcatBackend& backend, std::uint16_t slave, const PdoMap& map)
     }
 
     if (map.pdo_indices.size() > 0xFF) {
-        throw PdoMappingError("slave " + std::to_string(slave) + ": SM " + hex16(map.assign_index) + " has " +
+        throw PdoMappingError("slave " + std::to_string(slave) + ": SM " + hex16(assign_index) + " has " +
                               std::to_string(map.pdo_indices.size()) + " PDOs (max 255)");
     }
 
     // (e) Assign the PDO(s) to the SM, then set the assignment count.
     std::uint8_t sub = 1;
     for (const std::uint16_t pdo : map.pdo_indices) {
-        sdo_write_scalar<std::uint16_t>(backend, slave, map.assign_index, sub, pdo);
+        sdo_write_scalar<std::uint16_t>(backend, slave, assign_index, sub, pdo);
         ++sub;
     }
-    sdo_write_scalar<std::uint8_t>(backend, slave, map.assign_index, 0x00, static_cast<std::uint8_t>(map.pdo_indices.size()));
+    sdo_write_scalar<std::uint8_t>(backend, slave, assign_index, 0x00, static_cast<std::uint8_t>(map.pdo_indices.size()));
 }
 
 }  // namespace ethercat

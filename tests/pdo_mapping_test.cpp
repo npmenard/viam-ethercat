@@ -23,7 +23,6 @@ std::uint32_t key(std::uint16_t index, std::uint8_t sub) {
 // RxPDO 0x1600 assigned to SM 0x1C12, mapping ctrl(0x6040,16b) + target(0x607A,32b).
 PdoMap a6_rxpdo() {
     PdoMap m;
-    m.assign_index = 0x1C12;
     m.pdo_indices = {0x1600};
     m.entries[0x1600] = {PdoEntry{0x6040, 0x00, 16}, PdoEntry{0x607A, 0x00, 32}};
     return m;
@@ -42,7 +41,7 @@ std::vector<SimSlaveModel> one_slave() {
 
 TEST("apply_pdo_map emits the CiA remap SDO sequence in the load-bearing order") {
     SimBackend be{one_slave()};
-    apply_pdo_map(be, 1, a6_rxpdo());
+    apply_pdo_map(be, 1, a6_rxpdo(), ethercat::PdoDirection::Rx);
 
     const std::vector<std::uint32_t> expected = {
         key(0x1C12, 0x00),  // (a) disable SM assignment
@@ -62,7 +61,7 @@ TEST("apply_pdo_map emits the CiA remap SDO sequence in the load-bearing order")
 
 TEST("apply_pdo_map writes the packed entry value and final counts") {
     SimBackend be{one_slave()};
-    apply_pdo_map(be, 1, a6_rxpdo());
+    apply_pdo_map(be, 1, a6_rxpdo(), ethercat::PdoDirection::Rx);
 
     // entry 1 = (0x6040<<16)|(0<<8)|16 = 0x60400010, little-endian.
     const auto e1 = be.recorded_sdo(1, 0x1600, 0x01);
@@ -90,9 +89,35 @@ TEST("PdoMap::byte_size sums entry bits; rejects non-byte-aligned maps") {
 TEST("apply_pdo_map throws PdoMappingError when a PDO has no entry list") {
     SimBackend be{one_slave()};
     PdoMap m;
-    m.assign_index = 0x1C12;
     m.pdo_indices = {0x1600};  // but entries[0x1600] never populated
-    CHECK_THROWS_MSG(apply_pdo_map(be, 1, m), PdoMappingError, "no entry list");
+    CHECK_THROWS_MSG(apply_pdo_map(be, 1, m, ethercat::PdoDirection::Rx), PdoMappingError, "no entry list");
+}
+
+// #TODO-8: the SM assign-index is DERIVED from direction (Rx -> SM2 0x1C12, Tx ->
+// SM3 0x1C13); the user no longer supplies it. An override covers exotic layouts.
+TEST("#TODO-8: assign-index is derived from direction (override when set)") {
+    // the pure helper + the PdoMap accessor agree on the standard mapping
+    CHECK_EQ(ethercat::sm_assign_index(ethercat::PdoDirection::Rx), std::uint16_t{0x1C12});
+    CHECK_EQ(ethercat::sm_assign_index(ethercat::PdoDirection::Tx), std::uint16_t{0x1C13});
+    PdoMap derived;  // no override
+    CHECK_EQ(derived.assign_index(ethercat::PdoDirection::Rx), std::uint16_t{0x1C12});
+    CHECK_EQ(derived.assign_index(ethercat::PdoDirection::Tx), std::uint16_t{0x1C13});
+    PdoMap over;
+    over.assign_index_override = 0x1D00;                                             // exotic SM layout
+    CHECK_EQ(over.assign_index(ethercat::PdoDirection::Rx), std::uint16_t{0x1D00});  // override wins, ignores direction
+    CHECK_EQ(over.assign_index(ethercat::PdoDirection::Tx), std::uint16_t{0x1D00});
+
+    // and the derivation reaches the wire: a Tx map with NO override assigns through
+    // SM3 0x1C13 (the (a) disable + (e) assign writes target 0x1C13, not 0x1C12).
+    SimBackend be{one_slave()};
+    PdoMap tx;  // inputs; no assign_index supplied
+    tx.pdo_indices = {0x1A00};
+    tx.entries[0x1A00] = {PdoEntry{0x6041, 0x00, 16}, PdoEntry{0x6064, 0x00, 32}};
+    apply_pdo_map(be, 1, tx, ethercat::PdoDirection::Tx);
+    const auto log = be.sdo_log(1);
+    CHECK(!log.empty());
+    CHECK_EQ(log.front(), key(0x1C13, 0x00));  // (a) disabled SM3, derived from Tx
+    CHECK_EQ(log.back(), key(0x1C13, 0x00));   // (e) final assignment count on SM3
 }
 
 TEST_MAIN()

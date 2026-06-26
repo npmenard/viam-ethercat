@@ -224,10 +224,9 @@ TEST("#32.2: generic SDO abort -> SdoError; mapping-object abort -> PdoMappingEr
     // aborts -> apply_pdo_map re-tags it PdoMappingError (the name is correct there).
     be.set_sdo_write_abort(1, 0x1C12, 0);
     ethercat::PdoMap rx;
-    rx.assign_index = 0x1C12;
     rx.pdo_indices = {0x1600};
     rx.entries[0x1600] = {{0x6040, 0, 16}, {0x607A, 0, 32}};
-    CHECK_THROWS(ethercat::apply_pdo_map(be, 1, rx), ethercat::PdoMappingError);
+    CHECK_THROWS(ethercat::apply_pdo_map(be, 1, rx, ethercat::PdoDirection::Rx), ethercat::PdoMappingError);
 }
 
 TEST_MAIN()

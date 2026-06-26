@@ -280,10 +280,8 @@ ServoConfig fault_config() {
     c.ifname = "sim0";
     c.slave_id = 1;
     c.mode = ControlMode::ProfilePosition;
-    c.rxpdo.assign_index = 0x1C12;
     c.rxpdo.pdo_indices = {0x1600};
     c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6081, 0, 32}};
-    c.txpdo.assign_index = 0x1C13;
     c.txpdo.pdo_indices = {0x1A00};
     c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16}};
     c.fault_code_labels = {{0x8700, "Er74.1 / no SYNC0"}};

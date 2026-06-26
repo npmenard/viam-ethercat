@@ -167,8 +167,8 @@ void Master::configure() {
         // drive specifics here). A bad object/length surfaces as the backend's
         // PdoMappingError carrying the CoE abort code.
         apply_sdo_writes(sc.slave_id, sc.preop_sdo_writes);
-        apply_pdo_map(*backend_, sc.slave_id, sc.rxpdo);
-        apply_pdo_map(*backend_, sc.slave_id, sc.txpdo);
+        apply_pdo_map(*backend_, sc.slave_id, sc.rxpdo, PdoDirection::Rx);
+        apply_pdo_map(*backend_, sc.slave_id, sc.txpdo, PdoDirection::Tx);
         // AFTER the PDO assignment: SM-synchronization writes (0x1C32:01/0x1C33:01 sync
         // type). MUST follow the 0x1C12/0x1C13 assignment -- several drives re-default
         // 0x1C32 when the assignment changes, so a pre-assignment sync-type write is

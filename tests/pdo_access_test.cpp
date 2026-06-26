@@ -47,10 +47,8 @@ namespace {
 MasterConfig make_config() {
     SlaveConfig sc;
     sc.slave_id = 1;
-    sc.rxpdo.assign_index = 0x1C12;
     sc.rxpdo.pdo_indices = {0x1600};
     sc.rxpdo.entries[0x1600] = {{0x6040, 0, 16}, {0x607A, 0, 32}};
-    sc.txpdo.assign_index = 0x1C13;
     sc.txpdo.pdo_indices = {0x1A00};
     sc.txpdo.entries[0x1A00] = {{0x6041, 0, 16}, {0x6064, 0, 32}};
     sc.default_mode = Cia402Mode::ProfilePosition;

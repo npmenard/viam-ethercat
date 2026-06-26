@@ -33,7 +33,6 @@
     "command_queue_capacity": 64,
     "max_consecutive_wkc_errors": 5,
     "rxpdo": {
-      "assign_index": 7186,
       "pdos": [
         {
           "index": 5632,
@@ -46,7 +45,6 @@
       ]
     },
     "txpdo": {
-      "assign_index": 7187,
       "pdos": [
         {
           "index": 6656,

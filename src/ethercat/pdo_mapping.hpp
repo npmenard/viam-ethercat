@@ -27,13 +27,34 @@ struct PdoEntry {
     std::uint8_t bit_length = 0;
 };
 
-// A Sync-Manager PDO assignment: which PDO(s) (e.g. 0x1600) are assigned to the
-// SM (assign_index 0x1C12 for RxPDO, 0x1C13 for TxPDO), and the entry list of
-// each. `entries` is keyed by PDO index.
+// PDO direction = which SyncManager carries it. Fixed by the EtherCAT/CiA402
+// standard: outputs (master->slave, RxPDO) go through SM2, inputs (slave->master,
+// TxPDO) through SM3 -- so the SM PDO-assignment objects are fixed too.
+enum class PdoDirection : std::uint8_t { Rx, Tx };
+
+// The SM PDO-assignment object index for a direction (#TODO-8): RxPDO -> SM2 0x1C12,
+// TxPDO -> SM3 0x1C13. Universal for CiA402 servos -- the library derives it; the
+// user does not supply it.
+constexpr std::uint16_t sm_assign_index(PdoDirection dir) noexcept {
+    return dir == PdoDirection::Rx ? 0x1C12 : 0x1C13;
+}
+
+// A Sync-Manager PDO assignment: which PDO(s) (e.g. 0x1600) are assigned to the SM,
+// and the entry list of each (keyed by PDO index). The assign-index is DERIVED from
+// the map's direction (#TODO-8): the user names only the PDO(s) + entries. An escape
+// hatch (assign_index_override) covers exotic non-standard SM layouts; no CiA402
+// servo should need it.
 struct PdoMap {
-    std::uint16_t assign_index = 0;  // 0x1C12 (Rx) or 0x1C13 (Tx)
+    // 0 = derive from direction (the universal case). Set non-zero ONLY for a
+    // non-standard SM layout; then THIS index is used verbatim, ignoring direction.
+    std::uint16_t assign_index_override = 0;
     std::vector<std::uint16_t> pdo_indices;
     std::map<std::uint16_t, std::vector<PdoEntry>> entries;
+
+    // Effective SM assign-index: the override if set, else derived from direction.
+    std::uint16_t assign_index(PdoDirection dir) const noexcept {
+        return assign_index_override != 0 ? assign_index_override : sm_assign_index(dir);
+    }
 
     // Total mapped size in bytes (sum of all entry bit lengths / 8). Throws
     // PdoMappingError if the bit total is not byte-aligned.
@@ -62,8 +83,8 @@ struct SdoWrite {
 // generic code).
 struct SlaveConfig {
     std::uint16_t slave_id = 1;  // 1-based ring position
-    PdoMap rxpdo;                // assign_index 0x1C12
-    PdoMap txpdo;                // assign_index 0x1C13
+    PdoMap rxpdo;                // outputs -> SM2 0x1C12 (assign-index derived, #TODO-8)
+    PdoMap txpdo;                // inputs  -> SM3 0x1C13 (assign-index derived, #TODO-8)
     Cia402Mode default_mode = Cia402Mode::ProfilePosition;
     // Driver-supplied SDO writes applied in PRE-OP before the remap (drive tuning,
     // e.g. A6 C13 sync tolerance). Empty for slaves that need none.
@@ -155,6 +176,6 @@ struct MasterConfig {
 //       assignment count (assign_index:00 := M)
 // Throws PdoMappingError (clear text) if the map references a PDO with no entry
 // list or has too many entries/PDOs for the 1-byte counts.
-void apply_pdo_map(EcatBackend& backend, std::uint16_t slave, const PdoMap& map);
+void apply_pdo_map(EcatBackend& backend, std::uint16_t slave, const PdoMap& map, PdoDirection dir);
 
 }  // namespace ethercat

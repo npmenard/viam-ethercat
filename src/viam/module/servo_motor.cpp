@@ -84,15 +84,19 @@ double struct_num_or(const ProtoStruct& obj, const std::string& key, double dflt
     return p != nullptr ? *p : dflt;
 }
 
-// Parse one PDO map ({assign_index, pdos:[{index, entries:[{index,subindex,bit_length}]}]}).
-// The A6 (or any drive) map is CONFIG DATA -- never hardcoded here.
+// Parse one PDO map ({pdos:[{index, entries:[{index,subindex,bit_length}]}]}).
+// The A6 (or any drive) map is CONFIG DATA -- never hardcoded here. The SM assign-
+// index is DERIVED from direction at remap time (#TODO-8: Rx->0x1C12, Tx->0x1C13),
+// so the config no longer carries it. An optional "assign_index" key remains as an
+// override escape hatch for exotic non-standard SM layouts (default/absent = derive).
 PdoMap parse_pdo_map(const ProtoValue& val, const std::string& what) {
     const ProtoStruct* const obj = val.get<ProtoStruct>();
     if (obj == nullptr) {
         throw ConfigError(what + " must be an object");
     }
     PdoMap map;
-    map.assign_index = static_cast<std::uint16_t>(struct_num(*obj, "assign_index", what));
+    // Optional override only (0/absent = derive from direction). A stray 0 is ignored.
+    map.assign_index_override = static_cast<std::uint16_t>(struct_num_or(*obj, "assign_index", 0.0));
 
     const auto pdos_it = obj->find("pdos");
     if (pdos_it == obj->end()) {
