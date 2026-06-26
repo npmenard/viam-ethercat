@@ -113,7 +113,7 @@ void Runner::start() {
     // after the join in stop() (the one audited site post-#47).
     master_.set_rt_active(true);
     rt_ = std::jthread([this](const std::stop_token& st) { rt_body(st); });
-    rt_tid_ = rt_.get_id();
+    rt_tid_.store(rt_.get_id(), std::memory_order_release);
 }
 
 void Runner::request_stop() noexcept {
@@ -129,7 +129,7 @@ void Runner::stop() noexcept {
     // Debug-assert + degrade to request_stop() (no counter -- #47 TODO-1 dropped it).
     // (TODO-3 will make stop() private so this scenario is unreachable by construction;
     // until then the guard stays as the runtime backstop.)
-    if (std::this_thread::get_id() == rt_tid_) {
+    if (std::this_thread::get_id() == rt_tid_.load(std::memory_order_acquire)) {
         assert(false && "Runner::stop() called from the RT thread -- use ctx.request_stop()");
         request_stop();
         return;

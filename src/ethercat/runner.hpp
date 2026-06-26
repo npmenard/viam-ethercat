@@ -95,6 +95,12 @@ class Runner;
 // copies the next cycle in is still a data race (per-access locking is the only
 // fix; out of scope). The debug assert (check_live) steers developers away from
 // ALL out-of-window use, the cross-thread case included.
+//
+// SCOPING CAVEAT (do not over-read "owned data = always safe"): "safe-stale" holds
+// only WITHIN THE RUNNER'S LIFETIME. The ctx lives in the Runner's controls_ deque,
+// so a handle that OUTLIVES the Runner (used after the Runner is destroyed) is a
+// use-after-free, not safe-stale. Deterministic owner-side teardown/ownership is
+// TODO-3's territory; within a live Runner, escape is harmless.
 class CycleContext {
    public:
     // Read a typed field from THIS cycle's latched input image (the feedback the
@@ -288,8 +294,14 @@ class Runner {
     std::atomic<StopReason> reason_{StopReason::None};
     std::atomic<bool> stop_flag_{false};
     std::atomic<bool> started_{false};
-    std::thread::id rt_tid_{};  // set at spawn; the stop()-from-RT re-entrancy check
-    std::jthread rt_;           // last member
+    // Set by start() (main) right after spawn; read by stop()'s self-join guard, which
+    // may run on the RT thread (a control calling stop() from step()). Atomic so that
+    // cross-thread access is race-free (#49) -- TSan flags the plain form once the
+    // NDEBUG TSan lane (#50) actually exercises the stop()-from-RT path in test #47.10.
+    // (TODO-3 deletes this guard by construction -- stop() goes private -- retiring both
+    // the field and the race; until then this is the correct stopgap.)
+    std::atomic<std::thread::id> rt_tid_{};
+    std::jthread rt_;  // last member
 };
 
 }  // namespace ethercat

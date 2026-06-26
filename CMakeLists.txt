@@ -396,6 +396,21 @@ if (ETHERCAT_SANITIZE_THREAD AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
                  "seqlock fences are load-bearing). Configure with clang to build it.")
 endif()
 if (ETHERCAT_SANITIZE_THREAD AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  # #50: the TSan lane MUST be an NDEBUG config. Several concurrency tests are gated
+  # `#ifdef NDEBUG` (e.g. runner_test #47.10: the escaped-ctx + stop()-from-RT paths,
+  # which in a debug build would trip check_live's assert instead of running). Under a
+  # Debug build those tests compile to a `CHECK(true)` STUB -- so the very races they
+  # exist to catch (and which TSan would flag, e.g. the Runner self-join-guard rt_tid_
+  # access, #49) go UN-SANITIZED while the lane still reports green. Fail loud: require
+  # a build type whose flags carry -DNDEBUG.
+  if (NOT CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+    message(FATAL_ERROR
+        "ETHERCAT_SANITIZE_THREAD requires an NDEBUG build type (got "
+        "CMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}'). NDEBUG-gated concurrency tests "
+        "(#ifdef NDEBUG) silently stub out otherwise, so the TSan lane would run green "
+        "without sanitizing the paths it exists for. Re-configure with "
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo (keeps -g for symbolized races + defines NDEBUG).")
+  endif()
   add_executable(pdo_cache_test_tsan
     tests/pdo_cache_test.cpp
     src/ethercat/pdo_cache.cpp
