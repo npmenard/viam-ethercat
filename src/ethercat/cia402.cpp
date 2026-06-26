@@ -54,34 +54,53 @@ const char* to_string(Cia402Mode mode) noexcept {
     return "Unknown";
 }
 
+namespace {
+// DS402 statusword state decode (CiA 402, statusword 0x6041, Table "State coding").
+// Two masks isolate the state-defining bits, then each state is a fixed pattern
+// under one of them:
+//   - kStateMaskLow (0x4F) = bits 0,1,2,3,6 -- the four states that DON'T care about
+//     bit5 (quick-stop): NotReadyToSwitchOn, SwitchOnDisabled, FaultReactionActive, Fault.
+//   - kStateMaskFull (0x6F) = bits 0,1,2,3,5,6 -- adds bit5, distinguishing the states
+//     that DO (ReadyToSwitchOn, SwitchedOn, OperationEnabled, QuickStopActive).
+// Patterns are mutually exclusive, so test order matters only for ill-formed words,
+// which the defensive fall-through maps to Fault.
+constexpr unsigned kStateMaskLow = 0x4FU;
+constexpr unsigned kStateMaskFull = 0x6FU;
+
+constexpr unsigned kState_NotReadyToSwitchOn = 0x00U;   // under kStateMaskLow
+constexpr unsigned kState_SwitchOnDisabled = 0x40U;     // under kStateMaskLow
+constexpr unsigned kState_ReadyToSwitchOn = 0x21U;      // under kStateMaskFull
+constexpr unsigned kState_SwitchedOn = 0x23U;           // under kStateMaskFull
+constexpr unsigned kState_OperationEnabled = 0x27U;     // under kStateMaskFull
+constexpr unsigned kState_QuickStopActive = 0x07U;      // under kStateMaskFull
+constexpr unsigned kState_FaultReactionActive = 0x0FU;  // under kStateMaskLow
+constexpr unsigned kState_Fault = 0x08U;                // under kStateMaskLow
+}  // namespace
+
 Cia402State Status::decode() const noexcept {
-    // Standard DS402 decode. Masks 0x4F (bits 0..3,6) and 0x6F (bits 0..3,5,6)
-    // isolate the state-defining bits; the patterns below are mutually
-    // exclusive, so order only matters for ill-formed words (handled by the
-    // defensive fall-through to Fault).
     const unsigned s = raw;
-    if ((s & 0x4FU) == 0x00U) {
+    if ((s & kStateMaskLow) == kState_NotReadyToSwitchOn) {
         return Cia402State::NotReadyToSwitchOn;
     }
-    if ((s & 0x4FU) == 0x40U) {
+    if ((s & kStateMaskLow) == kState_SwitchOnDisabled) {
         return Cia402State::SwitchOnDisabled;
     }
-    if ((s & 0x6FU) == 0x21U) {
+    if ((s & kStateMaskFull) == kState_ReadyToSwitchOn) {
         return Cia402State::ReadyToSwitchOn;
     }
-    if ((s & 0x6FU) == 0x23U) {
+    if ((s & kStateMaskFull) == kState_SwitchedOn) {
         return Cia402State::SwitchedOn;
     }
-    if ((s & 0x6FU) == 0x27U) {
+    if ((s & kStateMaskFull) == kState_OperationEnabled) {
         return Cia402State::OperationEnabled;
     }
-    if ((s & 0x6FU) == 0x07U) {
+    if ((s & kStateMaskFull) == kState_QuickStopActive) {
         return Cia402State::QuickStopActive;
     }
-    if ((s & 0x4FU) == 0x0FU) {
+    if ((s & kStateMaskLow) == kState_FaultReactionActive) {
         return Cia402State::FaultReactionActive;
     }
-    if ((s & 0x4FU) == 0x08U) {
+    if ((s & kStateMaskLow) == kState_Fault) {
         return Cia402State::Fault;
     }
     // Unrecognized statusword: treat as Fault (never report operational).
