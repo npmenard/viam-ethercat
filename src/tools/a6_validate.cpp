@@ -612,8 +612,7 @@ int main(int argc, char** argv) {
 
     const WkcStats stats = master.wkc_stats();  // library-side tally (incl. window cycles)
     std::cout << "\n=== done. stop=" << to_string(reason) << (control.safety_abort() ? " (CSP SAFETY ABORT)" : "")
-              << " | bad-WKC cycles: " << stats.bad_cycles << " / " << stats.total_cycles
-              << " | contract violations: " << runner.contract_violations() << " ===\n";
+              << " | bad-WKC cycles: " << stats.bad_cycles << " / " << stats.total_cycles << " ===\n";
     // Exit code: bring-up/rt-setup failures are hard errors (the old return 1 paths);
     // a completed run -- including a safety abort that cleanly disabled -- reports 0
     // with the cause printed (matches the old tool's behavior).

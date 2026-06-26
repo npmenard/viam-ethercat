@@ -1,6 +1,7 @@
 #include "ethercat/runner.hpp"
 
 #include <cassert>
+#include <cstring>
 #include <string>
 #include <utility>
 
@@ -55,10 +56,14 @@ WkcStats CycleContext::wkc() const noexcept {
 }
 
 void CycleContext::check_live() const noexcept {
-    if (!live_) {
-        runner_->note_violation();
-        assert(live_ && "CycleContext used outside its dispatch window (#47 §3b)");
-    }
+    // Debug-only (#47 TODO-1): a control that touches the ctx outside its dispatch
+    // window gets a loud, immediate failure in debug builds. In release this compiles
+    // to nothing -- and per the owned-data design (inputs_/outputs_ are by-value, not
+    // spans into live buffers) the worst case there is SAFE-STALE: a valid object with
+    // last-cycle data, never a dangling/in-flight read. There is no release-mode
+    // counter (the old contract_violations was dropped: owned data makes the escape
+    // harmless rather than merely counted).
+    assert(live_ && "CycleContext used outside its dispatch window (#47 TODO-1: valid on the RT thread, during dispatch only)");
 }
 
 // --- Runner ----------------------------------------------------------------
@@ -86,7 +91,7 @@ void Runner::attach(std::uint16_t slave_id, SlaveControl& control) {
             throw ConfigError("Runner::attach: slave " + std::to_string(slave_id) + " already has a control attached");
         }
     }
-    controls_.push_back(Attached{slave_id, &control, CycleContext{this}});
+    controls_.emplace_back(slave_id, &control, this);  // ctx built in place (non-movable, #47 TODO-1)
 }
 
 void Runner::start() {
@@ -120,10 +125,11 @@ void Runner::stop() noexcept {
     if (!started_.load(std::memory_order_acquire)) {
         return;  // never started (or a failed start): nothing to tear down
     }
-    // Re-entrancy guard (#47 §3b): stop() from the RT thread itself would self-join
-    // (deadlock). Counted as a contract violation + degraded to request_stop().
+    // Re-entrancy guard: stop() from the RT thread itself would self-join (deadlock).
+    // Debug-assert + degrade to request_stop() (no counter -- #47 TODO-1 dropped it).
+    // (TODO-3 will make stop() private so this scenario is unreachable by construction;
+    // until then the guard stays as the runtime backstop.)
     if (std::this_thread::get_id() == rt_tid_) {
-        note_violation();
         assert(false && "Runner::stop() called from the RT thread -- use ctx.request_stop()");
         request_stop();
         return;
@@ -153,21 +159,36 @@ void Runner::latch_reason(StopReason r) noexcept {
     (void)reason_.compare_exchange_strong(expected, r, std::memory_order_acq_rel);  // first cause wins
 }
 
-void Runner::note_violation() noexcept {
-    violations_.fetch_add(1, std::memory_order_relaxed);
-}
-
 template <class Fn>
 void Runner::dispatch(Attached& a, std::uint64_t cycle, std::int64_t dc, bool stopping, Fn&& fn) noexcept {
     CycleContext& ctx = a.ctx;
-    ctx.inputs_ = master_.input_image(a.slave_id);
-    ctx.outputs_ = master_.outputs(a.slave_id);
+    const std::span<const std::byte> in = master_.input_image(a.slave_id);
+    const std::span<std::byte> out = master_.outputs(a.slave_id);
+
+    // COPY-IN (#47 TODO-1): refresh the ctx's OWNED input from this cycle's latched
+    // feedback. Applies to EVERY ctx-touching hook -- incl. sync_faulted() during
+    // bring-up, which loads FaultCode and must see the refreshed input.
+    ctx.input_size_ = in.size();
+    std::memcpy(ctx.inputs_.data(), in.data(), in.size());
+    // SEED the OWNED output from the live command image, so a field the hook does NOT
+    // store carries its current wire value over (exactly the old direct-span semantic;
+    // a read-only hook then copies back a no-op). Owned buffers also persist across
+    // cycles, but seeding makes a read-only or partial-write hook behavior-identical to
+    // the pre-TODO-1 span that wrote through to the live image.
+    ctx.output_size_ = out.size();
+    std::memcpy(ctx.outputs_.data(), out.data(), out.size());
+
     ctx.cycle_ = cycle;
     ctx.dc_time_ = dc;
     ctx.stopping_ = stopping;
-    ctx.live_ = true;  // the dispatch window (#47 §3b): ctx is legal ONLY in here
+    ctx.live_ = true;  // the dispatch window (#47 TODO-1): ctx is legal ONLY in here
     fn(ctx);
     ctx.live_ = false;
+
+    // COPY-OUT: the owned output goes to the wire; it ships with the NEXT process().
+    // A store made through an escaped (stale) handle after this point lands in the
+    // owned buffer only and never reaches here -> never reaches the wire.
+    std::memcpy(out.data(), ctx.outputs_.data(), out.size());
 }
 
 void Runner::rt_body(const std::stop_token& st) noexcept {

@@ -21,11 +21,14 @@
 // catch-up + WKC/cycle visibility -- observable and recoverable (skipped
 // cycles, counters move), never silent corruption, never an off-phase burst.
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <span>
 #include <thread>
-#include <vector>
 
 #include "ethercat/master.hpp"
 #include "ethercat/realtime.hpp"
@@ -75,22 +78,43 @@ class Runner;
 // copy forms (read_rpdo / their own atomics) OUTSIDE step(), as before.
 // No Master&, no SDO, no map access, no raw image pointers -- load/store at
 // pre-resolved FieldLocation handles is the whole hot-path surface.
+//
+// OWNED DATA (#47 §3b, TODO-1): the input/output images are held BY VALUE (fixed
+// arrays @ kMaxPdoBytes), NOT spans into the Runner's live process buffers.
+// dispatch() copies the slave's input image IN before each hook and the owned
+// output buffer OUT after. The win: a control that stashes the ctx and touches it
+// after step() returns reads a VALID object with STALE data -- never a dangling or
+// in-flight read (at 1 kHz a wild read into repointed buffers could command
+// dangerous motion). C++ can't forbid the escape (no borrow checker), so we make
+// the escape HARMLESS instead. A store through a stale handle lands in the
+// already-copied-back owned buffer and never reaches the wire.
+//
+// CONTRACT: valid on the RT thread, during the dispatch window ONLY. Owned data
+// fixes the realistic single-RT-thread escape; it does NOT make the ctx safe to
+// SHARE ACROSS THREADS -- a non-RT thread reading the ctx while the RT thread
+// copies the next cycle in is still a data race (per-access locking is the only
+// fix; out of scope). The debug assert (check_live) steers developers away from
+// ALL out-of-window use, the cross-thread case included.
 class CycleContext {
    public:
     // Read a typed field from THIS cycle's latched input image (the feedback the
-    // cycle's process() just exchanged; stable for the whole step()).
+    // cycle's process() just exchanged; stable for the whole step()). Reads the
+    // OWNED input copy that dispatch() refreshed before the hook.
     template <PdoScalar T>
     T load(FieldLocation loc) const noexcept {
         check_live();
-        return load_le<T>(inputs_, loc);
+        // View only this slave's valid Tx prefix, so bounds behave exactly as the
+        // old image-sized span did (a loc past the real image is still out-of-range).
+        return load_le<T>(std::span<const std::byte>(inputs_).first(input_size_), loc);
     }
-    // Stage a typed field into the output image. SHIPS WITH CYCLE N+1's process()
-    // -- the same 1-cycle command latency P2b verified on hardware. Step authors:
-    // a store this cycle is on the wire NEXT cycle.
+    // Stage a typed field into the OWNED output buffer; dispatch() copies it to the
+    // wire AFTER the hook, so it SHIPS WITH CYCLE N+1's process() -- the same
+    // 1-cycle command latency P2b verified on hardware. Step authors: a store this
+    // cycle is on the wire NEXT cycle.
     template <PdoScalar T>
     void store(FieldLocation loc, T v) noexcept {
         check_live();
-        store_le<T>(outputs_, loc, v);
+        store_le<T>(std::span<std::byte>(outputs_).first(output_size_), loc, v);
     }
     // Steady-cycle counter: 0 at the first step() after Operational.
     std::uint64_t cycle() const noexcept {
@@ -114,19 +138,38 @@ class CycleContext {
     // The #40 WKC health counters (fields individually relaxed, +/-1 skew by design).
     WkcStats wkc() const noexcept;
 
+    // Deleted copy AND move (#47 TODO-1): the ctx is a long-lived Runner-owned
+    // member, handed out by reference per dispatch. It was IMPLICITLY copyable
+    // (only the ctor is private, so the copy ctor was implicitly public --
+    // `auto saved = ctx;` compiled). Deleting both makes a stash a compile error,
+    // not a silent value-copy that would alias the owned buffers in confusing ways.
+    CycleContext(const CycleContext&) = delete;
+    CycleContext& operator=(const CycleContext&) = delete;
+    CycleContext(CycleContext&&) = delete;
+    CycleContext& operator=(CycleContext&&) = delete;
+
    private:
     friend class Runner;
     explicit CycleContext(Runner* runner) noexcept : runner_(runner) {}
-    // Contract check (#47 §3b, "runtime-checked"): ctx is valid ONLY during its own
-    // dispatch window (the Runner marks live around each hook/step call). A control
-    // that caches the ctx pointer and uses it outside its cycle is a contract
-    // violation: counted ALWAYS (Runner::contract_violations) + asserted in debug.
-    // (Our release builds define NDEBUG, so the counter is the testable signal.)
+    // Contract check (#47 §3b, TODO-1): the ctx is valid ONLY during its own
+    // dispatch window (the Runner sets live_ around each hook/step call). A control
+    // that caches the ctx and touches it outside its window trips this in DEBUG --
+    // a loud, immediate failure pointing at the misuse. In release it compiles to
+    // nothing, and per the owned-data design the worst case there is safe-stale
+    // (a valid object with last-cycle data), never corruption -- so there is no
+    // release-mode counter (the old contract_violations counter is gone: the user
+    // found it contrived, and owned data makes the escape harmless rather than
+    // merely counted).
     void check_live() const noexcept;
 
     Runner* runner_;
-    std::span<const std::byte> inputs_;  // refreshed each cycle (the latched feedback)
-    std::span<std::byte> outputs_;       // the live command image (ships next cycle)
+    // Owned images (NOT spans into live buffers). dispatch() copies the slave input
+    // in before the hook and copies this output out after -- so an escaped ctx reads
+    // safe-stale data and an escaped store never reaches the wire.
+    std::array<std::byte, kMaxPdoBytes> inputs_{};   // refreshed each cycle (latched feedback)
+    std::array<std::byte, kMaxPdoBytes> outputs_{};  // staged command (copied to wire post-hook)
+    std::size_t input_size_ = 0;                     // valid prefix of inputs_  (this slave's Tx image)
+    std::size_t output_size_ = 0;                    // valid prefix of outputs_ (this slave's Rx image)
     std::uint64_t cycle_ = 0;
     std::int64_t dc_time_ = 0;
     bool stopping_ = false;
@@ -215,18 +258,17 @@ class Runner {
         return RunnerStatus{phase_.load(std::memory_order_relaxed), reason_.load(std::memory_order_relaxed)};
     }
 
-    // #47 §3b contract-violation counter (ctx-use-outside-cycle, RT-thread re-entry
-    // into stop()): counted ALWAYS (our release builds define NDEBUG, so the debug
-    // asserts alone would be invisible there); asserted in debug builds too. Test 10
-    // proves the checks non-vacuous against a deliberately-misbehaving control.
-    std::uint32_t contract_violations() const noexcept {
-        return violations_.load(std::memory_order_relaxed);
-    }
-
    private:
     friend class CycleContext;
 
+    // Holds a control + its owned-data CycleContext. The ctx is non-copyable AND
+    // non-movable (#47 TODO-1), so Attached is too -- hence controls_ is a std::deque
+    // (node-based: stable addresses, never relocates elements on growth) populated by
+    // in-place emplace_back. A std::vector would require moving elements on realloc.
+    // The ctor builds the ctx in place from the Runner* (CycleContext's ctor is
+    // private; Attached, a member of Runner which is its friend, may call it).
     struct Attached {
+        Attached(std::uint16_t id, SlaveControl* c, Runner* r) noexcept : slave_id(id), control(c), ctx(r) {}
         std::uint16_t slave_id;
         SlaveControl* control;
         CycleContext ctx;
@@ -234,18 +276,17 @@ class Runner {
 
     void rt_body(const std::stop_token& st) noexcept;
     void latch_reason(StopReason r) noexcept;  // first cause wins (CAS from None)
-    void note_violation() noexcept;
-    // Refresh a ctx for this cycle + dispatch one hook/step with the live window set.
+    // Refresh a ctx for this cycle (copy the slave input IN), dispatch one hook/step
+    // with the live window set, then copy the ctx output OUT to the wire (#47 TODO-1).
     template <class Fn>
     void dispatch(Attached& a, std::uint64_t cycle, std::int64_t dc, bool stopping, Fn&& fn) noexcept;
 
     Master& master_;
     RunnerConfig cfg_;
-    std::vector<Attached> controls_;  // attach/slave order = step order
+    std::deque<Attached> controls_;  // attach/slave order = step order (node-based: see Attached)
     std::atomic<RunnerPhase> phase_{RunnerPhase::Idle};
     std::atomic<StopReason> reason_{StopReason::None};
     std::atomic<bool> stop_flag_{false};
-    std::atomic<std::uint32_t> violations_{0};
     std::atomic<bool> started_{false};
     std::thread::id rt_tid_{};  // set at spawn; the stop()-from-RT re-entrancy check
     std::jthread rt_;           // last member

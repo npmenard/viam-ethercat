@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "ethercat/master.hpp"
@@ -164,7 +165,6 @@ TEST("#47.1: full lifecycle order configured->operational->step->stop->window->c
     CHECK_EQ(c.stopping_steps, std::uint64_t{5});    // exactly teardown_cycles stopping steps
     CHECK(r.status().phase == RunnerPhase::Stopped);
     CHECK(r.status().reason == StopReason::Requested);
-    CHECK_EQ(r.contract_violations(), std::uint32_t{0});
 }
 
 // (2) step() is NEVER dispatched before Operational.
@@ -472,36 +472,63 @@ TEST("#47.9: stopping window delivers the disable policy; ignoring it is still s
     }
 }
 
-// (10) The §3b contract checks are NON-VACUOUS: a deliberately-misbehaving control
-// (ctx used outside its dispatch window; Runner::stop() from the RT thread) is
-// DETECTED -- the always-on violation counter increments (our release builds define
-// NDEBUG, so the counter is the testable face of the debug asserts) and the
-// stop()-from-RT degrades safely to request_stop() instead of self-join deadlock.
-// NOTE: this test runs the misbehavior in a child-free, assert-disabled (NDEBUG)
-// build; under a debug build the SAME paths assert, by design.
-TEST("#47.10: ctx-use-outside-cycle + stop()-from-RT are detected (and survive)") {
+// CycleContext is non-copyable AND non-movable (#47 TODO-1): a stash is a COMPILE
+// error, not a silent value-copy aliasing the owned buffers. (Was implicitly
+// copyable -- only the ctor was private, so `auto saved = ctx;` compiled.)
+static_assert(!std::is_copy_constructible_v<CycleContext> && !std::is_move_constructible_v<CycleContext>,
+              "#47 TODO-1: CycleContext must be non-copyable and non-movable");
+
+// (10) OWNED-DATA value semantics (#47 TODO-1): the ctx holds its images BY VALUE, so
+// a control that ESCAPES the ctx (stashes &ctx and touches it outside its dispatch
+// window) reads a VALID object with STALE data -- never a dangling/in-flight read --
+// and a store through the escaped handle lands in the owned buffer and NEVER reaches
+// the wire. (Pre-TODO-1 the ctx held spans into the live process buffers: the same
+// escape was UB / a wild read that at 1 kHz could command dangerous motion.)
+// Also smoke-checks the stop()-from-RT guard degrades (no self-join deadlock) while it
+// still exists (TODO-3 deletes it by construction). NDEBUG only: in a debug build the
+// out-of-window touch would (correctly) trip check_live's assert -- see the manual
+// broken-baseline (remove the live_ guard -> the assert no longer fires).
+TEST("#47.10: escaped ctx is safe-stale, never on the wire (owned-data value semantics)") {
 #ifdef NDEBUG
-    Master m{make_config(), std::make_unique<SimBackend>(make_models())};
+    auto sim = std::make_unique<SimBackend>(make_models());
+    SimBackend* simp = sim.get();
+    Master m{make_config(), std::move(sim)};
     m.init();
     m.configure();
     Runner r{m, fast_runner_cfg()};
     TestControl c;
+    const FieldLocation cw_loc{0, true};  // ctrlword @ offset 0 (the test map)
+    constexpr std::uint16_t kShipped = 0x000F;
+    c.request_stop_at_cycle = 6;
     c.on_step = [&](CycleContext& ctx) {
-        (void)ctx;
-        if (c.steps == 3 && c.cached_ctx != nullptr) {
-            // MISBEHAVIOR 2: re-enter the Runner from the RT thread.
-            r.stop();  // would self-join-deadlock; must degrade to request_stop + count
+        ctx.store<std::uint16_t>(cw_loc, kShipped);  // a known, deterministic last-shipped value
+        if (c.steps == 3) {
+            // stop()-from-RT must DEGRADE to request_stop, not self-join-deadlock
+            // (the test merely COMPLETING proves it -- a deadlock would hang).
+            r.stop();
         }
     };
     r.attach(1, c);
     r.run();
-    // MISBEHAVIOR 1: use the cached ctx OUTSIDE any dispatch window (post-join).
+
+    // cached_ctx was stashed by on_operational (the escape). The Runner is still alive,
+    // so it points at a VALID CycleContext holding last-dispatch (stale) data.
     CHECK(c.cached_ctx != nullptr);
-    (void)c.cached_ctx->cycle();                         // counted, not crashed (NDEBUG)
-    CHECK(r.contract_violations() >= std::uint32_t{2});  // both misbehaviors detected
-    CHECK(r.status().phase == RunnerPhase::Stopped);     // and the run still ended safely
+    const std::uint64_t stale_cycle = c.cached_ctx->cycle();  // stale-but-DEFINED, no crash/UB
+    CHECK(stale_cycle != UINT64_MAX);                         // it's a real prior cycle value, not garbage
+
+    // The wire holds the last value the IN-WINDOW stores shipped...
+    const auto before = simp->slave_io(1).outputs;
+    CHECK_EQ(ethercat::load_le<std::uint16_t>(before.subspan(0, 2)), kShipped);
+    // ...and a store through the ESCAPED handle (outside any window) does NOT reach it:
+    // it lands in the owned output buffer, which no dispatch will copy out again.
+    c.cached_ctx->store<std::uint16_t>(cw_loc, 0xBEEF);
+    const auto after = simp->slave_io(1).outputs;
+    CHECK_EQ(ethercat::load_le<std::uint16_t>(after.subspan(0, 2)), kShipped);  // still kShipped, NOT 0xBEEF
+
+    CHECK(r.status().phase == RunnerPhase::Stopped);  // and the run ended safely (no deadlock)
 #else
-    CHECK(true);  // debug builds: the same paths assert() -- not runnable in-process
+    CHECK(true);  // debug builds: the out-of-window touch asserts -- not runnable in-process
 #endif
 }
 
