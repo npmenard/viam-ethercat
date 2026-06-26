@@ -61,22 +61,19 @@ struct PdoMap {
     std::size_t byte_size() const;
 };
 
-// A one-shot SDO write the driver wants applied at configure() time, in PRE-OP,
-// BEFORE the PDO remap. This is how drive-specific TUNING params stay config DATA
-// (not hardcoded): e.g. the A6's C13 sync-jitter-tolerance group, which must be
-// written while the drive is quiescent (several C13 params are "at-stop only").
-// `data` is the raw little-endian object value; its length MUST match the object's
-// CoE data type or the drive aborts (the abort code surfaces via PdoMappingError).
+// A raw SDO write descriptor: {object index:subindex, little-endian value bytes}.
+// `data`'s length MUST match the object's CoE data type or the drive aborts.
+// CONSUMER-issued (#TODO-2): the Master no longer runs lists of these at configure()
+// time -- setup-SDO POLICY belongs to the consumer, which issues its writes via
+// Master::sdo_write() while it is the single port owner (post-configure, pre-RT).
+// The surviving use is a data carrier for the consumer's vendor fault-reset (#39:
+// ServoConfig::vendor_fault_reset, A6 0x2031:01). Best-effort vs mandatory is the
+// CONSUMER's call at the call site (e.g. run_vendor_fault_reset try/catches), not a
+// flag here -- the old `optional` field served only the deleted apply_sdo_writes.
 struct SdoWrite {
     std::uint16_t index = 0;
     std::uint8_t subindex = 0;
     std::vector<std::byte> data;
-    // Best-effort: if the drive rejects this write (read-only object, length/value
-    // abort), LOG and CONTINUE instead of failing configure(). For diagnostic /
-    // optional tuning writes where one rejected sub-index must not block the rest
-    // (e.g. the A6's 0x1C33:01 input-SM sync type may be read-only while 0x1C32:01
-    // output-SM is the one that matters). Default false = mandatory (throws).
-    bool optional = false;
 };
 
 // Per-slave configuration (config DATA; the A6 specifics live here, never in
@@ -86,20 +83,16 @@ struct SlaveConfig {
     PdoMap rxpdo;                // outputs -> SM2 0x1C12 (assign-index derived, #TODO-8)
     PdoMap txpdo;                // inputs  -> SM3 0x1C13 (assign-index derived, #TODO-8)
     Cia402Mode default_mode = Cia402Mode::ProfilePosition;
-    // Driver-supplied SDO writes applied in PRE-OP before the remap (drive tuning,
-    // e.g. A6 C13 sync tolerance). Empty for slaves that need none.
-    std::vector<SdoWrite> preop_sdo_writes;
-    // SDO writes applied in PRE-OP AFTER the PDO remap/assignment. Required for the
-    // SM-synchronization objects 0x1C32:01 / 0x1C33:01 (sync type): the ETG startup
-    // order is map -> assign (0x1C12/0x1C13) -> SM-sync, because several drives
-    // RE-DEFAULT 0x1C32 when the PDO assignment changes -- so a sync-type write done
-    // before the assignment gets clobbered back to its default. Empty for most slaves.
-    std::vector<SdoWrite> postremap_sdo_writes;
-    // NOTE (#39): the per-slave vendor fault-reset (`fault_reset`) is GONE -- vendor
-    // policy is consumer-side. Consumers run their reset via Master::sdo_write() while
-    // still the single port owner (pre-RT-spawn): see the servo module's
-    // vendor_fault_reset config and a6_validate's --reset-fault. Steady-state operator
-    // reset (RT running) is #22's queue.
+    // NOTE (#TODO-2): the generic preop_sdo_writes / postremap_sdo_writes lists are
+    // GONE -- "run these extra SDOs for me at configure()" was the same orchestration
+    // anti-pattern #39 evicted for the vendor fault-reset. Setup-SDO POLICY is the
+    // consumer's: it issues its own writes via Master::sdo_write() while still the
+    // single port owner (post-configure, pre-RT-spawn -- see the servo module's
+    // vendor_fault_reset / a6_validate's --reset-fault). The STRUCTURAL remap SDOs
+    // (0x1C12/0x1C13 assign + 0x1600/0x1A00 entries) STAY in configure() -- they're
+    // intrinsic to the init->map sequence, not consumer policy. (No A6 setup write
+    // needs to run before the remap, audited at #TODO-2, so no pre-remap hook exists;
+    // a drive that needed one would get a narrow named hook, not a generic list.)
     // OPTIONAL SYNC0 cycle granularity this slave accepts, in ns (#44). Some drives only
     // accept SYNC0 cycles that are an integer multiple of a base tick -- the A6 requires a
     // 250 us multiple and otherwise faults AT OP ENTRY (Er74.0 "cycle error"), a cryptic

@@ -139,41 +139,21 @@ void Master::configure() {
     // every configure() / power-on.
     backend_->request_state(0, EcatState::PreOp);
 
-    // Apply a list of driver SDO writes. A write marked optional that the drive
-    // rejects (read-only object / CoE abort) is logged and skipped, not fatal --
-    // for diagnostic / best-effort tuning writes; a mandatory write still throws.
-    const auto apply_sdo_writes = [this](std::uint16_t slave_id, const std::vector<SdoWrite>& writes) {
-        for (const SdoWrite& w : writes) {
-            if (w.optional) {
-                try {
-                    backend_->sdo_write(slave_id, w.index, w.subindex, w.data);
-                } catch (const Error& e) {
-                    (void)std::fprintf(stderr,
-                                       "[ethercat] optional SDO write to slave %u object 0x%04X:%02X rejected (continuing): %s\n",
-                                       static_cast<unsigned>(slave_id),
-                                       static_cast<unsigned>(w.index),
-                                       static_cast<unsigned>(w.subindex),
-                                       e.what());
-                }
-            } else {
-                backend_->sdo_write(slave_id, w.index, w.subindex, w.data);
-            }
-        }
-    };
-
     for (const SlaveConfig& sc : config_.slaves) {
-        // PRE-OP SDO writes BEFORE the remap: drive-tuning params that must land while
-        // the drive is quiescent and the SM mapping is still default (config DATA; no
-        // drive specifics here). A bad object/length surfaces as the backend's
-        // PdoMappingError carrying the CoE abort code.
-        apply_sdo_writes(sc.slave_id, sc.preop_sdo_writes);
+        // The STRUCTURAL PDO remap (#TODO-2 keeps this in Master -- it's intrinsic to the
+        // init->map sequence, not consumer policy): assign 0x1600/0x1A00 to SM2/SM3
+        // (0x1C12/0x1C13) + write the entry lists. The generic preop/postremap SDO lists
+        // that used to bracket this are GONE -- setup-SDO policy is the consumer's, run
+        // via Master::sdo_write() post-configure while it is the single port owner.
+        //
+        // ETG ORDERING LESSON (preserve for a future named SM-sync hook, #TODO-2 / DA):
+        // an SM-sync-type write (0x1C32:01 / 0x1C33:01) MUST go AFTER this apply_pdo_map,
+        // not before -- several drives RE-DEFAULT 0x1C32 when the PDO assignment changes,
+        // so a sync-type write done before the assignment is silently clobbered. (The A6
+        // needs none -- it self-selects DC from the PRE-OP SYNC0 arm, #20 -- but the next
+        // drive that needs an explicit sync-type write must place its hook here, post-remap.)
         apply_pdo_map(*backend_, sc.slave_id, sc.rxpdo, PdoDirection::Rx);
         apply_pdo_map(*backend_, sc.slave_id, sc.txpdo, PdoDirection::Tx);
-        // AFTER the PDO assignment: SM-synchronization writes (0x1C32:01/0x1C33:01 sync
-        // type). MUST follow the 0x1C12/0x1C13 assignment -- several drives re-default
-        // 0x1C32 when the assignment changes, so a pre-assignment sync-type write is
-        // clobbered (ETG startup order: map -> assign -> SM-sync).
-        apply_sdo_writes(sc.slave_id, sc.postremap_sdo_writes);
         // Set modes-of-operation (0x6060, U8) via SDO -- NOT mapped cyclically. A real
         // drive left in mode 0 never moves; this is the one drive-mode write per
         // configure(). PP=1 / PV=3 from the configured default_mode.

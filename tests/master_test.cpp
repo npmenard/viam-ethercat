@@ -192,53 +192,12 @@ TEST("Master: configure() sets modes-of-operation 0x6060 from default_mode (SDO)
     CHECK_EQ(static_cast<int>(std::to_integer<std::uint8_t>(mode[0])), 1);  // PP = 1
 }
 
-TEST("Master: configure() applies preop_sdo_writes (drive tuning) before the remap") {
-    MasterConfig cfg = make_config();
-    // Two driver-supplied PRE-OP writes (mirrors the A6 C13 sync-tolerance tune).
-    cfg.slaves[0].preop_sdo_writes = {
-        {0x2013, 0x06, {std::byte{0x02}, std::byte{0x00}}},  // U16 = 2
-        {0x2013, 0x07, {std::byte{0x70}, std::byte{0x17}}},  // U16 = 6000
-    };
-    auto sim = std::make_unique<SimBackend>(make_models());
-    SimBackend* sim_ptr = sim.get();
-    Master master{cfg, std::move(sim)};
-    master.init();
-    master.configure();
-
-    // The raw values were written verbatim.
-    const std::vector<std::byte> a = sim_ptr->recorded_sdo(1, 0x2013, 0x06);
-    const std::vector<std::byte> b = sim_ptr->recorded_sdo(1, 0x2013, 0x07);
-    CHECK_EQ(a.size(), std::size_t{2});
-    CHECK_EQ(static_cast<int>(std::to_integer<std::uint8_t>(a[0])), 0x02);
-    CHECK_EQ(static_cast<int>(std::to_integer<std::uint8_t>(b[1])), 0x17);
-
-    // ...and they landed BEFORE the remap: their keys lead the SDO log.
-    const std::vector<std::uint32_t> log = sim_ptr->sdo_log(1);
-    const auto first = log.front();
-    CHECK_EQ(first, (std::uint32_t{0x2013} << 8U) | 0x06U);
-}
-
-TEST("Master: configure() applies postremap_sdo_writes AFTER the PDO assignment") {
-    MasterConfig cfg = make_config();
-    // An SM-sync-type write (mirrors the A6 0x1C32:01 = DC SYNC0): must land after the
-    // 0x1C12/0x1C13 assignment or the drive re-defaults it.
-    cfg.slaves[0].postremap_sdo_writes = {
-        {0x1C32, 0x01, {std::byte{0x02}, std::byte{0x00}}},  // sync type = DC SYNC0
-    };
-    auto sim = std::make_unique<SimBackend>(make_models());
-    SimBackend* sim_ptr = sim.get();
-    Master master{cfg, std::move(sim)};
-    master.init();
-    master.configure();
-
-    const std::vector<std::uint32_t> log = sim_ptr->sdo_log(1);
-    const auto key = [](std::uint16_t idx, std::uint8_t sub) { return (static_cast<std::uint32_t>(idx) << 8U) | sub; };
-    const auto sync_pos = std::find(log.begin(), log.end(), key(0x1C32, 0x01));
-    const auto assign_pos = std::find(log.begin(), log.end(), key(0x1C12, 0x00));  // RxPDO SM assignment
-    CHECK(sync_pos != log.end());                                                  // the sync-type write happened
-    CHECK(assign_pos != log.end());                                                // the assignment happened
-    CHECK(assign_pos < sync_pos);                                                  // ...and the assignment came FIRST
-}
+// #TODO-2: the generic preop_sdo_writes / postremap_sdo_writes orchestration was
+// EVICTED from Master (setup-SDO policy is the consumer's, run via Master::sdo_write
+// post-configure -- the #39 pattern). The two tests that exercised those lists are
+// gone with the mechanism; the surviving consumer-side path (vendor_fault_reset) is
+// covered in controller_offline_test. The STRUCTURAL remap order is still pinned by
+// pdo_mapping_test (the 5-step apply_pdo_map sequence) + the mode-set test below.
 
 TEST("Master+SimBackend: dc_time() advances across process() (DC phase-lock input)") {
     Master master{make_config(), std::make_unique<SimBackend>(make_models())};
