@@ -9,6 +9,7 @@
 #include <soem/soem.h>
 
 #include "ethercat/errors.hpp"
+#include "ethercat/hex.hpp"
 
 namespace ethercat {
 
@@ -46,15 +47,6 @@ EcatState from_soem_state(std::uint16_t soem) noexcept {
     }
 }
 
-std::string hex32(std::uint32_t v) {
-    static constexpr char kDigits[] = "0123456789ABCDEF";
-    std::string out = "0x00000000";
-    for (int i = 0; i < 8; ++i) {
-        out[static_cast<std::size_t>(9 - i)] = kDigits[(v >> (4U * static_cast<unsigned>(i))) & 0xFU];
-    }
-    return out;
-}
-
 // Drain SOEM's error stack and, if a CoE abort is present, return its detail.
 // SOEM reports an SDO abort by pushing an ec_errort (with .AbortCode) even when
 // the mailbox working counter is non-zero, so checking the WKC alone can miss it.
@@ -63,7 +55,7 @@ std::string pop_coe_abort(ecx_contextt* ctx) {
     ec_errort err{};
     while (ecx_poperror(ctx, &err)) {
         if (err.Etype == EC_ERR_TYPE_SDO_ERROR) {
-            detail = ", CoE abort " + hex32(static_cast<std::uint32_t>(err.AbortCode));
+            detail = ", CoE abort " + hex(static_cast<std::uint32_t>(err.AbortCode));
         }
     }
     return detail;
@@ -127,7 +119,7 @@ std::size_t SoemBackend::open(std::string_view ifname) {
         for (int i = 1; i <= count; ++i) {
             const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
             detail += " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
-                      " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
+                      " ALstatuscode=" + hex(static_cast<std::uint32_t>(al)) + " (" + ec_ALstatuscode2string(al) + ")]";
         }
         ecx_close(&impl_->ctx);
         throw InitError("EtherCAT slaves did not reach PRE-OP on '" + name + "' (reached " + to_string(from_soem_state(reached)) + ")" +
@@ -170,7 +162,7 @@ std::size_t SoemBackend::open(std::string_view ifname) {
             ecx_readstate(&impl_->ctx);
             const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
             std::string detail = " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
-                                 " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
+                                 " ALstatuscode=" + hex(static_cast<std::uint32_t>(al)) + " (" + ec_ALstatuscode2string(al) + ")]";
             ecx_close(&impl_->ctx);
             throw InitError("slave " + std::to_string(i) + " CoE mailbox-out (SM0) not writable within ~10s after PRE-OP on '" + name +
                             "' -- mbxsend would not transmit" + detail);
@@ -198,7 +190,7 @@ std::size_t SoemBackend::open(std::string_view ifname) {
             ecx_readstate(&impl_->ctx);
             const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
             std::string detail = " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
-                                 " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
+                                 " ALstatuscode=" + hex(static_cast<std::uint32_t>(al)) + " (" + ec_ALstatuscode2string(al) + ")]";
             ecx_close(&impl_->ctx);
             throw InitError("slave " + std::to_string(i) +
                             " CoE handler did not answer a warm-up SDO read (0x1018:01) within ~15s after PRE-OP on '" + name + "'" +
@@ -295,7 +287,7 @@ void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
         for (int i = 1; i <= impl_->ctx.slavecount; ++i) {
             const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
             detail += " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
-                      " ALstatuscode=" + hex32(al) + " (" + ec_ALstatuscode2string(al) + ")]";
+                      " ALstatuscode=" + hex(static_cast<std::uint32_t>(al)) + " (" + ec_ALstatuscode2string(al) + ")]";
         }
         throw InitError("slave " + std::to_string(slave) + " did not reach state " + to_string(target) + " (reached " +
                         to_string(from_soem_state(reached)) + ")" + detail);

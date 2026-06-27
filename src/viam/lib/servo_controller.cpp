@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "ethercat/errors.hpp"
+#include "ethercat/hex.hpp"
 #include "ethercat/pdo_buffer.hpp"
 #include "ethercat/realtime.hpp"
 #include "ethercat/soem_backend.hpp"
@@ -30,17 +31,6 @@ constexpr std::uint16_t kFaultCode = 0x603F;   // drive error code (TxPDO, optio
 // vendor value. The bring-up gate reads it from config (nullopt ⇒ no detection).
 constexpr std::uint16_t kVelActual = 0x606C;  // velocity actual value (TxPDO, optional feedback)
 constexpr std::uint64_t kNsPerSec = 1'000'000'000ULL;
-
-// 4-digit uppercase hex of a U16 (e.g. 0xABCD -> "ABCD"); for last_error()'s
-// "drive fault 0x...." line. Cold path; no iostream/locale.
-std::string to_hex16(std::uint16_t v) {
-    static constexpr char kDigits[] = "0123456789ABCDEF";
-    std::string s(4, '0');
-    for (int i = 0; i < 4; ++i) {
-        s[static_cast<std::size_t>(3 - i)] = kDigits[(v >> (4U * static_cast<unsigned>(i))) & 0xFU];
-    }
-    return s;
-}
 
 // #40 item 7: ONE clock helper -- alias the shared realtime::monotonic_ns (the local
 // duplicate is gone; watchdog + last_cycle_time are the users).
@@ -906,7 +896,7 @@ std::string ServoController::last_error() const {
         const std::uint16_t code = state_.drive_fault_code.load(std::memory_order_relaxed);
         if (code != 0) {
             const std::string gloss = fault_gloss(code);
-            append("drive fault 0x" + to_hex16(code) + (gloss.empty() ? "" : " (" + gloss + ")"));
+            append("drive fault " + hex(code) + (gloss.empty() ? "" : " (" + gloss + ")"));
         } else {
             append("drive fault (code pending)");
         }

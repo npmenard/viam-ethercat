@@ -5,6 +5,7 @@
 #include <string>
 
 #include "ethercat/errors.hpp"
+#include "ethercat/hex.hpp"
 #include "ethercat/pdo_buffer.hpp"
 
 namespace ethercat {
@@ -24,18 +25,6 @@ void sdo_write_scalar(EcatBackend& backend, std::uint16_t slave, std::uint16_t i
     } catch (const SdoError& e) {
         throw PdoMappingError(std::string("PDO mapping write rejected: ") + e.what());
     }
-}
-
-std::string hex16(std::uint16_t v) {
-    std::array<char, 7> buf{};  // "0x" + 4 hex + NUL
-    static constexpr char kDigits[] = "0123456789ABCDEF";
-    buf[0] = '0';
-    buf[1] = 'x';
-    buf[2] = kDigits[(v >> 12) & 0xF];
-    buf[3] = kDigits[(v >> 8) & 0xF];
-    buf[4] = kDigits[(v >> 4) & 0xF];
-    buf[5] = kDigits[v & 0xF];
-    return std::string(buf.data());
 }
 
 }  // namespace
@@ -61,12 +50,12 @@ void apply_pdo_map(EcatBackend& backend, std::uint16_t slave, const PdoMap& map,
     for (const std::uint16_t pdo : map.pdo_indices) {
         const auto it = map.entries.find(pdo);
         if (it == map.entries.end()) {
-            throw PdoMappingError("slave " + std::to_string(slave) + ": PDO " + hex16(pdo) + " assigned to SM " + hex16(assign_index) +
+            throw PdoMappingError("slave " + std::to_string(slave) + ": PDO " + hex(pdo) + " assigned to SM " + hex(assign_index) +
                                   " has no entry list");
         }
         const std::vector<PdoEntry>& list = it->second;
         if (list.size() > 0xFF) {
-            throw PdoMappingError("slave " + std::to_string(slave) + ": PDO " + hex16(pdo) + " has " + std::to_string(list.size()) +
+            throw PdoMappingError("slave " + std::to_string(slave) + ": PDO " + hex(pdo) + " has " + std::to_string(list.size()) +
                                   " entries (max 255)");
         }
 
@@ -83,7 +72,7 @@ void apply_pdo_map(EcatBackend& backend, std::uint16_t slave, const PdoMap& map,
     }
 
     if (map.pdo_indices.size() > 0xFF) {
-        throw PdoMappingError("slave " + std::to_string(slave) + ": SM " + hex16(assign_index) + " has " +
+        throw PdoMappingError("slave " + std::to_string(slave) + ": SM " + hex(assign_index) + " has " +
                               std::to_string(map.pdo_indices.size()) + " PDOs (max 255)");
     }
 
