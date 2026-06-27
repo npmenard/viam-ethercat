@@ -10,11 +10,38 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
+
+// TSan detection (defined up here so the death-test helper below can be compiled out under
+// TSan -- fork()+abort() under a sanitizer is unsupported, and the wedge tests assert
+// fail-stop, not race-freedom; the CLEAN teardown they'd otherwise cover runs under TSan via
+// the other tests). #50 spirit preserved: no race-correctness test is hidden.
+#if defined(__SANITIZE_THREAD__)
+#define ETHERCAT_UNDER_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define ETHERCAT_UNDER_TSAN 1
+#endif
+#endif
+
+// The wedge death tests need fork/waitpid/abort; compile them (and their helper) only when
+// not under TSan and not in a no-fork environment.
+#if !defined(ETHERCAT_UNDER_TSAN) && !defined(ETHERCAT_NO_DEATH_TESTS)
+#define ETHERCAT_WEDGE_DEATH_TESTS 1
+#endif
+
+#ifdef ETHERCAT_WEDGE_DEATH_TESTS
+#include <csignal>         // SIGABRT/SIGKILL (the wedge fail-stop death tests, #52)
+#include <cstdio>          // freopen (child stderr -> /dev/null)
+#include <sys/resource.h>  // setrlimit(RLIMIT_CORE) -- no core dumps from the death-test children
+#include <sys/wait.h>      // fork/waitpid
+#include <unistd.h>        // fork/_exit
+#endif
 
 #include "ethercat/master.hpp"
 #include "ethercat/runner.hpp"
@@ -591,98 +618,127 @@ class WedgeControl : public SlaveControl {
         }
     }
 };
+
+#ifdef ETHERCAT_WEDGE_DEATH_TESTS
+// Fork-based death test (#52): the wedge path FAIL-STOPS via std::abort(), so it cannot be
+// observed in-process -- run `body` in a forked child and inspect how it died. The parent
+// BOUNDS the wait (the H1 liveness check: the abort must happen, not hang) -- on timeout the
+// child is SIGKILLed and `timed_out` is set. Child stderr -> /dev/null (the loud wedge log
+// is expected) and core dumps are disabled (RLIMIT_CORE=0). Forking is safe here: by the
+// time these tests run, every prior test's RT thread is joined -- only the main thread is
+// live at fork (a child started from a multi-threaded parent may only call async-signal-safe
+// code, which holds: the child sets up its OWN Master/thread AFTER the fork).
+struct ChildResult {
+    bool timed_out = false;
+    bool signaled = false;
+    int sig = 0;
+    bool exited = false;
+    int code = 0;
+};
+
+inline ChildResult run_in_child(const std::function<void()>& body, std::chrono::milliseconds timeout) {
+    const ::pid_t pid = ::fork();
+    if (pid == 0) {
+        const ::rlimit no_core{0, 0};
+        (void)::setrlimit(RLIMIT_CORE, &no_core);
+        (void)std::freopen("/dev/null", "w", stderr);
+        body();
+        ::_exit(0);  // body returned WITHOUT aborting -> clean exit; the test flags it (no SIGABRT)
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    int status = 0;
+    for (;;) {
+        const ::pid_t w = ::waitpid(pid, &status, WNOHANG);
+        if (w == pid) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            (void)::kill(pid, SIGKILL);
+            (void)::waitpid(pid, &status, 0);
+            return ChildResult{.timed_out = true};
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    ChildResult res;
+    if (WIFSIGNALED(status)) {
+        res.signaled = true;
+        res.sig = WTERMSIG(status);
+    }
+    if (WIFEXITED(status)) {
+        res.exited = true;
+        res.code = WEXITSTATUS(status);
+    }
+    return res;
+}
+#endif  // ETHERCAT_WEDGE_DEATH_TESTS
 }  // namespace
 
-// (12) TODO-3 H1 -- the LIVENESS guarantee: a wedged step() must NOT hang teardown.
-// stop() bounded-waits, then on timeout RELEASES (leaks) the RtCore and latches Wedged so
-// it RETURNS. The drive stays SAFE (PD gaps upstream of step() -> SM watchdog
-// de-energizes); only the MODULE wedges. *Baseline (declared): an UNBOUNDED join hangs
-// forever -> the test never returns (timeout) -- which the bounded wait replaced.*
+// (12) TODO-3 H1 / #52 -- a wedged step() is an unrecoverable RT fault: stop() bounded-waits,
+// then FAIL-STOPS via std::abort(). It does NOT detach-and-return (that UAFs the externally-
+// owned control the parked thread still holds, #52) and does NOT hang (the H1 liveness goal:
+// the process restarts under its supervisor instead of wedging the operator). The drive is
+// SAFE regardless (PD gaps upstream of step() -> SM watchdog de-energizes).
+// *Baselines (declared): (a) an UNBOUNDED join hangs forever -> the death-test child never
+// dies -> `timed_out` (the bounded wait replaced it); (b) detach+return -> the child exits
+// 0 (no SIGABRT) AND, under ASAN on the dtor path, a heap-UAF as ~Runner/the consumer free
+// state the parked thread reads (which abort-instead-of-teardown removes).*
 //
-// #52 (the leak-on-wedge UAF fix): the abandoned RT thread captured the *RtCore*, never
-// the Runner, so the RtCore is what gets leaked-but-kept-LIVE -- the Runner is a NORMAL
-// scoped object that destructs the moment the leaked-RtCore handoff is done (its dtor's
-// stop() short-circuits on the null rt_core_). What still must outlive the abandoned
-// thread is the EXTERNALLY-owned Master + control (held by reference, not owned by the
-// RtCore): a wedge is unrecoverable, so the test RETAINS them in a reachable `kept_alive`
-// (no free -> no UAF with the abandoned thread; reachable -> no LSan leak report; the
-// leaked RtCore stays LSan-reachable as a root on the still-blocked thread's stack). The
-// wedge is never released -- the thread stays harmlessly blocked in step().
-//
-// TSan detection: this INTENTIONALLY leaves a thread running on isolated, never-freed
-// state for the rest of the process. It's a LIVENESS test (stop returns, doesn't hang),
-// not a data-race test -- the race-relevant teardown (clean join) is covered by the other
-// tests, which DO run under TSan. Exclude only this one from the TSan lane (#50 spirit
-// preserved: no race-correctness test is hidden -- this asserts liveness, not race-freedom).
-#if defined(__SANITIZE_THREAD__)
-#define ETHERCAT_UNDER_TSAN 1
-#elif defined(__has_feature)
-#if __has_feature(thread_sanitizer)
-#define ETHERCAT_UNDER_TSAN 1
-#endif
-#endif
-
-#ifndef ETHERCAT_UNDER_TSAN
-TEST("#47.12 (TODO-3 H1): wedged step() -> bounded stop returns + Wedged, no hang") {
-    // Externally-owned Master + control: a wedge abandons them to the still-running thread
-    // forever, so RETAIN them reachable (kept_alive) -- never freed, never destructed.
-    static std::vector<void*> kept_alive;
-    auto* m = new Master(make_config(), std::make_unique<SimBackend>(make_models()));
-    m->init();
-    m->configure();
-    auto* c = new WedgeControl();
-    kept_alive.push_back(m);
-    kept_alive.push_back(c);
+// These are DEATH tests (the abort can't be observed in-process): a forked child wedges and
+// the parent asserts it died by SIGABRT within a bound. With abort there is NO abandoned
+// thread surviving into the rest of the suite, so the prior TSan concern is gone outright --
+// but fork()+abort() under a sanitizer is unsupported/flaky, and these assert FAIL-STOP, not
+// race-freedom (the race-relevant CLEAN teardown is covered by the other tests, which run
+// under TSan). So they stay excluded from both the TSan lane and any no-fork environment
+// (see the ETHERCAT_WEDGE_DEATH_TESTS gate near the includes).
+#ifdef ETHERCAT_WEDGE_DEATH_TESTS
+// Body shared by both wedge death tests: bring a wedged Runner up in the child, then run the
+// teardown the test wants (passed in). The control is declared BEFORE the Runner (the
+// lifetime contract) and the teardown is what aborts -- nothing after it runs.
+namespace {
+template <class Teardown>
+void wedge_child(Teardown&& teardown) {
+    Master m{make_config(), std::make_unique<SimBackend>(make_models())};
+    m.init();
+    m.configure();
+    WedgeControl c;  // before r
     RunnerConfig rc = fast_runner_cfg();
-    rc.stop_join_timeout = std::chrono::milliseconds(120);  // small ceiling -> fast test
-    // The Runner is a NORMAL scoped object now (#52): the thread holds the RtCore, not it.
-    Runner r{*m, rc};
-    r.attach(1, *c);
+    rc.stop_join_timeout = std::chrono::milliseconds(120);  // small ceiling -> fast wedge detect
+    Runner r{m, rc};
+    r.attach(1, c);
     r.start();
-    while (!c->in_step.load(std::memory_order_acquire)) {  // wait until the wedge is engaged
+    while (!c.in_step.load(std::memory_order_acquire)) {  // wait until the wedge is engaged
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    ethercat::RunnerTestPeer::stop(r);  // bounded wait -> wedge detected -> release (leak) + Wedged, RETURNS
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
-    CHECK(elapsed < std::chrono::milliseconds(600));  // returned, did NOT hang
-    CHECK(r.status().reason == StopReason::Wedged);    // reported from the null-rt_core_ branch
-    CHECK(r.status().phase == RunnerPhase::Stopped);
-    // r destructs HERE (end of scope) on the REAL ~Runner path while the RT thread is still
-    // wedged+abandoned -- its stop() short-circuits (rt_core_ released). ASAN proves the
-    // dtor touches nothing the leaked thread owns: no UAF.
+    teardown(r);  // -> stop() detects the wedge -> std::abort() (control flow ends here)
+}
+}  // namespace
+
+TEST("#47.12 (TODO-3 H1/#52): wedged step() -> stop() FAIL-STOPS (SIGABRT), no hang") {
+    // Drives the PRIVATE stop() directly (the SDK Stoppable::stop() / request-and-confirm
+    // shape). A wedge must abort the process, not hang and not return.
+    const ChildResult cr = run_in_child(
+        [] { wedge_child([](Runner& r) { ethercat::RunnerTestPeer::stop(r); }); },
+        std::chrono::milliseconds(3000));
+    CHECK(!cr.timed_out);        // the abort happened -> the child died (did NOT hang)
+    CHECK(cr.signaled);          // ...by a signal...
+    CHECK_EQ(cr.sig, SIGABRT);   // ...specifically SIGABRT (fail-stop, not a normal exit)
+    CHECK(!cr.exited);           // not a clean exit (a detach+return baseline would exit 0)
 }
 
-// (12b) #52 -- the PRODUCTION ~Runner path on a wedge (the exact path the old leak-test
-// sidestepped). No RunnerTestPeer, no manual stop(): a scoped Runner is DROPPED while its
-// step() is wedged, so ~Runner -> stop() -> bounded wait -> RELEASE the RtCore. ASAN on
-// this test is the no-UAF proof: the dtor (and ~Runner destroying its members) races the
-// abandoned RT thread, which only ever touches the LEAKED RtCore + the retained Master/
-// control -- never a Runner member. Liveness: dropping must not hang.
-TEST("#47.12b (TODO-3 #52): ~Runner on a wedged step() -> release-not-UAF, dtor returns") {
-    static std::vector<void*> kept_alive;
-    auto* m = new Master(make_config(), std::make_unique<SimBackend>(make_models()));
-    m->init();
-    m->configure();
-    auto* c = new WedgeControl();
-    kept_alive.push_back(m);
-    kept_alive.push_back(c);
-    RunnerConfig rc = fast_runner_cfg();
-    rc.stop_join_timeout = std::chrono::milliseconds(120);
-    const auto t0 = std::chrono::steady_clock::now();
-    {
-        Runner r{*m, rc};
-        r.attach(1, *c);
-        r.start();
-        while (!c->in_step.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        // drop r -> ~Runner runs the wedge teardown (release the RtCore, no join/close).
-    }
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
-    CHECK(elapsed < std::chrono::milliseconds(600));  // the dtor returned (bounded), did NOT hang
+TEST("#47.12b (TODO-3 #52): ~Runner on a wedged step() -> FAIL-STOP, no UAF teardown") {
+    // The exact PRODUCTION dtor path (no peer, no manual stop): a scoped Runner is DROPPED
+    // mid-wedge, so ~Runner -> stop() -> abort BEFORE any member (or the consumer's control)
+    // is destroyed. This is the path the old leak-test sidestepped; under ASAN it is the
+    // no-UAF proof -- nothing is torn down, so there is nothing for the parked thread to UAF.
+    const ChildResult cr = run_in_child(
+        [] { wedge_child([](Runner&) { /* drop r at wedge_child's scope end -> ~Runner aborts */ }); },
+        std::chrono::milliseconds(3000));
+    CHECK(!cr.timed_out);
+    CHECK(cr.signaled);
+    CHECK_EQ(cr.sig, SIGABRT);
+    CHECK(!cr.exited);
 }
-#endif  // !ETHERCAT_UNDER_TSAN
+#endif  // ETHERCAT_WEDGE_DEATH_TESTS
 
 // (13) TODO-3 -- de-energize on destruction is STRUCTURAL: destroying the Runner with NO
 // explicit stop still runs the graceful teardown (the disable policy ships, then close()).

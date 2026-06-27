@@ -4,6 +4,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -52,8 +53,7 @@ const char* to_string(RunnerPhase p) noexcept {
 void CycleContext::request_stop() noexcept {
     // Legal from inside step()/hooks (the RT error channel) AND harmless if the
     // control cached the ctx -- it only latches an atomic. Routed through core_ (the
-    // RT-shared state), which OUTLIVES the Runner on a wedge (leaked, #52) -- so a
-    // request from a step() running after a wedge-detach still touches LIVE state.
+    // RT-shared state the thread itself lives in), reachable for the whole RT lifetime.
     core_->latch_reason(StopReason::Requested);
     core_->stop_flag_.store(true, std::memory_order_release);
 }
@@ -144,59 +144,58 @@ void Runner::start() {
 }
 
 void Runner::request_stop() noexcept {
-    if (RtCore* core = rt_core_.get()) {
-        core->request_stop();
-    }
-    // else: already wedged-and-leaked -- the abandoned thread can no longer be steered;
-    // the HW SM watchdog is the de-energize backstop.
+    rt_core_->request_stop();
 }
 
 void Runner::stop() noexcept {
     if (!started_.load(std::memory_order_acquire)) {
         return;  // never started (or a failed start): nothing to tear down
     }
-    RtCore* core = rt_core_.get();
-    if (core == nullptr) {
-        return;  // a prior stop() already wedged + LEAKED the RtCore -- nothing left to join/close
-    }
+    RtCore& core = *rt_core_;
     // PRIVATE (#TODO-3): only ~Runner + run() reach here, both owner-thread -- so this
     // never runs on the RT thread and the old self-join guard is gone by construction.
-    core->request_stop();  // latch Requested (first-cause) + set the flag
+    core.request_stop();  // latch Requested (first-cause) + set the flag
 
-    // BOUNDED join (#TODO-3 H1): wait for the RT loop to finish its stopping window and
+    // BOUNDED wait (#TODO-3 H1): wait for the RT loop to finish its stopping window and
     // mark Stopped, up to a derived/configured ceiling. A non-wedged teardown reaches
-    // Stopped well inside it; a WEDGED step() never does -> we LEAK the RtCore (#52) and
-    // declare Wedged so stop() returns (liveness) instead of hanging forever. The drive
-    // stays SAFE either way: PD gaps upstream of a wedged step() -> the SM watchdog
-    // de-energizes. The in-process join is never the de-energize mechanism.
-    std::chrono::nanoseconds bound = core->cfg_.stop_join_timeout;
+    // Stopped well inside it; a WEDGED step() never does.
+    std::chrono::nanoseconds bound = core.cfg_.stop_join_timeout;
     if (bound <= std::chrono::nanoseconds::zero()) {
         const std::uint64_t period_ns = 1'000'000'000ULL / master_.loop_rate_hz();
-        const auto derived = std::chrono::nanoseconds((static_cast<std::uint64_t>(core->cfg_.teardown_cycles) + 20U) * period_ns * 4U);
+        const auto derived = std::chrono::nanoseconds((static_cast<std::uint64_t>(core.cfg_.teardown_cycles) + 20U) * period_ns * 4U);
         bound = std::max<std::chrono::nanoseconds>(std::chrono::milliseconds(250), derived);
     }
     const auto deadline = std::chrono::steady_clock::now() + bound;
-    while (core->phase_.load(std::memory_order_acquire) != RunnerPhase::Stopped) {
+    while (core.phase_.load(std::memory_order_acquire) != RunnerPhase::Stopped) {
         if (std::chrono::steady_clock::now() >= deadline) {
-            // WEDGED: the loop did not exit in time. RELEASE (leak) the RtCore -- the
-            // detached-and-still-running thread keeps using the leaked-but-LIVE state
-            // instead of members ~Runner is about to destroy (the #52 UAF fix: a bounded
-            // LEAK, never a use-after-free). Do NOT join/close -- the leaked thread owns
-            // the bus; the HW watchdog de-energizes. status() now reports {Stopped,
-            // Wedged} from the null-rt_core_ branch.
-            (void)rt_core_.release();
+            // WEDGED -> FAIL-STOP (#52). The RT thread is stuck INSIDE control->step() and
+            // will never return; it holds the ctx (Runner-internal, leakable) AND the
+            // EXTERNALLY-owned control (a reference from attach() -- NOT ours to leak). If
+            // we returned, the orderly dtor chain (~ServoController -> ~Runner -> destroy
+            // the control) would free state the abandoned thread is actively using ->
+            // use-after-free, possibly heap-corrupting the host process. There is no safe
+            // way to reclaim a thread parked in foreign code, and we cannot keep the
+            // consumer's control alive past its owner. So we do NOT tear down: abort the
+            // process. The drive is already SAFE (PD gapped upstream of the wedge -> the SM
+            // watchdog de-energizes ~50ms); the supervisor (viam-server) restarts the
+            // module. Deterministic fail-stop beats undefined behavior; this is a
+            // genuinely unrecoverable RT fault. (H1 LIVENESS is still met -- the operator
+            // is not stuck: the process restarts -- and no rogue thread corrupts a
+            // torn-down heap.)
             (void)std::fprintf(stderr,
                                "[ethercat] Runner::stop: RT loop WEDGED -- step() did not return within the bounded "
-                               "teardown ceiling; RtCore LEAKED (thread abandoned with live state, no UAF) so teardown "
-                               "returns. The drive de-energizes via the SM watchdog (PD gapped upstream of the wedge); "
-                               "the MODULE is wedged and must be restarted. status().reason=Wedged.\n");
-            return;
+                               "teardown ceiling. The RT thread is parked inside a control's step() and cannot be "
+                               "reclaimed; continuing teardown would use-after-free the control it still holds. "
+                               "FAIL-STOP: aborting the module process. The drive de-energizes via the SM watchdog "
+                               "(PD gapped upstream of the wedge); the supervisor will restart the module.\n");
+            (void)std::fflush(stderr);
+            std::abort();
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     // Clean exit: the loop reached Stopped, so the join returns immediately.
-    if (core->thread_.joinable()) {
-        core->thread_.join();
+    if (core.thread_.joinable()) {
+        core.thread_.join();
     }
     master_.set_rt_active(false);  // joined -- single port owner again
     master_.close();               // the proven INIT teardown (idempotent at the backend)

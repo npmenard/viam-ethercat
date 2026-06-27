@@ -85,9 +85,9 @@ struct RunnerConfig {
 
 class Runner;
 // The heap-held, RT-thread-shared cyclic state (#TODO-3 / #52). The Runner owns it by
-// unique_ptr; the RT thread lives INSIDE it (not capturing the Runner), so on a wedge
-// the Runner releases (LEAKS) it -- the detached thread keeps using leaked-but-LIVE
-// state, never the Runner's destroyed members. See the class def below.
+// unique_ptr; the RT thread lives INSIDE it (capturing the RtCore*, not the Runner), so
+// the clean teardown's join is a clean barrier and a wedge fail-stops rather than tearing
+// down under the parked thread. See the class def below.
 class RtCore;
 // White-box test access to the PRIVATE teardown (#TODO-3): consumers stop by dropping
 // the Runner, but the H1 bounded-join / Wedged + H4 concurrency tests must drive stop()
@@ -121,10 +121,10 @@ struct RunnerTestPeer;
 //
 // SCOPING CAVEAT (do not over-read "owned data = always safe"): "safe-stale" holds
 // only WITHIN THE RtCore'S LIFETIME. The ctx lives in the RtCore's controls_ deque
-// (heap-owned by the Runner, leaked-not-freed on a wedge #52), so a handle that
-// OUTLIVES the Runner+RtCore (used after a clean teardown destroys them) is a
-// use-after-free, not safe-stale. Deterministic owner-side teardown/ownership is
-// TODO-3's territory; within a live Runner, escape is harmless.
+// (heap-owned by the Runner), so a handle that OUTLIVES the Runner+RtCore (used after a
+// clean teardown destroys them) is a use-after-free, not safe-stale. Deterministic
+// owner-side teardown/ownership is TODO-3's territory; within a live Runner, escape is
+// harmless. (A wedge never destroys the RtCore -- it fail-stops, #52.)
 class CycleContext {
    public:
     // Read a typed field from THIS cycle's latched input image (the feedback the
@@ -192,7 +192,7 @@ class CycleContext {
     // merely counted).
     void check_live() const noexcept;
 
-    RtCore* core_;  // the RT-shared state (request_stop/wkc go through it); leaked-on-wedge (#52)
+    RtCore* core_;  // the RT-shared state (request_stop/wkc go through it; #52)
     // Owned images (NOT spans into live buffers). dispatch() copies the slave input
     // in before the hook and copies this output out after -- so an escaped ctx reads
     // safe-stale data and an escaped store never reaches the wire.
@@ -296,14 +296,14 @@ class SlaveControl {
     }
 };
 
-// The RT-thread-shared cyclic state (#TODO-3 / #52 -- the wedge-detach UAF fix). EVERYTHING
-// the RT thread touches lives HERE, on the heap, owned by the Runner via unique_ptr -- and
-// the thread itself lives here too (thread_). The RT loop captures the RtCore* (NOT the
-// Runner), so it never reaches a Runner member. On a clean stop the Runner joins thread_
-// then destroys this normally; on a WEDGE the Runner RELEASES this unique_ptr (LEAKS it,
-// never freed) so the detached-but-running thread keeps using leaked-but-LIVE state instead
-// of the Runner's destroyed members -> the production ~Runner-destroys-under-wedge path is a
-// bounded LEAK, not a use-after-free (DA #52). Not copyable/movable (atomics + non-movable ctx).
+// The RT-thread-shared cyclic state (#TODO-3 / #52). EVERYTHING the RT thread touches that
+// the Runner OWNS lives HERE, on the heap, owned by the Runner via unique_ptr -- and the
+// thread itself lives here too (thread_). The RT loop captures the RtCore* (NOT the Runner),
+// so it never reaches a Runner member; on a CLEAN stop the Runner joins thread_ (the barrier)
+// then destroys this normally -- no member is touched after the join. (On a WEDGE the Runner
+// does NOT tear down at all: it FAIL-STOPS via std::abort(), #52 -- the RT thread is parked
+// inside the EXTERNALLY-owned control's step(), which RtCore cannot leak, so the only
+// UAF-free option is to not free anything. See Runner::stop().) Not copyable/movable.
 class RtCore {
    public:
     RtCore(Master& master, RunnerConfig cfg) noexcept : master_(master), cfg_(cfg) {}
@@ -342,7 +342,7 @@ class RtCore {
     std::atomic<RunnerPhase> phase_{RunnerPhase::Idle};
     std::atomic<StopReason> reason_{StopReason::None};
     std::atomic<bool> stop_flag_{false};
-    std::jthread thread_;  // spawned by Runner::start(); joined on clean stop; LEAKED-with-RtCore on wedge
+    std::jthread thread_;  // spawned by Runner::start(); joined on clean stop; a wedge fail-stops the process
 };
 
 // The orchestration layer (#47 §1): owns the RT state (RtCore) + the teardown around it.
@@ -360,7 +360,9 @@ class Runner {
     // so de-energize-on-destruction is STRUCTURAL on every non-wedged path. The OWNER stops
     // deterministically by DROPPING the Runner. There is NO public stop(); the only two stop
     // paths are ctx.request_stop() (RT) and destruction. A wedged step() can't hang it -- the
-    // join is bounded (H1: on timeout the RtCore is LEAKED + StopReason::Wedged, no UAF #52).
+    // wait is bounded (H1: on timeout the process FAIL-STOPS via std::abort(), #52 -- a wedged
+    // RT thread parked in foreign step() is unrecoverable, so we abort rather than tear down
+    // state it still holds; the supervisor restarts the module).
     ~Runner();
 
     // Attach a control to a slave (1-based). PRE-start only. Throws ConfigError on
@@ -387,18 +389,17 @@ class Runner {
     // Non-RT stop REQUEST (a signal-handler-adjacent thread, or the SDK's Stoppable::stop()
     // on the gRPC thread): latches Requested + sets the flag; the RT loop enters its stopping
     // window next cycle. Does NOT join -- the join is the dtor's job. Pairs with
-    // status()-polling for command-and-confirm. No-op after a wedge (RtCore released).
+    // status()-polling for command-and-confirm.
     void request_stop() noexcept;
 
     // RELAXED diagnostic snapshot, NOT a happens-before edge: polling status().phase ==
     // Stopped does NOT synchronize-with the RT thread's writes. To read control-published
     // state, use the CONTROL's own atomics (or, in a test, the dtor JOIN as the edge) --
-    // never this poll. Reports {Stopped, Wedged} once the RtCore has been leaked on a wedge.
+    // never this poll. (StopReason::Wedged is never OBSERVED here -- a wedge fail-stops the
+    // process inside stop(), #52, so there is no surviving Runner to report it.)
     RunnerStatus status() const noexcept {
-        if (const RtCore* c = rt_core_.get()) {
-            return RunnerStatus{c->phase_.load(std::memory_order_relaxed), c->reason_.load(std::memory_order_relaxed)};
-        }
-        return RunnerStatus{RunnerPhase::Stopped, StopReason::Wedged};  // RtCore leaked-on-wedge
+        return RunnerStatus{rt_core_->phase_.load(std::memory_order_relaxed),
+                            rt_core_->reason_.load(std::memory_order_relaxed)};
     }
 
    private:
@@ -406,14 +407,15 @@ class Runner {
 
     // The teardown, PRIVATE (#TODO-3): called only by ~Runner and run() (both non-RT,
     // owner-thread). request -> BOUNDED-wait the stopping window -> on success join + clear
-    // the #39 bracket + master.close(); on timeout (a wedged step()) RELEASE (leak) the
-    // RtCore + latch Wedged + loud log (do NOT join/close -- the leaked thread owns the bus;
-    // the HW SM watchdog de-energizes). Private => unreachable from the RT thread => the old
-    // self-join guard (+ its rt_tid_ atomic, #49) are DELETED, unreachable by construction.
+    // the #39 bracket + master.close(); on timeout (a wedged step()) FAIL-STOP via
+    // std::abort() after a loud log (#52: the parked thread holds the externally-owned
+    // control we can't leak, so tearing down would UAF -- abort instead; the drive is
+    // SM-watchdog-safe and the supervisor restarts the module). Private => unreachable from
+    // the RT thread => the old self-join guard (+ its rt_tid_ atomic, #49) are DELETED.
     void stop() noexcept;
 
-    Master& master_;                     // owner-side close()/set_rt_active(false) on the clean path
-    std::unique_ptr<RtCore> rt_core_;    // the RT-shared state + thread; RELEASED (leaked) on wedge (#52)
+    Master& master_;                   // owner-side close()/set_rt_active(false) on the clean path
+    std::unique_ptr<RtCore> rt_core_;  // the RT-shared state + thread (heap: stable address; never released)
     std::atomic<bool> started_{false};
 };
 
