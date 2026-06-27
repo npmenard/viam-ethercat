@@ -69,6 +69,20 @@ endif()
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Minimum-toolchain floor (#TODO-9): GCC 13. GCC 13 (2023) ships in all current LTS
+# distros; the build image is ubuntu:noble (24.04, default g++-13/14). The floor buys
+# a complete C++20 stdlib -- libstdc++ 13 has <format> (libstdc++ 12 does NOT) and
+# <expected> (libstdc++ 12+), so it unblocks std::format adoption (#TODO-5) and lets
+# the ethercat::Expected shim retire to std::expected (#51). clang builds inherit the
+# newest installed libstdc++, so the clang lanes get the same stdlib. Fail loud on an
+# older GCC so a stale toolchain surfaces here, not as a cryptic missing-<format> error.
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
+  message(FATAL_ERROR
+      "GCC ${CMAKE_CXX_COMPILER_VERSION} is below the project floor (GCC 13, #TODO-9). "
+      "GCC 13's libstdc++ is required for complete C++20 (<format>/<expected>). "
+      "Use g++-13+ (ubuntu:noble ships it) or build with clang-16+ against libstdc++ 13.")
+endif()
+
 
 # Produce a compilation database for clang-tidy / editors.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -280,6 +294,19 @@ if (ETHERCAT_BUILD_MODULE)
   # NOT in viam_apply_wall_werror -- so genuine enum-constexpr issues in our library
   # TUs still fail. Known boost-mpl issue (boostorg/mpl#69); UR carries the same flag.
   target_compile_options(ethercat-servo PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
+
+  # DEPLOYMENT runtime story (#TODO-9): statically link libstdc++ + libgcc INTO the
+  # shipped module binary. The module is built on noble (gcc-13/14 libstdc++ 13) but
+  # deployed to robots whose system libstdc++ may be OLDER -- libstdc++ is forward- but
+  # NOT backward-compatible, so a binary referencing libstdc++ 13 symbols (the
+  # GLIBCXX_3.4.32 that <format> pulls, once #TODO-5 lands) would fail to load on a
+  # gcc-11/12 robot with a missing-symbol error. Static-linking makes the module self-
+  # contained: it carries its own libstdc++/libgcc and runs regardless of the target's
+  # stdlib. ONLY the shipped executable gets this (library/tests run in-image). libc
+  # stays dynamic (glibc IS backward-compatible + must match the host). This is the
+  # spec's "settle the deployment story" decision; reversible if a thin-runtime target
+  # is ever preferred. NOTE: applies to GNU/Clang; both honor these flags.
+  target_link_options(ethercat-servo PRIVATE -static-libstdc++ -static-libgcc)
 
   install(
     TARGETS
