@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -220,27 +221,32 @@ TEST("#47.3: (phase,event) matrix -- steady fault, steady request, bring-up stop
         Master m{make_config(), std::make_unique<SimBackend>(make_models())};
         m.init();
         m.configure();
-        Runner r{m, fast_runner_cfg()};
-        TestControl c;
+        TestControl c;               // before r (lifetime contract) + read AFTER the join below
         c.sync_fault_always = true;  // hold in bring-up
-        r.attach(1, c);
-        r.start();
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));  // a few bring-up cycles
-        const auto stop_t0 = std::chrono::steady_clock::now();
-        r.stop();
-        const auto stop_elapsed = std::chrono::steady_clock::now() - stop_t0;
+        std::chrono::steady_clock::duration stop_elapsed{};
+        {
+            Runner r{m, fast_runner_cfg()};
+            r.attach(1, c);
+            r.start();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));  // a few bring-up cycles
+            // #TODO-3: stop() is private now -- request the stop, wait for the RT loop to mark
+            // Stopped, then drop r (dtor JOINS). PROMPTNESS pinned (P2 cell-check): the pump must
+            // exit on the stop FLAG -- a flag-ignoring pump reaching the same end-state via its
+            // give-up bound (bringup_timeout) is a DIFFERENT exit path with identical values;
+            // only the wall time betrays it. The status().phase poll is RELAXED (liveness only),
+            // so the control's non-atomic fields (steps/stop_reason) are read AFTER the dtor
+            // JOIN below -- the join is the happens-before edge (a relaxed poll is NOT).
+            const auto stop_t0 = std::chrono::steady_clock::now();
+            r.request_stop();
+            while (r.status().phase != RunnerPhase::Stopped) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            stop_elapsed = std::chrono::steady_clock::now() - stop_t0;
+            CHECK(r.status().phase == RunnerPhase::Stopped);
+        }  // r dtor: bounded join (immediate -- already Stopped) -> close; SYNCHRONIZES with on_stop
         CHECK_EQ(c.steps, std::uint64_t{0});
         CHECK_EQ(c.stopping_steps, std::uint64_t{0});  // no stopping window pre-OP
         CHECK(c.stop_reason == StopReason::Requested);
-        CHECK(r.status().phase == RunnerPhase::Stopped);
-        // PROMPTNESS pinned (architect's P2 cell-check): the pump must exit on the stop
-        // FLAG -- a flag-ignoring pump reaching the same end-state via its give-up bound
-        // (bringup_timeout) is a DIFFERENT exit path with identical values; only the
-        // join wall-time betrays it. The bound is ~3 orders over a real join (CI-jitter
-        // headroom) and discriminates ONLY while bound << bringup_timeout -- that
-        // inequality is MACHINE-CHECKED below (DA's construction rule): shrinking the
-        // cfg's timeout for test speed must fail HERE, loudly, instead of silently
-        // vacuating the elapsed assert.
         constexpr auto kStopPromptBound = std::chrono::seconds(1);
         CHECK(fast_runner_cfg().bringup_timeout >= 5 * kStopPromptBound);  // the discriminator guard
         CHECK(stop_elapsed < kStopPromptBound);
@@ -415,14 +421,19 @@ TEST("#47.8: attach-after-start throws; on_configured failure -> clean no-spawn 
         m.sdo_write(1, 0x5FFF, 0x01, one);  // generic test object; throws if rt_active leaked
     }
     {
-        Runner r{m, fast_runner_cfg()};
+        // #TODO-3 ORDERING: the control MUST outlive the Runner -- the RT thread calls
+        // control->step() until ~Runner joins it, so a control destroyed first (declared
+        // AFTER the Runner) would be touched dead during the dtor's bounded join. Declare
+        // c BEFORE r so r (and its thread-join) tears down first, c still alive.
         TestControl c;
         c.request_stop_at_cycle = 3;
+        Runner r{m, fast_runner_cfg()};
         r.attach(1, c);
         r.start();
         TestControl late;
         CHECK_THROWS(r.attach(1, late), ethercat::ConfigError);  // attach-after-start
-        r.stop();
+        // No explicit stop() -- the control self-requests at cycle 3 and the r dtor runs
+        // the bounded teardown at scope end (joining while c is still alive).
     }
 }
 
@@ -484,10 +495,11 @@ static_assert(!std::is_copy_constructible_v<CycleContext> && !std::is_move_const
 // and a store through the escaped handle lands in the owned buffer and NEVER reaches
 // the wire. (Pre-TODO-1 the ctx held spans into the live process buffers: the same
 // escape was UB / a wild read that at 1 kHz could command dangerous motion.)
-// Also smoke-checks the stop()-from-RT guard degrades (no self-join deadlock) while it
-// still exists (TODO-3 deletes it by construction). NDEBUG only: in a debug build the
-// out-of-window touch would (correctly) trip check_live's assert -- see the manual
-// broken-baseline (remove the live_ guard -> the assert no longer fires).
+// (The old stop()-from-RT smoke-check is GONE: #TODO-3 made stop() private, so a control
+// literally cannot name r.stop() from step() -- the self-join scenario is now a COMPILE
+// error, structurally impossible, not a runtime-degraded guard.) NDEBUG only: in a debug
+// build the out-of-window touch would (correctly) trip check_live's assert -- see the
+// manual broken-baseline (remove the live_ guard -> the assert no longer fires).
 TEST("#47.10: escaped ctx is safe-stale, never on the wire (owned-data value semantics)") {
 #ifdef NDEBUG
     auto sim = std::make_unique<SimBackend>(make_models());
@@ -502,11 +514,6 @@ TEST("#47.10: escaped ctx is safe-stale, never on the wire (owned-data value sem
     c.request_stop_at_cycle = 6;
     c.on_step = [&](CycleContext& ctx) {
         ctx.store<std::uint16_t>(cw_loc, kShipped);  // a known, deterministic last-shipped value
-        if (c.steps == 3) {
-            // stop()-from-RT must DEGRADE to request_stop, not self-join-deadlock
-            // (the test merely COMPLETING proves it -- a deadlock would hang).
-            r.stop();
-        }
     };
     r.attach(1, c);
     r.run();
@@ -558,6 +565,110 @@ TEST("#47.11: a bus fault mid-window does NOT cut the window short") {
     CHECK_EQ(c.stopping_steps, std::uint64_t{8});   // the FULL window ran (not cut at 3)
     CHECK(c.stop_reason == StopReason::Requested);  // first cause won; the fault didn't relatch
     CHECK(r.status().phase == RunnerPhase::Stopped);
+}
+
+// White-box access to the PRIVATE teardown (#TODO-3): consumers stop by dropping the
+// Runner, but H1/H4 must drive stop() directly. Declared a friend in runner.hpp.
+namespace ethercat {
+struct RunnerTestPeer {
+    static void stop(Runner& r) noexcept {
+        r.stop();
+    }
+};
+}  // namespace ethercat
+
+namespace {
+// A control whose step() BLOCKS until released -- models a WEDGED RT loop (TODO-3 H1).
+class WedgeControl : public SlaveControl {
+   public:
+    std::atomic<bool> release{false};
+    std::atomic<bool> in_step{false};
+    void step(CycleContext& ctx) noexcept override {
+        (void)ctx;
+        in_step.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+};
+}  // namespace
+
+// (12) TODO-3 H1 -- the LIVENESS guarantee: a wedged step() must NOT hang teardown.
+// stop() bounded-joins, then DETACHES the thread and latches Wedged so it RETURNS. The
+// drive stays SAFE (PD gaps upstream of step() -> SM watchdog de-energizes); only the
+// MODULE wedges. *Baseline (declared): an UNBOUNDED join hangs forever -> the test never
+// returns (timeout) -- which the bounded join replaced.*
+// TSan detection: the wedge test below INTENTIONALLY abandons a detached thread (the
+// documented Wedged behavior), which TSan's join-everything model flags as racing the
+// teardown. It's a LIVENESS test (stop returns, doesn't hang), not a data-race test --
+// the race-relevant teardown (clean join) is covered by the other tests, which DO run
+// under TSan. Exclude only this one from the TSan lane (#50 spirit preserved: no
+// race-correctness test is hidden -- this asserts liveness, not race-freedom).
+#if defined(__SANITIZE_THREAD__)
+#define ETHERCAT_UNDER_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define ETHERCAT_UNDER_TSAN 1
+#endif
+#endif
+
+#ifndef ETHERCAT_UNDER_TSAN
+TEST("#47.12 (TODO-3 H1): wedged step() -> bounded stop returns + Wedged, no hang") {
+    // A real wedge ABANDONS the module: the detached RT thread outlives the teardown and
+    // keeps touching the master/control. So the test must NOT destruct (or even release)
+    // them while that thread lives -- it heap-allocates and keeps them reachable forever
+    // (no free -> no race/UAF with the detached thread; no leak report -> still reachable).
+    // The wedge is never released: the thread stays harmlessly blocked in step().
+    static std::vector<void*> kept_alive;  // reachable owner of the abandoned objects
+    auto* m = new Master(make_config(), std::make_unique<SimBackend>(make_models()));
+    m->init();
+    m->configure();
+    auto* c = new WedgeControl();
+    RunnerConfig rc = fast_runner_cfg();
+    rc.stop_join_timeout = std::chrono::milliseconds(120);  // small ceiling -> fast test
+    auto* r = new Runner(*m, rc);
+    r->attach(1, *c);
+    r->start();
+    while (!c->in_step.load(std::memory_order_acquire)) {  // wait until the wedge is engaged
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    ethercat::RunnerTestPeer::stop(*r);  // bounded join -> wedge detected -> detach + Wedged, RETURNS
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(elapsed < std::chrono::milliseconds(600));  // returned, did NOT hang
+    CHECK(r->status().reason == StopReason::Wedged);
+    CHECK(r->status().phase == RunnerPhase::Stopped);
+    kept_alive.push_back(r);  // abandon (never freed): the detached wedged thread keeps using them
+    kept_alive.push_back(m);
+    kept_alive.push_back(c);
+}
+#endif  // !ETHERCAT_UNDER_TSAN
+
+// (13) TODO-3 -- de-energize on destruction is STRUCTURAL: destroying the Runner with NO
+// explicit stop still runs the graceful teardown (the disable policy ships, then close()).
+// This is the Tier-2 dtor path (SDK never called stop()). *Baseline (declared): a
+// non-owning Runner whose dtor doesn't chain -> the disable never ships -> this fails.*
+TEST("#47.13 (TODO-3): ~Runner de-energizes even with NO explicit stop (Tier-2 dtor)") {
+    auto sim = std::make_unique<SimBackend>(make_models());
+    SimBackend* simp = sim.get();
+    Master m{make_config(), std::move(sim)};
+    m.init();
+    m.configure();
+    TestControl c;  // before r
+    const FieldLocation cw_loc{0, true};
+    c.request_stop_at_cycle = 4;
+    c.on_step = [&](CycleContext& ctx) {
+        ctx.store<std::uint16_t>(cw_loc, ctx.stopping() ? std::uint16_t{0x0000} : std::uint16_t{0x000F});
+    };
+    {
+        Runner r{m, fast_runner_cfg()};
+        r.attach(1, c);
+        r.start();
+        // NO stop()/run() -- drop r at scope end. The control self-requests at cycle 4; the
+        // ~Runner bounded teardown ships the cw=0 disable through the window, then close().
+    }
+    const auto out = simp->slave_io(1).outputs;
+    CHECK_EQ(ethercat::load_le<std::uint16_t>(out.subspan(0, 2)), std::uint16_t{0x0000});  // disable shipped
 }
 
 TEST_MAIN()

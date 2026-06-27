@@ -1,8 +1,12 @@
 #include "ethercat/runner.hpp"
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "ethercat/errors.hpp"
@@ -21,6 +25,8 @@ const char* to_string(StopReason r) noexcept {
             return "BringupAborted";
         case StopReason::RtSetupFailed:
             return "RtSetupFailed";
+        case StopReason::Wedged:
+            return "Wedged";
     }
     return "Unknown";
 }
@@ -113,7 +119,6 @@ void Runner::start() {
     // after the join in stop() (the one audited site post-#47).
     master_.set_rt_active(true);
     rt_ = std::jthread([this](const std::stop_token& st) { rt_body(st); });
-    rt_tid_.store(rt_.get_id(), std::memory_order_release);
 }
 
 void Runner::request_stop() noexcept {
@@ -125,24 +130,49 @@ void Runner::stop() noexcept {
     if (!started_.load(std::memory_order_acquire)) {
         return;  // never started (or a failed start): nothing to tear down
     }
-    // Re-entrancy guard: stop() from the RT thread itself would self-join (deadlock).
-    // Debug-assert + degrade to request_stop() (no counter -- #47 TODO-1 dropped it).
-    // (TODO-3 will make stop() private so this scenario is unreachable by construction;
-    // until then the guard stays as the runtime backstop.)
-    if (std::this_thread::get_id() == rt_tid_.load(std::memory_order_acquire)) {
-        assert(false && "Runner::stop() called from the RT thread -- use ctx.request_stop()");
-        request_stop();
-        return;
+    // PRIVATE (#TODO-3): only ~Runner + run() reach here, both owner-thread -- so this
+    // never runs on the RT thread and the old self-join guard is gone by construction.
+    request_stop();  // latch Requested (first-cause) + set the flag
+
+    // BOUNDED join (#TODO-3 H1): wait for the RT loop to finish its stopping window and
+    // mark Stopped, up to a derived/configured ceiling. A non-wedged teardown reaches
+    // Stopped well inside it; a WEDGED step() never does -> we DETACH the thread and
+    // declare Wedged so stop() returns (liveness) instead of hanging forever. The drive
+    // stays SAFE either way: PD gaps upstream of a wedged step() -> the SM watchdog
+    // de-energizes. The in-process join is never the de-energize mechanism.
+    std::chrono::nanoseconds bound = cfg_.stop_join_timeout;
+    if (bound <= std::chrono::nanoseconds::zero()) {
+        const std::uint64_t period_ns = 1'000'000'000ULL / master_.loop_rate_hz();
+        const auto derived = std::chrono::nanoseconds((static_cast<std::uint64_t>(cfg_.teardown_cycles) + 20U) * period_ns * 4U);
+        bound = std::max<std::chrono::nanoseconds>(std::chrono::milliseconds(250), derived);
     }
-    request_stop();
+    const auto deadline = std::chrono::steady_clock::now() + bound;
+    while (phase_.load(std::memory_order_acquire) != RunnerPhase::Stopped) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            // WEDGED: the loop did not exit in time. The terminal teardown verdict
+            // OVERRIDES the stop cause (operationally "the module wedged" is what an
+            // operator must see); detach so we don't hang; do NOT touch master_ -- the
+            // detached thread may still hold it (the HW watchdog handles de-energize).
+            reason_.store(StopReason::Wedged, std::memory_order_release);
+            phase_.store(RunnerPhase::Stopped, std::memory_order_release);
+            if (rt_.joinable()) {
+                rt_.detach();
+            }
+            (void)std::fprintf(stderr,
+                               "[ethercat] Runner::stop: RT loop WEDGED -- step() did not return within the bounded "
+                               "teardown ceiling; thread DETACHED so teardown returns. The drive de-energizes via the "
+                               "SM watchdog (PD gapped upstream of the wedge); the MODULE is wedged and must be "
+                               "restarted. status().reason=Wedged.\n");
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    // Clean exit: the loop reached Stopped, so the join returns immediately.
     if (rt_.joinable()) {
         rt_.join();
     }
     master_.set_rt_active(false);  // joined -- single port owner again
-    if (phase_.load(std::memory_order_relaxed) != RunnerPhase::Stopped) {
-        phase_.store(RunnerPhase::Stopped, std::memory_order_relaxed);
-    }
-    master_.close();  // the proven INIT teardown (idempotent at the backend)
+    master_.close();               // the proven INIT teardown (idempotent at the backend)
 }
 
 void Runner::run() {

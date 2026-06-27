@@ -42,6 +42,11 @@ enum class StopReason : std::uint8_t {
     BusFault,        // Master's consecutive-WKC fault latch fired in steady state
     BringupAborted,  // bring-up gave up (bounded -- the no-hammer invariant; no auto-retry)
     RtSetupFailed,   // SCHED_FIFO unavailable && RunnerConfig::require_realtime
+    Wedged,          // teardown (#TODO-3 H1): a wedged step() did not reach Stopped within the
+                     // bounded join -> the thread was DETACHED so stop() returns (liveness). The
+                     // drive is still SAFE (PD gapped upstream of the wedge -> SM watchdog fires);
+                     // the MODULE is wedged. The HW watchdog is the de-energize backstop, never
+                     // the in-process join. Surfaced via status() + a loud log.
 };
 const char* to_string(StopReason r) noexcept;
 
@@ -68,9 +73,21 @@ struct RunnerConfig {
     // still flowing (e.g. CiA402 cw->0x00). Floor 1. Safety does NOT depend on it: a
     // window-ignoring control still ends at master.close()'s proven INIT teardown.
     std::uint32_t teardown_cycles = 100;  // ~100 ms @ 1 kHz
+    // The BOUNDED-JOIN ceiling (#TODO-3 H1): the most wall time stop()/~Runner waits for
+    // the RT loop to finish its stopping window and exit before declaring it WEDGED and
+    // DETACHING it (so teardown returns -- liveness -- instead of hanging on a wedged
+    // step()). 0 = derive: max(250ms, (teardown_cycles + 20 slack) x period x 4) -- the
+    // x4 covers a dead bus where each receive blocks ~EC_TIMEOUTRET. Must exceed the
+    // genuine window wall time, or a healthy slow teardown is misread as wedged.
+    std::chrono::milliseconds stop_join_timeout{0};
 };
 
 class Runner;
+// White-box test access to the PRIVATE teardown (#TODO-3): consumers stop by dropping
+// the Runner, but the H1 bounded-join / Wedged + H4 concurrency tests must drive stop()
+// directly. Defined only in runner_test; never in production. (The API stays private:
+// a consumer cannot name stop(); only this declared peer can.)
+struct RunnerTestPeer;
 
 // The per-cycle, per-slave RT surface handed to SlaveControl -- the #30 RT FORM ONLY.
 // Rpdo/Tpdo (the throwing copy forms) are deliberately NOT here: they resolve
@@ -237,27 +254,40 @@ class Runner {
     Runner& operator=(const Runner&) = delete;
     Runner(Runner&&) = delete;
     Runner& operator=(Runner&&) = delete;
-    ~Runner();  // stop()
+    // RAII teardown (#TODO-3): the destructor IS the teardown -- it runs the graceful
+    // stop (request -> bounded-join the stopping window -> set_rt_active(false) ->
+    // master.close()), so de-energize-on-destruction is STRUCTURAL on every non-wedged
+    // path (it runs even if no one called a stop). The OWNER stops deterministically by
+    // DROPPING the Runner (e.g. resetting a unique_ptr) -- the dtor blocks until joined.
+    // There is NO public stop(); the only two stop paths are ctx.request_stop() (RT) and
+    // destruction. A wedged step() can't hang it -- the join is bounded (H1: detach +
+    // StopReason::Wedged on timeout).
+    ~Runner();
 
     // Attach a control to a slave (1-based). PRE-start only. Throws ConfigError on
     // attach-after-start, an unknown slave id, or a duplicate attach for the slave.
+    // LIFETIME CONTRACT (#TODO-3): the control is held by reference and the RT thread
+    // calls control->step() until teardown JOINS that thread (in ~Runner). So the
+    // control MUST OUTLIVE the Runner -- declare/own it BEFORE the Runner (the dtor
+    // joins first, the control dies after). A control destroyed while the thread still
+    // runs is a use-after-free. (ServoController owns its control + Runner as members in
+    // that order; a6_validate declares the control before the Runner.)
     void attach(std::uint16_t slave_id, SlaveControl& control);
 
     // Non-RT hooks (on_configured, may throw -> nothing spawned) -> lock_current ->
     // set_rt_active(true) -> spawn the RT thread (realtime::setup -> bring-up ->
     // steady -> stopping window, per §5). Throws ConfigError on no-controls/restart.
     void start();
-    // Graceful stop: request (latches Requested if nothing latched yet) -> the RT
-    // loop runs its stopping window and exits -> join -> set_rt_active(false) ->
-    // master.close() (the proven INIT teardown). Idempotent; safe when never started.
-    void stop() noexcept;
     // Convenience (the a6_validate / #21 shape): start() + block until the RT loop
-    // ends (poll status()), then the stop() teardown. SIGINT integration = the
-    // consumer's handler calling request_stop().
+    // ends (poll status()), then the teardown. SIGINT integration = the consumer's
+    // handler calling request_stop(). (For a custom poll loop, call start() then DROP
+    // the Runner to stop -- the dtor teardown -- since stop() is not public.)
     void run();
 
-    // Non-RT stop request (e.g. from a signal-handler-adjacent thread): latches
-    // Requested; the RT loop enters its stopping window on the next cycle.
+    // Non-RT stop REQUEST (e.g. a signal-handler-adjacent thread, or the SDK's
+    // Stoppable::stop() on the gRPC thread): latches Requested + sets the flag; the RT
+    // loop enters its stopping window on the next cycle. Does NOT join -- the join is
+    // the dtor's job (#TODO-3). Pairs with status()-polling for command-and-confirm.
     void request_stop() noexcept;
 
     RunnerStatus status() const noexcept {
@@ -266,6 +296,7 @@ class Runner {
 
    private:
     friend class CycleContext;
+    friend struct RunnerTestPeer;  // #TODO-3: white-box access to private stop() in tests only
 
     // Holds a control + its owned-data CycleContext. The ctx is non-copyable AND
     // non-movable (#47 TODO-1), so Attached is too -- hence controls_ is a std::deque
@@ -280,6 +311,14 @@ class Runner {
         CycleContext ctx;
     };
 
+    // The teardown, PRIVATE (#TODO-3): called only by ~Runner and run() (both non-RT,
+    // owner-thread). request -> BOUNDED-join the stopping window -> on success
+    // set_rt_active(false) + master.close(); on timeout (a wedged step()) detach the
+    // thread + latch StopReason::Wedged + loud log (do NOT touch master from here -- a
+    // detached live thread may still hold it; the HW SM watchdog de-energizes). Private
+    // => unreachable from the RT thread => the old self-join re-entrancy guard (and its
+    // rt_tid_ atomic, #49) are DELETED, unreachable by construction.
+    void stop() noexcept;
     void rt_body(const std::stop_token& st) noexcept;
     void latch_reason(StopReason r) noexcept;  // first cause wins (CAS from None)
     // Refresh a ctx for this cycle (copy the slave input IN), dispatch one hook/step
@@ -294,13 +333,9 @@ class Runner {
     std::atomic<StopReason> reason_{StopReason::None};
     std::atomic<bool> stop_flag_{false};
     std::atomic<bool> started_{false};
-    // Set by start() (main) right after spawn; read by stop()'s self-join guard, which
-    // may run on the RT thread (a control calling stop() from step()). Atomic so that
-    // cross-thread access is race-free (#49) -- TSan flags the plain form once the
-    // NDEBUG TSan lane (#50) actually exercises the stop()-from-RT path in test #47.10.
-    // (TODO-3 deletes this guard by construction -- stop() goes private -- retiring both
-    // the field and the race; until then this is the correct stopgap.)
-    std::atomic<std::thread::id> rt_tid_{};
+    // (#TODO-3: the rt_tid_ atomic + self-join guard are GONE -- stop() is private, so it
+    // can never run on the RT thread, so self-join is unreachable by construction. The
+    // #49 race is retired with the field it lived on.)
     std::jthread rt_;  // last member
 };
 

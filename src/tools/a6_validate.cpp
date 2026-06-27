@@ -569,46 +569,53 @@ int main(int argc, char** argv) {
     // as window policy inside A6Control::step().
     rc.teardown_cycles = 150;
 
-    Runner runner(master, rc);
-    try {
-        runner.attach(slave, control);
-        runner.start();  // on_configured (field resolution) runs here; throws abort cleanly
-    } catch (const Error& e) {
-        std::cerr << "[B] runner start failed: " << e.what() << '\n';
-        master.close();
-        return 1;
-    }
+    // #TODO-3: stop() is no longer public -- the owner stops by DROPPING the Runner, whose
+    // dtor runs the bounded teardown (join -> rt_active(false) -> master.close()). Scope the
+    // Runner so its destructor fires before we read the final WkcStats off the (still-alive)
+    // master. `reason` is read inside the scope, before the dtor.
+    StopReason reason = StopReason::None;
+    {
+        Runner runner(master, rc);
+        try {
+            runner.attach(slave, control);
+            runner.start();  // on_configured (field resolution) runs here; throws abort cleanly
+        } catch (const Error& e) {
+            std::cerr << "[B] runner start failed: " << e.what() << '\n';
+            master.close();
+            return 1;
+        }
 
-    // --- main = the NON-RT printer + SIGINT relay (the old in-loop prints, off-thread).
-    auto last_print = std::chrono::steady_clock::now() - std::chrono::seconds(1);
-    while (runner.status().phase != RunnerPhase::Stopped) {
-        if (g_stop.load()) {
-            runner.request_stop();  // SIGINT -> graceful stop (the window runs the disable policy)
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now - last_print >= std::chrono::milliseconds(200)) {  // ~5 Hz
-            last_print = now;
-            const RunnerStatus st = runner.status();
-            if (st.phase == RunnerPhase::BringingUp) {
-                std::cout << "[B] bring-up... dcPhase=" << tel.dc_phase_ns.load(std::memory_order_relaxed) << "ns\n";
-            } else if (st.phase == RunnerPhase::Running || st.phase == RunnerPhase::Stopping) {
-                const Status status{tel.sw.load(std::memory_order_relaxed)};
-                std::cout << "    t=" << tel.cycle.load(std::memory_order_relaxed) / kLoopHz << "s " << to_string(status.decode())
-                          << " sw=0x" << std::hex << status.raw << " 0x603F=0x" << tel.fc.load(std::memory_order_relaxed) << std::dec
-                          << " mode=" << static_cast<int>(tel.mode.load(std::memory_order_relaxed)) << " Rx.cw=0x" << std::hex
-                          << tel.cw.load(std::memory_order_relaxed) << std::dec
-                          << " cmdTarget=" << tel.target.load(std::memory_order_relaxed)
-                          << " pos=" << tel.pos.load(std::memory_order_relaxed)
-                          << " followErr=" << (tel.target.load(std::memory_order_relaxed) - tel.pos.load(std::memory_order_relaxed))
-                          << " vel=" << tel.vel.load(std::memory_order_relaxed) << " badWKC=" << tel.bad_wkc.load(std::memory_order_relaxed)
-                          << " dcPhase=" << tel.dc_phase_ns.load(std::memory_order_relaxed) << "ns"
-                          << (st.phase == RunnerPhase::Stopping ? " [STOPPING]" : "") << '\n';
+        // --- main = the NON-RT printer + SIGINT relay (the old in-loop prints, off-thread).
+        auto last_print = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        while (runner.status().phase != RunnerPhase::Stopped) {
+            if (g_stop.load()) {
+                runner.request_stop();  // SIGINT -> graceful stop (the window runs the disable policy)
             }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_print >= std::chrono::milliseconds(200)) {  // ~5 Hz
+                last_print = now;
+                const RunnerStatus st = runner.status();
+                if (st.phase == RunnerPhase::BringingUp) {
+                    std::cout << "[B] bring-up... dcPhase=" << tel.dc_phase_ns.load(std::memory_order_relaxed) << "ns\n";
+                } else if (st.phase == RunnerPhase::Running || st.phase == RunnerPhase::Stopping) {
+                    const Status status{tel.sw.load(std::memory_order_relaxed)};
+                    std::cout << "    t=" << tel.cycle.load(std::memory_order_relaxed) / kLoopHz << "s " << to_string(status.decode())
+                              << " sw=0x" << std::hex << status.raw << " 0x603F=0x" << tel.fc.load(std::memory_order_relaxed) << std::dec
+                              << " mode=" << static_cast<int>(tel.mode.load(std::memory_order_relaxed)) << " Rx.cw=0x" << std::hex
+                              << tel.cw.load(std::memory_order_relaxed) << std::dec
+                              << " cmdTarget=" << tel.target.load(std::memory_order_relaxed)
+                              << " pos=" << tel.pos.load(std::memory_order_relaxed)
+                              << " followErr=" << (tel.target.load(std::memory_order_relaxed) - tel.pos.load(std::memory_order_relaxed))
+                              << " vel=" << tel.vel.load(std::memory_order_relaxed)
+                              << " badWKC=" << tel.bad_wkc.load(std::memory_order_relaxed)
+                              << " dcPhase=" << tel.dc_phase_ns.load(std::memory_order_relaxed) << "ns"
+                              << (st.phase == RunnerPhase::Stopping ? " [STOPPING]" : "") << '\n';
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    const StopReason reason = runner.status().reason;
-    runner.stop();  // join -> rt_active(false) -> master.close() (the proven INIT teardown)
+        reason = runner.status().reason;  // read before the dtor teardown
+    }  // <-- ~Runner: bounded stop -> join -> rt_active(false) -> master.close()
 
     const WkcStats stats = master.wkc_stats();  // library-side tally (incl. window cycles)
     std::cout << "\n=== done. stop=" << to_string(reason) << (control.safety_abort() ? " (CSP SAFETY ABORT)" : "")
