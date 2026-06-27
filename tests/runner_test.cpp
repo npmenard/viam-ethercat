@@ -594,16 +594,26 @@ class WedgeControl : public SlaveControl {
 }  // namespace
 
 // (12) TODO-3 H1 -- the LIVENESS guarantee: a wedged step() must NOT hang teardown.
-// stop() bounded-joins, then DETACHES the thread and latches Wedged so it RETURNS. The
-// drive stays SAFE (PD gaps upstream of step() -> SM watchdog de-energizes); only the
-// MODULE wedges. *Baseline (declared): an UNBOUNDED join hangs forever -> the test never
-// returns (timeout) -- which the bounded join replaced.*
-// TSan detection: the wedge test below INTENTIONALLY abandons a detached thread (the
-// documented Wedged behavior), which TSan's join-everything model flags as racing the
-// teardown. It's a LIVENESS test (stop returns, doesn't hang), not a data-race test --
-// the race-relevant teardown (clean join) is covered by the other tests, which DO run
-// under TSan. Exclude only this one from the TSan lane (#50 spirit preserved: no
-// race-correctness test is hidden -- this asserts liveness, not race-freedom).
+// stop() bounded-waits, then on timeout RELEASES (leaks) the RtCore and latches Wedged so
+// it RETURNS. The drive stays SAFE (PD gaps upstream of step() -> SM watchdog
+// de-energizes); only the MODULE wedges. *Baseline (declared): an UNBOUNDED join hangs
+// forever -> the test never returns (timeout) -- which the bounded wait replaced.*
+//
+// #52 (the leak-on-wedge UAF fix): the abandoned RT thread captured the *RtCore*, never
+// the Runner, so the RtCore is what gets leaked-but-kept-LIVE -- the Runner is a NORMAL
+// scoped object that destructs the moment the leaked-RtCore handoff is done (its dtor's
+// stop() short-circuits on the null rt_core_). What still must outlive the abandoned
+// thread is the EXTERNALLY-owned Master + control (held by reference, not owned by the
+// RtCore): a wedge is unrecoverable, so the test RETAINS them in a reachable `kept_alive`
+// (no free -> no UAF with the abandoned thread; reachable -> no LSan leak report; the
+// leaked RtCore stays LSan-reachable as a root on the still-blocked thread's stack). The
+// wedge is never released -- the thread stays harmlessly blocked in step().
+//
+// TSan detection: this INTENTIONALLY leaves a thread running on isolated, never-freed
+// state for the rest of the process. It's a LIVENESS test (stop returns, doesn't hang),
+// not a data-race test -- the race-relevant teardown (clean join) is covered by the other
+// tests, which DO run under TSan. Exclude only this one from the TSan lane (#50 spirit
+// preserved: no race-correctness test is hidden -- this asserts liveness, not race-freedom).
 #if defined(__SANITIZE_THREAD__)
 #define ETHERCAT_UNDER_TSAN 1
 #elif defined(__has_feature)
@@ -614,33 +624,63 @@ class WedgeControl : public SlaveControl {
 
 #ifndef ETHERCAT_UNDER_TSAN
 TEST("#47.12 (TODO-3 H1): wedged step() -> bounded stop returns + Wedged, no hang") {
-    // A real wedge ABANDONS the module: the detached RT thread outlives the teardown and
-    // keeps touching the master/control. So the test must NOT destruct (or even release)
-    // them while that thread lives -- it heap-allocates and keeps them reachable forever
-    // (no free -> no race/UAF with the detached thread; no leak report -> still reachable).
-    // The wedge is never released: the thread stays harmlessly blocked in step().
-    static std::vector<void*> kept_alive;  // reachable owner of the abandoned objects
+    // Externally-owned Master + control: a wedge abandons them to the still-running thread
+    // forever, so RETAIN them reachable (kept_alive) -- never freed, never destructed.
+    static std::vector<void*> kept_alive;
     auto* m = new Master(make_config(), std::make_unique<SimBackend>(make_models()));
     m->init();
     m->configure();
     auto* c = new WedgeControl();
+    kept_alive.push_back(m);
+    kept_alive.push_back(c);
     RunnerConfig rc = fast_runner_cfg();
     rc.stop_join_timeout = std::chrono::milliseconds(120);  // small ceiling -> fast test
-    auto* r = new Runner(*m, rc);
-    r->attach(1, *c);
-    r->start();
+    // The Runner is a NORMAL scoped object now (#52): the thread holds the RtCore, not it.
+    Runner r{*m, rc};
+    r.attach(1, *c);
+    r.start();
     while (!c->in_step.load(std::memory_order_acquire)) {  // wait until the wedge is engaged
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     const auto t0 = std::chrono::steady_clock::now();
-    ethercat::RunnerTestPeer::stop(*r);  // bounded join -> wedge detected -> detach + Wedged, RETURNS
+    ethercat::RunnerTestPeer::stop(r);  // bounded wait -> wedge detected -> release (leak) + Wedged, RETURNS
     const auto elapsed = std::chrono::steady_clock::now() - t0;
     CHECK(elapsed < std::chrono::milliseconds(600));  // returned, did NOT hang
-    CHECK(r->status().reason == StopReason::Wedged);
-    CHECK(r->status().phase == RunnerPhase::Stopped);
-    kept_alive.push_back(r);  // abandon (never freed): the detached wedged thread keeps using them
+    CHECK(r.status().reason == StopReason::Wedged);    // reported from the null-rt_core_ branch
+    CHECK(r.status().phase == RunnerPhase::Stopped);
+    // r destructs HERE (end of scope) on the REAL ~Runner path while the RT thread is still
+    // wedged+abandoned -- its stop() short-circuits (rt_core_ released). ASAN proves the
+    // dtor touches nothing the leaked thread owns: no UAF.
+}
+
+// (12b) #52 -- the PRODUCTION ~Runner path on a wedge (the exact path the old leak-test
+// sidestepped). No RunnerTestPeer, no manual stop(): a scoped Runner is DROPPED while its
+// step() is wedged, so ~Runner -> stop() -> bounded wait -> RELEASE the RtCore. ASAN on
+// this test is the no-UAF proof: the dtor (and ~Runner destroying its members) races the
+// abandoned RT thread, which only ever touches the LEAKED RtCore + the retained Master/
+// control -- never a Runner member. Liveness: dropping must not hang.
+TEST("#47.12b (TODO-3 #52): ~Runner on a wedged step() -> release-not-UAF, dtor returns") {
+    static std::vector<void*> kept_alive;
+    auto* m = new Master(make_config(), std::make_unique<SimBackend>(make_models()));
+    m->init();
+    m->configure();
+    auto* c = new WedgeControl();
     kept_alive.push_back(m);
     kept_alive.push_back(c);
+    RunnerConfig rc = fast_runner_cfg();
+    rc.stop_join_timeout = std::chrono::milliseconds(120);
+    const auto t0 = std::chrono::steady_clock::now();
+    {
+        Runner r{*m, rc};
+        r.attach(1, *c);
+        r.start();
+        while (!c->in_step.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        // drop r -> ~Runner runs the wedge teardown (release the RtCore, no join/close).
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(elapsed < std::chrono::milliseconds(600));  // the dtor returned (bounded), did NOT hang
 }
 #endif  // !ETHERCAT_UNDER_TSAN
 

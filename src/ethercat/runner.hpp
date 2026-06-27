@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <span>
 #include <thread>
 
@@ -83,6 +84,11 @@ struct RunnerConfig {
 };
 
 class Runner;
+// The heap-held, RT-thread-shared cyclic state (#TODO-3 / #52). The Runner owns it by
+// unique_ptr; the RT thread lives INSIDE it (not capturing the Runner), so on a wedge
+// the Runner releases (LEAKS) it -- the detached thread keeps using leaked-but-LIVE
+// state, never the Runner's destroyed members. See the class def below.
+class RtCore;
 // White-box test access to the PRIVATE teardown (#TODO-3): consumers stop by dropping
 // the Runner, but the H1 bounded-join / Wedged + H4 concurrency tests must drive stop()
 // directly. Defined only in runner_test; never in production. (The API stays private:
@@ -114,8 +120,9 @@ struct RunnerTestPeer;
 // ALL out-of-window use, the cross-thread case included.
 //
 // SCOPING CAVEAT (do not over-read "owned data = always safe"): "safe-stale" holds
-// only WITHIN THE RUNNER'S LIFETIME. The ctx lives in the Runner's controls_ deque,
-// so a handle that OUTLIVES the Runner (used after the Runner is destroyed) is a
+// only WITHIN THE RtCore'S LIFETIME. The ctx lives in the RtCore's controls_ deque
+// (heap-owned by the Runner, leaked-not-freed on a wedge #52), so a handle that
+// OUTLIVES the Runner+RtCore (used after a clean teardown destroys them) is a
 // use-after-free, not safe-stale. Deterministic owner-side teardown/ownership is
 // TODO-3's territory; within a live Runner, escape is harmless.
 class CycleContext {
@@ -172,8 +179,8 @@ class CycleContext {
     CycleContext& operator=(CycleContext&&) = delete;
 
    private:
-    friend class Runner;
-    explicit CycleContext(Runner* runner) noexcept : runner_(runner) {}
+    friend class RtCore;
+    explicit CycleContext(RtCore* core) noexcept : core_(core) {}
     // Contract check (#47 §3b, TODO-1): the ctx is valid ONLY during its own
     // dispatch window (the Runner sets live_ around each hook/step call). A control
     // that caches the ctx and touches it outside its window trips this in DEBUG --
@@ -185,7 +192,7 @@ class CycleContext {
     // merely counted).
     void check_live() const noexcept;
 
-    Runner* runner_;
+    RtCore* core_;  // the RT-shared state (request_stop/wkc go through it); leaked-on-wedge (#52)
     // Owned images (NOT spans into live buffers). dispatch() copies the slave input
     // in before the hook and copies this output out after -- so an escaped ctx reads
     // safe-stale data and an escaped store never reaches the wire.
@@ -289,9 +296,58 @@ class SlaveControl {
     }
 };
 
-// The orchestration layer (#47 §1): owns the RT thread + everything around it.
-// Master must be open()+init()+configure()d (the consumer's throwing config phase)
-// before start(). One Runner per Master; not copyable/movable.
+// The RT-thread-shared cyclic state (#TODO-3 / #52 -- the wedge-detach UAF fix). EVERYTHING
+// the RT thread touches lives HERE, on the heap, owned by the Runner via unique_ptr -- and
+// the thread itself lives here too (thread_). The RT loop captures the RtCore* (NOT the
+// Runner), so it never reaches a Runner member. On a clean stop the Runner joins thread_
+// then destroys this normally; on a WEDGE the Runner RELEASES this unique_ptr (LEAKS it,
+// never freed) so the detached-but-running thread keeps using leaked-but-LIVE state instead
+// of the Runner's destroyed members -> the production ~Runner-destroys-under-wedge path is a
+// bounded LEAK, not a use-after-free (DA #52). Not copyable/movable (atomics + non-movable ctx).
+class RtCore {
+   public:
+    RtCore(Master& master, RunnerConfig cfg) noexcept : master_(master), cfg_(cfg) {}
+    RtCore(const RtCore&) = delete;
+    RtCore& operator=(const RtCore&) = delete;
+    RtCore(RtCore&&) = delete;
+    RtCore& operator=(RtCore&&) = delete;
+
+    void request_stop() noexcept;             // latch Requested + set the flag (RT or owner)
+    void latch_reason(StopReason r) noexcept;  // first cause wins (CAS from None)
+    void rt_body(const std::stop_token& st) noexcept;
+
+    // Holds a control + its owned-data CycleContext. The ctx is non-copyable AND
+    // non-movable (#47 TODO-1), so Attached is too -- hence controls_ is a std::deque
+    // (node-based: stable addresses) populated by in-place emplace_back. The ctor builds
+    // the ctx in place from the RtCore* (CycleContext's private ctor; Attached, a member
+    // of RtCore which is its friend, may call it).
+    struct Attached {
+        Attached(std::uint16_t id, SlaveControl* c, RtCore* core) noexcept : slave_id(id), control(c), ctx(core) {}
+        std::uint16_t slave_id;
+        SlaveControl* control;
+        CycleContext ctx;
+    };
+
+    // Refresh a ctx for this cycle (copy the slave input IN), dispatch one hook/step with
+    // the live window set, then copy the ctx output OUT to the wire (#47 TODO-1).
+    template <class Fn>
+    void dispatch(Attached& a, std::uint64_t cycle, std::int64_t dc, bool stopping, Fn&& fn) noexcept;
+
+    friend class CycleContext;  // request_stop()/wkc() reach master_/stop_flag_ through core_
+    friend class Runner;        // the owner drives attach/start/stop on this
+
+    Master& master_;
+    RunnerConfig cfg_;
+    std::deque<Attached> controls_;  // attach/slave order = step order
+    std::atomic<RunnerPhase> phase_{RunnerPhase::Idle};
+    std::atomic<StopReason> reason_{StopReason::None};
+    std::atomic<bool> stop_flag_{false};
+    std::jthread thread_;  // spawned by Runner::start(); joined on clean stop; LEAKED-with-RtCore on wedge
+};
+
+// The orchestration layer (#47 §1): owns the RT state (RtCore) + the teardown around it.
+// Master must be open()+init()+configure()d (the consumer's throwing config phase) before
+// start(). One Runner per Master; not copyable/movable.
 class Runner {
    public:
     Runner(Master& master, RunnerConfig cfg) noexcept;
@@ -299,89 +355,66 @@ class Runner {
     Runner& operator=(const Runner&) = delete;
     Runner(Runner&&) = delete;
     Runner& operator=(Runner&&) = delete;
-    // RAII teardown (#TODO-3): the destructor IS the teardown -- it runs the graceful
-    // stop (request -> bounded-join the stopping window -> set_rt_active(false) ->
-    // master.close()), so de-energize-on-destruction is STRUCTURAL on every non-wedged
-    // path (it runs even if no one called a stop). The OWNER stops deterministically by
-    // DROPPING the Runner (e.g. resetting a unique_ptr) -- the dtor blocks until joined.
-    // There is NO public stop(); the only two stop paths are ctx.request_stop() (RT) and
-    // destruction. A wedged step() can't hang it -- the join is bounded (H1: detach +
-    // StopReason::Wedged on timeout).
+    // RAII teardown (#TODO-3): the destructor IS the teardown -- it runs the graceful stop
+    // (request -> bounded-join the stopping window -> set_rt_active(false) -> master.close()),
+    // so de-energize-on-destruction is STRUCTURAL on every non-wedged path. The OWNER stops
+    // deterministically by DROPPING the Runner. There is NO public stop(); the only two stop
+    // paths are ctx.request_stop() (RT) and destruction. A wedged step() can't hang it -- the
+    // join is bounded (H1: on timeout the RtCore is LEAKED + StopReason::Wedged, no UAF #52).
     ~Runner();
 
     // Attach a control to a slave (1-based). PRE-start only. Throws ConfigError on
     // attach-after-start, an unknown slave id, or a duplicate attach for the slave.
     // LIFETIME CONTRACT (#TODO-3): the control is held by reference and the RT thread
-    // calls control->step() until teardown JOINS that thread (in ~Runner). So the
-    // control MUST OUTLIVE the Runner -- declare/own it BEFORE the Runner (the dtor
-    // joins first, the control dies after). A control destroyed while the thread still
-    // runs is a use-after-free. (ServoController owns its control + Runner as members in
-    // that order; a6_validate declares the control before the Runner.)
+    // calls control->step() until teardown JOINS that thread (in ~Runner). So the control
+    // MUST OUTLIVE the Runner -- declare/own it BEFORE the Runner (the dtor joins first,
+    // the control dies after). A control destroyed while the thread still runs is a UAF.
+    // (ServoController owns control + Runner as members in that order; a6_validate declares
+    // the control before the Runner.)
     void attach(std::uint16_t slave_id, SlaveControl& control);
 
-    // Non-RT hooks (on_configured, may throw -> nothing spawned) -> lock_current ->
-    // set_rt_active(true) -> spawn the RT thread (realtime::setup -> bring-up ->
-    // steady -> stopping window, per §5). Throws ConfigError on no-controls/restart.
+    // Non-RT hooks (on_configured(ConfigContext&), may throw -> nothing spawned) ->
+    // lock_current -> set_rt_active(true) -> spawn the RT thread INSIDE the RtCore
+    // (realtime::setup -> bring-up -> steady -> stopping window, per §5). Throws
+    // ConfigError on no-controls/restart.
     void start();
-    // Convenience (the a6_validate / #21 shape): start() + block until the RT loop
-    // ends (poll status()), then the teardown. SIGINT integration = the consumer's
-    // handler calling request_stop(). (For a custom poll loop, call start() then DROP
-    // the Runner to stop -- the dtor teardown -- since stop() is not public.)
+    // Convenience (the a6_validate / #21 shape): start() + block until the RT loop ends
+    // (poll status()), then the teardown. SIGINT integration = the consumer's handler
+    // calling request_stop(). (For a custom poll loop, call start() then DROP the Runner to
+    // stop -- the dtor teardown -- since stop() is not public.)
     void run();
 
-    // Non-RT stop REQUEST (e.g. a signal-handler-adjacent thread, or the SDK's
-    // Stoppable::stop() on the gRPC thread): latches Requested + sets the flag; the RT
-    // loop enters its stopping window on the next cycle. Does NOT join -- the join is
-    // the dtor's job (#TODO-3). Pairs with status()-polling for command-and-confirm.
+    // Non-RT stop REQUEST (a signal-handler-adjacent thread, or the SDK's Stoppable::stop()
+    // on the gRPC thread): latches Requested + sets the flag; the RT loop enters its stopping
+    // window next cycle. Does NOT join -- the join is the dtor's job. Pairs with
+    // status()-polling for command-and-confirm. No-op after a wedge (RtCore released).
     void request_stop() noexcept;
 
+    // RELAXED diagnostic snapshot, NOT a happens-before edge: polling status().phase ==
+    // Stopped does NOT synchronize-with the RT thread's writes. To read control-published
+    // state, use the CONTROL's own atomics (or, in a test, the dtor JOIN as the edge) --
+    // never this poll. Reports {Stopped, Wedged} once the RtCore has been leaked on a wedge.
     RunnerStatus status() const noexcept {
-        return RunnerStatus{phase_.load(std::memory_order_relaxed), reason_.load(std::memory_order_relaxed)};
+        if (const RtCore* c = rt_core_.get()) {
+            return RunnerStatus{c->phase_.load(std::memory_order_relaxed), c->reason_.load(std::memory_order_relaxed)};
+        }
+        return RunnerStatus{RunnerPhase::Stopped, StopReason::Wedged};  // RtCore leaked-on-wedge
     }
 
    private:
-    friend class CycleContext;
     friend struct RunnerTestPeer;  // #TODO-3: white-box access to private stop() in tests only
 
-    // Holds a control + its owned-data CycleContext. The ctx is non-copyable AND
-    // non-movable (#47 TODO-1), so Attached is too -- hence controls_ is a std::deque
-    // (node-based: stable addresses, never relocates elements on growth) populated by
-    // in-place emplace_back. A std::vector would require moving elements on realloc.
-    // The ctor builds the ctx in place from the Runner* (CycleContext's ctor is
-    // private; Attached, a member of Runner which is its friend, may call it).
-    struct Attached {
-        Attached(std::uint16_t id, SlaveControl* c, Runner* r) noexcept : slave_id(id), control(c), ctx(r) {}
-        std::uint16_t slave_id;
-        SlaveControl* control;
-        CycleContext ctx;
-    };
-
     // The teardown, PRIVATE (#TODO-3): called only by ~Runner and run() (both non-RT,
-    // owner-thread). request -> BOUNDED-join the stopping window -> on success
-    // set_rt_active(false) + master.close(); on timeout (a wedged step()) detach the
-    // thread + latch StopReason::Wedged + loud log (do NOT touch master from here -- a
-    // detached live thread may still hold it; the HW SM watchdog de-energizes). Private
-    // => unreachable from the RT thread => the old self-join re-entrancy guard (and its
-    // rt_tid_ atomic, #49) are DELETED, unreachable by construction.
+    // owner-thread). request -> BOUNDED-wait the stopping window -> on success join + clear
+    // the #39 bracket + master.close(); on timeout (a wedged step()) RELEASE (leak) the
+    // RtCore + latch Wedged + loud log (do NOT join/close -- the leaked thread owns the bus;
+    // the HW SM watchdog de-energizes). Private => unreachable from the RT thread => the old
+    // self-join guard (+ its rt_tid_ atomic, #49) are DELETED, unreachable by construction.
     void stop() noexcept;
-    void rt_body(const std::stop_token& st) noexcept;
-    void latch_reason(StopReason r) noexcept;  // first cause wins (CAS from None)
-    // Refresh a ctx for this cycle (copy the slave input IN), dispatch one hook/step
-    // with the live window set, then copy the ctx output OUT to the wire (#47 TODO-1).
-    template <class Fn>
-    void dispatch(Attached& a, std::uint64_t cycle, std::int64_t dc, bool stopping, Fn&& fn) noexcept;
 
-    Master& master_;
-    RunnerConfig cfg_;
-    std::deque<Attached> controls_;  // attach/slave order = step order (node-based: see Attached)
-    std::atomic<RunnerPhase> phase_{RunnerPhase::Idle};
-    std::atomic<StopReason> reason_{StopReason::None};
-    std::atomic<bool> stop_flag_{false};
+    Master& master_;                     // owner-side close()/set_rt_active(false) on the clean path
+    std::unique_ptr<RtCore> rt_core_;    // the RT-shared state + thread; RELEASED (leaked) on wedge (#52)
     std::atomic<bool> started_{false};
-    // (#TODO-3: the rt_tid_ atomic + self-join guard are GONE -- stop() is private, so it
-    // can never run on the RT thread, so self-join is unreachable by construction. The
-    // #49 race is retired with the field it lived on.)
-    std::jthread rt_;  // last member
 };
 
 }  // namespace ethercat

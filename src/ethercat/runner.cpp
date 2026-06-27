@@ -51,14 +51,16 @@ const char* to_string(RunnerPhase p) noexcept {
 
 void CycleContext::request_stop() noexcept {
     // Legal from inside step()/hooks (the RT error channel) AND harmless if the
-    // control cached the ctx -- it only latches an atomic.
-    runner_->latch_reason(StopReason::Requested);
-    runner_->stop_flag_.store(true, std::memory_order_release);
+    // control cached the ctx -- it only latches an atomic. Routed through core_ (the
+    // RT-shared state), which OUTLIVES the Runner on a wedge (leaked, #52) -- so a
+    // request from a step() running after a wedge-detach still touches LIVE state.
+    core_->latch_reason(StopReason::Requested);
+    core_->stop_flag_.store(true, std::memory_order_release);
 }
 
 WkcStats CycleContext::wkc() const noexcept {
     check_live();
-    return runner_->master_.wkc_stats();
+    return core_->master_.wkc_stats();
 }
 
 void CycleContext::check_live() const noexcept {
@@ -72,12 +74,28 @@ void CycleContext::check_live() const noexcept {
     assert(live_ && "CycleContext used outside its dispatch window (#47 TODO-1: valid on the RT thread, during dispatch only)");
 }
 
+// --- RtCore (the RT-thread-shared cyclic state; #TODO-3 / #52) ---------------
+
+void RtCore::request_stop() noexcept {
+    latch_reason(StopReason::Requested);
+    stop_flag_.store(true, std::memory_order_release);
+}
+
+void RtCore::latch_reason(StopReason r) noexcept {
+    StopReason expected = StopReason::None;
+    (void)reason_.compare_exchange_strong(expected, r, std::memory_order_acq_rel);  // first cause wins
+}
+
 // --- Runner ----------------------------------------------------------------
 
-Runner::Runner(Master& master, RunnerConfig cfg) noexcept : master_(master), cfg_(cfg) {
-    if (cfg_.teardown_cycles == 0) {
-        cfg_.teardown_cycles = 1;  // documented floor
+Runner::Runner(Master& master, RunnerConfig cfg) noexcept : master_(master) {
+    if (cfg.teardown_cycles == 0) {
+        cfg.teardown_cycles = 1;  // documented floor
     }
+    // The RT state is heap-held from construction so its address is STABLE for the
+    // thread to capture and so a wedge can LEAK it intact (#52). OOM here terminates
+    // (noexcept) -- a Runner you cannot allocate is unrecoverable regardless.
+    rt_core_ = std::make_unique<RtCore>(master, cfg);
 }
 
 Runner::~Runner() {
@@ -92,86 +110,93 @@ void Runner::attach(std::uint16_t slave_id, SlaveControl& control) {
         throw ConfigError("Runner::attach: slave " + std::to_string(slave_id) + " out of range (bus has " +
                           std::to_string(master_.slave_count()) + ")");
     }
-    for (const Attached& a : controls_) {
+    for (const RtCore::Attached& a : rt_core_->controls_) {
         if (a.slave_id == slave_id) {
             throw ConfigError("Runner::attach: slave " + std::to_string(slave_id) + " already has a control attached");
         }
     }
-    controls_.emplace_back(slave_id, &control, this);  // ctx built in place (non-movable, #47 TODO-1)
+    rt_core_->controls_.emplace_back(slave_id, &control, rt_core_.get());  // ctx built in place (non-movable, #47 TODO-1)
 }
 
 void Runner::start() {
     if (started_.load(std::memory_order_acquire)) {
         throw ConfigError("Runner::start: already started (one start() per Runner; restart = a fresh Runner)");
     }
-    if (controls_.empty()) {
+    if (rt_core_->controls_.empty()) {
         throw ConfigError("Runner::start: no controls attached");
     }
     // NON-RT hooks first -- the ONLY throwing phase. A throw here aborts start()
     // cleanly: nothing locked, no thread, no rt_active bracket, master untouched.
     // on_configured gets the RESTRICTED ConfigContext (§3a, TODO-10), never a raw Master&.
-    for (Attached& a : controls_) {
+    for (RtCore::Attached& a : rt_core_->controls_) {
         ConfigContext cfg{master_, a.slave_id};
         a.control->on_configured(cfg);
     }
     realtime::lock_current();
     started_.store(true, std::memory_order_release);
-    phase_.store(RunnerPhase::BringingUp, std::memory_order_relaxed);
+    rt_core_->phase_.store(RunnerPhase::BringingUp, std::memory_order_relaxed);
     // #39 bracket: declared active EXACTLY across the RT thread's lifetime; cleared
     // after the join in stop() (the one audited site post-#47).
     master_.set_rt_active(true);
-    rt_ = std::jthread([this](const std::stop_token& st) { rt_body(st); });
+    // The thread captures the RtCore* (NOT `this`) -- so it never reaches a Runner
+    // member, and a leaked RtCore (#52 wedge) carries everything the thread needs.
+    rt_core_->thread_ = std::jthread([core = rt_core_.get()](const std::stop_token& st) { core->rt_body(st); });
 }
 
 void Runner::request_stop() noexcept {
-    latch_reason(StopReason::Requested);
-    stop_flag_.store(true, std::memory_order_release);
+    if (RtCore* core = rt_core_.get()) {
+        core->request_stop();
+    }
+    // else: already wedged-and-leaked -- the abandoned thread can no longer be steered;
+    // the HW SM watchdog is the de-energize backstop.
 }
 
 void Runner::stop() noexcept {
     if (!started_.load(std::memory_order_acquire)) {
         return;  // never started (or a failed start): nothing to tear down
     }
+    RtCore* core = rt_core_.get();
+    if (core == nullptr) {
+        return;  // a prior stop() already wedged + LEAKED the RtCore -- nothing left to join/close
+    }
     // PRIVATE (#TODO-3): only ~Runner + run() reach here, both owner-thread -- so this
     // never runs on the RT thread and the old self-join guard is gone by construction.
-    request_stop();  // latch Requested (first-cause) + set the flag
+    core->request_stop();  // latch Requested (first-cause) + set the flag
 
     // BOUNDED join (#TODO-3 H1): wait for the RT loop to finish its stopping window and
     // mark Stopped, up to a derived/configured ceiling. A non-wedged teardown reaches
-    // Stopped well inside it; a WEDGED step() never does -> we DETACH the thread and
+    // Stopped well inside it; a WEDGED step() never does -> we LEAK the RtCore (#52) and
     // declare Wedged so stop() returns (liveness) instead of hanging forever. The drive
     // stays SAFE either way: PD gaps upstream of a wedged step() -> the SM watchdog
     // de-energizes. The in-process join is never the de-energize mechanism.
-    std::chrono::nanoseconds bound = cfg_.stop_join_timeout;
+    std::chrono::nanoseconds bound = core->cfg_.stop_join_timeout;
     if (bound <= std::chrono::nanoseconds::zero()) {
         const std::uint64_t period_ns = 1'000'000'000ULL / master_.loop_rate_hz();
-        const auto derived = std::chrono::nanoseconds((static_cast<std::uint64_t>(cfg_.teardown_cycles) + 20U) * period_ns * 4U);
+        const auto derived = std::chrono::nanoseconds((static_cast<std::uint64_t>(core->cfg_.teardown_cycles) + 20U) * period_ns * 4U);
         bound = std::max<std::chrono::nanoseconds>(std::chrono::milliseconds(250), derived);
     }
     const auto deadline = std::chrono::steady_clock::now() + bound;
-    while (phase_.load(std::memory_order_acquire) != RunnerPhase::Stopped) {
+    while (core->phase_.load(std::memory_order_acquire) != RunnerPhase::Stopped) {
         if (std::chrono::steady_clock::now() >= deadline) {
-            // WEDGED: the loop did not exit in time. The terminal teardown verdict
-            // OVERRIDES the stop cause (operationally "the module wedged" is what an
-            // operator must see); detach so we don't hang; do NOT touch master_ -- the
-            // detached thread may still hold it (the HW watchdog handles de-energize).
-            reason_.store(StopReason::Wedged, std::memory_order_release);
-            phase_.store(RunnerPhase::Stopped, std::memory_order_release);
-            if (rt_.joinable()) {
-                rt_.detach();
-            }
+            // WEDGED: the loop did not exit in time. RELEASE (leak) the RtCore -- the
+            // detached-and-still-running thread keeps using the leaked-but-LIVE state
+            // instead of members ~Runner is about to destroy (the #52 UAF fix: a bounded
+            // LEAK, never a use-after-free). Do NOT join/close -- the leaked thread owns
+            // the bus; the HW watchdog de-energizes. status() now reports {Stopped,
+            // Wedged} from the null-rt_core_ branch.
+            (void)rt_core_.release();
             (void)std::fprintf(stderr,
                                "[ethercat] Runner::stop: RT loop WEDGED -- step() did not return within the bounded "
-                               "teardown ceiling; thread DETACHED so teardown returns. The drive de-energizes via the "
-                               "SM watchdog (PD gapped upstream of the wedge); the MODULE is wedged and must be "
-                               "restarted. status().reason=Wedged.\n");
+                               "teardown ceiling; RtCore LEAKED (thread abandoned with live state, no UAF) so teardown "
+                               "returns. The drive de-energizes via the SM watchdog (PD gapped upstream of the wedge); "
+                               "the MODULE is wedged and must be restarted. status().reason=Wedged.\n");
             return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     // Clean exit: the loop reached Stopped, so the join returns immediately.
-    if (rt_.joinable()) {
-        rt_.join();
+    if (core->thread_.joinable()) {
+        core->thread_.join();
     }
     master_.set_rt_active(false);  // joined -- single port owner again
     master_.close();               // the proven INIT teardown (idempotent at the backend)
@@ -180,19 +205,14 @@ void Runner::stop() noexcept {
 void Runner::run() {
     start();
     // Block until the RT loop ends (any cause), then run the join/close teardown.
-    while (phase_.load(std::memory_order_acquire) != RunnerPhase::Stopped) {
+    while (rt_core_->phase_.load(std::memory_order_acquire) != RunnerPhase::Stopped) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     stop();
 }
 
-void Runner::latch_reason(StopReason r) noexcept {
-    StopReason expected = StopReason::None;
-    (void)reason_.compare_exchange_strong(expected, r, std::memory_order_acq_rel);  // first cause wins
-}
-
 template <class Fn>
-void Runner::dispatch(Attached& a, std::uint64_t cycle, std::int64_t dc, bool stopping, Fn&& fn) noexcept {
+void RtCore::dispatch(Attached& a, std::uint64_t cycle, std::int64_t dc, bool stopping, Fn&& fn) noexcept {
     CycleContext& ctx = a.ctx;
     const std::span<const std::byte> in = master_.input_image(a.slave_id);
     const std::span<std::byte> out = master_.outputs(a.slave_id);
@@ -223,7 +243,7 @@ void Runner::dispatch(Attached& a, std::uint64_t cycle, std::int64_t dc, bool st
     std::memcpy(out.data(), ctx.outputs_.data(), out.size());
 }
 
-void Runner::rt_body(const std::stop_token& st) noexcept {
+void RtCore::rt_body(const std::stop_token& st) noexcept {
     (void)st;
     // realtime setup (mlockall/mallopt/prefault/SCHED_FIFO). require_realtime
     // semantics preserved: SCHED failure + require -> latched abort, no bring-up.
