@@ -22,6 +22,7 @@
 #include "test_harness.hpp"
 
 using ethercat::Cia402Mode;
+using ethercat::ConfigContext;
 using ethercat::CycleContext;
 using ethercat::FieldLocation;
 using ethercat::Master;
@@ -104,9 +105,8 @@ class TestControl : public SlaveControl {
     StopReason stop_reason = StopReason::None;
     CycleContext* cached_ctx = nullptr;  // test 10: the misbehaving cache
 
-    void on_configured(Master& master, std::uint16_t slave_id) override {
-        (void)master;
-        (void)slave_id;
+    void on_configured(ethercat::ConfigContext& cfg) override {
+        (void)cfg;
         events.emplace_back("configured");
         if (fail_configure) {
             throw ethercat::ConfigError("TestControl: deliberate on_configured failure");

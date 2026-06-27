@@ -109,8 +109,10 @@ void Runner::start() {
     }
     // NON-RT hooks first -- the ONLY throwing phase. A throw here aborts start()
     // cleanly: nothing locked, no thread, no rt_active bracket, master untouched.
+    // on_configured gets the RESTRICTED ConfigContext (§3a, TODO-10), never a raw Master&.
     for (Attached& a : controls_) {
-        a.control->on_configured(master_, a.slave_id);
+        ConfigContext cfg{master_, a.slave_id};
+        a.control->on_configured(cfg);
     }
     realtime::lock_current();
     started_.store(true, std::memory_order_release);

@@ -199,6 +199,51 @@ class CycleContext {
     bool live_ = false;  // set by the Runner around dispatch only
 };
 
+// The configure-time surface handed to on_configured (#47 §3a, TODO-10): the RESTRICTED,
+// pre-spawn analog of CycleContext. Exposes ONLY the legitimate configure-time operations
+// -- typed field resolution (the width assert fires here) + one-time SDOs -- bound to this
+// control's slave. It NEVER exposes process()/cyclic PD or a raw Master&.
+//
+// WHY (the H1 structural close, DA's seam): a raw Master& would let a control stash it and
+// call process() from a wedged step(), keeping PD flowing so the SM watchdog never fires ->
+// the cycling-wedge (energized-forever) becomes REACHABLE. With no process() reachable from
+// ANY hook (ctx or this), "a wedged step() is watchdog-safe" is STRUCTURAL, not contractual.
+// The SDO seam does not re-open the door: a stashed ConfigContext used to sdo_write from
+// step() hits the #39 rt_active guard -> THROWS through the noexcept step -> terminate
+// (loud, fails CLOSED) -- never a silent watchdog-defeat. Stashing it gains a control nothing.
+class ConfigContext {
+   public:
+    // Resolve a typed Rx/Tx field to a pre-resolved FieldLocation handle (the width assert
+    // vs the mapped bit_length fires HERE, at configure). Same as Master::resolve_rx/tx<F>,
+    // bound to this slave -- the control never names the slave id or touches the Master.
+    template <class F>
+    FieldLocation resolve_rx() const {
+        return master_.resolve_rx<F>(slave_id_);
+    }
+    template <class F>
+    FieldLocation resolve_tx() const {
+        return master_.resolve_tx<F>(slave_id_);
+    }
+    // One-time SDOs while the consumer is the single port owner (pre-RT). e.g. a regime
+    // readback or a vendor fault-reset. Post-spawn (a stashed handle), Master's rt_active
+    // guard makes these THROW.
+    void sdo_write(std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
+        master_.sdo_write(slave_id_, index, sub, data);
+    }
+    std::size_t sdo_read(std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
+        return master_.sdo_read(slave_id_, index, sub, out);
+    }
+    std::uint16_t slave_id() const noexcept {
+        return slave_id_;
+    }
+
+   private:
+    friend class Runner;
+    ConfigContext(Master& master, std::uint16_t slave_id) noexcept : master_(master), slave_id_(slave_id) {}
+    Master& master_;
+    std::uint16_t slave_id_;
+};
+
 // The consumer interface: per-slave POLICY. Derive it; the library runs everything.
 class SlaveControl {
    public:
@@ -210,13 +255,13 @@ class SlaveControl {
     virtual ~SlaveControl() = default;
 
     // NON-RT, pre-spawn, the ONLY hook that may THROW: resolve typed fields
-    // (resolve_rx/resolve_tx<F> -- the width assert fires here, at configure time),
-    // run one-time SDOs (e.g. a 0x605A regime readback via master.sdo_read -- the
+    // (cfg.resolve_rx/resolve_tx<F> -- the width assert fires here, at configure time),
+    // run one-time SDOs (e.g. a 0x605A regime readback via cfg.sdo_read -- the
     // single-port-owner phase), validate config. A throw aborts start() cleanly:
-    // nothing spawned, no bracket set, master untouched.
-    virtual void on_configured(Master& master, std::uint16_t slave_id) {
-        (void)master;
-        (void)slave_id;
+    // nothing spawned, no bracket set, master untouched. Receives the RESTRICTED
+    // ConfigContext (§3a), NOT a raw Master& -- so no process() is reachable from any hook.
+    virtual void on_configured(ConfigContext& cfg) {
+        (void)cfg;
     }
     // RT, once, the first cycle AT Operational -- before the first step().
     virtual void on_operational(CycleContext& ctx) noexcept {

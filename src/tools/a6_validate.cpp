@@ -191,16 +191,17 @@ class A6Control final : public SlaveControl {
     }
 
     // NON-RT, pre-spawn, may throw: resolve every typed field ONCE (configure-time
-    // width asserts). This map is built in this file, so all eight are mapped.
-    void on_configured(Master& master, std::uint16_t slave_id) override {
-        cw_loc_ = master.resolve_rx<cia402::ControlWord>(slave_id);
-        target_loc_ = master.resolve_rx<cia402::TargetPosition>(slave_id);
-        pv_loc_ = master.resolve_rx<cia402::ProfileVelocity>(slave_id);
-        sw_loc_ = master.resolve_tx<cia402::Statusword>(slave_id);
-        pos_loc_ = master.resolve_tx<cia402::PositionActual>(slave_id);
-        vel_loc_ = master.resolve_tx<cia402::VelocityActual>(slave_id);
-        fc_loc_ = master.resolve_tx<cia402::FaultCode>(slave_id);
-        mode_loc_ = master.resolve_tx<cia402::ModeDisplay>(slave_id);
+    // width asserts). This map is built in this file, so all eight are mapped. Uses the
+    // restricted ConfigContext (#TODO-10) -- resolve_rx/tx bound to the slave, no Master&.
+    void on_configured(ConfigContext& cfg) override {
+        cw_loc_ = cfg.resolve_rx<cia402::ControlWord>();
+        target_loc_ = cfg.resolve_rx<cia402::TargetPosition>();
+        pv_loc_ = cfg.resolve_rx<cia402::ProfileVelocity>();
+        sw_loc_ = cfg.resolve_tx<cia402::Statusword>();
+        pos_loc_ = cfg.resolve_tx<cia402::PositionActual>();
+        vel_loc_ = cfg.resolve_tx<cia402::VelocityActual>();
+        fc_loc_ = cfg.resolve_tx<cia402::FaultCode>();
+        mode_loc_ = cfg.resolve_tx<cia402::ModeDisplay>();
     }
 
     // RT, every bring-up cycle: the old run_to_operational gate, verbatim -- Er74.1
