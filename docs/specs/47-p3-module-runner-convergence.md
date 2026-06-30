@@ -221,7 +221,10 @@ NON-RT supervisor (module wrapper; Master persists here across Runner lifetimes)
   WRAPPER-PERSISTENT — it lives in the non-RT §4 unit layer and SURVIVES the drop+reconstruct.** It is DISTINCT from
   the enable-position: clearing it on recovery would silently re-zero the user's frame → `go_to(X)` would land at a
   different PHYSICAL position post-recovery. So: re-capture the enable-position (mechanical baseline); **PRESERVE
-  `zero_offset_counts` (user-semantic)**; clear only the in-flight/Faulted lifecycle state.
+  `zero_offset_counts` (user-semantic)**; clear the in-flight/Faulted lifecycle state. **ALSO CLEAR the pending
+  CommandQueue entries + the motion slot** on recovery (DA P3a finding): `commands_` persists across the
+  drop+reconstruct, so a stale `set_rpm`/`set_target` enqueued after the fault would otherwise drain into SURPRISE
+  motion in the recovered session — flush it as part of the fresh-session re-seed.
 - **TWO bounds (transient vs wedge):** **N=3 + backoff** bounds a TRANSIENT fault (a clean re-bring-up reaches
   OP next attempt). **SAME fault recurs at OP-ENTRY → LATCH IMMEDIATELY** (don't exhaust N): each attempt is a
   full INIT→OP bounce, and an Er74-at-OP-entry fault re-triggers every attempt = the repeated-OP-entry WEDGE
