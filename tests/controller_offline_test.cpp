@@ -204,6 +204,11 @@ TEST("ServoController(PP): the commanded rpm is written to profile velocity (0x6
     ctrl.go_to(600.0, 1.0);  // 600 rpm
     CHECK(sim != nullptr);
     const std::int32_t expected = ethercat::servo::rpm_to_device_velocity(600.0, kCountsPerRev, 1.0);
+    // received_profile_velocity() reads a NON-ATOMIC int the RT thread writes (sim_backend.hpp:
+    // "call only AFTER the controller is stopped/joined"). stop() joins the RT thread first, so
+    // the read is race-free (the last-written 0x6081 persists). The value reached the drive
+    // during the move above; this just observes it without racing the writer.
+    ctrl.stop();
     CHECK_EQ(sim->received_profile_velocity(1), std::abs(expected));  // rpm reached the drive, not 0
 }
 
