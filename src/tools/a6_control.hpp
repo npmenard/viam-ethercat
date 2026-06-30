@@ -92,6 +92,12 @@ struct Options {
     std::int32_t pos_tol = 300;      // --pos-tol (DA-C: proven HW default 300; tighten only with a bench deadband measurement)
 };
 
+// Count the mutually-exclusive move modes set (>1 => CLI conflict). Pure + testable.
+inline int mode_flag_count(const Options& o) noexcept {
+    return static_cast<int>(o.move_pp) + static_cast<int>(o.move_sine) + static_cast<int>(o.csp_probe) +
+           static_cast<int>(o.move_pos) + static_cast<int>(o.move_vel);
+}
+
 // RT->main telemetry: each field is an independent relaxed atomic. Cross-field skew
 // of a cycle is fine for a 5 Hz console print; no field tears. Written every step()
 // (cheap), read by main's printer.

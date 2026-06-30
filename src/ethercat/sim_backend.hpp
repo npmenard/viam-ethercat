@@ -43,6 +43,16 @@ struct SimSlaveModel {
     std::int32_t counts_per_step = 1000;     // PP: how fast actual chases target per cycle
     std::int32_t velocity_off = -1;          // optional: 0x60FF target velocity offset in outputs (i32); <0 = none
     std::int32_t profile_velocity_off = -1;  // optional: 0x6081 PP profile-velocity offset in outputs (u32); <0 = none
+    std::int32_t mode_display_off = -1;      // optional: 0x6061 mode-display (i8) offset in INPUTS; <0 = not emitted (#53)
+
+    // --- #53 PV / quick-stop modeling (all default to a conformant A6 that PASSES the gates) ---
+    std::int16_t quick_stop_option = 2;          // 0x605A read value (must be 2 for the control to energize PV)
+    std::uint32_t quick_stop_decel_echo = 0;     // 0x6085 sdo_read OVERRIDE (clamp / absent model) when *_forced
+    bool quick_stop_decel_echo_forced = false;   // true -> sdo_read(0x6085) returns quick_stop_decel_echo (0 = absent/refuse, or a clamped value)
+    std::int32_t quick_stop_decel_step = 0;      // QuickStopActive: |velocity| ramp-down PER CYCLE (toy counts/cycle); 0 = instant stop
+    bool quick_stop_suppress_auto_disable = false;  // model a drive that reports 0x605A=2 but does NOT auto-transition QSA->SwitchOnDisabled at zero (forces the control's cw->0x00 BACKSTOP to do the disable -- tests that path while configure still passes)
+    std::int8_t mode_echo_value = 0;             // forced 0x6061 echo (wrong-mode refuse test) when mode_echo_forced
+    bool mode_echo_forced = false;               // true -> 0x6061 reports mode_echo_value; else it echoes effective_mode (#53 DA-B)
     // De-mask of the #16 TxPDO FEEDBACK fields (offsets into the INPUT image; <0 = not
     // mapped, so the controller's read path falls back -- exercises the optional guard).
     std::int32_t fault_code_off = -1;       // 0x603F drive error code (u16) in inputs
@@ -128,6 +138,13 @@ class SimBackend final : public EcatBackend {
     // TEST-ONLY: call only AFTER the controller is stopped/joined -- it reads a
     // non-atomic int the RT thread writes via exchange(); a live concurrent read races.
     std::int32_t received_profile_velocity(std::uint16_t slave) const noexcept;
+    // #53 PV test visibility (call only AFTER the controller is stopped/joined -- RT-written):
+    // last 0x60FF (target velocity) the device saw; the 0x606C velocity at the QuickStopActive ->
+    // SwitchOnDisabled transition (proves the ramp reached ~0 BEFORE de-energize); and whether
+    // the device ever entered QuickStopActive (proves a CiA402 Quick-Stop, not a torque-cut).
+    std::int32_t received_target_velocity(std::uint16_t slave) const noexcept;
+    std::int32_t velocity_at_qsa_exit(std::uint16_t slave) const noexcept;
+    bool entered_qsa(std::uint16_t slave) const noexcept;
     // Toggle whether a slave asserts the PP set-point-acknowledge (bit12). When
     // suppressed, the controller's new-set-point handshake times out; re-enabling
     // lets a subsequent move complete (handshake-timeout-then-recovery test).
@@ -179,6 +196,11 @@ class SimBackend final : public EcatBackend {
         std::atomic<std::uint16_t> stale_fault_code{0};         // forces 0x603F = this REGARDLESS of fault state (flag-gating test)
         std::int32_t profile_velocity = 0;                      // last 0x6081 seen in the command image (test visibility; RT-only)
         std::int32_t velocity = 0;                              // per-cycle actual delta (0x606C de-mask; RT-only)
+        // #53 PV/quick-stop state (RT-only; read by tests AFTER stop/join):
+        std::int32_t pv_velocity = 0;                       // current PV/QSA velocity (toy counts/cycle == 0x606C)
+        std::int32_t target_velocity = 0;                   // last 0x60FF seen in the command image (test visibility)
+        std::int32_t velocity_at_qsa_exit = 0x7fffffff;     // 0x606C the cycle the device left QuickStopActive -> SwitchOnDisabled (proves ramp-then-disable)
+        bool entered_qsa = false;                           // device ever reached QuickStopActive (proves Quick-Stop, not torque-cut)
         std::atomic<bool> suppress_ack{false};                  // test hook (toggled live during a handshake): never assert bit12
         std::atomic<std::uint32_t> fault_clear_delay{0};        // #18 type-(a) reflect latency (cycles); 0 = instant
         std::atomic<bool> fault_persistent{false};              // #18 type-(b) cause-persists: reset edge ignored

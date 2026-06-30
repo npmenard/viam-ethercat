@@ -107,6 +107,18 @@ std::size_t SimBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::
                           std::to_string(slaves_.size()) + ")");
     }
     const Slave& s = slaves_[slave - 1];
+    // #53: 0x605A (quick-stop option, i16) is a device object the control READS to assert the
+    // PV stop regime -- serve it from the model (default 2). 0x6085 (quick-stop decel) normally
+    // reads back the written value (dictionary, below), but the model can FORCE a clamp/absent
+    // echo (0 -> the control refuses; a clamped value -> the control uses the echoed value).
+    if (index == 0x605A && sub == 0 && out.size() >= 2) {
+        store_le<std::int16_t>(out.subspan(0, 2), s.model.quick_stop_option);
+        return 2;
+    }
+    if (index == 0x6085 && sub == 0 && s.model.quick_stop_decel_echo_forced && out.size() >= 4) {
+        store_le<std::uint32_t>(out.subspan(0, 4), s.model.quick_stop_decel_echo);
+        return 4;
+    }
     const auto it = s.dictionary.find(sdo_key(index, sub));
     if (it == s.dictionary.end()) {
         return 0;
@@ -253,6 +265,10 @@ void SimBackend::step_device(Slave& s) noexcept {
             break;
         case St::QuickStopActive:
             if (disable_voltage) {
+                // #53 control-driven exit (the 0x605A in {5,6,7} backstop, OR the no-op cw=0x00
+                // the control sends after the =2 auto-disable): record the 0x606C velocity at the
+                // de-energize so the test can prove it ramped to ~0 FIRST (not a torque-cut).
+                s.velocity_at_qsa_exit = s.pv_velocity;
                 s.device_state = St::SwitchOnDisabled;
             } else if (enable_op) {
                 s.device_state = St::OperationEnabled;
@@ -337,9 +353,35 @@ void SimBackend::step_device(Slave& s) noexcept {
                 s.actual = (next < s.target) ? s.target : next;
             }
         } else if (s.effective_mode == Cia402Mode::ProfileVelocity && s.model.velocity_off >= 0) {
-            const std::int32_t vel = load_le<std::int32_t>(out.subspan(static_cast<std::size_t>(s.model.velocity_off), 4));
-            s.actual = static_cast<std::int32_t>(s.actual + vel);
+            // De-mask: record the commanded 0x60FF (test visibility), and (toy) take the
+            // velocity instantly (no accel ramp -- only the quick-stop DECEL ramp matters
+            // for the #53 safety assertion). actual integrates the velocity per cycle.
+            s.target_velocity = load_le<std::int32_t>(out.subspan(static_cast<std::size_t>(s.model.velocity_off), 4));
+            s.pv_velocity = s.target_velocity;
+            s.actual = static_cast<std::int32_t>(s.actual + s.pv_velocity);
         }
+    } else if (s.device_state == St::QuickStopActive) {
+        // #53 Quick-Stop DECEL: ramp |pv_velocity| toward 0 by the model's per-cycle step
+        // (0 = instant), still INTEGRATING the (shrinking) velocity -> an ENERGIZED decel that
+        // emits a decreasing 0x606C, exactly the ramp-then-disable the PV stop must achieve.
+        s.entered_qsa = true;
+        const std::int32_t step = s.model.quick_stop_decel_step;
+        if (step <= 0 || std::abs(s.pv_velocity) <= step) {
+            s.pv_velocity = 0;
+        } else {
+            s.pv_velocity += (s.pv_velocity > 0) ? -step : step;
+        }
+        s.actual = static_cast<std::int32_t>(s.actual + s.pv_velocity);
+        // 0x605A == 2 (PRIMARY): once the drive reaches its own zero it AUTO-transitions
+        // QuickStopActive -> SwitchOnDisabled (the control's cw->0x00 is then a no-op).
+        // quick_stop_suppress_auto_disable models a drive that does NOT auto-disable -> the
+        // control's cw->0x00 BACKSTOP must do it (tested under a passing 0x605A=2).
+        if (s.pv_velocity == 0 && s.model.quick_stop_option == 2 && !s.model.quick_stop_suppress_auto_disable) {
+            s.velocity_at_qsa_exit = 0;  // driver-owned de-energize, at zero
+            s.device_state = St::SwitchOnDisabled;
+        }
+    } else {
+        s.pv_velocity = 0;  // not energized / not moving
     }
     s.velocity = static_cast<std::int32_t>(s.actual - actual_before_motion);  // per-cycle delta -> 0x606C feedback
 
@@ -375,6 +417,13 @@ void SimBackend::step_device(Slave& s) noexcept {
             code = s.fault_code.load(std::memory_order_relaxed);  // gated: code only while faulted
         }
         store_le<std::uint16_t>(in.subspan(static_cast<std::size_t>(s.model.fault_code_off), 2), code);
+    }
+    // #53 mode-display echo (0x6061, i8): normally the SDO-set effective_mode (the A6 reflects
+    // the accepted 0x6060); the model can FORCE a wrong value to model the A6 SILENTLY ignoring
+    // an unsupported mode-set (#45) -- the controller's DA-B echo gate must refuse to enable.
+    if (s.model.mode_display_off >= 0) {
+        const std::int8_t md = s.model.mode_echo_forced ? s.model.mode_echo_value : static_cast<std::int8_t>(s.effective_mode);
+        in[static_cast<std::size_t>(s.model.mode_display_off)] = static_cast<std::byte>(md);
     }
 
     s.prev_ctrlword = cw;
@@ -497,6 +546,27 @@ std::int32_t SimBackend::received_profile_velocity(std::uint16_t slave) const no
         return slaves_[slave - 1].profile_velocity;
     }
     return 0;
+}
+
+std::int32_t SimBackend::received_target_velocity(std::uint16_t slave) const noexcept {
+    if (slave >= 1 && slave <= slaves_.size()) {
+        return slaves_[slave - 1].target_velocity;
+    }
+    return 0;
+}
+
+std::int32_t SimBackend::velocity_at_qsa_exit(std::uint16_t slave) const noexcept {
+    if (slave >= 1 && slave <= slaves_.size()) {
+        return slaves_[slave - 1].velocity_at_qsa_exit;
+    }
+    return 0;
+}
+
+bool SimBackend::entered_qsa(std::uint16_t slave) const noexcept {
+    if (slave >= 1 && slave <= slaves_.size()) {
+        return slaves_[slave - 1].entered_qsa;
+    }
+    return false;
 }
 
 std::vector<std::byte> SimBackend::recorded_sdo(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const {

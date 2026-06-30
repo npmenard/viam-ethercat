@@ -190,8 +190,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    const int mode_flags = static_cast<int>(opt.move_pp) + static_cast<int>(opt.move_sine) + static_cast<int>(opt.csp_probe) +
-                           static_cast<int>(opt.move_pos) + static_cast<int>(opt.move_vel);
+    const int mode_flags = mode_flag_count(opt);
     if (mode_flags > 1) {
         std::cerr << "error: --move-pp / --move-pos / --move-vel / --move-sine / --csp-probe are mutually exclusive "
                      "(one mode of operation at a time)\n";
