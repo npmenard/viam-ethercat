@@ -88,6 +88,10 @@ procedure), [`a6-hardware-wiring.md`](./a6-hardware-wiring.md) (wiring/safety),
   Don't expect "resume". If you need stay-in-quick-stop semantics, set 605A to
   5–7 — but note a 605A change **takes effect only after a control-power
   cycle**, and the FSM's default model no longer matches; prefer the default.
+  ⚠ Once SwitchOnDisabled is reached the output stage is OFF — see **Q13**: the
+  velocity reading (0x606C) is then a meaningless estimator artifact, and on a
+  loaded/vertical axis the shaft can back-drive for real. Don't treat the axis
+  as "safely stopped" on the velocity reading alone.
 
 ### Q5. Statusword bit 10 ("target reached") is ALWAYS 1; bit 14 unsupported
 - **Quirk:** bit 10 "Position reach — **Not supported. This bit remains 1 all
@@ -176,7 +180,10 @@ procedure), [`a6-hardware-wiring.md`](./a6-hardware-wiring.md) (wiring/safety),
   e-gear setting**. If someone changes C10.18/C10.19 on the drive, every
   reported position/velocity is silently wrong until the config is updated.
   Sanity check after any drive re-configuration: command a known rpm and
-  compare the reported velocity.
+  compare the reported velocity. **Note the noise floor:** 0x606C reads
+  ±~2000–4000 c/s even at a commanded standstill (≈ ±1 rpm) — set velocity-zero
+  thresholds above that. And once the drive de-energizes, 0x606C stops being
+  meaningful entirely — see **Q13**.
 
 ### Q11. Following-error window default is 24 REVOLUTIONS — far looser than you'd assume
 - **Quirk:** 0x6065 (excessive position deviation threshold) defaults to
@@ -211,6 +218,38 @@ procedure), [`a6-hardware-wiring.md`](./a6-hardware-wiring.md) (wiring/safety),
   mechanical-design constraint, not something the module can change. Include
   fault-stop behavior in any safety assessment of the machine.
 
+### Q13. 0x606C (velocity actual) is MEANINGLESS once the output stage is disabled — and is never a safety signal on a loaded axis
+- **Quirk (HW finding, #53 energized bench run; DA-confirmed from the wire trace):**
+  after a Quick Stop reaches **SwitchOnDisabled** (output stage off, see Q4),
+  0x606C does **not** read ~0. It shows a large **damped reverse excursion** —
+  observed a single ring peaking **≈ −23000 c/s**, decaying to the at-rest noise
+  floor within **~50 ms** — with **zero re-energize**. This is a velocity-
+  **estimator artifact**, not real motion: the back-acceleration it implies is
+  physically impossible on a free shaft with no applied torque. The estimator
+  simply produces garbage once the drive stops controlling current.
+- **Standstill noise floor:** even **energized and holding position**, 0x606C
+  carries a **±~2000–4000 c/s** noise floor (≈ ±0.9–1.8 rpm at 131072 c/rev,
+  Q10). Any "velocity ≈ 0" threshold must sit **above** this band or it will
+  never read stopped.
+- **⚠ SAFETY COROLLARY (matters for #37 on a real/loaded axis):** on a **loaded
+  or vertical axis**, motion *after* de-energize **can be REAL** — gravity or a
+  load back-drives the shaft once torque is removed. So 0x606C-after-
+  SwitchOnDisabled **cannot distinguish an estimator artifact from a genuine
+  runaway**. **Do NOT use "post-SOD velocity is just noise" as a safety
+  assumption on a loaded axis.** Gate de-energize-safety on **position
+  deviation** (is the shaft actually moving in encoder *position*, which is real
+  even when de-energized), a **mechanical brake** (0x6040 brake DO / a holding
+  brake), or **re-engage logic** — not on the post-disable velocity reading.
+- **Manual / source:** velocity-unit basis Q10 (a6.txt:3529-3531); SwitchOnDisabled
+  reached per Q4 / 0x605A=2 (a6.txt:13499); the excursion + noise-floor numbers
+  are bench-measured (#53), not in the manual.
+- **Handled:** the controller's move-complete predicate already cross-checks
+  position + a velocity *threshold* (Q5), so it tolerates the noise floor; but no
+  code today treats post-SOD velocity as a safety signal — and per the corollary
+  it must not. Cross-refs: **Q4** (quick-stop → SwitchOnDisabled, the state this
+  occurs in), **Q10** (the counts/s unit + noise magnitude), **Q12** (fault-class
+  stop behavior — a related "what the shaft physically does" safety concern).
+
 ---
 
 ## Quick reference — statusword bits with non-standard behavior on the A6
@@ -232,6 +271,12 @@ procedure), [`a6-hardware-wiring.md`](./a6-hardware-wiring.md) (wiring/safety),
 | ErC1.x / ErC2.0 | 0x8700 | Sync jitter / frame loss / watchdog / SYNC loss | Resettable after cause fixed |
 | ErA0.1 | 0x7305 | Multi-turn overflow at ±32 k revs (Q3) | Resettable; re-home |
 | (any) bit3 set | per table | Drive faulted, shaft per fault class (Q12) | bit7 pulse (Q6) or vendor reset (Q7) |
+
+> **Velocity-as-safety-signal warning (Q13):** 0x606C is a ±2–4 k c/s-noisy
+> estimate when energized and an outright meaningless artifact once de-energized
+> (SwitchOnDisabled). On a loaded/vertical axis, real gravity back-drive is
+> indistinguishable from the artifact — gate de-energize safety on position
+> deviation / a brake, never on post-disable velocity.
 
 ---
 
