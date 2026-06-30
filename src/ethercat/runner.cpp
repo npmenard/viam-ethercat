@@ -63,6 +63,11 @@ WkcStats CycleContext::wkc() const noexcept {
     return core_->master_.wkc_stats();
 }
 
+bool CycleContext::fault() const noexcept {
+    check_live();
+    return core_->master_.fault();
+}
+
 void CycleContext::check_live() const noexcept {
     // Debug-only (#47 TODO-1): a control that touches the ctx outside its dispatch
     // window gets a loud, immediate failure in debug builds. In release this compiles
