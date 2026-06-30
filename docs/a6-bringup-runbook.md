@@ -5,6 +5,7 @@ Step-by-step procedure to bring the `viam:ethercat:servo` motor module up on a *
 **Read alongside:**
 - [`docs/a6-hardware-wiring.md`](./a6-hardware-wiring.md) — power/motor/comms wiring + the ⚠️ mains-voltage safety section. **Do the wiring (and its safety steps) before anything here.**
 - [`docs/deployment-capabilities.md`](./deployment-capabilities.md) — granting `CAP_NET_RAW`/`CAP_NET_ADMIN`/`CAP_SYS_NICE`/`CAP_IPC_LOCK` + RT/memlock limits to the module process.
+- [`docs/a6-quirks.md`](./a6-quirks.md) — **consolidated A6 quirk list** (bit10 always-1, quick-stop→SwitchOnDisabled, Er74/vendor-reset/wedge, 250 µs cycle rule, units/e-gear rescale, fault-class stop behavior…). Read before commissioning or debugging surprises.
 - A6-EC drive manual (`a6-manuals/`) — object dictionary, CiA402, fault codes. Section cites below (e.g. "§10.x") refer to the A6 manual.
 
 > ⚠️ **Safety:** the wiring doc's safety section governs. Mains voltage; qualified electrician for power wiring; power off ≥10 min before touching terminals; PE ground; MCCB + contactor on the input. On the bench, **couple the motor to nothing** (or a known-safe inertia) for the first enable/jog — a mis-scaled velocity or a runaway will spin the shaft.
