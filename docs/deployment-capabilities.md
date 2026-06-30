@@ -206,7 +206,7 @@ Notes:
 
 ---
 
-## C++ runtime (libstdc++) ABI floor on the robot
+## C++ runtime ABI floor on the robot (libstdc++ + glibc)
 
 The module is built in a Docker image (`ubuntu:noble`, GCC 13) and shipped as
 `module.tar.gz` — but it **runs on the robot's machine**, dynamically linked
@@ -218,6 +218,17 @@ version on the deployment target.
   `libstdc++` fails to **load** the module with
   `version 'GLIBCXX_3.4.32' not found`. This is a raise from the previous
   `ubuntu:jammy` (GCC 11) build, whose floor was `GLIBCXX_3.4.30`.
+- **A SECOND, independent floor: glibc `GLIBC_2.39`.** The noble build also
+  raises the glibc requirement. Measured on the noble build: the module binary
+  itself needs `GLIBC_2.38`, and the bundled `libviamsdk.so` needs `GLIBC_2.39`,
+  so the **net glibc floor is `2.39`**. An older robot fails to load with
+  `version 'GLIBC_2.39' not found`. This is a *separate axis* from libstdc++:
+  `-static-libstdc++ -static-libgcc` does nothing for it, and — unlike
+  libstdc++ — glibc **cannot be bundled** out of the floor (see below). **Net:
+  the deployment target must be noble-class or newer on BOTH axes** — glibc
+  ≥ `2.39` AND libstdc++ ≥ `GLIBCXX_3.4.32`. (Same yaskawa precedent: a noble
+  build of `libviamsdk.so` sets the identical glibc floor, so a robot that runs
+  a shipping noble Viam module already meets it.)
 - **Why the module's own static linking doesn't remove it.** Even if the module
   binary links the C++ runtime statically (`-static-libstdc++ -static-libgcc`),
   that only covers *our* code. The module bundles and loads the Viam SDK's
@@ -237,22 +248,39 @@ version on the deployment target.
   `libviamsdk.so` requires the **same `GLIBCXX_3.4.32` floor**. So any robot that
   can run a shipping noble-built Viam module already meets this floor — adopting
   it puts us no worse off than an existing deployed module.
-- **For a sub-noble target fleet (optional, not applied).** If a specific
-  customer fleet runs a `libstdc++` older than `GLIBCXX_3.4.32`, the module can
-  be made self-contained by **bundling `libstdc++.so.6` inside `module.tar.gz`**
-  alongside `libviamsdk.so` (the `$ORIGIN` RPATH already resolves co-located
-  libraries first). The newer bundled `libstdc++.so.6` then satisfies both our
-  binary and `libviamsdk.so`, and the robot needs only a compatible **glibc**
-  (which is backward-compatible — a binary built against older glibc runs on
-  newer, so glibc is not the constraint here). This step is **not applied by
-  default** (the noble floor is precedented-safe); it is available if a target
-  fleet is known to be below the floor.
+- **For a sub-noble target fleet — bundling does NOT suffice; a sysroot rebuild
+  is required (not applied).** Bundling `libstdc++.so.6` inside `module.tar.gz`
+  (via `$ORIGIN` RPATH) clears the *libstdc++* floor only. It does **not** clear
+  the glibc floor: glibc is not the constraint-direction people expect. glibc's
+  compatibility guarantee is **forward** (a binary built against an *older* glibc
+  runs on a *newer* one) — but we build on noble (`GLIBC_2.39`) and run on the
+  *target*, so an *older* target is the unsupported direction. And glibc
+  **cannot be bundled** the way libstdc++ can: `ld.so` and `libc.so.6` are
+  selected by the kernel at `exec`, before `$ORIGIN`/RPATH interposition applies,
+  so a bundled libc is not used for the program loader. A `module.tar.gz` that
+  bundles only `libstdc++.so.6` would clear `GLIBCXX_3.4.32` and then still
+  **fail at exec on `GLIBC_2.39 not found`**. The real way to deploy to a
+  sub-noble fleet is to **rebuild the module against the target's (older) glibc**
+  — i.e. build in a sysroot / older base image matching the fleet's glibc — not
+  to bundle. This is **not applied by default** (the noble floor is
+  precedented-safe via yaskawa); it is the documented path if a target fleet is
+  known to be below the floor.
 
-**Verify a target's floor:** `strings /usr/lib/x86_64-linux-gnu/libstdc++.so.6 |
-grep GLIBCXX_3.4.3` on the robot — it must list `GLIBCXX_3.4.32`. Or check the
-module after deploy: `ldd <module-binary>` resolves cleanly (no "not found"),
-and `objdump -T libviamsdk.so | grep -o 'GLIBCXX_[0-9.]*' | sort -V | tail -1`
-shows the max required version (≤ what the robot provides).
+**Verify the module's required floors** (compute the max over the binary AND
+every bundled `.so` — the static-linked binary alone *understates* the floor; in
+practice `libviamsdk.so` dominates both axes):
+
+```
+# libstdc++ (GLIBCXX) floor:
+objdump -T <module-binary> libviamsdk.so* | grep -o 'GLIBCXX_[0-9.]*' | sort -V | tail -1
+# glibc (GLIBC) floor:
+objdump -T <module-binary> libviamsdk.so* | grep -o 'GLIBC_[0-9.]*'   | sort -V | tail -1
+```
+Expected on the noble build: `GLIBCXX_3.4.32` and `GLIBC_2.39`. **Verify a
+target robot meets both:** `strings /usr/lib/*/libstdc++.so.6 | grep -o
+'GLIBCXX_[0-9.]*' | sort -V | tail -1` must be ≥ `GLIBCXX_3.4.32`, and `ldd
+--version` (or the glibc on the robot) must be ≥ `2.39`. After deploy, `ldd
+<module-binary>` must resolve cleanly (no `not found`).
 
 ---
 
