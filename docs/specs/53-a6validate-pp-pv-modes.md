@@ -111,6 +111,15 @@ enable** (the A6 silently ignores unsupported mode-sets — TODO-45). No mid-run
   observed correlation length. (Moot under `0x605A=2` where the DRIVE owns the disable; the
   debounce only matters in the `0x605A∈{5,6,7}` backstop regime, which we refuse anyway — so
   in practice this is belt-and-suspenders for the fallback path.)
+- **HW-bench tuning classification (DA de-scope — NON-GATING):** because we ENFORCE `0x605A=2`,
+  the event-driven `cw→0x00` path is non-critical — the drive self-de-energizes at its own zero,
+  and even if our watch "wins" the race it fires at `|0x606C| < ~500 c/s ≈ 0.23 rev/s` =
+  effectively at rest (negligible KE, debounced). So **measuring the `0x606C` noise floor /
+  correlation-time to tune `kZeroVelThresh`/`kZeroVelDebounce` is a NICE-TO-HAVE (bench-exit
+  latency only), NOT a safety-gating HW data-point.** The ONE safety-critical HW tune that
+  remains is **`0x6085`'s decel-ceiling, proven via the decel-SLOPE check** (quirk #45). Keep
+  the event path as uniform both-regimes code (clean) — it's defensive, not load-bearing, at the
+  enforced default.
 - **`0x6085` (quick-stop decel) CONCRETE value** — set in `A6Control::on_configured` via
   `cfg.sdo_write` (the `on_configured` setup-SDO home). Principle: `0x6085 := VEL_ceiling /
   t_qs` for a brisk target stop-time `t_qs ≈ 200 ms`. For the bench's expected velocity
