@@ -1,6 +1,6 @@
 # #47-P3 / #37 — Viam module → Runner + SlaveControl convergence
 
-**Status:** DRAFT — **Revision 6** (supervisor mechanics corrected per DA re-gate: one-shot Runner → drop+reconstruct). Pending DA **re-gate**. No code written.
+**Status:** DRAFT — **Revision 7** (canonical generic mode-switch from M56S §4.2.3 + recovery re-attach = fresh session). Rev-6 design DA-SIGNED; pending DA quick-gate of the rev-7 addition. No code written.
 **Authors:** architect (design), team-lead (relay). **Reviewer:** _user._
 
 > Comment with `> COMMENT: ...` / `<!-- ... -->` anywhere.
@@ -93,7 +93,7 @@ One active motion intent. Blocking moves (`go_to`/`go_for`) take an exclusive sl
 
 - **bus / RT:** `ifname`, `target_loop_rate_hz`, `require_realtime`, `rt_priority`, `use_distributed_clocks`, `sync0_cycle_ns`
 - **motion / units (per-motor):** `counts_per_rev`, `gear_ratio`, `max_motor_speed_rpm`
-- **standard CiA402 tunables:** `quick_stop_decel` (0x6085), `quick_stop_option` (0x605A), `position_tolerance`, `zero_vel_threshold`
+- **standard CiA402 tunables:** `quick_stop_decel` (0x6085), `quick_stop_option` (0x605A), `position_tolerance`, `zero_vel_threshold`, `mode_switch_settle_timeout` (T_switch, §6)
 - **recovery (generic app-policy):** `fault_recovery_max_attempts` (=3), `fault_recovery_backoff_ms`
 - **device-specific (the residual ONE):** `fault_reset_mechanism` (default bit7; A6 = vendor-sdo) — also selects recovery location (§A R2)
 - **optional:** `peak_current_limit`/`rated_current` (torque-permille, absent by default)
@@ -110,8 +110,30 @@ move's units mid-run), `ifname`, dc/sync0/loop-rate/rt params, PDO map, `fault_r
 ## §6 API → mode, is_moving
 
 - `go_to`/`go_for` → PP; `set_rpm` → PV; `set_power(p)` → PV velocity = `p × max_motor_speed_rpm` (velocity-scaled, NOT torque).
-- Per-command mode: `Cmd` carries mode; `step()` switches `0x6060` + re-echo-checks on change. (HW-verify A6 PP↔PV — §10 P3c.)
 - `is_moving` = ALWAYS internal `|target−actual| ≤ position_tolerance && |vel| ≤ zero_vel_threshold`.
+
+### THE CANONICAL GENERIC MODE-SWITCH (per-command; supersedes the M6 PV→PP-specific form)
+`Cmd` carries `mode`. In `step()`, when a dequeued command needs `mode ≠ current_mode`, run this **before** executing it:
+```
+1. PRECONDITION — motor STOPPED (|vel| ≤ zero_vel_threshold). If still moving, ramp to zero
+     FIRST in the CURRENT mode; do NOT switch yet.                          [never switch mid-motion]
+2. SEED the new mode's RxPDO command objects to SAFE values BEFORE the switch (no-lunge):
+     PP → 0x607A = THIS-cycle CycleContext.load<PositionActual> (actual counts);  PV → 0x60FF = 0
+3. WRITE 0x6060 = new mode.
+4. TRANSITION WINDOW — for up to T_switch (mode_switch_settle_timeout) cycles, treat 0x6061 +
+     the new mode's TxPDO feedback as UNDEFINED: command NO motion, do NOT fault on mismatch yet.
+5. CONFIRM — 0x6061 == commanded → proceed (enable the new motion). If no match within T_switch
+     OR a drive error/EMCY fires during the window → mode-switch FAILED → the command's waiter
+     throws "mode-switch failed" (reject / Degraded).
+```
+**Device variation handled GENERICALLY (not per-device code):** `mode_switch_settle_timeout` (T_switch) is a
+config tunable (A6 transition short; M56S "takes time" — same knob, different value). Step 5 catches **both**
+failure shapes: a SILENT `0x6061` mismatch (A6 #45 silently-ignores) AND a drive ERROR/EMCY (M56S errors on an
+unsupported mode). **Provenance:** verified against the M56S/MDX+ manual §4.2.3 — a real second device that
+*explicitly* requires stop-before-switch + tolerate-undefined-transition + errors-on-unsupported-mode. This is the
+**generic CiA402 mode-switch contract**, not an A6 quirk — the A6 is its short-window/silent-ignore instance.
+Composes with R3 (the single-in-flight slot means step 1 only drains the accepted command's own prior-mode motion)
+and the rev-4 generic `0x6061==commanded` echo-check (now applied per-switch, not only at first enable).
 
 ---
 
@@ -185,6 +207,12 @@ NON-RT supervisor (module wrapper; Master persists here across Runner lifetimes)
   BEFORE the new one is constructed — **sequential drop→construct, never overlapped** (two live Runners on one
   Master = two threads on the port = CLAUDE.md L3, PD corruption / 0x001B). No double-teardown: `close()` lives
   ONLY in `~Runner`; `request_stop()` just flags the loop to exit.
+- **RE-ATTACH = FRESH SESSION (P3b impl-nit):** the control object is WRAPPER-OWNED and PERSISTS across the
+  drop+reconstruct (only the Runner is dropped). So the fresh Runner's `on_operational` MUST re-seed the control
+  to a clean operational baseline — CLEAR any Faulted/Resetting sub-state + the cancelled move's in-flight slot +
+  any pending generation (already terminated at the fault, §R2a); RE-CAPTURE the enable-position from THIS
+  session's actual feedback. The monotonic gen counter may continue (just an id source); no *in-flight/pending*
+  status survives. Re-attach = fresh session — the lifecycle is re-seeded by `on_operational`, never inherited.
 - **TWO bounds (transient vs wedge):** **N=3 + backoff** bounds a TRANSIENT fault (a clean re-bring-up reaches
   OP next attempt). **SAME fault recurs at OP-ENTRY → LATCH IMMEDIATELY** (don't exhaust N): each attempt is a
   full INIT→OP bounce, and an Er74-at-OP-entry fault re-triggers every attempt = the repeated-OP-entry WEDGE
