@@ -82,7 +82,6 @@ struct Options {
     double sine_amplitude = 20000.0;       // counts (peak); --sine-amplitude
     double sine_period = 4.0;              // seconds; --sine-period
     std::int32_t follow_err_limit = 5000;  // counts; CSP tool-level following-error abort
-    int seconds = 6;
     // --- #53 new modes ---
     bool move_pos = false;            // --move-pos POS [VEL]: absolute Profile-Position move-to (PP)
     bool move_vel = false;           // --move-vel VEL: continuous Profile-Velocity until Ctrl-C (PV)
@@ -275,10 +274,8 @@ class A6Control final : public SlaveControl {
             return;
         }
 
-        // --- duration / completion stops (the old loop's exit conditions).
-        if (cycle >= static_cast<std::uint64_t>(opt_.seconds) * kLoopHz) {
-            ctx.request_stop();
-        }
+        // --- completion stop: move-to modes finish on their own when reached;
+        // continuous modes (hold / sine / PV) run until SIGINT (Ctrl-C -> request_stop).
         if ((opt_.move_pp || opt_.move_pos) && move_done_ && cycle % 500 == 0) {
             ctx.request_stop();  // let it settle a moment, then finish
         }

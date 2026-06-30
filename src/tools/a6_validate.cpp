@@ -158,14 +158,12 @@ int main(int argc, char** argv) {
             opt.sine_period = std::stod(args[++i]);
         } else if (a == "--follow-err-limit" && i + 1 < args.size()) {
             opt.follow_err_limit = std::stoi(args[++i]);
-        } else if (a == "--seconds" && i + 1 < args.size()) {
-            opt.seconds = std::stoi(args[++i]);
         } else if (a.rfind("--", 0) != 0) {
             opt.ifname = a;
         } else {
             std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]]\n"
                       << "                   [--move-pos POS [VEL]] [--move-vel VEL] [--pos-tol N]\n"
-                      << "                   [--move-sine [--sine-amplitude N] [--sine-period S]] [--csp-probe] [--seconds N]\n"
+                      << "                   [--move-sine [--sine-amplitude N] [--sine-period S]] [--csp-probe]\n"
                       << "  --move-pos POS [VEL]: *** MOTION (needs --enable) *** absolute PP move-to POS counts at VEL\n"
                       << "               counts/s (profile vel; default from --move-pp RPM if omitted). Reached = |POS-actual|\n"
                       << "               <= --pos-tol (default 300 counts, #53 DA-C) AND velocity ~0; then holds.\n"
