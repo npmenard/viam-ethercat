@@ -156,6 +156,19 @@ enable** (the A6 silently ignores unsupported mode-sets — TODO-45). No mid-run
   harmless no-op `cw=0` (cost: ≤ ~2 s bench-exit after Ctrl-C). (a6_validate is the TOOL,
   not the module, so the #47-C2 SIGTERM→SIGKILL grace upper-bound on `teardown_cycles`
   does NOT apply — a 2 s window is fine; Ctrl-C is the tool's own SIGINT.)
+- **Runner window mechanics (cpp-expert, TODO-3/#52) — why the window must cover the decel:**
+  after request_stop the RT loop runs exactly `teardown_cycles` MORE cycles (`ctx.stopping()`,
+  PD flowing, `step()` called), THEN exits → `set_rt_active(false)` → `master.close()` (drive
+  OP→…→INIT). **`close()` is the final cut: whatever isn't de-energized by cycle N gets dropped
+  in motion.** So the window MUST cover the quick-stop decel + tail. Under enforced `0x605A=2`
+  the DRIVE reaches SwitchOnDisabled at its own zero in ~200 ms (`0x6085`=6.5 M, 600 rpm) ≪ the
+  2 s window → `close()` always lands AFTER the self-disable; the VEL guard makes this provable
+  for the whole envelope (refuse VEL whose decel wouldn't fit). **No wedge-abort conflict
+  (cpp-expert):** the bounded join `stop_join_timeout = max(250 ms, (teardown_cycles+20)·period·4)`
+  → ~8 s at N=2000, always ≥ the window, so the long PV window never trips the #52 wedge-abort;
+  and a genuinely wedged `step()` still de-energizes via the SM watchdog in ~50 ms (PD gaps —
+  `process()` is upstream of `step()`), so the 8 s is software-cleanup latency, NOT
+  de-energize latency.
 - The `0x6085`-honored assumption is **load-bearing** (quirk #45 — the A6 silently ignores
   unsupported objects): the HW gate confirms not just "`0x606C` reaches 0" but that the
   observed decel SLOPE matches the commanded `0x6085` (≈ `VEL/0.2 s`), proving the
