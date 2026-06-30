@@ -137,6 +137,17 @@ int main(int argc, char** argv) {
             if (i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0) {
                 opt.move_rpm = std::stod(args[++i]);
             }
+        } else if (a == "--move-pos" && i + 1 < args.size()) {
+            opt.move_pos = true;  // #53 absolute PP move-to; requires --enable (checked below)
+            opt.pos_target = std::stoi(args[++i]);
+            if (i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0) {
+                opt.pp_vel_cps = std::stoi(args[++i]);  // optional profile velocity (counts/s)
+            }
+        } else if (a == "--move-vel" && i + 1 < args.size()) {
+            opt.move_vel = true;  // #53 continuous PV until Ctrl-C; requires --enable
+            opt.pv_vel_cps = std::stoi(args[++i]);
+        } else if (a == "--pos-tol" && i + 1 < args.size()) {
+            opt.pos_tol = std::stoi(args[++i]);  // #53 DA-C: reached tolerance (counts); default 300
         } else if (a == "--move-sine") {
             opt.move_sine = true;  // requires an EXPLICIT --enable (checked below) -- no implicit energize
         } else if (a == "--csp-probe") {
@@ -153,7 +164,14 @@ int main(int argc, char** argv) {
             opt.ifname = a;
         } else {
             std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]]\n"
+                      << "                   [--move-pos POS [VEL]] [--move-vel VEL] [--pos-tol N]\n"
                       << "                   [--move-sine [--sine-amplitude N] [--sine-period S]] [--csp-probe] [--seconds N]\n"
+                      << "  --move-pos POS [VEL]: *** MOTION (needs --enable) *** absolute PP move-to POS counts at VEL\n"
+                      << "               counts/s (profile vel; default from --move-pp RPM if omitted). Reached = |POS-actual|\n"
+                      << "               <= --pos-tol (default 300 counts, #53 DA-C) AND velocity ~0; then holds.\n"
+                      << "  --move-vel VEL: *** CONTINUOUS MOTION (needs --enable) *** Profile-Velocity at VEL counts/s until\n"
+                      << "               Ctrl-C. On stop: CiA402 Quick-Stop (cw=0x0B) -> drive ramps via 0x6085 -> de-energizes\n"
+                      << "               at zero (requires 0x605A=2, asserted at configure; 0x6085 written + readback-checked).\n"
                       << "  The DC bring-up is automatic (Runner-owned, #47): configure() arms SYNC0 in PRE-OP, the\n"
                       << "  Runner's pump runs SETTLE -> request OP once -> AWAIT_OP, gapless + phase-locked.\n"
                       << "  Er74.1 in SAFE-OP is normal pre-sync, clears at OP.\n"
@@ -172,20 +190,25 @@ int main(int argc, char** argv) {
         }
     }
 
-    const int mode_flags = static_cast<int>(opt.move_pp) + static_cast<int>(opt.move_sine) + static_cast<int>(opt.csp_probe);
+    const int mode_flags = static_cast<int>(opt.move_pp) + static_cast<int>(opt.move_sine) + static_cast<int>(opt.csp_probe) +
+                           static_cast<int>(opt.move_pos) + static_cast<int>(opt.move_vel);
     if (mode_flags > 1) {
-        std::cerr << "error: --move-pp / --move-sine / --csp-probe are mutually exclusive (one mode of operation at a time)\n";
+        std::cerr << "error: --move-pp / --move-pos / --move-vel / --move-sine / --csp-probe are mutually exclusive "
+                     "(one mode of operation at a time)\n";
         return 2;
     }
-    // SAFETY: a move must NOT silently energize. --move-pp/--move-sine require an explicit
+    // SAFETY: a move must NOT silently energize. The move flags require an explicit
     // --enable, so a forgotten --enable FAILS CLOSED instead of moving the shaft.
-    if ((opt.move_pp || opt.move_sine) && !opt.enable) {
-        std::cerr << "error: --move-pp / --move-sine command ENERGIZED MOTION and require an explicit --enable\n"
+    if ((opt.move_pp || opt.move_sine || opt.move_pos || opt.move_vel) && !opt.enable) {
+        std::cerr << "error: --move-pp / --move-pos / --move-vel / --move-sine command ENERGIZED MOTION and require an "
+                     "explicit --enable\n"
                   << "       (safety: motion must be a deliberate opt-in -- a forgotten --enable will not silently move the shaft).\n"
                   << "       For a non-energizing CSP feedback read, use --csp-probe instead.\n";
         return 2;
     }
-    const Cia402Mode mode = (opt.move_sine || opt.csp_probe) ? Cia402Mode::CyclicSyncPosition : Cia402Mode::ProfilePosition;
+    const Cia402Mode mode = opt.move_vel                       ? Cia402Mode::ProfileVelocity
+                            : (opt.move_sine || opt.csp_probe) ? Cia402Mode::CyclicSyncPosition
+                                                               : Cia402Mode::ProfilePosition;  // move_pos / move_pp / plain hold
 
     (void)std::signal(SIGINT, on_sigint);
 
@@ -193,8 +216,11 @@ int main(int argc, char** argv) {
               << "mode: " << to_string(mode) << " | enable=" << (opt.enable ? "YES (motor energizes)" : "no") << " | move="
               << (opt.move_sine ? "SINE A=" + std::to_string(static_cast<long>(opt.sine_amplitude)) +
                                       "ct T=" + std::to_string(opt.sine_period) + "s (CSP, soft-started)"
-                  : opt.move_pp ? std::to_string(opt.move_revs) + " rev @ " + std::to_string(opt.move_rpm) + " rpm (PP)"
-                                : "none (hold)")
+                  : opt.move_vel ? "VEL " + std::to_string(opt.pv_vel_cps) + " counts/s (PV, until Ctrl-C)"
+                  : opt.move_pos ? "POS " + std::to_string(opt.pos_target) + " counts @ " +
+                                       std::to_string(opt.pp_vel_cps > 0 ? opt.pp_vel_cps : 0) + " counts/s (PP move-to)"
+                  : opt.move_pp  ? std::to_string(opt.move_revs) + " rev @ " + std::to_string(opt.move_rpm) + " rpm (PP)"
+                                 : "none (hold)")
               << "\n\n";
 
     // DC SYNC0 cycle = loop period; the A6 requires an integer multiple of 250 us.
@@ -257,7 +283,7 @@ int main(int argc, char** argv) {
 
     // --- the Runner (#47 P2): library-owned RT thread / pacer / bring-up / window / close.
     Telemetry tel;
-    A6Control control(opt, tel);
+    A6Control control(opt, tel, mode);
     RunnerConfig rc;
     rc.rt_priority = 80;
     rc.require_realtime = false;  // validation tool runs best-effort (matches the old behavior)
@@ -266,6 +292,13 @@ int main(int argc, char** argv) {
     // first 100 (no shaft yank), then 50 of cw=0x00 disable -- the old two teardown loops
     // as window policy inside A6Control::step().
     rc.teardown_cycles = 150;
+    // #53 PV needs a GENEROUS window: Ctrl-C -> Quick-Stop -> the drive ramps via 0x6085 ->
+    // de-energizes at its zero. kPvTeardownCycles (~2 s @ 1 kHz) is an upper bound; the
+    // control disables EARLY on the velocity event. (Tool, not module -- the #47-C2 grace
+    // upper bound doesn't apply; a 2 s SIGINT-to-exit is fine.)
+    if (opt.move_vel) {
+        rc.teardown_cycles = kPvTeardownCycles;
+    }
 
     // #TODO-3: stop() is no longer public -- the owner stops by DROPPING the Runner, whose
     // dtor runs the bounded teardown (join -> rt_active(false) -> master.close()). Scope the
