@@ -50,17 +50,47 @@ enable** (the A6 silently ignores unsupported mode-sets — TODO-45). No mid-run
 
 - Mode `ProfileVelocity` (`0x6060` = 3).
 - On enable: stream `0x60FF = VEL` each cycle. Drive ramps via `0x6083`/`0x6084`.
-- **Stop (Ctrl-C → `ctx.stopping()`): CiA402 Quick-Stop.** Command controlword **bit2
-  (Quick Stop)** → the *drive* performs its own controlled decel via **`0x6085`
-  (quick-stop deceleration)** and holds Quick-Stop-Active. Watch `0x606C`; once
-  `|0x606C| < kZeroVelThresh` (≈ 50 counts/s), THEN command cw → `0x00` (disable).
-  **Event-driven on real feedback — not a fixed-counter race.**
+- **Stop (Ctrl-C → `ctx.stopping()`): CiA402 Quick-Stop.** Command the Quick-Stop
+  transition (T11, OperationEnabled→QuickStopActive) — **controlword `0x0B`: CLEAR bit2
+  while KEEPING bit1 (Enable Voltage) and bits 0,3** (`0x0F & ~0x04`). *Polarity matters:
+  the Quick-Stop command is bit2 = 0, NOT bit2 = 1 — enable-operation `0x0F` already has
+  bit2 SET; a wrong polarity = no quick-stop = the torque-cut-at-speed we are preventing.*
+  In QuickStopActive the *drive* performs its own controlled decel via **`0x6085`
+  (quick-stop deceleration)** and ignores streamed `0x60FF`. Watch `0x606C`; once
+  `|0x606C| < kZeroVelThresh` for **`kZeroVelDebounce` consecutive cycles** (debounce so a
+  velocity-estimate noise dip can't disable mid-decel), THEN command cw → `0x00`
+  (disable voltage → SwitchOnDisabled). **Event-driven on real feedback — not a
+  fixed-counter race.**
+- **`kZeroVelThresh` concrete:** set just ABOVE the measured `0x606C` velocity-estimate
+  noise floor (a one-time bench data-point). Start at **≈ 500 counts/s** (≈ 0.23 rev/s at
+  2^17 counts/rev — genuinely stopped, a negligible cut if disabled there), `kZeroVelDebounce
+  = 5` cycles. NOTE: ≈ 50 counts/s (the earlier guess) is likely BELOW the noise floor →
+  the event may never fire → it safely falls back to the window upper bound (disable at
+  window-end, motor long stopped) but the bench-exit is slow; 500 c/s reliably fires early.
+- **`0x6085` (quick-stop decel) CONCRETE value** — set in `A6Control::on_configured` via
+  `cfg.sdo_write` (the `on_configured` setup-SDO home). Principle: `0x6085 := VEL_ceiling /
+  t_qs` for a brisk target stop-time `t_qs ≈ 200 ms`. For the bench's expected velocity
+  ceiling (~600 rpm = `600/60 × 131072` ≈ **1.31 Mcounts/s**, `kCountsPerRev = 131072`),
+  **`0x6085 ≈ 6,553,600 counts/s²` (= 50 rev/s², stops 600 rpm in ~200 ms; stops 60 rpm in
+  ~20 ms)** — brisk, well inside the 2 s window for every sane VEL. **Default to this**; tune
+  DOWN if the drive trips the quick-stop on regen/overcurrent (and tune the window UP to
+  match). HW-verify it's honored (next bullet + quirk #45).
+- **VEL guard (CLI, fail-closed):** with a fixed `0x6085` and the window `W`, a too-large
+  VEL can't stop in time. Refuse `--move-vel VEL` where `|VEL| / 0x6085 + t_margin > W`
+  (i.e. `|VEL| > 0x6085 × (W − t_margin)`; with `0x6085 = 6.5 M`, `W = 2 s`, `t_margin =
+  100 ms` → `VEL_max ≈ 12.4 Mcounts/s ≈ 5680 rpm` — far above any bench use, so it never
+  bites in practice, but it makes "the window covers worst-case decel" TRUE by construction
+  rather than assumed).
 - `RunnerConfig.teardown_cycles` = a **generous upper bound** (≈ 2000 = 2 s @ 1 kHz);
   the control disables **early** within it on the velocity event. Leftover cycles are
-  harmless no-op `cw=0` (cost: ≤ ~2 s bench-exit after Ctrl-C).
-- `0x6085` (quick-stop decel) is set in `A6Control::on_configured` via `cfg.sdo_write`
-  (the TODO-2 `on_configured` home for setup SDOs) to a brisk value so decel from the
-  max test velocity completes well inside the window.
+  harmless no-op `cw=0` (cost: ≤ ~2 s bench-exit after Ctrl-C). (a6_validate is the TOOL,
+  not the module, so the #47-C2 SIGTERM→SIGKILL grace upper-bound on `teardown_cycles`
+  does NOT apply — a 2 s window is fine; Ctrl-C is the tool's own SIGINT.)
+- The `0x6085`-honored assumption is **load-bearing** (quirk #45 — the A6 silently ignores
+  unsupported objects): the HW gate confirms not just "`0x606C` reaches 0" but that the
+  observed decel SLOPE matches the commanded `0x6085` (≈ `VEL/0.2 s`), proving the
+  quick-stop decel is real. If `0x6085`/quick-stop proves unreliable, fall back to CSV
+  (mode 9, master-streamed `0x60FF` ramp — fully master-controlled trajectory); noted, not adopted.
 - **RESIDUAL (stated, not implied-graceful):** PV + a *wedged* drive → the Runner's
   abort / SM-watchdog path de-energizes at residual speed (uncontrolled). A wedged drive
   cannot ramp; fail-stop is the only option.
@@ -70,8 +100,13 @@ enable** (the A6 silently ignores unsupported mode-sets — TODO-45). No mid-run
 - PP: sim drive moves `0x6064` toward `0x607A`; assert reached at `|Δ| ≤ 50`; assert the
   bit4 rising-edge handshake (bit12 ack observed, bit4 cleared between); assert
   zero-jump-free (first enabled frame carries POS, no spurious jump).
-- PV: assert `0x60FF` streamed == VEL; on stop, the sim models quick-stop decel — assert
-  cw→`0x00` happens ONLY AFTER `|0x606C| < thresh` (disable NOT issued at speed).
+- PV: assert `0x60FF` streamed == VEL; on stop, the sim models quick-stop decel via `0x6085`
+  — assert cw goes `0x0B` (quick-stop, bit2 cleared) first, then cw→`0x00` happens ONLY
+  AFTER `|0x606C| < thresh` for the debounce count (disable NOT issued at speed). *Baseline:
+  a control that disables on a fixed cycle-counter instead of the `0x606C` velocity event →
+  disables at residual speed → the "vel < thresh before cw→0" assert FAILS (pins the
+  event-driven disable — the whole point).* Also assert the window is a sufficient UPPER
+  bound: at `VEL_max`, the modeled decel reaches `<thresh` before window-end.
 - Mode echo: wrong-mode (sim ignores `0x6060`) → refuse to enable (fail-closed).
 - Exclusivity: two move flags → error.
 
