@@ -195,12 +195,15 @@ TEST("#53 PV 0x605A=2 (primary): drive auto-disables at its zero, AFTER vel ramp
     CHECK(simp->velocity_at_qsa_exit(1) >= 0);
 }
 
-TEST("#53 PV backstop: drive does NOT auto-disable -> control's cw->0x00 disables AFTER vel below thresh") {
-    // Models the 0x605A in {5,6,7} "stay in QuickStopActive" regime as a drive that REPORTS
-    // 0x605A=2 (so configure passes) but does NOT auto-transition at zero -> the control's
-    // event-driven cw->0x00 BACKSTOP must do the disable. (The control refuses an actual
-    // 0x605A!=2 at configure -- covered by its own test -- so this exercises the backstop code
-    // path under a passing assert, per the spec's "uniform both-regimes code" + de-scope.)
+TEST("#53 PV backstop (SYNTHETIC defensive coverage): control's cw->0x00 disables AFTER vel below thresh") {
+    // SYNTHETIC, NOT a HW-reachable regime (architect-confirmed framing): a real 0x605A=2 drive
+    // ALWAYS auto-disables at its zero, and the control REFUSES an actual 0x605A!=2 at configure
+    // -- so a "reports 2 but never auto-disables" drive cannot occur on HW. This test fabricates
+    // exactly that (report 0x605A=2 so configure passes; suppress the auto-disable) purely to get
+    // CODE COVERAGE of the control's cw->0x00 backstop, which is DEFENSIVE dead-code-at-the-default
+    // (DA: "keep it as uniform both-regimes code, defensive not load-bearing"). The reachable-on-HW
+    // path is the PRIMARY test above (drive self-disables). A future reader: this does NOT imply a
+    // =2 drive can fail to auto-disable.
     auto models = std::vector<SimSlaveModel>{make_model()};
     models[0].quick_stop_option = 2;
     models[0].quick_stop_suppress_auto_disable = true;
