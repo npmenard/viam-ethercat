@@ -31,6 +31,11 @@ RxPDO `0x1600` superset: `{ctrl 0x6040, 0x607A target-pos, 0x6081 profile-vel,
 `0x6060` set **once at configure** (`a6.default_mode` from the CLI mode). After SAFE-OP,
 read `0x6061` and require it == commanded **before** enabling; mismatch → **refuse to
 enable** (the A6 silently ignores unsupported mode-sets — TODO-45). No mid-run switch.
+- **IMPLEMENTATION MUST-DO (DA-B, load-bearing for PV):** the current `a6_validate.cpp:390`
+  only STORES `0x6061` to telemetry — there is NO `== commanded` check. TODO-45's echo gate
+  was the MODULE path, NOT this tool. #53 adds PV (`0x6060=3`); if the A6 doesn't honor `=3`,
+  `--move-vel` streams `0x60FF` into a drive still in PP/CSP → undefined ENERGIZED behavior.
+  `mode_loc_` is already resolved — add the `0x6061==requested` gate at enable, refuse otherwise.
 
 ## A6Control — absolute PP (`--move-pos`)
 
@@ -40,16 +45,31 @@ enable** (the A6 silently ignores unsupported mode-sets — TODO-45). No mid-run
   await sw **bit12** (set-point acknowledge) → clear bit4 → await bit12 clear. Exactly
   one edge; never leave bit4=1 across setpoints (else the next target is silently not
   latched).
-- **Reached** = `|0x6064_actual − POS| ≤ 50` counts AND `|0x606C| ≈ 0`. Report "reached",
-  then hold (re-send cw=enable, no new bit4 edge). Do NOT use A6 sw bit10 ("target
-  reached" is quirkily always-set — TODO-43).
+- **Reached** = `|0x6064_actual − POS| ≤ kPosReachedTol` counts AND `|0x606C| ≤ kZeroVelThresh`
+  (debounced, same as PV §). Report "reached", then hold (re-send cw=enable, no new bit4 edge).
+  Do NOT use A6 sw bit10 ("target reached" is quirkily always-set — TODO-43).
+  - **`kPosReachedTol` (DA-C, must-fix):** the existing code uses `< 300` (a6_validate.cpp:104,
+    HW-tested); the task asked for `≤ 50`. Tightening 300→50 risks **never-completes** (infinite
+    settle-spin) if the A6's positioning deadband parks outside ±50. **Default to the PROVEN 300**
+    (configurable via `--pos-tol`); 50 is achievable ONLY if a bench measurement shows the A6
+    deadband ≤ 50 — verify before tightening. A "reached 300 counts early" report is a benign
+    validation outcome; an infinite spin is not.
 - The absolute target is measured against the **same zero reference** as feedback/SetZero.
+- **DA-C, must-fix — do NOT flip the existing `--move-pp`:** `--move-pp` is a working, HW-tested
+  path (bit6 currently unset → 0 → it's an absolute-move-to-a-computed-relative-target). #53
+  ONLY ADDS `--move-pos` (bit6=0, reusing the existing bit4↔bit12 handshake verbatim). Do NOT
+  retro-flip `--move-pp` to bit6=1 (true relative) as part of #53 — that is a behavior change to
+  a green path requiring its own HW re-validation. Leave `--move-pp` byte-for-byte as-is.
 - `--follow-err-limit` still aborts + disables on `|cmd − actual|` runaway.
 
 ## A6Control — PV (`--move-vel`)
 
 - Mode `ProfileVelocity` (`0x6060` = 3).
-- On enable: stream `0x60FF = VEL` each cycle. Drive ramps via `0x6083`/`0x6084`.
+- On enable: stream `0x60FF = VEL` each cycle. Drive ramps via `0x6083` (accel).
+- **(DA-G) defensive: write `0x607A = live 0x6064` each PV cycle.** `0x607A` (target position)
+  is over-mapped but inert in PV per the superset map — but if it holds a STALE value and the
+  A6 cross-supervises position, it could throw a following-error. Mirroring `0x607A` to the
+  live actual position keeps it benign. HW-confirm: no `0x603F` following-error during PV.
 - **Stop (Ctrl-C → `ctx.stopping()`): CiA402 Quick-Stop.** Command the Quick-Stop
   transition (T11, OperationEnabled→QuickStopActive) — **controlword `0x0B`: CLEAR bit2
   while KEEPING bit1 (Enable Voltage) and bits 0,3** (`0x0F & ~0x04`). *Polarity matters:
@@ -75,12 +95,26 @@ enable** (the A6 silently ignores unsupported mode-sets — TODO-45). No mid-run
   ~20 ms)** — brisk, well inside the 2 s window for every sane VEL. **Default to this**; tune
   DOWN if the drive trips the quick-stop on regen/overcurrent (and tune the window UP to
   match). HW-verify it's honored (next bullet + quirk #45).
-- **VEL guard (CLI, fail-closed):** with a fixed `0x6085` and the window `W`, a too-large
-  VEL can't stop in time. Refuse `--move-vel VEL` where `|VEL| / 0x6085 + t_margin > W`
-  (i.e. `|VEL| > 0x6085 × (W − t_margin)`; with `0x6085 = 6.5 M`, `W = 2 s`, `t_margin =
-  100 ms` → `VEL_max ≈ 12.4 Mcounts/s ≈ 5680 rpm` — far above any bench use, so it never
-  bites in practice, but it makes "the window covers worst-case decel" TRUE by construction
-  rather than assumed).
+  - **(DA-A) readback-echo refuse — catches absent/clamped OFFLINE:** immediately after the
+    `sdo_write(0x6085)`, `cfg.sdo_read(0x6085)`; if readback ≠ written (object absent /
+    clamped / read-only) → **REFUSE to energize** at configure. This catches the gross
+    "object not there" case before any motion; the subtle "drive accepts+stores but doesn't
+    APPLY it in quick-stop" residual still needs the HW decel-slope check (kept).
+  - **(DA-E) `0x6085`/`a_decel_max` must come FROM the bench decel-ceiling measurement, not a
+    guess:** if `0x6085` is set ABOVE the drive's true decel ceiling, the quick-stop can't
+    achieve it → the motor isn't stopped by window-end → the `close()`→INIT backstop fires,
+    which **IS a torque-cut at speed — just a LOGGED one** (the loud diagnostic is POST-HOC,
+    after the cut). So the backstop's defensiveness is load-bearing on `0x6085 ≤ true ceiling`.
+    Set it from the measured ceiling before any energized run is trusted; the default 6.5 M is
+    a STARTING point pending that measurement.
+- **VEL guard — CONFIGURE-TIME, pre-energize (DA-H):** with a fixed `0x6085` and window `W`,
+  a too-large VEL can't stop in time. `VEL` and `0x6085` are BOTH known at configure, so this
+  is a **configure-time refusal BEFORE `--enable` acts** (consistent with the `--enable`
+  fail-closed posture — never energize then discover it). Refuse `--move-vel VEL` where
+  `|VEL| / 0x6085 + t_margin > W` (i.e. `|VEL| > 0x6085 × (W − t_margin)`; with `0x6085 = 6.5 M`,
+  `W = 2 s`, `t_margin = 100 ms` → `VEL_max ≈ 12.4 Mcounts/s ≈ 5680 rpm` — far above any bench
+  use, so it never bites in practice, but it makes "the window covers worst-case decel" TRUE
+  by construction rather than assumed).
 - `RunnerConfig.teardown_cycles` = a **generous upper bound** (≈ 2000 = 2 s @ 1 kHz);
   the control disables **early** within it on the velocity event. Leftover cycles are
   harmless no-op `cw=0` (cost: ≤ ~2 s bench-exit after Ctrl-C). (a6_validate is the TOOL,
@@ -97,8 +131,10 @@ enable** (the A6 silently ignores unsupported mode-sets — TODO-45). No mid-run
 
 ## Offline tests (sim)
 
-- PP: sim drive moves `0x6064` toward `0x607A`; assert reached at `|Δ| ≤ 50`; assert the
-  bit4 rising-edge handshake (bit12 ack observed, bit4 cleared between); assert
+- PP: sim drive moves `0x6064` toward `0x607A`; assert reached at `|Δ| ≤ kPosReachedTol`;
+  assert the bit4 rising-edge handshake — **(DA-I) assert the bit4 edge COUNT == 1** (a
+  level-not-edge bug re-asserts bit4 every cycle and silently fails to latch the next setpoint;
+  count==1 + bit12 ack observed + bit4 cleared between is the non-vacuous pin); assert
   zero-jump-free (first enabled frame carries POS, no spurious jump).
 - PV: assert `0x60FF` streamed == VEL; on stop, the sim models quick-stop decel via `0x6085`
   — assert cw goes `0x0B` (quick-stop, bit2 cleared) first, then cw→`0x00` happens ONLY
