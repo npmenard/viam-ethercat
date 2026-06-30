@@ -75,18 +75,42 @@ enable** (the A6 silently ignores unsupported mode-sets — TODO-45). No mid-run
   while KEEPING bit1 (Enable Voltage) and bits 0,3** (`0x0F & ~0x04`). *Polarity matters:
   the Quick-Stop command is bit2 = 0, NOT bit2 = 1 — enable-operation `0x0F` already has
   bit2 SET; a wrong polarity = no quick-stop = the torque-cut-at-speed we are preventing.*
-  In QuickStopActive the *drive* performs its own controlled decel via **`0x6085`
-  (quick-stop deceleration)** and ignores streamed `0x60FF`. Watch `0x606C`; once
-  `|0x606C| < kZeroVelThresh` for **`kZeroVelDebounce` consecutive cycles** (debounce so a
-  velocity-estimate noise dip can't disable mid-decel), THEN command cw → `0x00`
-  (disable voltage → SwitchOnDisabled). **Event-driven on real feedback — not a
-  fixed-counter race.**
+  (DA: `0x0B` is the mask-style command; `0x02` is the textbook-minimal exact value — if the
+  A6 turns out to decode the QS command by EXACT match rather than mask, `0x02` is the
+  conformant fallback. `0x0B` should work; HW-checkable.) The motor transitions to
+  QuickStopActive **IMMEDIATELY at full speed** and decelerates DURING QuickStopActive (an
+  ENERGIZED decel state, `sw & 0x6F == 0x07`) — NOT during OperationEnabled.
+- **WHO de-energizes — regime depends on `0x605A` (Quick-Stop option code); this is
+  load-bearing (DA Finding 2 + a6-quirks Q4):**
+  - **PRIMARY (A6 factory default `0x605A = 2` — "decel on `0x6085` ramp, then AUTO-transition
+    to SwitchOnDisabled"):** the **DRIVE** ramps via `0x6085` and **self-de-energizes** at its
+    OWN zero (→ SwitchOnDisabled). The control just holds `cw = 0x0B` and observes; it does NOT
+    need to command the disable.
+  - **BACKSTOP (`0x605A ∈ {5,6,7}` "stay in QuickStopActive"):** the drive ramps but holds
+    QSA energized at zero → the control's event-driven path takes over: watch `0x606C`; once
+    `|0x606C| < kZeroVelThresh` for **`kZeroVelDebounce` consecutive cycles** (debounce so a
+    velocity-estimate noise dip can't disable mid-decel), command `cw → 0x00` (disable voltage
+    → SwitchOnDisabled). This path is also the no-op-safe fallback under `=2`.
+  - **ASSERT, do NOT set (DA + Q4):** READ `0x605A` at configure and **require `== 2`; refuse
+    to energize otherwise.** A drive reconfigured to `0` (coast — no decel!) or `1` (decel on
+    `0x6084`, not `0x6085`) silently breaks the `0x6085` premise. Do NOT `sdo_write` `0x605A` —
+    Q4: a `0x605A` change takes effect only after a control-power cycle, so a warm write won't
+    apply; read-and-assert is the only correct move.
+  - So the control's event-driven `cw→0x00` is correctly a **BACKSTOP**, not the primary, at the
+    default — the spec earlier framed it backwards. Both regimes converge on SwitchOnDisabled;
+    the design is regime-robust.
 - **`kZeroVelThresh` concrete:** set just ABOVE the measured `0x606C` velocity-estimate
   noise floor (a one-time bench data-point). Start at **≈ 500 counts/s** (≈ 0.23 rev/s at
   2^17 counts/rev — genuinely stopped, a negligible cut if disabled there), `kZeroVelDebounce
   = 5` cycles. NOTE: ≈ 50 counts/s (the earlier guess) is likely BELOW the noise floor →
   the event may never fire → it safely falls back to the window upper bound (disable at
   window-end, motor long stopped) but the bench-exit is slow; 500 c/s reliably fires early.
+  **(DA refine) the bench tune must capture the velocity-estimate noise CORRELATION TIME, not
+  just amplitude:** a 5-cycle debounce defeats noise correlated < 5 cycles, but a low-frequency
+  estimator wander correlated > 5 cycles would slip through — size `kZeroVelDebounce` above the
+  observed correlation length. (Moot under `0x605A=2` where the DRIVE owns the disable; the
+  debounce only matters in the `0x605A∈{5,6,7}` backstop regime, which we refuse anyway — so
+  in practice this is belt-and-suspenders for the fallback path.)
 - **`0x6085` (quick-stop decel) CONCRETE value** — set in `A6Control::on_configured` via
   `cfg.sdo_write` (the `on_configured` setup-SDO home). Principle: `0x6085 := VEL_ceiling /
   t_qs` for a brisk target stop-time `t_qs ≈ 200 ms`. For the bench's expected velocity
@@ -95,11 +119,13 @@ enable** (the A6 silently ignores unsupported mode-sets — TODO-45). No mid-run
   ~20 ms)** — brisk, well inside the 2 s window for every sane VEL. **Default to this**; tune
   DOWN if the drive trips the quick-stop on regen/overcurrent (and tune the window UP to
   match). HW-verify it's honored (next bullet + quirk #45).
-  - **(DA-A) readback-echo refuse — catches absent/clamped OFFLINE:** immediately after the
-    `sdo_write(0x6085)`, `cfg.sdo_read(0x6085)`; if readback ≠ written (object absent /
-    clamped / read-only) → **REFUSE to energize** at configure. This catches the gross
-    "object not there" case before any motion; the subtle "drive accepts+stores but doesn't
-    APPLY it in quick-stop" residual still needs the HW decel-slope check (kept).
+  - **(DA-A) readback-echo + use the ECHOED value:** immediately after the `sdo_write(0x6085)`,
+    `cfg.sdo_read(0x6085)`. If absent / read-only / zero → **REFUSE to energize** at configure
+    (gross failure, before any motion). If the drive CLAMPED it to a valid-but-different value,
+    **use the ECHOED value for ALL downstream math** — the VEL guard (§ below) and the expected
+    decel slope — never the commanded value (DA: else a clamped-lower decel means a too-fast VEL
+    passes a guard computed against the wrong, too-high decel). The subtle "accepts+stores but
+    doesn't APPLY in quick-stop" residual still needs the HW decel-slope check (kept).
   - **(DA-E) `0x6085`/`a_decel_max` must come FROM the bench decel-ceiling measurement, not a
     guess:** if `0x6085` is set ABOVE the drive's true decel ceiling, the quick-stop can't
     achieve it → the motor isn't stopped by window-end → the `close()`→INIT backstop fires,
@@ -107,7 +133,8 @@ enable** (the A6 silently ignores unsupported mode-sets — TODO-45). No mid-run
     after the cut). So the backstop's defensiveness is load-bearing on `0x6085 ≤ true ceiling`.
     Set it from the measured ceiling before any energized run is trusted; the default 6.5 M is
     a STARTING point pending that measurement.
-- **VEL guard — CONFIGURE-TIME, pre-energize (DA-H):** with a fixed `0x6085` and window `W`,
+- **VEL guard — CONFIGURE-TIME, pre-energize (DA-H); compute from the ECHOED `0x6085`:** with
+  the readback-confirmed `0x6085` (DA-A above) and window `W`,
   a too-large VEL can't stop in time. `VEL` and `0x6085` are BOTH known at configure, so this
   is a **configure-time refusal BEFORE `--enable` acts** (consistent with the `--enable`
   fail-closed posture — never energize then discover it). Refuse `--move-vel VEL` where
@@ -136,27 +163,47 @@ enable** (the A6 silently ignores unsupported mode-sets — TODO-45). No mid-run
   level-not-edge bug re-asserts bit4 every cycle and silently fails to latch the next setpoint;
   count==1 + bit12 ack observed + bit4 cleared between is the non-vacuous pin); assert
   zero-jump-free (first enabled frame carries POS, no spurious jump).
-- PV: assert `0x60FF` streamed == VEL; on stop, the sim models quick-stop decel via `0x6085`
-  — assert cw goes `0x0B` (quick-stop, bit2 cleared) first, then cw→`0x00` happens ONLY
-  AFTER `|0x606C| < thresh` for the debounce count (disable NOT issued at speed). *Baseline:
-  a control that disables on a fixed cycle-counter instead of the `0x606C` velocity event →
-  disables at residual speed → the "vel < thresh before cw→0" assert FAILS (pins the
-  event-driven disable — the whole point).* Also assert the window is a sufficient UPPER
-  bound: at `VEL_max`, the modeled decel reaches `<thresh` before window-end.
-- Mode echo: wrong-mode (sim ignores `0x6060`) → refuse to enable (fail-closed).
+- PV: assert `0x60FF` streamed == VEL; on stop, assert cw goes `0x0B` (quick-stop, bit2
+  cleared) first. Two sim regimes for the disable (model both):
+  - **`0x605A=2` (default/primary):** the sim drive ramps via `0x6085` and AUTO-transitions to
+    SwitchOnDisabled at its own zero — assert the de-energize (`sw → SwitchOnDisabled`) happens
+    AFTER `|0x606C| < thresh`, driven by the DRIVE (the control's `cw→0x00` is a no-op here).
+  - **`0x605A∈{5,6,7}` (backstop):** the sim holds QuickStopActive at zero — assert the
+    CONTROL's `cw→0x00` fires ONLY AFTER `|0x606C| < thresh` for the debounce count.
+  *Baseline (both regimes): a control/sim that de-energizes on a fixed cycle-counter instead of
+  the `0x606C` velocity event → de-energizes at residual speed → the "vel < thresh before
+  SwitchOnDisabled" assert FAILS (pins the event-driven/auto disable — the whole point).* Also
+  assert the window is a sufficient UPPER bound: at `VEL_max`, decel reaches `<thresh` before
+  window-end.
+- **`0x605A` assert (DA Finding 2):** sim returns `0x605A ≠ 2` (e.g. 0 coast) → configure
+  REFUSES to energize; `0x605A == 2` → proceeds.
+- Mode echo (DA-B): wrong-mode (sim `0x6061 ≠` commanded `0x6060`) → refuse to enable
+  (fail-closed) — pins the `==commanded` check the current code lacks.
+- `0x6085` readback (DA-A): sim clamps `0x6085` → the VEL guard uses the ECHOED (clamped)
+  value; sim returns `0x6085=0`/absent → refuse.
 - Exclusivity: two move flags → error.
 
 ## HW gate (team-lead, energized, USER-gated per run)
 
 - `--move-pos`: zero-jump-free latch (cmd==pos at enable), moves to POS, reaches
-  (`|Δ| ≤ 50`), holds; badWKC=0, no Er74.
-- `--move-vel`: runs at VEL (`0x606C ≈ VEL`); on Ctrl-C the **wire/feedback shows
-  `0x606C` ramping to ~0 BEFORE statusword leaves OperationEnabled / cw→0** (DA verifies:
-  ramp-then-disable, NOT torque-cut-at-speed); badWKC=0.
+  (`|Δ| ≤ kPosReachedTol`), holds; badWKC=0, no Er74.
+- `--move-vel` — **CORRECTED LANDMARK (DA Finding 1): the de-energize landmark is
+  SwitchOnDisabled, NOT "leaving OperationEnabled".** On Ctrl-C the statusword leaves
+  OperationEnabled IMMEDIATELY (→ QuickStopActive) at full speed — that's expected, not the
+  hazard. The safety proof is: **`0x606C` ramps to ~0 while STILL ENERGIZED in QuickStopActive
+  (`sw & 0x6F == 0x07`), and only THEN does the statusword reach SwitchOnDisabled
+  (`sw & 0x4F == 0x40`)** = the actual de-energize. DA verifies: vel→~0 in QSA *before*
+  SwitchOnDisabled (ramp-then-disable, NOT torque-cut-at-speed), AND the observed `0x606C`
+  decel SLOPE matches the (echoed) `0x6085` (proves it's honored, quirk #45); badWKC=0.
 
 ## DA gate (spec + impl)
 
-PV: Quick-Stop + event-driven disable on `0x606C≈0`, window covers worst-case decel,
-HW-verified ramp-before-disable, residual stated. PP: bit6=0, true rising-edge bit4 +
-bit12 ack + clear-between, reached=actual-vs-target (not bit10), same zero ref.
-Mode-fixed-per-invocation; echo fail-closed.
+PV: Quick-Stop (`cw=0x0B`, bit2-clear polarity confirmed); disable regime per `0x605A`
+(default `=2` → DRIVE auto-disables at its zero, primary; `∈{5,6,7}` → control event-driven
+`cw→0x00`, backstop), `0x605A==2` read-asserted at configure; `0x6085` readback-echoed +
+VEL-guard from the echoed value; HW landmark = vel→~0 in QuickStopActive BEFORE
+SwitchOnDisabled (`sw&0x4F==0x40`), decel-slope matches echoed `0x6085`; wedge residual
+stated. PP: bit6=0, true rising-edge bit4 + bit12 ack + clear-between (edge count==1),
+reached=actual-vs-target (not bit10) at `kPosReachedTol` default 300, same zero ref,
+`--move-pp` NOT flipped. Mode-fixed-per-invocation; `0x6061` echo fail-closed (impl gap at
+a6_validate.cpp:390 — must add the `==commanded` check).
