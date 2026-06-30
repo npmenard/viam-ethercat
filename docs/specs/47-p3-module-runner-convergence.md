@@ -1,6 +1,6 @@
 # #47-P3 / #37 — Viam module → Runner + SlaveControl convergence
 
-**Status:** DRAFT — **Revision 5** (folds DA's design-gate: 7 must / 5 should / 3 nits). Pending DA **re-gate** of the R2 redesign. No code written.
+**Status:** DRAFT — **Revision 6** (supervisor mechanics corrected per DA re-gate: one-shot Runner → drop+reconstruct). Pending DA **re-gate**. No code written.
 **Authors:** architect (design), team-lead (relay). **Reviewer:** _user._
 
 > Comment with `> COMMENT: ...` / `<!-- ... -->` anywhere.
@@ -77,7 +77,7 @@ One active motion intent. Blocking moves (`go_to`/`go_for`) take an exclusive sl
 
 **Completion + slot races (M7 — get these right):**
 - **(a) lost wakeup:** the gen-keyed waiter uses a **predicate loop** — `while(!terminal(gen)) cv.wait(...)` — re-checking completed/failed/stopped_gen AFTER arming, so a notify between check-and-sleep isn't lost.
-- **(b) slot reclaim:** `claim_motion_slot()` **reclaims a slot whose active gen is already TERMINAL** (else a 2nd go_to spuriously throws "operation ongoing" on a finished move). Claim reclaims-if-terminal; the waiter does not own release.
+- **(b) slot reclaim:** `claim_motion_slot()` **reclaims a slot whose active gen is already TERMINAL** via a SINGLE CAS (`compare_exchange(expected = FREE | terminal-gen, desired = new-gen)`) — not check-then-claim (TOCTOU between two gRPC claimers). Claim reclaims-if-terminal; the waiter does not own release.
 - **(c) terminal precedence:** RT sets gen N's terminal state **write-once / first-terminal-wins** (immutable); cancel of an already-completed gen = no-op. Classify: done→true | failed→throw(raw 0x603F) | stopped→throw "motor stopped" | disabled→throw "motor disabled" | timeout→throw.
 
 ---
@@ -98,7 +98,12 @@ One active motion intent. Blocking moves (`go_to`/`go_for`) take an exclusive sl
 - **device-specific (the residual ONE):** `fault_reset_mechanism` (default bit7; A6 = vendor-sdo) — also selects recovery location (§A R2)
 - **optional:** `peak_current_limit`/`rated_current` (torque-permille, absent by default)
 
-_Live-apply vs respawn (M5):_ tolerances / max_speed / gear / recovery-N — **live-apply** (atomic swap, no teardown, load HELD). Bus/drive params (ifname / dc / sync0 / 0x6085·0x605A SDO / PDO map) — **respawn** (teardown → **a documented LOAD-DROP window**; brake/support first on a load axis).
+_Live-apply vs respawn (M5):_ live-apply = an atomic POINTER-swap to an IMMUTABLE config snapshot (RT `step()`
+acquire-loads the pointer ONCE at cycle-top, uses that snapshot the whole step — no in-place mutation / torn read).
+**SOFT (live-appliable, no teardown, load HELD):** `position_tolerance`, `zero_vel_threshold`, `quick_stop_decel`/`option`,
+`max_motor_speed_rpm`, `fault_recovery_max_attempts`/`backoff`. **STRUCTURAL (FORCE respawn = a documented LOAD-DROP
+window; brake/support first on a load axis):** `counts_per_rev`, `gear_ratio` (mis-live-applying corrupts an in-flight
+move's units mid-run), `ifname`, dc/sync0/loop-rate/rt params, PDO map, `fault_reset_mechanism`.
 
 ---
 
@@ -135,8 +140,9 @@ A fault is an INVOLUNTARY de-energize (the drive drops its own torque); R2's job
 - **`disable()`** → explicit **operator** de-energize (its own disposition; overrides the hold contract, S1).
 
 **M6 — ordered PV→PP hold-switch (no lunge):** ramp vel→0 in PV → set `0x6060=PP` → **seed `0x607A`=ACTUAL counts** →
-bit4 rising edge → hold. **Failure disposition:** mode-echo or bit4-ack fails mid-switch → **STAY in PV-at-0 hold**
-(accept small drift), do NOT de-energize.
+bit4 rising edge → hold. The seeded `0x607A` is THIS cycle's `CycleContext.load<PositionActual>()` (RT-fresh latched
+feedback), NOT a stale published value. **Failure disposition:** mode-echo or bit4-ack fails mid-switch → **STAY in
+PV-at-0 hold** (accept small drift), do NOT de-energize.
 
 ### R2 — recovery LOCATION by mechanism × fault CLASS (M1/M2/M3)
 **Rule: only a controlword (PDO) edge is legal in step(); SDO reset + EtherCAT-state recovery are NON-RT.**
@@ -152,24 +158,42 @@ bit4 rising edge → hold. **Failure disposition:** mode-echo or bit4-ack fails 
 bit7 rising EDGE (edge-count==1, no level-spin) → fault must STAY clear K cycles → then →Enabling; re-fault during
 the hold → revert to Faulted WITHOUT re-spinning.
 
-**The NON-RT recovery SUPERVISOR (CLASS-B + vendor-sdo) — a bounded retry around `Runner::start()`:**
+**The NON-RT recovery SUPERVISOR (CLASS-B + vendor-sdo) — DROP + RECONSTRUCT the one-shot Runner:**
+Ownership: the **Master is WRAPPER-OWNED** (persists the whole resource lifetime); the **Runner only BORROWS it**
+(`Runner(Master&)`) and is **one-shot + disposable** — no public `stop()`, move-deleted, teardown = `~Runner`
+(bounded-join + `master.close()→INIT`). So recovery cannot "restart" a Runner; it **destroys + reconstructs** one.
 ```
 RT step() on a CLASS-B / vendor-sdo fault:
-   latch reason + ctx.request_stop()          // fault already dropped torque; teardown → close()→INIT
+   latch reason + ctx.request_stop()    // fault already dropped torque; this just makes the loop EXIT
    in-flight waiter THROWS;  last_error = raw 0x603F
 
-NON-RT supervisor (module wrapper; watches the latched recoverable-stop reason):
+NON-RT supervisor (module wrapper; Master persists here across Runner lifetimes):
    for k = 1..N (N=3, backoff ≈ 200·2^k ms):
-     1. WEDGE? (NIC NO-CARRIER link-state | WKC==0 sustained, S4) → FAULTED_LATCHED now
-     2. Runner.start()   // == the ec_sample recovery: on_configured does the confirmed-PRE-OP settle
-                        //    (CLAUDE.md L1) + vendor reset 0x2031:01 + DC re-arm → OP
-     3. reached & HELD OP (WKC sustained ≥ ~400cyc, S3) → OPERATIONAL (re-energized — R2 honored)
-     4. else backoff, retry
-   exhausted → FAULTED_LATCHED → Degraded (cleared only by explicit fault_reset()/reconfigure())
+     1. DROP the Runner  → ~Runner: bounded-join the RT thread + master.close()→INIT
+          // close()→INIT happens ONLY in ~Runner — and it IS the from-INIT state the A6 PRE-OP-settle
+          //   re-bring-up needs (CLAUDE.md L1). That's WHY recovery must DESTROY, not "re-start".
+          // ABORT-ON-WEDGE (#52): a WEDGED step() → dtor bounded-join → std::abort → process FAIL-STOP.
+          //   The supervisor recovers FAULTS, not WEDGES; a wedge is terminal, not a catchable retry.
+     2. [old Runner FULLY destroyed: join + close complete]   ← NEVER-TWO-RUNNERS barrier
+     3. CONSTRUCT fresh Runner(master, cfg); attach(control); start()
+          // start() → on_configured: confirmed-PRE-OP settle + vendor reset 0x2031:01 + DC re-arm → OP
+     4. reached & HELD OP (WKC sustained ≥ ~400 cyc, S3) → OPERATIONAL (re-energized — R2 honored)
+     5. else → backoff, next attempt
+   exhausted OR same-fault-latch (below) → FAULTED_LATCHED → Degraded (explicit fault_reset()/reconfigure only)
 ```
-Each attempt IS the full proven bring-up (the PRE-OP settle + vendor reset already live in `on_configured`). The
-user's "auto-re-energize" is **preserved** — as a bounded non-RT re-bring-up, not an in-RT cw edge — honoring both
-the ask and the wedge lesson. Wedge-detect (S4) only STOPS further retries; **M2 (don't retry class-B in-loop) is the real guard.**
+- **NEVER-TWO-RUNNERS invariant:** the old Runner is FULLY destroyed (RT thread joined + close→INIT complete)
+  BEFORE the new one is constructed — **sequential drop→construct, never overlapped** (two live Runners on one
+  Master = two threads on the port = CLAUDE.md L3, PD corruption / 0x001B). No double-teardown: `close()` lives
+  ONLY in `~Runner`; `request_stop()` just flags the loop to exit.
+- **TWO bounds (transient vs wedge):** **N=3 + backoff** bounds a TRANSIENT fault (a clean re-bring-up reaches
+  OP next attempt). **SAME fault recurs at OP-ENTRY → LATCH IMMEDIATELY** (don't exhaust N): each attempt is a
+  full INIT→OP bounce, and an Er74-at-OP-entry fault re-triggers every attempt = the repeated-OP-entry WEDGE
+  pattern; the reactive WKC==0/NO-CARRIER detector (S4) LAGS (the wedge is *caused by* the retries). The
+  same-fault-at-OP-entry latch (caps OP-entry contributions to ~2) is **the real wedge guard**; S4 only stops further retries.
+
+The CLASS-A bit7 in-loop path is unchanged (a controlword PDO edge, no Runner drop). Drop+reconstruct is for
+CLASS-B / vendor-sdo — i.e. **always the A6**. The user's "auto-re-energize" is preserved as this bounded non-RT
+re-bring-up; the Runner being one-shot is a FEATURE — it guarantees the `close→INIT` every attempt needs.
 
 ---
 
