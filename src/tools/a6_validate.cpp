@@ -63,6 +63,7 @@ constexpr std::uint16_t kControlword = 0x6040;
 constexpr std::uint16_t kStatusword = 0x6041;
 constexpr std::uint16_t kModeDisplay = 0x6061;
 constexpr std::uint16_t kTargetPosition = 0x607A;
+constexpr std::uint16_t kTargetVelocity = 0x60FF;  // PV target (#53; mapped here, consumed by the held PV path)
 constexpr std::uint16_t kPositionActual = 0x6064;
 constexpr std::uint16_t kProfileVelocity = 0x6081;
 constexpr std::uint16_t kVelocityActual = 0x606C;
@@ -124,6 +125,7 @@ MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
         {kControlword, 0, 16},
         {kTargetPosition, 0, 32},
         {kProfileVelocity, 0, 32},
+        {kTargetVelocity, 0, 32},  // #53: superset RxPDO -- mapped for the PV mode (target consumed by the held PV path); appended so PP/CSP offsets are unchanged
     };
 
     a6.txpdo.pdo_indices = {0x1A00};
