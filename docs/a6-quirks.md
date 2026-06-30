@@ -8,7 +8,10 @@ and what an operator/consumer of the module needs to do about it.
 
 **Read alongside:** [`a6-bringup-runbook.md`](./a6-bringup-runbook.md) (bench
 procedure), [`a6-hardware-wiring.md`](./a6-hardware-wiring.md) (wiring/safety),
-[`deployment-capabilities.md`](./deployment-capabilities.md) (process caps).
+[`deployment-capabilities.md`](./deployment-capabilities.md) (process caps),
+[`m56s-profile.md`](./m56s-profile.md) (the **second** target device — a
+near-standard profile that validates the generic-driver thesis; useful contrast
+for which of the behaviors below are A6-specific vs generic CiA402).
 
 > Scope note: items Q1–Q2 are **code-fix items** tracked as tasks (cross-ref
 > only). Q3–Q12 are the consolidated consumer/operator quirk list (librarian
