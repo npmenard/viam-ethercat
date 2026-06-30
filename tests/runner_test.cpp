@@ -640,8 +640,14 @@ inline ChildResult run_in_child(const std::function<void()>& body, std::chrono::
     const ::pid_t pid = ::fork();
     if (pid == 0) {
         const ::rlimit no_core{0, 0};
-        (void)::setrlimit(RLIMIT_CORE, &no_core);
-        (void)std::freopen("/dev/null", "w", stderr);
+        // Best-effort child hardening (no cores, quiet stderr). Both are warn_unused_result
+        // under glibc, and g++ -Werror=unused-result does NOT honor a (void) cast (only clang
+        // does) -- so CONSUME the result in a condition and ignore it. A failure here is
+        // harmless: at worst a core is still written / the wedge log isn't suppressed.
+        if (::setrlimit(RLIMIT_CORE, &no_core) != 0) { /* ignore: cores at worst still allowed */
+        }
+        if (std::freopen("/dev/null", "w", stderr) == nullptr) { /* ignore: stderr stays as-is */
+        }
         body();
         ::_exit(0);  // body returned WITHOUT aborting -> clean exit; the test flags it (no SIGABRT)
     }
