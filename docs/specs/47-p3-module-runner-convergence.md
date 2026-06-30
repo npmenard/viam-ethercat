@@ -1,6 +1,6 @@
 # #47-P3 / #37 — Viam module → Runner + SlaveControl convergence
 
-**Status:** DRAFT — **Revision 7** (canonical generic mode-switch from M56S §4.2.3 + recovery re-attach = fresh session). Rev-6 design DA-SIGNED; pending DA quick-gate of the rev-7 addition. No code written.
+**Status:** DRAFT — **Revision 8** (DA rev-7 sign + P3a cleared; folds DA's 4 P3b/P3c findings). Design DA-SIGNED; **P3a in progress** (task #54). No re-gate pending.
 **Authors:** architect (design), team-lead (relay). **Reviewer:** _user._
 
 > Comment with `> COMMENT: ...` / `<!-- ... -->` anywhere.
@@ -93,7 +93,7 @@ One active motion intent. Blocking moves (`go_to`/`go_for`) take an exclusive sl
 
 - **bus / RT:** `ifname`, `target_loop_rate_hz`, `require_realtime`, `rt_priority`, `use_distributed_clocks`, `sync0_cycle_ns`
 - **motion / units (per-motor):** `counts_per_rev`, `gear_ratio`, `max_motor_speed_rpm`
-- **standard CiA402 tunables:** `quick_stop_decel` (0x6085), `quick_stop_option` (0x605A), `position_tolerance`, `zero_vel_threshold`, `mode_switch_settle_timeout` (T_switch, §6)
+- **standard CiA402 tunables:** `quick_stop_decel` (0x6085), `quick_stop_option` (0x605A), `position_tolerance`, `zero_vel_threshold`, `mode_switch_settle_timeout` (T_switch, §6), `ramp_stop_timeout` (§6 step 1)
 - **recovery (generic app-policy):** `fault_recovery_max_attempts` (=3), `fault_recovery_backoff_ms`
 - **device-specific (the residual ONE):** `fault_reset_mechanism` (default bit7; A6 = vendor-sdo) — also selects recovery location (§A R2)
 - **optional:** `peak_current_limit`/`rated_current` (torque-permille, absent by default)
@@ -116,12 +116,15 @@ move's units mid-run), `ifname`, dc/sync0/loop-rate/rt params, PDO map, `fault_r
 `Cmd` carries `mode`. In `step()`, when a dequeued command needs `mode ≠ current_mode`, run this **before** executing it:
 ```
 1. PRECONDITION — motor STOPPED (|vel| ≤ zero_vel_threshold). If still moving, ramp to zero
-     FIRST in the CURRENT mode; do NOT switch yet.                          [never switch mid-motion]
+     FIRST in the CURRENT mode; do NOT switch yet. BOUNDED by ramp_stop_timeout — if |vel| never
+     reaches threshold (a load resisting stop), the switch FAILS "motor didn't stop for mode-switch"
+     (don't hang the queue).                                                [never switch mid-motion]
 2. SEED the new mode's RxPDO command objects to SAFE values BEFORE the switch (no-lunge):
      PP → 0x607A = THIS-cycle CycleContext.load<PositionActual> (actual counts);  PV → 0x60FF = 0
 3. WRITE 0x6060 = new mode.
 4. TRANSITION WINDOW — for up to T_switch (mode_switch_settle_timeout) cycles, treat 0x6061 +
      the new mode's TxPDO feedback as UNDEFINED: command NO motion, do NOT fault on mismatch yet.
+     HOLDS ENERGIZED through the window — cw stays 0x0F (OperationEnabled), per R1; "no motion" ≠ de-energize.
 5. CONFIRM — 0x6061 == commanded → proceed (enable the new motion). If no match within T_switch
      OR a drive error/EMCY fires during the window → mode-switch FAILED → the command's waiter
      throws "mode-switch failed" (reject / Degraded).
@@ -210,9 +213,15 @@ NON-RT supervisor (module wrapper; Master persists here across Runner lifetimes)
 - **RE-ATTACH = FRESH SESSION (P3b impl-nit):** the control object is WRAPPER-OWNED and PERSISTS across the
   drop+reconstruct (only the Runner is dropped). So the fresh Runner's `on_operational` MUST re-seed the control
   to a clean operational baseline — CLEAR any Faulted/Resetting sub-state + the cancelled move's in-flight slot +
-  any pending generation (already terminated at the fault, §R2a); RE-CAPTURE the enable-position from THIS
-  session's actual feedback. The monotonic gen counter may continue (just an id source); no *in-flight/pending*
-  status survives. Re-attach = fresh session — the lifecycle is re-seeded by `on_operational`, never inherited.
+  any pending generation (already terminated at the fault, §R2a); RE-CAPTURE the enable-position (the jump-avoidance
+  origin, session-mechanical) from THIS session's actual feedback. The monotonic gen counter may continue (just an
+  id source); no *in-flight/pending* status survives. Re-attach = fresh session — the lifecycle is re-seeded by
+  `on_operational`, never inherited.
+  **BUT `zero_offset_counts` (set_zero, the USER's home frame; `position() = position_counts − zero_offset`) is
+  WRAPPER-PERSISTENT — it lives in the non-RT §4 unit layer and SURVIVES the drop+reconstruct.** It is DISTINCT from
+  the enable-position: clearing it on recovery would silently re-zero the user's frame → `go_to(X)` would land at a
+  different PHYSICAL position post-recovery. So: re-capture the enable-position (mechanical baseline); **PRESERVE
+  `zero_offset_counts` (user-semantic)**; clear only the in-flight/Faulted lifecycle state.
 - **TWO bounds (transient vs wedge):** **N=3 + backoff** bounds a TRANSIENT fault (a clean re-bring-up reaches
   OP next attempt). **SAME fault recurs at OP-ENTRY → LATCH IMMEDIATELY** (don't exhaust N): each attempt is a
   full INIT→OP bounce, and an Er74-at-OP-entry fault re-triggers every attempt = the repeated-OP-entry WEDGE
@@ -242,7 +251,10 @@ re-bring-up; the Runner being one-shot is a FEATURE — it guarantees the `close
 
 - **P3a — Runner adoption, behavior-PRESERVING.** Hand-rolled loop → `Runner` + module `SlaveControl`; deletes the hand-rolled RT loop + unbounded join; adds Degraded-alive (§8).
 - **P3b — generic policy + A6 profile + R1/R2/R3 lifecycle.** Module `SlaveControl` AND a6_validate `A6Control` both wrap the generic policy. **Gate: the 10 #53 `a6_control_test` cases MUST all survive (generic policy + A6 profile) — the regression guard (N2)** + module API tests + HW bench.
-- **P3c — runtime PP↔PV mode-switch HW-verify** (§6): the one new behavior; user-gated bench.
+- **P3c — runtime PP↔PV mode-switch HW-verify** (§6): the one new behavior; user-gated bench. **Gate via a WIRE
+  TRACE** (like #53's decel capture), not just "0x6061 confirms": the `0x6060` switch must show `0x606C`/torque
+  with **NO coast / output-drop** across the switch cycles — i.e. the drive holds torque through its own mode change
+  (a per-switch coast on a load axis = a position drop). Criterion: continuous `0x606C` ≈ 0, no transient spike/drop, energized throughout.
 
 **Confirmed:** PV-hold = PP-at-current-counts ✓ · fault-retry cap = 3 + backoff ✓ · ready-for-DA ✓.
 **Open (small, §S2):** `set_rpm(0)` under a blocking move → throws "operation ongoing" (`halt()` is the stop verb) — confirm or prefer set_rpm(0)=stop.
