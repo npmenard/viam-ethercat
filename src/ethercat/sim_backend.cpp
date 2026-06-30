@@ -142,6 +142,9 @@ void SimBackend::map_process_data() {
 }
 
 void SimBackend::request_state(std::uint16_t slave, EcatState target) {
+    if (target == EcatState::Op) {
+        ++op_requests_;  // #47 test hook: the no-hammer metric (exactly one per start)
+    }
     if (slave == 0) {
         for (auto& s : slaves_) {
             s.state = target;

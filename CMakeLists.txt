@@ -178,6 +178,7 @@ target_sources(ethercat
     src/ethercat/pdo_mapping.cpp
     src/ethercat/master.cpp
     src/ethercat/realtime.cpp
+    src/ethercat/runner.cpp
     src/ethercat/soem_backend.cpp
     src/viam/lib/motion_profile.cpp
     src/viam/lib/servo_config.cpp
@@ -403,6 +404,7 @@ viam_add_test(soem_backend_test tests/soem_backend_test.cpp)
 viam_add_test(conversion_test tests/conversion_test.cpp)
 viam_add_test(dc_sync_test tests/dc_sync_test.cpp)
 viam_add_test(realtime_test tests/realtime_test.cpp)
+viam_add_test(runner_test tests/runner_test.cpp)
 viam_add_test(sine_move_test tests/sine_move_test.cpp)
 viam_add_test(servo_config_test tests/servo_config_test.cpp)
 viam_add_test(controller_offline_test tests/controller_offline_test.cpp)
@@ -421,6 +423,21 @@ if (ETHERCAT_SANITIZE_THREAD AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
                  "seqlock fences are load-bearing). Configure with clang to build it.")
 endif()
 if (ETHERCAT_SANITIZE_THREAD AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  # #50: the TSan lane MUST be an NDEBUG config. Several concurrency tests are gated
+  # `#ifdef NDEBUG` (e.g. runner_test #47.10: the escaped-ctx + stop()-from-RT paths,
+  # which in a debug build would trip check_live's assert instead of running). Under a
+  # Debug build those tests compile to a `CHECK(true)` STUB -- so the very races they
+  # exist to catch (and which TSan would flag, e.g. the Runner self-join-guard rt_tid_
+  # access, #49) go UN-SANITIZED while the lane still reports green. Fail loud: require
+  # a build type whose flags carry -DNDEBUG.
+  if (NOT CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+    message(FATAL_ERROR
+        "ETHERCAT_SANITIZE_THREAD requires an NDEBUG build type (got "
+        "CMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}'). NDEBUG-gated concurrency tests "
+        "(#ifdef NDEBUG) silently stub out otherwise, so the TSan lane would run green "
+        "without sanitizing the paths it exists for. Re-configure with "
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo (keeps -g for symbolized races + defines NDEBUG).")
+  endif()
   add_executable(pdo_cache_test_tsan
     tests/pdo_cache_test.cpp
     src/ethercat/pdo_cache.cpp
@@ -542,6 +559,41 @@ if (ETHERCAT_SANITIZE_THREAD AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   viam_apply_wall_werror(pdo_access_test_tsan)
   add_test(NAME pdo_access_test_tsan COMMAND pdo_access_test_tsan)
   set_tests_properties(pdo_access_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
+
+  # ThreadSanitizer build of the #47 Runner tests. The Runner spawns the RT thread
+  # while the test thread calls status()/stop()/request_stop()/contract_violations()
+  # concurrently (run()'s phase polling, test 3's start+sleep+stop, test 10's
+  # deliberate cross-thread misbehavior) -- the whole Runner + Master + sim stack is
+  # compiled directly under -fsanitize=thread so the spawn/join/atomics handoff and
+  # the #47 violation counter are instrumented. SOEM referenced, never executed.
+  add_executable(runner_test_tsan
+    tests/runner_test.cpp
+    src/ethercat/cia402.cpp
+    src/ethercat/pdo_cache.cpp
+    src/ethercat/pdo_mapping.cpp
+    src/ethercat/backend.cpp
+    src/ethercat/sim_backend.cpp
+    src/ethercat/soem_backend.cpp
+    src/ethercat/master.cpp
+    src/ethercat/realtime.cpp
+    src/ethercat/runner.cpp
+  )
+  target_include_directories(runner_test_tsan
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  )
+  target_link_libraries(runner_test_tsan
+    PRIVATE
+      soem
+      Threads::Threads
+      Boost::headers
+  )
+  target_compile_options(runner_test_tsan PRIVATE -fsanitize=thread -O1 -g)
+  target_link_options(runner_test_tsan PRIVATE -fsanitize=thread)
+  viam_apply_wall_werror(runner_test_tsan)
+  add_test(NAME runner_test_tsan COMMAND runner_test_tsan)
+  set_tests_properties(runner_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
 endif()
 
 
