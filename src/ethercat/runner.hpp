@@ -167,6 +167,12 @@ class CycleContext {
     void request_stop() noexcept;
     // The #40 WKC health counters (fields individually relaxed, +/-1 skew by design).
     WkcStats wkc() const noexcept;
+    // The Master's LATCHED bus-fault state (consecutive-WKC-error latch). Symmetric with
+    // wkc() -- a consumer step() that drives its own per-cycle fault policy off the bus
+    // tier (e.g. the servo module's two-tier fault) reads it HERE rather than touching the
+    // Master directly (the Runner is the sole Master toucher, #47-P3 §2). Same value the
+    // Runner itself uses to latch StopReason::BusFault.
+    bool fault() const noexcept;
 
     // Deleted copy AND move (#47 TODO-1): the ctx is a long-lived Runner-owned
     // member, handed out by reference per dispatch. It was IMPLICITLY copyable
