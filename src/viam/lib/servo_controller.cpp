@@ -121,11 +121,14 @@ void ServoController::start() {
     // window opens.
     master_ = std::make_unique<Master>(build_master_config(config_), backend_factory_());
     master_->init();
-    master_->configure();
+    master_->configure();  // -> SAFE-OP (may throw InitError; propagated as today -- the SDK retries)
     resolve_fields();
-    run_vendor_fault_reset(*master_, config_);  // #39: consumer-side, single port owner (pre-spawn)
+    run_vendor_fault_reset(*master_, config_);  // #39: consumer-side, single port owner (pre-Runner-start)
+    spawn_runner();
+}
 
-    // Reset per-run state.
+// Zero the per-run published atomics + RT-only working state (shared by start()/reconfigure()).
+void ServoController::reset_run_state() {
     stopping_.store(false, std::memory_order_release);
     rt_error_.store(RtError::None, std::memory_order_relaxed);
     state_.faulted.store(false, std::memory_order_relaxed);
@@ -145,62 +148,60 @@ void ServoController::start() {
     latched_ctrl_error_ = RtError::None;
     last_progress_actual_ = 0;
     stall_cycles_ = 0;
-
+    last_sync_code_ = 0;
     const std::uint64_t period_ns = kNsPerSec / config_.target_loop_rate_hz;
     const std::uint64_t stall_ns = config_.stall_threshold_cycles * period_ns;
     watchdog_ns_.store(std::max<std::uint64_t>(stall_ns, 20'000'000ULL), std::memory_order_release);
+}
 
-    std::promise<void> started;
-    std::future<void> ready = started.get_future();
-    // #39 RT-phase bracket: declared active EXACTLY across the RT thread's lifetime --
-    // Master's public SDO surface throws while set (port-ownership guard). Cleared
-    // after EVERY join (including failure paths) so a later pre-spawn SDO works.
-    master_->set_rt_active(true);
-    rt_thread_ =
-        std::jthread([this](const std::stop_token& st, std::promise<void> p) { run_rt_loop(st, std::move(p)); }, std::move(started));
-
-    // Bounded handshake: rethrows InitError if the RT thread couldn't get RT
-    // scheduling (and require_realtime), or fails loudly if it never signals.
-    if (ready.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
-        stopping_.store(true, std::memory_order_release);
-        rt_thread_.request_stop();
-        if (rt_thread_.joinable()) {
-            rt_thread_.join();
-        }
-        master_->set_rt_active(false);  // joined -- single port owner again
-        throw InitError("ServoController: RT thread failed to start within 2s");
+// Construct the one-shot Runner BORROWING master_, attach *this as the SlaveControl, and
+// start it. The Runner owns realtime setup + the DC bring-up pump + pacing + teardown (the
+// old run_rt_loop's job). #39: the Runner owns the set_rt_active bracket now. §8: a start-time
+// failure -> Degraded-but-alive (APIs throw, process stays up), never rethrown past here.
+void ServoController::spawn_runner() {
+    reset_run_state();
+    degraded_.store(false, std::memory_order_release);
+    degraded_reason_.clear();
+    RunnerConfig rc;
+    rc.rt_priority = config_.rt_priority;
+    rc.require_realtime = config_.require_realtime;
+    // The Er74 OP-entry gate (bringup_step -> Aborted) decides a failed bring-up, not this
+    // wall bound -- keep it well above Master's own op-await window (the pump backstop).
+    rc.bringup_timeout = std::chrono::milliseconds(120'000);
+    // Teardown window: a couple of disable-voltage stopping cycles (step() during stopping)
+    // then ~Runner's master.close()->INIT -- reproduces the old run_rt_loop exit (disable +
+    // final process), now Runner-owned + BOUNDED (deletes the old unbounded join).
+    rc.teardown_cycles = 2;
+    rt_runner_ = std::make_unique<Runner>(*master_, rc);
+    try {
+        rt_runner_->attach(config_.slave_id, *this);
+        rt_runner_->start();  // on_configured (no-op) -> set_rt_active(true) -> spawn the RT thread
+    } catch (const Error& e) {
+        // §8: refusal/attach failure at start -> Degraded; drop the un-started Runner.
+        degraded_reason_ = std::string("ServoController degraded at start: ") + e.what();
+        degraded_.store(true, std::memory_order_release);
+        rt_runner_.reset();  // ~Runner: never-started -> no join/close, just frees
     }
-    ready.get();  // rethrows the InitError set by setup_realtime() failure
 }
 
 void ServoController::stop() noexcept {
     const std::unique_lock<std::shared_mutex> lk(api_mutex_);
     stopping_.store(true, std::memory_order_release);
     completion_cv_.notify_all();  // wake any parked go_to/go_for waiters
-    rt_thread_.request_stop();
-    if (rt_thread_.joinable()) {
-        rt_thread_.join();
-    }
-    if (master_) {
-        master_->set_rt_active(false);  // #39: joined -- single port owner again
-    }
+    // Drop the Runner: ~Runner runs the BOUNDED teardown (join the RT thread -> set_rt_active(false)
+    // -> master.close()->INIT). A WEDGED step() fail-stops the process (#52), not an unbounded hang.
+    rt_runner_.reset();
 }
 
 void ServoController::reconfigure(ServoConfig config) {
     ServoConfig next = validated(std::move(config));
     const std::unique_lock<std::shared_mutex> lk(api_mutex_);
-    // Stop + join (RT thread gone) before touching master_.
+    // Drop the Runner FIRST (its ~Runner joins the RT thread + close()->INIT) before touching
+    // master_ -- the RT thread is master_'s only cyclic user, so this is the join barrier.
     stopping_.store(true, std::memory_order_release);
     completion_cv_.notify_all();
-    rt_thread_.request_stop();
-    if (rt_thread_.joinable()) {
-        rt_thread_.join();
-    }
-    // #39 NOTE: no set_rt_active(false) at THIS join -- deliberately. The flagged Master
-    // is destroyed on the next line and its replacement constructs rt_active_=false, so a
-    // stale-true is moot BY OBJECT LIFETIME. A future refactor that REUSES the Master
-    // across reconfigure() must add the explicit clear here.
-    master_.reset();  // safe: RT thread (its only cyclic user) is joined
+    rt_runner_.reset();
+    master_.reset();  // safe: Runner (master_'s only cyclic user) is destroyed
     config_ = std::move(next);
 
     // Restart with the new config (same body as start(), lock already held).
@@ -208,43 +209,8 @@ void ServoController::reconfigure(ServoConfig config) {
     master_->init();
     master_->configure();
     resolve_fields();
-    run_vendor_fault_reset(*master_, config_);  // #39: consumer-side, single port owner (pre-spawn)
-    stopping_.store(false, std::memory_order_release);
-    rt_error_.store(RtError::None, std::memory_order_relaxed);
-    state_.faulted.store(false, std::memory_order_relaxed);
-    state_.loop_cycle.store(0, std::memory_order_relaxed);
-    state_.last_cycle_time_ns.store(0, std::memory_order_relaxed);
-    state_.active_generation.store(0, std::memory_order_relaxed);
-    state_.completed_generation.store(0, std::memory_order_relaxed);
-    state_.failed_generation.store(0, std::memory_order_relaxed);
-    next_generation_.store(0, std::memory_order_relaxed);
-    state_.expected_wkc.store(master_->expected_wkc(), std::memory_order_relaxed);  // constant; read lock-free by last_error()
-    lifecycle_ = Init{};
-    last_cw_ = 0;
-    handshake_ = Handshake::Idle;
-    prev_actual_ = 0;
-    first_cycle_ = true;
-    halted_ = false;
-    latched_ctrl_error_ = RtError::None;
-    last_progress_actual_ = 0;
-    stall_cycles_ = 0;
-    const std::uint64_t period_ns = kNsPerSec / config_.target_loop_rate_hz;
-    watchdog_ns_.store(std::max<std::uint64_t>(config_.stall_threshold_cycles * period_ns, 20'000'000ULL), std::memory_order_release);
-    std::promise<void> started;
-    std::future<void> ready = started.get_future();
-    master_->set_rt_active(true);  // #39 RT-phase bracket (see start())
-    rt_thread_ =
-        std::jthread([this](const std::stop_token& st, std::promise<void> p) { run_rt_loop(st, std::move(p)); }, std::move(started));
-    if (ready.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
-        stopping_.store(true, std::memory_order_release);
-        rt_thread_.request_stop();
-        if (rt_thread_.joinable()) {
-            rt_thread_.join();
-        }
-        master_->set_rt_active(false);  // joined -- single port owner again
-        throw InitError("ServoController: RT thread failed to restart within 2s");
-    }
-    ready.get();
+    run_vendor_fault_reset(*master_, config_);  // #39: consumer-side, single port owner (pre-Runner-start)
+    spawn_runner();
 }
 
 void ServoController::resolve_fields() {
@@ -293,13 +259,6 @@ bool ServoController::txpdo_has(std::uint16_t index) const noexcept {
     return false;
 }
 
-bool ServoController::setup_realtime() const noexcept {
-    // P3c (#31): the hand-rolled mlockall+mallopt+SCHED_FIFO body moved to the shared
-    // realtime::setup() (which also adds the stack pre-fault). Same contract: the return
-    // is the SCHED_FIFO result ONLY (the require_realtime gate); the rest is best-effort.
-    return realtime::setup(config_.rt_priority);
-}
-
 bool ServoController::watchdog_expired() const noexcept {
     const std::uint64_t last = state_.last_cycle_time_ns.load(std::memory_order_acquire);
     if (last == 0) {
@@ -335,13 +294,12 @@ void ServoController::abort_active_move(RtError reason) noexcept {
     }
 }
 
-std::uint16_t ServoController::step_handshake(std::uint16_t base_cw, Status status) noexcept {
-    const std::uint16_t s = config_.slave_id;
+std::uint16_t ServoController::step_handshake(CycleContext& ctx, std::uint16_t base_cw, Status status) noexcept {
     switch (handshake_) {
         case Handshake::Idle:
             return base_cw;
         case Handshake::WriteTarget:
-            store_le<std::int32_t>(master_->outputs(s).subspan(f_target_.byte_offset, 4), target_counts_);
+            ctx.store<std::int32_t>(f_target_, target_counts_);
             handshake_ = Handshake::AwaitAck;
             handshake_cycles_remaining_ = config_.handshake_timeout_cycles;
             return ControlWord::with_new_setpoint(base_cw, true);  // raise bit4
@@ -375,9 +333,9 @@ std::uint16_t ServoController::step_handshake(std::uint16_t base_cw, Status stat
     return base_cw;
 }
 
-std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch& batch, std::int32_t actual) noexcept {
+std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, const CommandBatch& batch, std::int32_t actual) noexcept {
     const Cia402State dev = status.decode();
-    const bool bus_fault = master_->fault();
+    const bool bus_fault = ctx.fault();
 
     // A new motion command (or enable) clears the sticky Halt.
     if (batch.set_target.has_value() || batch.set_velocity.has_value() || batch.enable) {
@@ -436,15 +394,15 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
         }
         std::uint16_t cw = ControlWord::enable_operation();
         if (config_.mode == ControlMode::ProfilePosition) {
-            cw = step_handshake(cw, status);
+            cw = step_handshake(ctx, cw, status);
             // Write the commanded move speed to profile velocity (0x6081) every cycle
             // when it's mapped -- else the drive uses its default speed and the rpm
             // passed to go_to/go_for is silently ignored on hardware.
             if (f_profile_velocity_.mapped()) {
-                store_le<std::uint32_t>(master_->outputs(config_.slave_id).subspan(f_profile_velocity_.byte_offset, 4), profile_vel_);
+                ctx.store<std::uint32_t>(f_profile_velocity_, profile_vel_);
             }
         } else if (f_velocity_.mapped()) {
-            store_le<std::int32_t>(master_->outputs(config_.slave_id).subspan(f_velocity_.byte_offset, 4), pv_velocity_);
+            ctx.store<std::int32_t>(f_velocity_, pv_velocity_);
         }
         if (halted_) {
             cw = ControlWord::with_halt(cw, true);  // Stop = Halt (bit8, sticky), NOT QuickStop
@@ -510,7 +468,7 @@ std::uint16_t ServoController::step_lifecycle(Status status, const CommandBatch&
     return ControlWord::disable_voltage();
 }
 
-void ServoController::publish_state(Status status, std::int32_t actual, std::int32_t velocity, std::span<const std::byte> in) noexcept {
+void ServoController::publish_state(CycleContext& ctx, Status status, std::int32_t actual, std::int32_t velocity) noexcept {
     state_.position_counts.store(actual, std::memory_order_relaxed);
     state_.velocity.store(velocity, std::memory_order_relaxed);
 
@@ -561,15 +519,15 @@ void ServoController::publish_state(Status status, std::int32_t actual, std::int
     // each tier the payload is relaxed-stored BEFORE the flag is release-stored, so a
     // master_-free reader never sees a true flag with a stale payload (cross-tier skew
     // is benign: fault state is quasi-static once latched).
-    const bool bus_fault = master_->fault();
-    // BUS tier: payload (the raw last-exchange WKC -- the actual bad value at fault)
-    // then flag.
-    state_.fault_wkc.store(master_->last_wkc(), std::memory_order_relaxed);
+    const bool bus_fault = ctx.fault();
+    // BUS tier: payload (the raw last-exchange WKC -- the actual bad value at fault, ==
+    // master_->last_wkc()) then flag.
+    state_.fault_wkc.store(ctx.wkc().last, std::memory_order_relaxed);
     state_.wkc_faulted.store(bus_fault, std::memory_order_release);
-    // DRIVE tier: live-read 0x603F from THIS cycle's snapshot EVERY faulted cycle (not
+    // DRIVE tier: live-read 0x603F from THIS cycle's owned snapshot EVERY faulted cycle (not
     // edge-captured) so a code the drive latches a frame or two after it sets bit3 is
     // still picked up ("code pending" collapses to the rare hard-drop race only).
-    const std::uint16_t drive_code = f_fault_code_.mapped() ? load_le<std::uint16_t>(in.subspan(f_fault_code_.byte_offset, 2)) : 0;
+    const std::uint16_t drive_code = f_fault_code_.mapped() ? ctx.load<std::uint16_t>(f_fault_code_) : 0;
     state_.drive_fault_code.store(drive_code, std::memory_order_relaxed);
     state_.drive_faulted.store(status.fault(), std::memory_order_release);
     // CTRL tier: the published mirror of the latch (tracks abort, clears on fault_reset).
@@ -584,120 +542,106 @@ void ServoController::publish_state(Status status, std::int32_t actual, std::int
     state_.loop_cycle.fetch_add(1, std::memory_order_relaxed);
 }
 
-void ServoController::run_rt_loop(const std::stop_token& st, std::promise<void> started) noexcept {
-    if (!setup_realtime() && config_.require_realtime) {
-        started.set_exception(std::make_exception_ptr(
-            InitError("real-time scheduling unavailable (need CAP_SYS_NICE/RLIMIT_RTPRIO); set require_realtime=false "
-                      "to run best-effort")));
-        return;
-    }
-    started.set_value();
+// --- SlaveControl hooks (#54 P3a): the old run_rt_loop body, split across the Runner's
+// lifecycle. The Runner owns realtime setup + the DC bring-up pump + the one DcPacer +
+// pacing + the steady cadence + the stopping window + master.close(). What remains is POLICY.
 
-    const std::uint16_t slave = config_.slave_id;
-    const std::uint64_t period_ns = kNsPerSec / config_.target_loop_rate_hz;
-    const bool dc = config_.use_distributed_clocks;
-    // ONE pacer across the bring-up prelude + the steady loop (P3c, #31): it owns the
-    // absolute deadline + PI integral (armed now+period at construction, exactly the old
-    // `next` init) so the SAFE-OP->OP->steady handoff stays gapless + phase-locked.
-    // Phase-lock TARGET: mid-cycle (period/2) from the DC base -- locking on the SYNC0
-    // edge (0) leaves no jitter margin (#20 consolidated the shift to one knob). pace(0)
-    // when DC is off = pure periodic (correction 0), matching the old corr=0 branch.
-    // pace() == the old corr/next/catch-up/TIMER_ABSTIME block byte-for-byte: same
-    // dc_phase_correction, same `next += period + corr`, same re-read whole-period
-    // catch-up, same absolute-deadline sleep.
-    realtime::DcPacer pacer(period_ns, static_cast<std::int64_t>(period_ns) / 2);
+void ServoController::on_configured(ConfigContext& cfg) {
+    // No-op: field resolution + the #39 vendor fault-reset run in start()/reconfigure()
+    // (pre-Runner-start, single port owner) -- behavior-identical to today, and keeps this
+    // hook free of a throwing SDO mid-Runner-start. (P3b moves the SDO setup here.)
+    (void)cfg;
+}
 
-    // DC bring-up prelude (#20): configure() left the bus at SAFE-OP; drive the Master
-    // bring-up FSM to OPERATIONAL here, in the single RT loop, so process data flows
-    // continuously (gapless) and SYNC0 is armed only once PD is already flowing. The
-    // gate's drive_sync_faulted is THIS controller's read of 0x603F == the configured
-    // sync_fault_code (#TODO-4 -- Er74.1/0x8700 for the A6; nullopt ⇒ always false) from
-    // the prior step's feedback -- keeping Master free of CiA402 semantics. The caller
-    // (here) owns the phase-locked cadence.
-    bool bringup_ok = false;
-    while (!st.stop_requested()) {
-        const std::span<const std::byte> bin = master_->input_image(slave);
-        const std::uint16_t code = f_fault_code_.mapped() ? load_le<std::uint16_t>(bin.subspan(f_fault_code_.byte_offset, 2)) : 0;
-        // #TODO-4: drive-sync-faulted = mapped 0x603F == the configured no-sync code.
-        // nullopt (no vendor code declared) ⇒ always false (a generic non-DC-quirk drive).
-        const bool sync_faulted = config_.sync_fault_code.has_value() && code == *config_.sync_fault_code;
-        const ethercat::BringupStatus bs = master_->bringup_step(sync_faulted);
-        if (bs == ethercat::BringupStatus::Operational) {
-            bringup_ok = true;
-        } else if (bs == ethercat::BringupStatus::Aborted) {
-            // SYNC0 did not take (Er74.1 in the gate). Surface root cause (drive tier) +
-            // symptom (not operational); do NOT auto-retry -- repeated Er74 OP-entry
-            // wedges the A6 (NO-CARRIER -> control-power cycle), so a re-attempt needs an
-            // explicit restart/reconfigure. Fall through to the safe-state exit below.
-            // Report the read code; if the drive read 0 but we aborted on the sync gate,
-            // fall back to the configured no-sync code (0 if none declared) for diagnostics.
-            state_.drive_fault_code.store(code != 0 ? code : config_.sync_fault_code.value_or(0), std::memory_order_relaxed);
-            state_.drive_faulted.store(true, std::memory_order_release);
-            rt_error_.store(RtError::NotOperational, std::memory_order_release);
-            state_.faulted.store(true, std::memory_order_release);
-        }
-        // Maintain the phase-locked cadence even on the terminal step, so the steady loop
-        // picks up one clean period later (no gap). pace() = phase-corrected advance +
-        // phase-preserving whole-period catch-up + absolute-deadline sleep (DcPacer).
-        pacer.pace(dc ? master_->dc_time() : 0);
-        if (bs == ethercat::BringupStatus::Operational || bs == ethercat::BringupStatus::Aborted) {
-            break;
-        }
-    }
-    if (!bringup_ok) {
-        // Aborted, or stop requested during bring-up: leave the drive in a safe state
-        // (disable voltage) and exit -- never enter the steady control loop un-operational.
-        if (master_) {
-            store_le<std::uint16_t>(master_->outputs(slave).subspan(f_ctrlword_.byte_offset, 2), ControlWord::disable_voltage());
-            master_->process();
-        }
-        return;
-    }
+void ServoController::on_operational(CycleContext& ctx) noexcept {
+    // No explicit seed: the std::variant lifecycle climbs Init->Enabling->Operational inside
+    // step_lifecycle off the drive state, exactly as the old steady loop did.
+    (void)ctx;
+}
 
-    while (!st.stop_requested()) {
-        const CommandBatch batch = commands_.drain();
+bool ServoController::sync_faulted(const CycleContext& ctx) const noexcept {
+    // The old bring-up gate (#TODO-4): drive-sync-faulted = mapped 0x603F == the configured
+    // no-sync code; nullopt (none declared) => always false. Stash the read code for on_stop's
+    // bring-up-abort diagnostic (sync_faulted + on_stop both run on the RT thread).
+    const std::uint16_t code = f_fault_code_.mapped() ? ctx.load<std::uint16_t>(f_fault_code_) : 0;
+    last_sync_code_ = code;
+    return config_.sync_fault_code.has_value() && code == *config_.sync_fault_code;
+}
 
-        // ONE input-image snapshot per cycle (spec #16 §10): statusword/bit3, actual,
-        // 0x603F, 0x606C all slice from THIS span -- never a second input_image() call
-        // -- so the fault code matches the fault state it is reported with structurally.
-        const std::span<const std::byte> in = master_->input_image(slave);
-        const Status status{load_le<std::uint16_t>(in.subspan(f_statusword_.byte_offset, 2))};
-        const std::int32_t actual = load_le<std::int32_t>(in.subspan(f_actual_.byte_offset, 4));
-        if (first_cycle_) {
-            prev_actual_ = actual;  // avoid a spurious huge velocity on cycle 0
-            first_cycle_ = false;
-        }
-        // Velocity from the wire (0x606C) when mapped, else the instantaneous estimate
-        // (actual-delta * loop rate). One branch; identical fallback when unmapped.
-        const std::int32_t velocity =
+void ServoController::step(CycleContext& ctx) noexcept {
+    if (ctx.stopping()) {
+        // The Runner enters its stopping window on ANY stop cause -- including a BUS fault
+        // (master_.fault()), which the OLD loop did NOT treat as an exit: it kept running +
+        // publishing the fault tiers every cycle. So during stopping we still DISABLE (safe)
+        // but KEEP PUBLISHING, so last_error() composes the bus/drive fault that triggered the
+        // stop (behavior-preserving: the #16 compose-both tier liveness). The Runner ships the
+        // disable (final process) + close()->INIT after the window.
+        const Status sstatus{ctx.load<std::uint16_t>(f_statusword_)};
+        const std::int32_t sactual = ctx.load<std::int32_t>(f_actual_);
+        const std::int32_t svel =
             f_velocity_actual_.mapped()
-                ? load_le<std::int32_t>(in.subspan(f_velocity_actual_.byte_offset, 4))
-                : static_cast<std::int32_t>(static_cast<std::int64_t>(actual - prev_actual_) * config_.target_loop_rate_hz);
-        prev_actual_ = actual;
-
-        const std::uint16_t cw = step_lifecycle(status, batch, actual);
-        store_le<std::uint16_t>(master_->outputs(slave).subspan(f_ctrlword_.byte_offset, 2), cw);
-        last_cw_ = cw;
-
-        master_->process();
-        publish_state(status, actual, velocity, in);
-
-        // Keep the cyclic wakeup phase-locked to DC SYNC0 (ec_sync PI) every cycle when
-        // DC is on, so the master's send holds its phase relative to the drive's pulse
-        // (no slow drift out of lock). No-op (correction 0) on non-DC backends. pace() =
-        // the old corr/next/catch-up/TIMER_ABSTIME block, via the shared DcPacer (P3c).
-        pacer.pace(dc ? master_->dc_time() : 0);
+                ? ctx.load<std::int32_t>(f_velocity_actual_)
+                : static_cast<std::int32_t>(static_cast<std::int64_t>(sactual - prev_actual_) * config_.target_loop_rate_hz);
+        prev_actual_ = sactual;
+        ctx.store<std::uint16_t>(f_ctrlword_, ControlWord::disable_voltage());
+        publish_state(ctx, sstatus, sactual, svel);
+        return;
     }
 
-    // Leave the drive in a safe state and flush it out.
-    if (master_) {
-        store_le<std::uint16_t>(master_->outputs(slave).subspan(f_ctrlword_.byte_offset, 2), ControlWord::disable_voltage());
-        master_->process();
+    const CommandBatch batch = commands_.drain();
+
+    // ONE input snapshot per cycle (spec #16 §10): statusword/bit3, actual, 0x603F, 0x606C
+    // all read from THIS cycle's owned image (the Runner copied it in before step()), so the
+    // fault code matches the fault state it is reported with -- structurally, as before.
+    const Status status{ctx.load<std::uint16_t>(f_statusword_)};
+    const std::int32_t actual = ctx.load<std::int32_t>(f_actual_);
+    if (first_cycle_) {
+        prev_actual_ = actual;  // avoid a spurious huge velocity on cycle 0
+        first_cycle_ = false;
     }
+    // Velocity from the wire (0x606C) when mapped, else the instantaneous estimate
+    // (actual-delta * loop rate). One branch; identical fallback when unmapped.
+    const std::int32_t velocity =
+        f_velocity_actual_.mapped()
+            ? ctx.load<std::int32_t>(f_velocity_actual_)
+            : static_cast<std::int32_t>(static_cast<std::int64_t>(actual - prev_actual_) * config_.target_loop_rate_hz);
+    prev_actual_ = actual;
+
+    const std::uint16_t cw = step_lifecycle(ctx, status, batch, actual);
+    ctx.store<std::uint16_t>(f_ctrlword_, cw);
+    last_cw_ = cw;
+
+    // process() ships the cw + latches the next input -- Runner-owned, AROUND step() (the
+    // documented 1-cycle store latency, P2b HW-verified). publish reads THIS cycle's snapshot.
+    publish_state(ctx, status, actual, velocity);
+}
+
+void ServoController::on_stop(StopReason reason) noexcept {
+    if (reason == StopReason::BringupAborted) {
+        // SYNC0 did not take (Er74.1 in the gate). Surface root cause (drive tier) + symptom
+        // (not operational) -- the old run_rt_loop bring-up-abort branch, now here. No
+        // auto-retry (repeated Er74 OP-entry wedges the A6); recovery = explicit reconfigure.
+        state_.drive_fault_code.store(last_sync_code_ != 0 ? last_sync_code_ : config_.sync_fault_code.value_or(0),
+                                      std::memory_order_relaxed);
+        state_.drive_faulted.store(true, std::memory_order_release);
+        rt_error_.store(RtError::NotOperational, std::memory_order_release);
+        state_.faulted.store(true, std::memory_order_release);
+        degraded_.store(true, std::memory_order_release);  // §8: bring-up failed -> Degraded (APIs throw via last_error())
+    } else if (reason == StopReason::RtSetupFailed) {
+        // §8: realtime scheduling unavailable && require_realtime -> Degraded-but-alive (the
+        // old start() InitError throw is REPLACED by this, the task's explicit §8 addition).
+        rt_error_.store(RtError::NotOperational, std::memory_order_release);
+        degraded_.store(true, std::memory_order_release);
+    }
+    // Requested / BusFault: clean teardown -- the steady loop published the bus tier each
+    // cycle; parked waiters are woken by stop()'s notify_all.
 }
 
 void ServoController::set_rpm(double rpm) {
     const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    if (degraded_.load(std::memory_order_acquire)) {  // §8 Degraded-but-alive: motion APIs throw, never act
+        throw BusError("set_rpm unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
+    }
     if (config_.mode != ControlMode::ProfileVelocity) {
         throw ConfigError("set_rpm requires Profile Velocity (PV) mode; this servo is configured PP -- use go_to/go_for");
     }
@@ -748,6 +692,9 @@ void ServoController::go_to(double rpm, double position) {
     std::chrono::milliseconds move_timeout{0};
     {
         const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+        if (degraded_.load(std::memory_order_acquire)) {  // §8
+            throw BusError("go_to unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
+        }
         if (config_.mode != ControlMode::ProfilePosition) {
             throw ConfigError("go_to requires Profile Position (PP) mode; this servo is configured PV -- use set_rpm");
         }
@@ -772,6 +719,9 @@ void ServoController::go_for(double rpm, double revs) {
         std::chrono::milliseconds move_timeout{0};
         {
             const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+            if (degraded_.load(std::memory_order_acquire)) {  // §8
+                throw BusError("go_for unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
+            }
             // RELATIVE move (frame-agnostic): push SetTarget{relative=true} so the FSM
             // computes target = actual + delta. Do NOT route through go_to -- go_to now
             // adds zero_offset (absolute frame), which would double-shift a relative move.

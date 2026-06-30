@@ -44,6 +44,7 @@
 #include "ethercat/cia402.hpp"
 #include "ethercat/master.hpp"
 #include "ethercat/pdo_cache.hpp"
+#include "ethercat/runner.hpp"
 #include "viam/lib/servo_config.hpp"
 
 namespace ethercat::servo {
@@ -74,7 +75,12 @@ struct ControllerState {
     std::atomic<std::uint32_t> failed_generation{0};     // gen that stalled/timed out; wakes its waiter to throw
 };
 
-class ServoController {
+// #47-P3a: ServoController IS the module SlaveControl -- it already owns all the RT
+// policy + state, so it implements the Runner's hooks directly. The library Runner owns
+// the RT thread / pacing / bring-up / teardown; this wrapper owns the Master (persists the
+// resource lifetime) and BORROWS it to a one-shot Runner (rt_runner_, last member ->
+// destroyed first -> ~Runner joins before Master/state tear down).
+class ServoController : public SlaveControl {
    public:
     using BackendFactory = std::function<std::unique_ptr<EcatBackend>()>;
 
@@ -178,8 +184,21 @@ class ServoController {
     // && require_realtime) -> bounded start() handshake. The promise lives in the
     // thread (reconfigure-safe). On exit: leave outputs safe (Halt/disable) + a
     // final process(), then return so join() completes.
-    void run_rt_loop(const std::stop_token& st, std::promise<void> started) noexcept;
-    bool setup_realtime() const noexcept;                // mlockall + mallopt + SCHED_FIFO; false on RT-sched failure
+    // --- SlaveControl hooks (RT; the Runner owns the thread/pacing/bring-up/teardown) ---
+    // on_configured: no-op (field-resolve + vendor reset stay in start(), pre-Runner-start,
+    // single-port-owner -- behavior-identical to today). sync_faulted: the 0x603F==sync_fault_code
+    // bring-up gate. step: drain + snapshot + step_lifecycle + publish (the old steady body).
+    // on_stop: map the Runner's StopReason to the two-tier fault (bring-up abort / bus / clean).
+    void on_configured(ConfigContext& cfg) override;
+    bool sync_faulted(const CycleContext& ctx) const noexcept override;
+    void on_operational(CycleContext& ctx) noexcept override;
+    void step(CycleContext& ctx) noexcept override;
+    void on_stop(StopReason reason) noexcept override;
+
+    // Reset per-run state + construct/attach/start the one-shot Runner; on a start-time
+    // failure → Degraded-but-alive (§8), never rethrows past here. Shared by start()/reconfigure().
+    void spawn_runner();
+    void reset_run_state();                              // zero the per-run atomics + RT-only working state
     void resolve_fields();                               // cache controlword/status/target/actual/velocity FieldLocations
     bool rxpdo_has(std::uint16_t index) const noexcept;  // is `index` mapped in the RxPDO? (optional-field probe)
     bool txpdo_has(std::uint16_t index) const noexcept;  // is `index` mapped in the TxPDO? (optional feedback probe)
@@ -216,6 +235,12 @@ class ServoController {
     std::atomic<bool> stopping_{false};
     std::atomic<std::uint32_t> next_generation_{0};  // non-RT: assigns unique move ids
     std::atomic<std::uint64_t> watchdog_ns_{0};      // RT-liveness window (set at start; config-free reads)
+    // #54 P3a §8 Degraded-but-alive: set when start()/bring-up fails (RT-spawn / on_configured
+    // refusal / drive AL-reject) -- motion APIs throw "{degraded_reason_}", accessors fail-safe,
+    // the process NEVER crashes; reconfigure()/start() clear it on a clean retry. degraded_
+    // (lock-free) gates the accessors; degraded_reason_ is read/written under api_mutex_.
+    std::atomic<bool> degraded_{false};
+    std::string degraded_reason_;  // set (under api_mutex_) on a SYNCHRONOUS start failure; async (RT) failures use last_error()
 
     mutable std::shared_mutex api_mutex_;  // API=shared, lifecycle(start/stop/reconfigure)=exclusive
 
@@ -242,15 +267,16 @@ class ServoController {
     // LIVE (recomputed from master_->fault() each cycle) and is NOT stored here, so a
     // persistent bus fault correctly reappears after a fault_reset.
     RtError latched_ctrl_error_ = RtError::None;
+    mutable std::uint16_t last_sync_code_ = 0;  // #54: 0x603F read in (const) sync_faulted (bring-up), consumed by on_stop(BringupAborted)
 
-    // FSM helpers (RT-only). Defined in the .cpp.
-    std::uint16_t step_lifecycle(Status status, const CommandBatch& batch, std::int32_t actual) noexcept;
-    std::uint16_t step_handshake(std::uint16_t base_cw, Status status) noexcept;
+    // FSM helpers (RT-only). Defined in the .cpp. ctx replaces the old direct master_
+    // output writes / master_->fault() reads (the Runner is the sole Master toucher).
+    std::uint16_t step_lifecycle(CycleContext& ctx, Status status, const CommandBatch& batch, std::int32_t actual) noexcept;
+    std::uint16_t step_handshake(CycleContext& ctx, std::uint16_t base_cw, Status status) noexcept;
     std::uint16_t fault_reset_with_rearm(Status status) noexcept;
-    // `in` is THIS cycle's single input-image snapshot (spec #16 §10): 0x603F is
-    // sliced from the SAME span as statusword/actual, so the code matches the fault
-    // state it is reported with -- structurally, not by timing luck.
-    void publish_state(Status status, std::int32_t actual, std::int32_t velocity, std::span<const std::byte> in) noexcept;
+    // Reads THIS cycle's owned input snapshot via ctx (0x603F, statusword, etc. all from
+    // the same latched image the Runner copied in -- structurally consistent, as before).
+    void publish_state(CycleContext& ctx, Status status, std::int32_t actual, std::int32_t velocity) noexcept;
     // Abort the in-flight move: set BOTH tiers -- latched_ctrl_error_ (+rt_error_
     // for last_error) AND failed_generation+notify (to wake the go_to waiter
     // PROMPTLY). The invariant: every FSM path that fails the active move calls this.
@@ -264,10 +290,13 @@ class ServoController {
     // UAF). master_ unique_ptr -> rebuilt by reconfigure() AFTER join (RT thread
     // is its only cyclic user). rt_thread_ LAST -> destroyed/joined first.
     CommandQueue commands_;
-    std::unique_ptr<Master> master_;
+    std::unique_ptr<Master> master_;  // WRAPPER-OWNED: persists the resource lifetime; the Runner only BORROWS it
     Lifecycle lifecycle_{Init{}};
 
-    std::jthread rt_thread_;  // MUST be last member
+    // #54 P3a: the one-shot library Runner BORROWS master_ + holds *this as its control. LAST
+    // member -> destroyed FIRST -> ~Runner bounded-joins the RT thread + master.close()->INIT
+    // BEFORE master_/commands_/state tear down (the control MUST outlive the Runner).
+    std::unique_ptr<Runner> rt_runner_;  // MUST be last member
 };
 
 }  // namespace ethercat::servo
