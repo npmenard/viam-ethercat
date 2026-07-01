@@ -329,4 +329,79 @@ TEST("#53 PP move-to: reaches target within tol, single bit4 edge, zero-jump-fre
     (void)simp;
 }
 
+// --- #47-P3b sub-step 5 (P3c): the canonical runtime PP->PV mode-switch (§6), through A6Control ---
+// Config variant: 0x6060 (mode-of-op, i8) appended to the RxPDO so the switch can write it cyclically.
+namespace {
+MasterConfig make_cfg_switch() {
+    MasterConfig cfg = make_cfg(Cia402Mode::ProfilePosition);
+    cfg.slaves[0].rxpdo.entries[0x1600].push_back({0x6060, 0, 8});  // #47-P3b 5a: mode-of-op in RxPDO (14->15 B)
+    return cfg;
+}
+SimSlaveModel make_model_switch() {
+    SimSlaveModel m = make_model();
+    m.output_bytes = 15;     // + 0x6060 @ 14
+    m.mode_of_op_off = 14;   // consume 0x6060 from the RxPDO -> effective_mode (echoed on 0x6061)
+    return m;
+}
+}  // namespace
+
+TEST("#47-P3b P3c: runtime PP->PV mode-switch confirms (0x6061=PV) + gives up safe on silent-mismatch") {
+    // SUCCESS: PP move -> reached -> §6 switch (stop-first -> write 0x6060=PV -> 0x6061 echoes PV -> confirm) -> jog.
+    auto sim = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_switch()});
+    SimBackend* simp = sim.get();
+    Master m{make_cfg_switch(), std::move(sim)};
+    m.init();
+    m.configure();
+    Options o;
+    o.enable = true;
+    o.move_pos = true;
+    o.pos_target = 20000;
+    o.pp_vel_cps = 4000;
+    o.pos_tol = 300;
+    o.then_jog_vel = true;  // after the PP move reaches -> SWITCH to PV and jog
+    o.pv_vel_cps = 3000;
+    Telemetry tel;
+    A6Control ctrl(o, tel, Cia402Mode::ProfilePosition);
+    // Ready = 0x6061 (published tel.mode) echoes PV(3): the canonical switch confirmed on the wire.
+    const bool confirmed = run_and_stop(m, ctrl, tel, fast_rc(), [](Telemetry& t) { return t.mode.load() == 3; }, 3000, /*settle_ms=*/20);
+    CHECK(confirmed);                    // the §6 switch completed: 0x6061 confirmed PV
+    CHECK(ctrl.switched_to_vel());       // A6Control latched PP-reached -> requested the switch
+    CHECK_EQ(ctrl.confirmed_mode(), 3);  // policy's last 0x6061 read == PV(3)
+    CHECK(!ctrl.mode_switch_failed());   // clean success, no give-up
+    (void)simp;
+}
+
+TEST("#47-P3b P3c: mode-switch FAILURE -- 0x6061 never echoes (silent-mismatch, #45) -> 'mode-switch failed' + SAFE") {
+    // The drive SILENTLY IGNORES the mode-write (0x6061 stays PP even after 0x6060=PV) -- the #45
+    // shape. The §6 confirm never fires -> within T_switch the switch FAILS -> mode_switch_failed +
+    // the SAFE disposition: give up, revert to the confirmed (PP) mode, stay ENERGIZED at rest (NOT
+    // a de-energize, NOT a lunge, NOT a retry storm).
+    SimSlaveModel model = make_model_switch();
+    model.mode_echo_forced = true;  // force 0x6061 = the OLD mode regardless of 0x6060 (silent-ignore)
+    model.mode_echo_value = 1;      // always echo PP(1)
+    auto sim = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{model});
+    SimBackend* simp = sim.get();
+    Master m{make_cfg_switch(), std::move(sim)};
+    m.init();
+    m.configure();
+    Options o;
+    o.enable = true;
+    o.move_pos = true;
+    o.pos_target = 20000;
+    o.pp_vel_cps = 4000;
+    o.pos_tol = 300;
+    o.then_jog_vel = true;
+    o.pv_vel_cps = 3000;
+    Telemetry tel;
+    A6Control ctrl(o, tel, Cia402Mode::ProfilePosition);
+    // Run to a timeout (0x6061 never becomes PV -> the switch can't confirm; give it time to reach PP,
+    // attempt the switch, and hit the T_switch settle timeout -> fail), then stop + inspect (post-join).
+    run_and_stop(m, ctrl, tel, fast_rc(), [](Telemetry&) { return false; }, 800);
+    CHECK(ctrl.switched_to_vel() == false);   // gave up: reverted to the confirmed mode (not stuck requesting PV)
+    CHECK(ctrl.mode_switch_failed());         // the switch reported failure (silent-mismatch)
+    CHECK_EQ(ctrl.confirmed_mode(), 1);       // still PP(1) -- never entered PV
+    CHECK_EQ(tel.mode.load(), 1);             // 0x6061 held PP the whole time (energized, no mode change)
+    (void)simp;
+}
+
 TEST_MAIN()

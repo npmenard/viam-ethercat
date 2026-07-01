@@ -102,6 +102,7 @@ MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
         {kTargetPosition, 0, 32},
         {kProfileVelocity, 0, 32},
         {kTargetVelocity, 0, 32},  // #53: superset RxPDO -- mapped for the PV mode (target consumed by the held PV path); appended so PP/CSP offsets are unchanged
+        {kModeOfOperation, 0, 8},  // #47-P3b 5a (P3c): mode-of-operation in the RxPDO so the runtime PP<->PV mode-switch can write 0x6060 cyclically (14->15 B; P3c HW step-1 = bring-up re-verify with this map)
     };
 
     a6.txpdo.pdo_indices = {0x1A00};
@@ -146,6 +147,9 @@ int main(int argc, char** argv) {
         } else if (a == "--move-vel" && i + 1 < args.size()) {
             opt.move_vel = true;  // #53 continuous PV until Ctrl-C; requires --enable
             opt.pv_vel_cps = std::stoi(args[++i]);
+        } else if (a == "--then-jog-vel" && i + 1 < args.size()) {
+            opt.then_jog_vel = true;  // #47-P3b P3c: after the --move-pos reaches, SWITCH PP->PV (§6) + jog at VEL until Ctrl-C
+            opt.pv_vel_cps = std::stoi(args[++i]);
         } else if (a == "--pos-tol" && i + 1 < args.size()) {
             opt.pos_tol = std::stoi(args[++i]);  // #53 DA-C: reached tolerance (counts); default 300
         } else if (a == "--move-sine") {
@@ -167,6 +171,8 @@ int main(int argc, char** argv) {
                       << "  --move-pos POS [VEL]: *** MOTION (needs --enable) *** absolute PP move-to POS counts at VEL\n"
                       << "               counts/s (profile vel; default from --move-pp RPM if omitted). Reached = |POS-actual|\n"
                       << "               <= --pos-tol (default 300 counts, #53 DA-C) AND velocity ~0; then holds.\n"
+                      << "  --move-pos POS --then-jog-vel VEL: *** MOTION (needs --enable) *** move to POS (PP), then at\n"
+                      << "                   reach SWITCH PP->PV (runtime 0x6060 mode-switch, P3c) and jog at VEL counts/s until Ctrl-C\n"
                       << "  --move-vel VEL: *** CONTINUOUS MOTION (needs --enable) *** Profile-Velocity at VEL counts/s until\n"
                       << "               Ctrl-C. On stop: CiA402 Quick-Stop (cw=0x0B) -> drive ramps via 0x6085 -> de-energizes\n"
                       << "               at zero (requires 0x605A=2, asserted at configure; 0x6085 written + readback-checked).\n"
