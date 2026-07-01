@@ -366,7 +366,7 @@ TEST("#47-P3c REGRESSION: a 0x6060-MAPPED enable ladder SEEDS the mode from cycl
     o.pos_tol = 300;
     Telemetry tel;
     A6Control ctrl(o, tel, Cia402Mode::ProfilePosition);
-    const bool energized = run_and_stop(m, ctrl, tel, fast_rc(), [](Telemetry& t) { return t.enabled.load(); }, 1500);
+    const bool energized = run_and_stop(m, ctrl, tel, fast_rc(), [](Telemetry& t) { return t.enabled.load(); }, 3000);  // generous deadline (siblings use 3000) -- bring-up is ~tens of ms; headroom vs scheduler hiccups
     CHECK(energized);                                                 // reached OperationEnabled (cw hit 0x0F) -- the fix
     CHECK(!ctrl.mode_refused());                                      // the mode-echo gate did NOT refuse
     CHECK(simp->effective_mode(1) == Cia402Mode::ProfilePosition);    // 0x6060 seeded to PP on the wire through the ladder

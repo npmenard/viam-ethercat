@@ -205,11 +205,14 @@ void SimBackend::step_device(Slave& s) noexcept {
     if (s.model.mode_of_op_off >= 0) {
         const auto m = static_cast<std::int8_t>(out[static_cast<std::size_t>(s.model.mode_of_op_off)]);
         const auto requested = static_cast<Cia402Mode>(m);
-        // #47-P3c FIDELITY (wire-confirmed): a MAPPED 0x6060 OVERRIDES the SDO default -- the A6 follows
-        // the RxPDO mode-of-operation once cycling, so a wire 0 means mode 0 (NO mode), NOT "keep the
-        // SDO-set mode." Before this the sim kept echoing the SDO default on a wire 0, so a policy that
-        // failed to seed 0x6060 through the enable ladder still PASSED the mode-echo gate offline -- the
-        // P3c enable-ladder bug was invisible in sim. Now 0x6061 tracks the PDO, and a mis-seed fails.
+        // #47-P3c FIDELITY -- GENERIC CiA402, NOT a device flag (DA device-agnostic check): when 0x6060 is
+        // RxPDO-MAPPED, a PDO value OVERRIDES the SDO-set default for ANY drive (PDO-overrides-SDO for a
+        // mapped object is standard CoE), so ModeDisplay(0x6061) FOLLOWS the PDO byte -- a wire 0 means
+        // mode 0 (NO mode), NOT "keep the SDO-set mode." (Only when 0x6060 is NOT mapped does the SDO
+        // default stand -- that path skips this whole block.) Before this, the sim echoed the SDO default
+        // on a wire 0, so a policy that failed to seed 0x6060 through the enable ladder still PASSED the
+        // mode-echo gate offline -- the P3c enable-ladder bug (its A6 instance) was invisible in sim. Now
+        // 0x6061 tracks the PDO for A6 AND M56S alike, and a mis-seed fails the gate.
         if (m == 0) {
             s.effective_mode = Cia402Mode::None;
             s.mode_pending = Cia402Mode::None;
