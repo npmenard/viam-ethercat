@@ -326,8 +326,13 @@ TEST("ServoController(PV): LIFECYCLE-stop is a RAMP-then-disable, not a torque-c
     // straight torque-cut / disable-voltage) AND it left QuickStopActive with |vel| <= threshold
     // (de-energized only AFTER the ramp -- the #53 landmark). The VEL guard makes the command
     // rampable-in-window, so the ramp completes inside the teardown window.
+    // NON-VACUOUS by construction (team-lead): drive the MAX-CLAMPED velocity (the largest the VEL
+    // guard permits for this 0x6085 + window) with a ramp that needs ~the FULL window -- so a
+    // 2-cycle teardown CANNOT complete the ramp (torque-cut) but the sized window CAN. budget =
+    // 200000 x (0.100 - 0.050) = 10000 counts/s; the sim ramps at 150/cycle -> ~67 cycles to reach
+    // rest (>> 2, < the 100-cycle sized window). set_rpm(3000) clamps to the 10000 ceiling.
     SimSlaveModel m = make_model(ControlMode::ProfileVelocity, /*feedback=*/true);
-    m.quick_stop_decel_step = 2500;  // ramp 5000 -> 2500 -> 0 (reaches its zero + auto-disables well inside teardown)
+    m.quick_stop_decel_step = 150;  // ~67 cycles to ramp the 10000 max-clamped velocity to 0
     SimBackend* simp = nullptr;
     ServoController::BackendFactory factory = [m, &simp] {
         auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m});
@@ -335,13 +340,13 @@ TEST("ServoController(PV): LIFECYCLE-stop is a RAMP-then-disable, not a torque-c
         return std::unique_ptr<EcatBackend>(std::move(be));
     };
     ServoConfig cfg = make_config(ControlMode::ProfileVelocity, /*feedback=*/true);
-    cfg.quick_stop_decel = 100'000;  // budget = 100000 * (0.100 - 0.050) = 5000 counts/s
-    cfg.controlled_stop_window_ms = 100;
+    cfg.quick_stop_decel = 200'000;         // budget = 200000 * (0.100 - 0.050) = 10000 counts/s
+    cfg.controlled_stop_window_ms = 100;    // teardown window = 100 cycles @1kHz (>> the ~67-cycle ramp)
     cfg.velocity_threshold = 2000;
     ServoController ctrl{cfg, factory};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
-    ctrl.set_rpm(60.0);  // clamped to ~5000 counts/s by the guard (velocity_counts reads ~5000 in feedback mode)
+    ctrl.set_rpm(3000.0);  // >> ceiling -> clamped to the 10000 max the guard permits (needs the full window to ramp)
     CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(300)));
     ctrl.stop();  // LIFECYCLE-stop -> Quick-Stop (ramp, energized) -> de-energize at REST
     CHECK(simp != nullptr);
