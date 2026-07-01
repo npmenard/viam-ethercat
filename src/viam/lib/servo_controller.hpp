@@ -187,6 +187,7 @@ class ServoController : public SlaveControl {
         FaultResetFailed,
         MotorStopped,   // #47-P3b R3: an in-flight move CANCELLED by stop()/halt() -> waiter throws
         MotorDisabled,  // #47-P3b R3: an in-flight move CANCELLED by disable() (operator de-energize) -> waiter throws
+        ModeMismatch,   // #47-P3c/#57: 0x6061 != commanded mode at SwitchedOn -> REFUSE to energize (fail-closed, #45)
     };
 
     // The RT thread body (loop while !st.stop_requested()). `started` is fulfilled
@@ -239,6 +240,19 @@ class ServoController : public SlaveControl {
     FieldLocation f_actual_;
     FieldLocation f_velocity_;
     FieldLocation f_profile_velocity_;  // 0x6081 PP move speed; !mapped() if not in the map (optional)
+    // #47-P3c/#57 enable-ladder mode fields (OPTIONAL). The module's own enable FSM (not the policy)
+    // climbs to OE, so it must itself (a) SEED 0x6060 = commanded mode through the ladder when 0x6060 is
+    // RxPDO-mapped (else a PDO-following drive enables in mode 0 -- the #56 shape, bench maps only), and
+    // (b) enforce the #45 mode-echo GATE when 0x6061 is TxPDO-mapped (refuse OE if 0x6061 != commanded --
+    // the A6 production map DOES map 0x6061). Both !mapped() => the respective step is inert.
+    FieldLocation f_mode_wr_;    // 0x6060 mode-of-operation (RxPDO write); !mapped() => SDO-set only (prod)
+    FieldLocation f_mode_disp_;  // 0x6061 mode-display (TxPDO read); !mapped() => no mode-echo gate
+    // #47-P3c/#57 enable-time mode-echo gate state (RT-only). STICKY once resolved so the drive doesn't
+    // oscillate RTSO<->SwitchedOn: Pending until the drive is SwitchedOn with 0x6061 mapped, then Passed
+    // (0x6061 == commanded -> allow OE) or Failed (mismatch -> latch RtError::ModeMismatch + de-energize).
+    // Reset to Pending on Init->Enabling so a fresh bring-up / fault-recovery re-checks.
+    enum class ModeGate : std::uint8_t { Pending, Passed, Failed };
+    ModeGate mode_gate_ = ModeGate::Pending;
     // TxPDO feedback fields (spec #16). Both OPTIONAL (!mapped() => not in the map):
     FieldLocation f_fault_code_;       // 0x603F U16 drive error code (last_error gloss)
     FieldLocation f_velocity_actual_;  // 0x606C S32 velocity-actual (wire velocity; else estimate)

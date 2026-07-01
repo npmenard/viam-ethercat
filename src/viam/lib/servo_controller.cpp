@@ -26,6 +26,7 @@ constexpr std::uint16_t kActualPos = 0x6064;
 constexpr std::uint16_t kTargetVel = 0x60FF;
 constexpr std::uint16_t kProfileVel = 0x6081;  // PP move speed (carries the GoTo/GoFor rpm); optional in the map
 constexpr std::uint16_t kModeOfOp = 0x6060;    // runtime mode-of-operation (RxPDO); present => PV->PP hold-switch (M6)
+constexpr std::uint16_t kModeDisplay = 0x6061;  // mode display (TxPDO); present => enable-time mode-echo gate (#45/#57)
 constexpr std::uint16_t kFaultCode = 0x603F;   // drive error code (TxPDO, optional feedback)
 // #TODO-4: the A6's "no-SYNC0" code (0x8700 / Er74.1) is NO LONGER a constant here --
 // it's CONFIG DATA (ServoConfig::sync_fault_code), so this generic core carries no
@@ -287,6 +288,11 @@ void ServoController::resolve_fields() {
     // RT loop falls back (velocity estimate) / omits the tier (fault code).
     f_fault_code_ = txpdo_has(kFaultCode) ? master_->tx_field(s, kFaultCode, 0) : FieldLocation{};
     f_velocity_actual_ = txpdo_has(kVelActual) ? master_->tx_field(s, kVelActual, 0) : FieldLocation{};
+    // #47-P3c/#57 enable-ladder mode fields: 0x6060 (write, seed the mode through the ladder) is present
+    // only in a PDO-mapped-0x6060 map (bench/M6); 0x6061 (read, the mode-echo gate) is present in the A6
+    // production map. Both optional -> !mapped() makes the respective enable-ladder step inert.
+    f_mode_wr_ = rxpdo_has(kModeOfOp) ? master_->rx_field(s, kModeOfOp, 0) : FieldLocation{};
+    f_mode_disp_ = txpdo_has(kModeDisplay) ? master_->tx_field(s, kModeDisplay, 0) : FieldLocation{};
 
     // #47-P3b R1 opt-out OBSERVABILITY (DA): a module WITHOUT a configured quick_stop_decel stops
     // via UNCONTROLLED disable-voltage coast -- a known, predictable coast, safe BECAUSE we won't
@@ -412,6 +418,7 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             lifecycle_ = Faulted{};
         } else {
             lifecycle_ = Enabling{};
+            mode_gate_ = ModeGate::Pending;  // #57: re-arm the mode-echo gate for this bring-up
         }
         return ControlWord::disable_voltage();
     }
@@ -419,6 +426,34 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         if (dev == Cia402State::Fault) {
             lifecycle_ = Faulted{};
             return ControlWord::disable_voltage();  // latch the fault; reset is EXPLICIT (Faulted handles it)
+        }
+        // #47-P3c/#57: SEED 0x6060 = commanded mode through the enable ladder. The module's OWN enable FSM
+        // (not the policy, which is stepped only post-OE) drives the ladder, so it must write the mode
+        // itself -- else on a PDO-mapped-0x6060 map the drive follows the PDO (=0) and enables in mode 0.
+        // Inert when 0x6060 is SDO-set only (production): f_mode_wr_ !mapped().
+        if (f_mode_wr_.mapped()) {
+            ctx.store<cia402::ModeOfOperation::type>(f_mode_wr_, static_cast<std::int8_t>(to_cia402_mode(config_.mode)));
+        }
+        // #47-P3c/#57 MODE-ECHO GATE (#45 fail-closed, in the module's OWN ladder): once the drive is
+        // SwitchedOn the commanded mode should be adopted (SDO-set at configure, or PDO-seeded above), so
+        // require 0x6061 == commanded BEFORE energizing to OE. A mismatch (the A6 silently ignored the
+        // mode) latches Failed -> de-energize + RtError::ModeMismatch (last_error), STICKY (no RTSO<->SO
+        // oscillation). Inert when 0x6061 isn't mapped. Mirrors the policy's line-232 gate, which the
+        // module never reaches (it delegates to the policy only post-OE).
+        if (mode_gate_ == ModeGate::Pending && f_mode_disp_.mapped() &&
+            (dev == Cia402State::SwitchedOn || dev == Cia402State::OperationEnabled)) {
+            const auto want = static_cast<std::int8_t>(to_cia402_mode(config_.mode));
+            const auto echo = ctx.load<cia402::ModeDisplay::type>(f_mode_disp_);
+            if (echo == want) {
+                mode_gate_ = ModeGate::Passed;
+            } else {
+                mode_gate_ = ModeGate::Failed;
+                latched_ctrl_error_ = RtError::ModeMismatch;
+                rt_error_.store(RtError::ModeMismatch, std::memory_order_release);
+            }
+        }
+        if (mode_gate_ == ModeGate::Failed) {
+            return ControlWord::disable_voltage();  // REFUSE: fail-closed, stay de-energized (is_powered false)
         }
         if (dev == Cia402State::OperationEnabled) {
             lifecycle_ = Operational{};
@@ -1058,6 +1093,9 @@ std::string ServoController::last_error() const {
             break;
         case RtError::MotorDisabled:
             append("motor disabled");
+            break;
+        case RtError::ModeMismatch:
+            append("drive mode-of-operation (0x6061) did not match the commanded mode -- refused to energize");
             break;
         case RtError::None:
             break;

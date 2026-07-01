@@ -467,6 +467,63 @@ TEST("ServoController(PV): M6 -- a PV->PP hold-switch that can't confirm stays E
     CHECK(simp->effective_mode(1) == ethercat::Cia402Mode::ProfileVelocity);  // reverted to PV (interim bit8 hold), not stuck in PP
 }
 
+namespace {
+// #47-P3c/#57: a switch-capable A6-shaped module config that maps BOTH 0x6060 (RxPDO) AND 0x6061 (TxPDO
+// mode-display) -- the piece the standard make_model omits, which hid the module's enable-seed + #45 gate
+// offline. 0x6061 @12 in the feedback TxPDO (status@0, actual@2, 603F@6, 606C@8, 6061@12 -> 13 B).
+ServoConfig make_config_modegate() {
+    ServoConfig c = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
+    c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16},
+                              PdoEntry{0x606C, 0, 32}, PdoEntry{0x6061, 0, 8}};
+    return c;
+}
+SimSlaveModel make_model_modegate() {
+    SimSlaveModel m = make_model(ControlMode::ProfilePosition, /*feedback=*/true);
+    m.input_bytes = 13;
+    m.mode_display_off = 12;  // 0x6061 follows the PDO 0x6060 (faithful sim) unless mode_echo_forced
+    return m;
+}
+}  // namespace
+
+TEST("#47-P3c/#57: module 0x6060+0x6061-mapped enable ladder reaches OE with the mode seeded (non-vacuous vs the seed)") {
+    // The module's OWN enable FSM seeds 0x6060 through the ladder; the faithful sim makes 0x6061 follow
+    // the PDO mode, so the mode-echo gate sees 0x6061 == PP and allows OE. NON-VACUOUS vs the seed: with
+    // the Enabling-branch seed disabled, wire 0x6060=0 -> 0x6061=0 != PP -> the gate refuses -> never
+    // powered -> this FAILS. (Mirrors a6_control's P3c REGRESSION but through the MODULE's own ladder.)
+    SimBackend* sim = nullptr;
+    ServoController::BackendFactory factory = [&sim] {
+        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_modegate()});
+        sim = be.get();
+        return std::unique_ptr<EcatBackend>(std::move(be));
+    };
+    ServoController ctrl{make_config_modegate(), factory};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));  // seed -> 0x6061=PP -> gate Passed -> OE
+    (void)sim;
+}
+
+TEST("#47-P3c/#57: module mode-echo MISMATCH (0x6061 != commanded) REFUSES to energize (#45 fail-closed, last_error)") {
+    // The #45 safety gate, now ACTIVE in the module's ladder (was structurally absent -- fsm_ was
+    // mode-blind). The drive reports 0x6061 = CSP(8) != commanded PP(1) (silent-ignore shape) -> the gate
+    // latches Failed -> de-energizes + surfaces RtError::ModeMismatch via last_error(). NON-VACUOUS vs the
+    // gate: without it the module energizes into the wrong mode (is_powered true).
+    SimSlaveModel m = make_model_modegate();
+    m.mode_echo_forced = true;
+    m.mode_echo_value = 8;  // CSP(8) != commanded PP(1): the drive "silently ignored" the mode-set
+    SimBackend* sim = nullptr;
+    ServoController::BackendFactory factory = [m, &sim] {
+        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m});
+        sim = be.get();
+        return std::unique_ptr<EcatBackend>(std::move(be));
+    };
+    ServoController ctrl{make_config_modegate(), factory};
+    ctrl.start();
+    const bool powered = wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(400));
+    CHECK(!powered);                                                              // REFUSED: never energized into the wrong mode
+    CHECK(ctrl.last_error().find("mode-of-operation") != std::string::npos);      // diagnosable: last_error names the mismatch
+    (void)sim;
+}
+
 TEST("ServoController(PV): a displaced, stopped motor reports is_moving == false") {
     // Regression for the PP-predicate-in-PV bug: target_counts_ is never set in PV,
     // so the old position-tolerance predicate reported a stopped-but-displaced PV
