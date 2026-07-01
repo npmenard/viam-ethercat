@@ -77,7 +77,8 @@ for which of the behaviors below are A6-specific vs generic CiA402).
   The CiA402 "resume from QuickStopActive" transition (T16) exists **only for
   605A ∈ 5–7** and is therefore unreachable at default.
 - **Manual:** 0x605A entry (RW, I16, 0–7, default 2, **not PDO-mappable**,
-  modifiable during operation but **effective only upon re-power-on**;
+  modifiable during operation but **effective only upon re-power-on**
+  (per the parameter-list "Effective Time" attribute, §11.2.2; OD row
   a6.txt:13499); value meanings (a6.txt:14656-14663): 0–3 = stop "keeping
   de-energized status" (→ SwitchOnDisabled), 5–7 = stop "keeping **position
   lock** status" (the stay-in-QuickStopActive variants; value 4 is undefined);
