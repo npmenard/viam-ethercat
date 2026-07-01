@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "ethercat/cia402.hpp"
+#include "ethercat/cia402_policy.hpp"  // #47-P3b: the generic policy this control now wraps for PP/PV
 #include "ethercat/errors.hpp"
 #include "ethercat/master.hpp"
 #include "ethercat/pdo_buffer.hpp"
@@ -126,7 +127,8 @@ class A6Control final : public SlaveControl {
    public:
     // `mode` is the commanded 0x6060 (the CLI mode); its int8 value is what 0x6061 must
     // echo before we enable (#53 DA-B). build_a6_config() set the SAME mode at configure.
-    A6Control(const Options& opt, Telemetry& tel, Cia402Mode mode) noexcept : opt_(opt), tel_(tel) {
+    A6Control(const Options& opt, Telemetry& tel, Cia402Mode mode) noexcept
+        : opt_(opt), tel_(tel), policy_(make_a6_profile(opt)) {
         goal_ = opt_.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
         profile_vel_ = static_cast<std::uint32_t>(opt_.move_rpm / 60.0 * kCountsPerRev);
         commanded_mode_disp_ = static_cast<std::int8_t>(mode);  // 0x6061 echo target (PP=1, PV=3, CSP=8)
@@ -148,43 +150,22 @@ class A6Control final : public SlaveControl {
         mode_loc_ = cfg.resolve_tx<cia402::ModeDisplay>();
         tv_loc_ = cfg.resolve_rx<cia402::TargetVelocity>();  // #53: PV target (also over-mapped in PP/CSP, inert)
 
-        // #53 PV configure-time, pre-energize refusals (fail-closed -- a throw here aborts
-        // start() cleanly, before any motion). Only for --move-vel.
-        if (opt_.move_vel) {
-            // 0x605A (quick-stop option) ASSERT == 2 (DA Finding 2 / Q4): the 0x6085-decel ->
-            // auto-SwitchOnDisabled regime the PV stop relies on. Do NOT write it (a warm
-            // write needs a control-power cycle to apply) -- read-and-require.
-            std::array<std::byte, 2> qso{};
-            const std::size_t n = cfg.sdo_read(kQuickStopOption, 0, qso);
-            const std::int16_t qs_opt = n >= 2 ? load_le<std::int16_t>(qso) : std::int16_t{-1};
-            if (qs_opt != kQuickStopOptionRequired) {
-                throw ConfigError("A6Control: 0x605A (quick-stop option) = " + std::to_string(qs_opt) +
-                                  ", require == 2 (decel on 0x6085 then auto SwitchOnDisabled). Refusing to energize "
-                                  "PV -- a different option silently breaks the controlled-stop premise (0=coast, "
-                                  "1=decel on 0x6084). Fix the drive's 0x605A (control-power-cycle it) and retry.");
-            }
-            // 0x6085 (quick-stop decel) write + readback-echo (DA-A): use the ECHOED value
-            // for the VEL guard + the HW decel-slope expectation, never the commanded value.
-            cfg.sdo_write(kQuickStopDecel, 0, sdo_value<std::uint32_t>(kQuickStopDecelDefault));
-            std::array<std::byte, 4> qd{};
-            const std::size_t m = cfg.sdo_read(kQuickStopDecel, 0, qd);
-            const std::uint32_t echoed = m >= 4 ? load_le<std::uint32_t>(qd) : 0U;
-            if (echoed == 0U) {
-                throw ConfigError("A6Control: 0x6085 (quick-stop decel) readback = 0 / absent after write. Refusing to "
-                                  "energize PV -- without a real decel the quick-stop can't stop the motor in the window.");
-            }
-            qs_decel_echoed_ = echoed;
-            // VEL guard (DA-H): with the echoed decel and the window W, a too-large VEL can't
-            // ramp to 0 in time. Both are known now -> refuse at configure (fail-closed),
-            // making "the window covers the worst-case decel" TRUE by construction.
-            const double window_s = static_cast<double>(kPvTeardownCycles) / static_cast<double>(kLoopHz);
-            const double vel_max = static_cast<double>(echoed) * (window_s - kVelGuardMarginS);
-            if (std::abs(static_cast<double>(opt_.pv_vel_cps)) > vel_max) {
-                throw ConfigError("A6Control: --move-vel " + std::to_string(opt_.pv_vel_cps) +
-                                  " counts/s exceeds the quick-stop window budget (|VEL| <= 0x6085 * (W - margin) = " +
-                                  std::to_string(static_cast<long long>(vel_max)) + " counts/s for 0x6085=" +
-                                  std::to_string(echoed) + ", W=" + std::to_string(window_s) +
-                                  "s). Refusing to energize -- it could not ramp to 0 before de-energize.");
+        // #47-P3b: the GENERIC policy owns the PV configure-time refusals (0x605A assert +
+        // 0x6085 write/readback-echo) -- it resolves its OWN field handles from the same cfg.
+        // The VEL guard stays a WRAPPER concern (it needs the commanded velocity + the window,
+        // both bench/units-known -- §4/FOLD 1). All fail-closed (a throw aborts start()).
+        if (uses_policy_()) {
+            const std::uint32_t echoed = policy_.configure(cfg, /*needs_quick_stop=*/opt_.move_vel);
+            if (opt_.move_vel) {
+                const double window_s = static_cast<double>(kPvTeardownCycles) / static_cast<double>(kLoopHz);
+                const double vel_max = static_cast<double>(echoed) * (window_s - kVelGuardMarginS);
+                if (std::abs(static_cast<double>(opt_.pv_vel_cps)) > vel_max) {
+                    throw ConfigError("A6Control: --move-vel " + std::to_string(opt_.pv_vel_cps) +
+                                      " counts/s exceeds the quick-stop window budget (|VEL| <= 0x6085 * (W - margin) = " +
+                                      std::to_string(static_cast<long long>(vel_max)) + " counts/s for 0x6085=" +
+                                      std::to_string(echoed) + ", W=" + std::to_string(window_s) +
+                                      "s). Refusing to energize -- it could not ramp to 0 before de-energize.");
+                }
             }
         }
     }
@@ -221,6 +202,10 @@ class A6Control final : public SlaveControl {
     // cycle's latched feedback), stores at the bottom (ship with the NEXT exchange --
     // the same +1-cycle latency the old make_tpdo/submit had).
     void step(CycleContext& ctx) noexcept override {
+        if (uses_policy_()) {  // #47-P3b: --move-pos / --move-vel are driven by the generic policy
+            step_policy_(ctx);
+            return;
+        }
         const Status status{ctx.load<cia402::Statusword::type>(sw_loc_)};
         const std::int32_t pos = ctx.load<cia402::PositionActual::type>(pos_loc_);
         const std::int32_t vel = ctx.load<cia402::VelocityActual::type>(vel_loc_);
@@ -450,19 +435,51 @@ class A6Control final : public SlaveControl {
 
     // --- read-after-stop accessors (offline tests; the join is the happens-before edge) ---
     bool move_done() const noexcept {
-        return move_done_;
+        return uses_policy_() ? policy_.state().reached : move_done_;
     }
     bool mode_refused() const noexcept {
-        return mode_refused_;
+        return uses_policy_() ? policy_.state().mode_mismatch : mode_refused_;
     }
     int bit4_edges() const noexcept {
-        return bit4_edges_;
+        return uses_policy_() ? policy_.bit4_edges() : bit4_edges_;
     }
     std::uint32_t qs_decel_echoed() const noexcept {
-        return qs_decel_echoed_;
+        return uses_policy_() ? policy_.qs_decel_echoed() : qs_decel_echoed_;
     }
 
    private:
+    // #47-P3b: drive the generic policy for --move-pos (PP absolute) / --move-vel (PV). The
+    // wrapper builds the per-cycle Command from the CLI opts, hands it to the policy, publishes
+    // telemetry from the policy's outputs + the ctx feedback, and ends a completed move-to. The
+    // policy owns ALL the CiA402 sequencing (enable ladder, mode-echo, bit4 handshake, quick-stop,
+    // reached). This tool keeps its own CSP-sine / PP-relative / plain-hold paths (bench-only).
+    void step_policy_(CycleContext& ctx) noexcept {
+        PolicyCommand cmd;
+        cmd.mode = opt_.move_vel ? Cia402Mode::ProfileVelocity : Cia402Mode::ProfilePosition;
+        cmd.enable = opt_.enable;
+        cmd.target_counts = opt_.pos_target;
+        cmd.profile_velocity = pp_profile_vel_;
+        cmd.target_velocity = opt_.pv_vel_cps;
+        cmd.token = 1;  // one bench move per invocation
+        const std::uint16_t cw = policy_.step(ctx, cmd);
+
+        // move-to finishes on reached; continuous PV runs until Ctrl-C -> request_stop.
+        if (opt_.move_pos && policy_.state().reached && ctx.cycle() % 500 == 0) {
+            ctx.request_stop();
+        }
+        // Bench telemetry: the same feedback the policy read this cycle.
+        const Status status{ctx.load<cia402::Statusword::type>(sw_loc_)};
+        const std::int32_t pos = ctx.load<cia402::PositionActual::type>(pos_loc_);
+        const std::int32_t vel = ctx.load<cia402::VelocityActual::type>(vel_loc_);
+        const std::uint16_t fc = ctx.load<cia402::FaultCode::type>(fc_loc_);
+        if (status.operation_enabled() && !announced_op_) {
+            announced_op_ = true;
+            tel_.enabled.store(true, std::memory_order_relaxed);
+        }
+        target_ = opt_.move_vel ? opt_.pv_vel_cps : opt_.pos_target;  // telemetry cmdTarget
+        publish(status.raw, fc, cw, pos, vel, ctx.cycle(), ctx);
+    }
+
     void publish(std::uint16_t sw,
                  std::uint16_t fc,
                  std::uint16_t cw,
@@ -482,8 +499,28 @@ class A6Control final : public SlaveControl {
         tel_.bad_wkc.store(ctx.wkc().bad_cycles, std::memory_order_relaxed);
     }
 
+    // #47-P3b: --move-pos / --move-vel run through the GENERIC policy; the bench-only CSP-sine
+    // (--move-sine) + PP-relative (--move-pp) + plain-hold paths stay as this tool's own code.
+    bool uses_policy_() const noexcept {
+        return opt_.move_pos || opt_.move_vel;
+    }
+    // The A6 DeviceProfile -- the tiny per-device residual. In-loop reset = CiA402 bit7 (the
+    // A6's vendor 0x2031:01 reset is a pre-start SDO run by main(), not the policy); the rest
+    // are the standard CiA402 tunables the bench uses. NO A6 codes leak into the generic policy.
+    static DeviceProfile make_a6_profile(const Options& opt) noexcept {
+        DeviceProfile p;
+        p.fault_reset = DeviceProfile::FaultReset::Cia402Bit7;
+        p.position_tolerance = opt.pos_tol;
+        p.zero_vel_threshold = kZeroVelThresh;
+        p.zero_vel_debounce = kZeroVelDebounce;
+        p.quick_stop_decel = kQuickStopDecelDefault;
+        p.quick_stop_option = kQuickStopOptionRequired;
+        return p;
+    }
+
     const Options& opt_;
     Telemetry& tel_;
+    Cia402Policy policy_;
     Cia402Fsm fsm_;
     Cia402State goal_ = Cia402State::ReadyToSwitchOn;
     std::uint32_t profile_vel_ = 0;
