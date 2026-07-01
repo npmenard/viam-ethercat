@@ -227,6 +227,18 @@ class Cia402Policy {
         const bool faulted = status.decode() == Cia402State::Fault;
         state_.phase = faulted ? PolicyState::Phase::Faulted : state_.phase;
 
+        // #47-P3c (WIRE-CONFIRMED bug fix): a MAPPED 0x6060 must carry the commanded mode from CYCLE 0
+        // -- BEFORE the mode-echo gate below and through the WHOLE enable ladder. The A6 follows the
+        // RxPDO mode-of-operation over the SDO default once it is cycling, so if 0x6060 is only written
+        // post-OperationEnabled (drive_operational_) it stays 0 through the ladder, the drive never
+        // adopts the commanded mode, and the gate sees 0x6061 != commanded -> SILENT request_stop (the
+        // move never happens; observed on the wire, cw stuck at 0x07). Seed it here every cycle EXCEPT
+        // while a mode-switch owns 0x6060 (run_mode_switch_ writes the transitional mode; the switch is
+        // post-OE anyway). Post-OE-steady this matches drive_operational_'s write (redundant, harmless).
+        if (mode_wr_loc_.mapped() && ms_phase_ == ModeSwitch::None) {
+            ctx.store<cia402::ModeOfOperation::type>(mode_wr_loc_, static_cast<std::int8_t>(cmd.mode));
+        }
+
         // MODE-ECHO fail-closed (#45, load-bearing for PV): before climbing to OperationEnabled,
         // at SwitchedOn require 0x6061 == the commanded mode; a mismatch refuses to enable.
         if (cmd.enable && !mode_checked_ && !state_.mode_mismatch && status.switched_on() && !status.operation_enabled()) {

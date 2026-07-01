@@ -204,25 +204,31 @@ void SimBackend::step_device(Slave& s) noexcept {
     // field mapped but not yet written) leaves effective_mode unchanged -- the drive keeps its mode.
     if (s.model.mode_of_op_off >= 0) {
         const auto m = static_cast<std::int8_t>(out[static_cast<std::size_t>(s.model.mode_of_op_off)]);
-        if (m != 0) {
-            const auto requested = static_cast<Cia402Mode>(m);
-            if (requested == s.model.unsupported_mode) {
-                // #47-P3b M56S: the drive REJECTS an unsupported mode -- effective_mode does NOT change,
-                // so 0x6061 never echoes it and the policy's confirm times out (mode_switch_failed).
-                s.mode_pending = Cia402Mode::None;
-            } else if (requested == s.effective_mode) {
-                s.mode_pending = Cia402Mode::None;  // already there -- nothing pending
-            } else if (s.effective_mode == Cia402Mode::None || s.model.mode_switch_latency == 0) {
-                // Initial establishment (None -> first mode) is ALWAYS instant so the enable-time mode-echo
-                // gate isn't tripped; the latency models a RUNTIME mode CHANGE. mode_switch_latency==0 = A6.
-                s.effective_mode = requested;
-            } else if (s.mode_pending != requested) {
-                s.mode_pending = requested;  // #47-P3b M56S: start the slow-transition countdown
-                s.mode_pending_cycles = s.model.mode_switch_latency;
-            } else if (--s.mode_pending_cycles == 0) {
-                s.effective_mode = requested;  // latency elapsed -> the switch APPLIES; 0x6061 now echoes it
-                s.mode_pending = Cia402Mode::None;
-            }
+        const auto requested = static_cast<Cia402Mode>(m);
+        // #47-P3c FIDELITY (wire-confirmed): a MAPPED 0x6060 OVERRIDES the SDO default -- the A6 follows
+        // the RxPDO mode-of-operation once cycling, so a wire 0 means mode 0 (NO mode), NOT "keep the
+        // SDO-set mode." Before this the sim kept echoing the SDO default on a wire 0, so a policy that
+        // failed to seed 0x6060 through the enable ladder still PASSED the mode-echo gate offline -- the
+        // P3c enable-ladder bug was invisible in sim. Now 0x6061 tracks the PDO, and a mis-seed fails.
+        if (m == 0) {
+            s.effective_mode = Cia402Mode::None;
+            s.mode_pending = Cia402Mode::None;
+        } else if (requested == s.model.unsupported_mode) {
+            // #47-P3b M56S: the drive REJECTS an unsupported mode -- effective_mode does NOT change,
+            // so 0x6061 never echoes it and the policy's confirm times out (mode_switch_failed).
+            s.mode_pending = Cia402Mode::None;
+        } else if (requested == s.effective_mode) {
+            s.mode_pending = Cia402Mode::None;  // already there -- nothing pending
+        } else if (s.effective_mode == Cia402Mode::None || s.model.mode_switch_latency == 0) {
+            // Establishment (None -> first mode) is ALWAYS instant; the latency models a RUNTIME mode
+            // CHANGE between two live modes. mode_switch_latency==0 = the A6 (instant).
+            s.effective_mode = requested;
+        } else if (s.mode_pending != requested) {
+            s.mode_pending = requested;  // #47-P3b M56S: start the slow-transition countdown
+            s.mode_pending_cycles = s.model.mode_switch_latency;
+        } else if (--s.mode_pending_cycles == 0) {
+            s.effective_mode = requested;  // latency elapsed -> the switch APPLIES; 0x6061 now echoes it
+            s.mode_pending = Cia402Mode::None;
         }
     }
 

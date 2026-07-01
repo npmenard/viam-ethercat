@@ -345,6 +345,34 @@ SimSlaveModel make_model_switch() {
 }
 }  // namespace
 
+TEST("#47-P3c REGRESSION: a 0x6060-MAPPED enable ladder SEEDS the mode from cycle 0 -> reaches OperationEnabled") {
+    // WIRE-CONFIRMED bug (tcpdump, energized P3c run): 0x6060 was only written INSIDE drive_operational_
+    // (post-OperationEnabled), so with 0x6060 RxPDO-mapped the drive sat at mode 0 through the entire
+    // enable ladder -- the A6 follows the PDO mode over the SDO default once cycling -> 0x6061 != commanded
+    // PP -> the mode-echo gate SILENTLY request_stop'd (cw stuck at 0x07, the move never happened). The fix
+    // seeds 0x6060 = commanded mode from cycle 0 (before the gate). This test asserts the ladder REACHES
+    // OperationEnabled with the mode seeded on the wire. FAILS on the pre-fix policy (never energizes);
+    // relies on the faithful sim (0x6061 FOLLOWS the PDO mode) -- together they make the bug reproducible.
+    auto sim = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_switch()});
+    SimBackend* simp = sim.get();
+    Master m{make_cfg_switch(), std::move(sim)};
+    m.init();
+    m.configure();
+    Options o;
+    o.enable = true;
+    o.move_pos = true;
+    o.pos_target = 20000;
+    o.pp_vel_cps = 4000;
+    o.pos_tol = 300;
+    Telemetry tel;
+    A6Control ctrl(o, tel, Cia402Mode::ProfilePosition);
+    const bool energized = run_and_stop(m, ctrl, tel, fast_rc(), [](Telemetry& t) { return t.enabled.load(); }, 1500);
+    CHECK(energized);                                                 // reached OperationEnabled (cw hit 0x0F) -- the fix
+    CHECK(!ctrl.mode_refused());                                      // the mode-echo gate did NOT refuse
+    CHECK(simp->effective_mode(1) == Cia402Mode::ProfilePosition);    // 0x6060 seeded to PP on the wire through the ladder
+    CHECK_EQ(tel.mode.load(), 1);                                     // 0x6061 echoes PP (the drive adopted the commanded mode)
+}
+
 TEST("#47-P3b P3c: runtime PP->PV mode-switch confirms (0x6061=PV) + gives up safe on silent-mismatch") {
     // SUCCESS: PP move -> reached -> §6 switch (stop-first -> write 0x6060=PV -> 0x6061 echoes PV -> confirm) -> jog.
     auto sim = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_switch()});
