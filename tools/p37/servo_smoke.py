@@ -24,8 +24,9 @@ def _opts():
     key, kid = os.getenv("VIAM_API_KEY"), os.getenv("VIAM_API_KEY_ID")
     if key and kid:
         return RobotClient.Options.with_api_key(api_key=key, api_key_id=kid)
-    # local-only viam-server (no cloud auth): connect with insecure/no creds.
-    return RobotClient.Options(dial_options=None)  # adjust per your local server's auth
+    # local-only viam-server (no cloud auth): insecure gRPC, no WebRTC signaling.
+    from viam.rpc.dial import DialOptions
+    return RobotClient.Options(dial_options=DialOptions(insecure=True, disable_webrtc=True))
 
 async def main() -> int:
     ap = argparse.ArgumentParser()
