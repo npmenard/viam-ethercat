@@ -256,6 +256,20 @@ void ServoController::resolve_fields() {
     // RT loop falls back (velocity estimate) / omits the tier (fault code).
     f_fault_code_ = txpdo_has(kFaultCode) ? master_->tx_field(s, kFaultCode, 0) : FieldLocation{};
     f_velocity_actual_ = txpdo_has(kVelActual) ? master_->tx_field(s, kVelActual, 0) : FieldLocation{};
+
+    // #47-P3b R1 opt-out OBSERVABILITY (DA): a module WITHOUT a configured quick_stop_decel stops
+    // via UNCONTROLLED disable-voltage coast -- a known, predictable coast, safe BECAUSE we won't
+    // Quick-Stop against an unverified/unsized decel. But on a load-holding / vertical axis a coast
+    // drifts/drops the load, so surface the opt-out at bring-up (non-RT, once) rather than let an
+    // operator find out the hard way. Not a hard require (opt-in philosophy) -- discoverable, same
+    // "observable, not silent" philosophy as the VEL clamp-below-requested.
+    if (config_.quick_stop_decel == 0) {
+        (void)std::fprintf(stderr,
+                           "[servo] slave %u: quick_stop_decel not set -> STOP is an UNCONTROLLED disable-voltage "
+                           "coast (safe, but a load-holding axis will drift/drop). Set quick_stop_decel (0x6085) for a "
+                           "controlled ramp-stop.\n",
+                           static_cast<unsigned>(s));
+    }
 }
 
 bool ServoController::rxpdo_has(std::uint16_t index) const noexcept {

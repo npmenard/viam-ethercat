@@ -245,6 +245,10 @@ TEST("ServoController: Stop (Halt) is sticky -- motor stays stopped, then re-com
     // Several cycles later it must STILL not be moving (Halt latched, not 1-shot).
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     CHECK(!ctrl.is_moving());
+    // MOTION-stop is HOLD-ENERGIZED (spec §A R1 / #47-P3b R1): Halt holds via bit8, cw stays 0x0F,
+    // the drive NEVER de-energizes (a de-energizing "stop" would fail this). Distinct from a
+    // LIFECYCLE-stop (de-energize) and from disable() (operator de-energize).
+    CHECK(ctrl.is_powered());
     // A new motion command clears Halt and moves again.
     ctrl.go_to(1000.0, 1.0);
     CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);
@@ -273,6 +277,23 @@ TEST("ServoController(PV): the velocity guard clamps a command the quick-stop ca
     const std::int32_t v = std::abs(ctrl.velocity_counts());
     CHECK(v > 0);              // still moving -- clamped, not rejected
     CHECK(v <= 10'000'000);    // ~budget (5e6) + slack; DEFINITELY below the ~1.31e8 unclamped request
+}
+
+TEST("ServoController: quick-stop OPT-OUT (no decel) -- configure skips the 0x605A/0x6085 SDO, stop coasts (#47-P3b R1)") {
+    // The opt-out path: quick_stop_decel == 0 -> needs_quick_stop == false -> the policy's
+    // quick-stop SDO setup (0x605A assert / 0x6085 write) is SKIPPED, and the stop is a P3a
+    // disable-voltage coast (a known, predictable stop -- safe without a verified/sized decel).
+    // The VEL guard is also inert (no budget to size against). This exercises the decel==0 branch
+    // that make_config's decel>0 fixture otherwise never hits.
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition);
+    cfg.quick_stop_decel = 0;  // opt out of the controlled ramp-stop
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, nullptr)};
+    ctrl.start();  // configure must NOT throw despite no quick-stop SDO (needs_quick_stop=false)
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.go_to(1000.0, 1.0);
+    CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);
+    ctrl.stop();  // LIFECYCLE-stop -> disable-voltage coast; must tear down cleanly (no hang/throw)
+    CHECK(!ctrl.is_powered());  // de-energized after the stop
 }
 
 TEST("ServoController(PV): a displaced, stopped motor reports is_moving == false") {
