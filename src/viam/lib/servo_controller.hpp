@@ -196,6 +196,13 @@ class ServoController : public SlaveControl {
     void on_operational(CycleContext& ctx) noexcept override;
     void step(CycleContext& ctx) noexcept override;
     void on_stop(StopReason reason) noexcept override;
+    // #47-P3b R1: event-driven teardown early-out -- true once the LIFECYCLE-stop has de-energized
+    // the drive AT REST (statusword SwitchOnDisabled during the stopping window), so the Runner
+    // ends the (generous, decel>0) teardown window as soon as the controlled ramp completes rather
+    // than always spinning the full cap. RT-only read (same thread as step()).
+    bool teardown_complete() const noexcept override {
+        return stop_at_rest_;
+    }
 
     // Reset per-run state + construct/attach/start the one-shot Runner; on a start-time
     // failure → Degraded-but-alive (§8), never rethrows past here. Shared by start()/reconfigure().
@@ -236,8 +243,19 @@ class ServoController : public SlaveControl {
     static DeviceProfile make_module_profile(const ServoConfig& c) noexcept;
     Cia402Policy policy_;
     // 0x6085 readback from policy_.configure (0 = quick-stop not configured). WRITTEN once by the
-    // RT thread in on_configured (pre-steady), READ by the non-RT set_rpm velocity guard -> atomic.
+    // RT thread in on_configured (pre-steady), READ by the non-RT velocity guard -> atomic.
     std::atomic<std::uint32_t> qs_decel_echoed_{0};
+    // Effective PV/PP velocity ceiling (counts/s) DERIVED from the teardown window (#47-P3b R1):
+    // max the echoed 0x6085 decel can ramp to 0 within (teardown_window - margin). 0 = no guard
+    // (quick-stop not configured). WRITTEN once in on_configured (RT), READ non-RT by set_rpm/go_to.
+    std::atomic<std::int64_t> vel_budget_cps_{0};
+    // RT teardown window in cycles (the Runner's stopping-window CAP): sized so a decel>0 Quick-Stop
+    // ramp completes before close(); 2 for the opt-out coast. The VEL budget derives from this same
+    // value -> window and budget are one source of truth.
+    std::uint32_t teardown_window_cycles() const noexcept;
+    // Clamp a commanded velocity (counts/s) to the stoppable-within-teardown-window budget (#47-P3b
+    // R1). Applied to the PV setpoint (0x60FF) AND the PP move speed (0x6081). Inert when unconfigured.
+    std::int32_t clamp_to_stop_budget(std::int32_t vel_cps) const noexcept;
 
     Cia402Fsm fsm_;
     ControllerState state_;
@@ -273,6 +291,7 @@ class ServoController : public SlaveControl {
     std::int32_t prev_actual_ = 0;  // previous-cycle actual (instantaneous velocity estimate)
     bool first_cycle_ = true;       // skip the velocity estimate on the first cycle
     bool halted_ = false;           // STICKY Stop: Halt stays asserted until a new motion command
+    bool stop_at_rest_ = false;     // RT-only (#47-P3b R1): drive reached SwitchOnDisabled during the stopping window -> teardown early-out
     // Controller-error tier: one-shot latches (HandshakeTimeout/MoveStalled) set by
     // the FSM, cleared ONLY by an explicit fault_reset. The bus WkcFault tier is
     // LIVE (recomputed from master_->fault() each cycle) and is NOT stored here, so a

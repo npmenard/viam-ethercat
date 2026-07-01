@@ -311,6 +311,15 @@ class SlaveControl {
         (void)ctx;
         return false;
     }
+    // RT, every STOPPING cycle (after step()): "is this control safely torn down -- de-energized
+    // AT REST -- so the Runner may end the teardown window EARLY?" The window (teardown_cycles) is
+    // the CAP; this is the event-driven early-out. DEFAULT false -> run the full window (unchanged
+    // for a control that doesn't opt in). A control doing a CONTROLLED ramp-stop (ramp vel->0 THEN
+    // de-energize) returns true once it reaches rest+disabled, so the common already-stopped case
+    // doesn't pay the full generous window AND a moving stop still ramps fully before close().
+    virtual bool teardown_complete() const noexcept {
+        return false;
+    }
 };
 
 // The RT-thread-shared cyclic state (#TODO-3 / #52). EVERYTHING the RT thread touches that

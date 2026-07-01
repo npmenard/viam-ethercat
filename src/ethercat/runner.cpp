@@ -351,10 +351,20 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
         pacer.pace(dct);
         ++cycle;
         if (stopping) {
-            // The entering cycle is the window's FIRST stopping cycle: exactly
+            // EVENT-DRIVEN early-out (#47-P3b R1): a control doing a CONTROLLED ramp-stop signals
+            // teardown_complete() once it is de-energized AT REST (ramped vel->0 THEN disabled), so
+            // the teardown ends as soon as it is SAFE -- the common already-stopped case doesn't pay
+            // the full generous window, and a moving stop still ramps fully (complete stays false
+            // until rest). `teardown_cycles` remains the hard CAP so a never-completing control
+            // (e.g. a dead bus that can't reach SwitchOnDisabled) still exits bounded.
+            bool all_torn_down = true;
+            for (const Attached& a : controls_) {
+                all_torn_down = all_torn_down && a.control->teardown_complete();
+            }
+            // The entering cycle is the window's FIRST stopping cycle: exactly up to
             // `teardown_cycles` step() dispatches see ctx.stopping()==true (floor 1).
             --window_left;
-            if (window_left == 0) {
+            if (all_torn_down || window_left == 0) {
                 break;
             }
         }

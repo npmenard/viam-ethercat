@@ -31,6 +31,9 @@ constexpr std::uint16_t kFaultCode = 0x603F;   // drive error code (TxPDO, optio
 // vendor value. The bring-up gate reads it from config (nullopt ⇒ no detection).
 constexpr std::uint16_t kVelActual = 0x606C;  // velocity actual value (TxPDO, optional feedback)
 constexpr std::uint64_t kNsPerSec = 1'000'000'000ULL;
+// #47-P3b R1 controlled-stop watchdog headroom: the teardown window / VEL budget reserve this much
+// time below the full window so the ramp finishes strictly BEFORE close() (A6 sync watchdog ~50ms).
+constexpr double kStopWindowMarginS = 0.05;
 
 // #40 item 7: ONE clock helper -- alias the shared realtime::monotonic_ns (the local
 // duplicate is gone; watchdog + last_cycle_time are the users).
@@ -173,6 +176,7 @@ void ServoController::reset_run_state() {
     prev_actual_ = 0;
     first_cycle_ = true;
     halted_ = false;
+    stop_at_rest_ = false;
     latched_ctrl_error_ = RtError::None;
     last_progress_actual_ = 0;
     stall_cycles_ = 0;
@@ -186,6 +190,19 @@ void ServoController::reset_run_state() {
 // start it. The Runner owns realtime setup + the DC bring-up pump + pacing + teardown (the
 // old run_rt_loop's job). #39: the Runner owns the set_rt_active bracket now. §8: a start-time
 // failure -> Degraded-but-alive (APIs throw, process stays up), never rethrown past here.
+std::uint32_t ServoController::teardown_window_cycles() const noexcept {
+    // Opt-out (no controlled stop): disable-voltage coast is instant -> the old 2-cycle window.
+    if (config_.quick_stop_decel == 0) {
+        return 2;
+    }
+    // decel>0: size the window to the controlled-stop budget so the Quick-Stop ramp COMPLETES before
+    // close()->INIT (no torque-cut). window_cycles = controlled_stop_window_ms x loop_rate. The event
+    // gate (teardown_complete) exits earlier once at rest; this is the hard CAP.
+    const std::uint64_t rate = config_.target_loop_rate_hz;
+    const std::uint64_t cyc = (static_cast<std::uint64_t>(config_.controlled_stop_window_ms) * rate + 999ULL) / 1000ULL;
+    return static_cast<std::uint32_t>(std::max<std::uint64_t>(cyc, 2ULL));
+}
+
 void ServoController::spawn_runner() {
     reset_run_state();
     degraded_.store(false, std::memory_order_release);
@@ -196,10 +213,11 @@ void ServoController::spawn_runner() {
     // The Er74 OP-entry gate (bringup_step -> Aborted) decides a failed bring-up, not this
     // wall bound -- keep it well above Master's own op-await window (the pump backstop).
     rc.bringup_timeout = std::chrono::milliseconds(120'000);
-    // Teardown window: a couple of disable-voltage stopping cycles (step() during stopping)
-    // then ~Runner's master.close()->INIT -- reproduces the old run_rt_loop exit (disable +
-    // final process), now Runner-owned + BOUNDED (deletes the old unbounded join).
-    rc.teardown_cycles = 2;
+    // Teardown window (#47-P3b R1): for a controlled Quick-Stop (quick_stop_decel>0) size it to the
+    // controlled-stop window so the ramp reaches REST before master.close()->INIT de-energizes (NO
+    // torque-cut at speed); the event gate (teardown_complete) exits as soon as the drive is at rest
+    // so the common already-stopped case doesn't pay the full window. Opt-out coast = 2 cycles.
+    rc.teardown_cycles = teardown_window_cycles();
     rt_runner_ = std::make_unique<Runner>(*master_, rc);
     try {
         rt_runner_->attach(config_.slave_id, *this);
@@ -564,7 +582,18 @@ void ServoController::on_configured(ConfigContext& cfg) {
     // start()/reconfigure(); this ADDS the policy's resolution (same Master, same SAFE-OP phase).
     // needs_quick_stop gated on a configured 0x6085 (quick_stop_decel > 0); the echoed value backs
     // the future velocity-window guard. A mode-mismatched 0x605A / absent 0x6085 THROWS (fail-closed).
-    qs_decel_echoed_.store(policy_.configure(cfg, /*needs_quick_stop=*/config_.quick_stop_decel > 0), std::memory_order_release);
+    const std::uint32_t echoed = policy_.configure(cfg, /*needs_quick_stop=*/config_.quick_stop_decel > 0);
+    qs_decel_echoed_.store(echoed, std::memory_order_release);
+    // DERIVE the velocity guard budget FROM the teardown window (architect FLAG 1 -- single source of
+    // truth, so the window and the budget can never disagree): the max velocity the echoed 0x6085
+    // decel can ramp to 0 within (teardown_window - margin). 0 -> guard inert.
+    std::int64_t budget = 0;
+    if (echoed > 0) {
+        const double window_s = static_cast<double>(teardown_window_cycles()) / static_cast<double>(config_.target_loop_rate_hz);
+        const double b = static_cast<double>(echoed) * std::max(0.0, window_s - kStopWindowMarginS);
+        budget = static_cast<std::int64_t>(b);
+    }
+    vel_budget_cps_.store(budget, std::memory_order_release);
 }
 
 void ServoController::on_operational(CycleContext& ctx) noexcept {
@@ -611,6 +640,12 @@ void ServoController::step(CycleContext& ctx) noexcept {
         } else {
             ctx.store<std::uint16_t>(f_ctrlword_, ControlWord::disable_voltage());
         }
+        // Event-driven teardown early-out (#47-P3b R1): once the drive is de-energized AT REST
+        // (SwitchOnDisabled -- the 0x605A==2 auto-transition at zero, or the disable-voltage
+        // backstop / opt-out coast landing), signal the Runner it may end the teardown window. A
+        // moving stop keeps this false until the controlled ramp reaches rest, so close() never
+        // cuts torque at speed; the generous decel>0 window is the hard cap.
+        stop_at_rest_ = sstatus.switch_on_disabled();
         publish_state(ctx, sstatus, sactual, svel);
         return;
     }
@@ -674,21 +709,22 @@ void ServoController::set_rpm(double rpm) {
     }
     const double clamped = clamp_rpm(rpm, config_.max_motor_speed_rpm);
     std::int32_t dev = rpm_to_device_velocity(clamped, config_.counts_per_rev, config_.gear_ratio);
-    // #47-P3b R1 VEL guard: when a controlled Quick-Stop is configured (echoed 0x6085 > 0), a
-    // commanded velocity must be STOPPABLE within the ramp budget -- clamp to what the decel can
-    // ramp to 0 in (ramp_stop_timeout - margin). CLAMP not reject: the motor turns at the ceiling,
-    // observably below the request (never a silent no-op). No effect when quick-stop isn't
-    // configured. Lands WITH the two-level Quick-Stop so no window has QS without the budget guard.
-    constexpr double kStopWindowMarginS = 0.05;  // watchdog headroom (A6 sync watchdog ~50ms, CLAUDE.md)
-    const std::uint32_t decel = qs_decel_echoed_.load(std::memory_order_acquire);
-    if (decel > 0) {
-        const double t_s = std::max(0.0, static_cast<double>(config_.ramp_stop_timeout_ms) / 1000.0 - kStopWindowMarginS);
-        const double budget = static_cast<double>(decel) * t_s;  // counts/s the decel can null within the window
-        if (static_cast<double>(std::abs(dev)) > budget) {
-            dev = dev >= 0 ? static_cast<std::int32_t>(budget) : -static_cast<std::int32_t>(budget);
-        }
-    }
+    dev = clamp_to_stop_budget(dev);  // #47-P3b R1: stoppable-within-teardown-window guard (0x60FF)
     (void)commands_.push(Command{SetVelocity{dev}});
+}
+
+std::int32_t ServoController::clamp_to_stop_budget(std::int32_t vel_cps) const noexcept {
+    // #47-P3b R1 VELOCITY GUARD: a commanded velocity must be STOPPABLE within the controlled-stop
+    // teardown window -- else a lifecycle-stop-while-moving would still be ramping when close()
+    // de-energizes = torque-cut. Clamp to the budget DERIVED from that window (vel_budget_cps_).
+    // CLAMP not reject: the motor turns at the ceiling, observably below the request. Applied to
+    // BOTH the PV setpoint (0x60FF/set_rpm) AND the PP move speed (0x6081/go_to,go_for) -- same
+    // hazard, same formula (architect FLAG 2). Inert (budget 0) when quick-stop isn't configured.
+    const std::int64_t budget = vel_budget_cps_.load(std::memory_order_acquire);
+    if (budget <= 0 || static_cast<std::int64_t>(std::abs(vel_cps)) <= budget) {
+        return vel_cps;
+    }
+    return vel_cps >= 0 ? static_cast<std::int32_t>(budget) : -static_cast<std::int32_t>(budget);
 }
 
 void ServoController::await_move(std::uint32_t generation, std::chrono::milliseconds timeout) {
@@ -745,7 +781,7 @@ void ServoController::go_to(double rpm, double position) {
         const std::int32_t counts = static_cast<std::int32_t>(revs_to_counts(position, config_.counts_per_rev, config_.gear_ratio) +
                                                               state_.zero_offset_counts.load(std::memory_order_acquire));
         const double clamped_rpm = clamp_rpm(rpm, config_.max_motor_speed_rpm);
-        const std::int32_t prof = rpm_to_device_velocity(clamped_rpm, config_.counts_per_rev, config_.gear_ratio);
+        const std::int32_t prof = clamp_to_stop_budget(rpm_to_device_velocity(clamped_rpm, config_.counts_per_rev, config_.gear_ratio));
         g = next_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
         move_timeout = config_.move_timeout_ms != 0 ? std::chrono::milliseconds(config_.move_timeout_ms) : std::chrono::milliseconds(30000);
         (void)commands_.push(Command{SetTarget{counts, static_cast<std::uint32_t>(std::abs(prof)), false, g}});

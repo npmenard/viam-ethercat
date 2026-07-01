@@ -92,11 +92,15 @@ struct ServoConfig {
     // SKIPPED (the drive falls back to disable-voltage on stop). >0 -> configured + asserted at
     // bring-up. Standard CiA402 tunable; from the hardware JSON (never a hardcoded device value).
     std::uint32_t quick_stop_decel = 0;
-    // Controlled-stop ramp budget (ms): the time the drive is allowed to ramp to a stop under
-    // Quick-Stop before the SM/sync watchdog would bite. Backs the PV velocity guard: a commanded
-    // velocity is clamped to what quick_stop_decel can ramp to 0 within this window (§6 step 1;
-    // #47-P3b R1). Only bites when quick_stop_decel > 0 (controlled stop configured).
-    std::uint32_t ramp_stop_timeout_ms = 1000;
+    // Controlled-stop WINDOW (ms): the single source of truth for the LIFECYCLE-stop (#47-P3b R1).
+    // It sizes the RT teardown window (teardown_cycles = window x loop_rate) so a Quick-Stop ramp
+    // COMPLETES before close()->INIT de-energizes (no torque-cut at speed), AND the velocity guard
+    // is DERIVED from it: a commanded velocity (0x60FF set_rpm AND 0x6081 go_to) is clamped to what
+    // quick_stop_decel can ramp to 0 within this window minus a watchdog margin. One knob -> the
+    // window and the budget can never disagree. Only active when quick_stop_decel > 0 (else the
+    // stop is a disable-voltage coast, instant, and the guard is inert). Distinct from the
+    // mode-switch ramp_stop_timeout (§6, a queue-liveness bound, not a de-energize deadline).
+    std::uint32_t controlled_stop_window_ms = 1000;
     // Fault-reset recovery window: cycles to hold the reset intent waiting for the drive
     // to reflect Fault->Switch-On-Disabled before giving up (type-(b) persistent cause).
     // Must exceed the drive's real clear-reflect latency; a too-large N only delays the

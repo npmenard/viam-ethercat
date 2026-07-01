@@ -198,7 +198,13 @@ TEST("ServoController(PP): the commanded rpm is written to profile velocity (0x6
     // writes it, the move runs at the drive's DEFAULT speed and the rpm is ignored.
     // The shared PP map carries 0x6081; assert the device received the commanded value.
     SimBackend* sim = nullptr;
-    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
+    // #47-P3b R1: the PP move speed (0x6081) is now ALSO clamped to the stop-window budget. Give this
+    // test enough window that 600 rpm (=1.31e6 counts/s) stays UNDER budget, so it still verifies the
+    // exact commanded value reaches 0x6081 (not the default). (The clamp itself is covered by the PV
+    // guard test + the go_to-clamp test below.)
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition);
+    cfg.controlled_stop_window_ms = 3000;  // budget = 500000 x (3.0 - 0.05) = 1.475e6 > 1.31e6 -> no clamp
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim)};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
 
@@ -211,6 +217,23 @@ TEST("ServoController(PP): the commanded rpm is written to profile velocity (0x6
     // during the move above; this just observes it without racing the writer.
     ctrl.stop();
     CHECK_EQ(sim->received_profile_velocity(1), std::abs(expected));  // rpm reached the drive, not 0
+}
+
+TEST("ServoController(PP): go_to move speed is clamped to the stop-window budget (#47-P3b R1)") {
+    // The PP move speed (0x6081) is a per-velocity-setpoint hazard IDENTICAL to PV: a fast go_to
+    // lifecycle-stopped mid-move would still be moving when close() de-energizes = torque-cut. So
+    // go_to's rpm is clamped to the SAME stop-window budget as set_rpm (architect FLAG 2).
+    SimBackend* sim = nullptr;
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition);
+    cfg.quick_stop_decel = 100'000;
+    cfg.controlled_stop_window_ms = 100;  // budget = 100000 x (0.100 - 0.050) = 5000 counts/s
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.go_to(600.0, 0.02);  // 600 rpm = 1.31e6 counts/s requested, FAR above the 5000 budget; small move
+    CHECK(sim != nullptr);
+    ctrl.stop();
+    CHECK_EQ(sim->received_profile_velocity(1), 5000);  // 0x6081 CLAMPED to budget, not the 1.31e6 request
 }
 
 TEST("ServoController(PP): go_for stays relative regardless of the zero") {
@@ -255,12 +278,12 @@ TEST("ServoController: Stop (Halt) is sticky -- motor stays stopped, then re-com
 }
 
 TEST("ServoController(PV): the velocity guard clamps a command the quick-stop can't ramp down (#47-P3b R1)") {
-    // A commanded velocity must be STOPPABLE within the controlled-stop ramp budget: the guard
-    // clamps set_rpm to what quick_stop_decel can null in (ramp_stop_timeout - margin). CLAMP not
-    // reject -- the motor turns at the ceiling, observably below the request.
+    // A commanded velocity must be STOPPABLE within the controlled-stop teardown window: the guard
+    // clamps set_rpm to what quick_stop_decel can null in (controlled_stop_window - margin). CLAMP
+    // not reject -- the motor turns at the ceiling, observably below the request.
     ServoConfig cfg = make_config(ControlMode::ProfileVelocity);
     cfg.quick_stop_decel = 100'000;   // counts/s^2 (echoed back by the sim)
-    cfg.ramp_stop_timeout_ms = 100;   // budget window; margin 50ms -> effective 50ms
+    cfg.controlled_stop_window_ms = 100;   // budget window; margin 50ms -> effective 50ms
     cfg.velocity_threshold = 1;       // is_moving = |vel| > 1
     // budget = 100000 * (0.100 - 0.050) = 5000 counts/s. set_rpm(60 rpm) = 131072 counts/s, FAR
     // above budget -> must clamp to ~5000, never the requested 131072.
@@ -313,23 +336,26 @@ TEST("ServoController(PV): LIFECYCLE-stop is a RAMP-then-disable, not a torque-c
     };
     ServoConfig cfg = make_config(ControlMode::ProfileVelocity, /*feedback=*/true);
     cfg.quick_stop_decel = 100'000;  // budget = 100000 * (0.100 - 0.050) = 5000 counts/s
-    cfg.ramp_stop_timeout_ms = 100;
+    cfg.controlled_stop_window_ms = 100;
     cfg.velocity_threshold = 2000;
     ServoController ctrl{cfg, factory};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
     ctrl.set_rpm(60.0);  // clamped to ~5000 counts/s by the guard (velocity_counts reads ~5000 in feedback mode)
     CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(300)));
-    ctrl.stop();  // LIFECYCLE-stop -> Quick-Stop (ramp, energized) -> de-energize at rest
+    ctrl.stop();  // LIFECYCLE-stop -> Quick-Stop (ramp, energized) -> de-energize at REST
     CHECK(simp != nullptr);
-    // entered_qsa is THE landmark: the drive reached QuickStopActive -> the stop engaged the
-    // controlled Quick-Stop (energized decel ramp), NOT a torque-cut / straight disable-voltage.
-    // The opt-out path (quick_stop_decel==0) would NEVER enter QSA (entered_qsa==false) -> this
-    // non-vacuously distinguishes the two-level controlled stop from a coast. (The exact
-    // vel-at-de-energize is the #53 a6_control_test's finer landmark; QSA auto-disable timing
-    // inside the module teardown window is the Runner's, not asserted here.)
+    // RESOLVER for the torque-cut MUST-FIX. entered_qsa: the stop engaged the controlled Quick-Stop
+    // (energized decel ramp), NOT a straight disable-voltage. THE fix assertion: the ramp actually
+    // REACHED REST before close() de-energized -- velocity_at_qsa_exit left its sentinel (the drive
+    // hit SwitchOnDisabled) AND at |vel| <= threshold. With the OLD 2-cycle teardown this FAILS
+    // (velocity_at_qsa_exit stuck at 0x7fffffff = close() cut torque mid-ramp); with the sized
+    // teardown window + event-gate it PASSES. (The full cw-disposition landmark lands at sub-step 5
+    // with M6's stop-sequence introspection.)
     CHECK(simp->entered_qsa(1));
-    CHECK(!ctrl.is_powered());  // de-energized after the controlled stop
+    CHECK(simp->velocity_at_qsa_exit(1) != 0x7fffffff);                        // reached rest+SwitchOnDisabled BEFORE close (fix)
+    CHECK(std::abs(simp->velocity_at_qsa_exit(1)) <= cfg.velocity_threshold);  // de-energized only AFTER the ramp
+    CHECK(!ctrl.is_powered());                                                 // de-energized after the controlled stop
 }
 
 
