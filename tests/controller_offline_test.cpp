@@ -366,8 +366,14 @@ TEST("ServoController(PV): LIFECYCLE-stop is a RAMP-then-disable, not a torque-c
     CHECK(simp->velocity_at_qsa_exit(1) != 0x7fffffff);                        // reached rest+SwitchOnDisabled BEFORE close (fix)
     CHECK(std::abs(simp->velocity_at_qsa_exit(1)) <= cfg.velocity_threshold);  // de-energized only AFTER the ramp
     CHECK(!ctrl.is_powered());                                                 // de-energized after the controlled stop
+    // #47-P3b 5d cw-DISPOSITION landmark (DA's deferred R1 item): the last controlword the drive
+    // consumed is the QUICK-STOP cw (0x000B = enable_operation with the quick-stop bit cleared) -- the
+    // drive was under CONTROLLED Quick-Stop right through the de-energize (it auto-transitioned to
+    // SwitchOnDisabled AT REST via 0x605A==2, the event-gate exiting the instant it disabled), NOT a
+    // disable-voltage torque-cut mid-ramp. Controlled-QS-through-rest = (last cw 0x0B) + entered_qsa +
+    // (velocity_at_qsa_exit <= thresh) together.
+    CHECK_EQ(simp->received_controlword(1), std::uint16_t{0x000B});
 }
-
 
 TEST("ServoController(PV): a displaced, stopped motor reports is_moving == false") {
     // Regression for the PP-predicate-in-PV bug: target_counts_ is never set in PV,

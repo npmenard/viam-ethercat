@@ -144,6 +144,7 @@ class SimBackend final : public EcatBackend {
     // SwitchOnDisabled transition (proves the ramp reached ~0 BEFORE de-energize); and whether
     // the device ever entered QuickStopActive (proves a CiA402 Quick-Stop, not a torque-cut).
     std::int32_t received_target_velocity(std::uint16_t slave) const noexcept;
+    std::uint16_t received_controlword(std::uint16_t slave) const noexcept;  // #47-P3b 5d: last cw consumed (stop-sequence disposition)
     std::int32_t velocity_at_qsa_exit(std::uint16_t slave) const noexcept;
     bool entered_qsa(std::uint16_t slave) const noexcept;
     // Toggle whether a slave asserts the PP set-point-acknowledge (bit12). When

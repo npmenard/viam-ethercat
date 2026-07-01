@@ -565,6 +565,15 @@ std::int32_t SimBackend::received_target_velocity(std::uint16_t slave) const noe
     return 0;
 }
 
+std::uint16_t SimBackend::received_controlword(std::uint16_t slave) const noexcept {
+    // The LAST controlword the drive consumed (call AFTER stop/join -- race-free). #47-P3b 5d: lets a
+    // test observe the stop-sequence cw disposition (0x0B Quick-Stop while ramping -> 0x00 disable at rest).
+    if (slave >= 1 && slave <= slaves_.size()) {
+        return slaves_[slave - 1].prev_ctrlword;
+    }
+    return 0;
+}
+
 std::int32_t SimBackend::velocity_at_qsa_exit(std::uint16_t slave) const noexcept {
     if (slave >= 1 && slave <= slaves_.size()) {
         return slaves_[slave - 1].velocity_at_qsa_exit;
