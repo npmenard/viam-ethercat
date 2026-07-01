@@ -226,6 +226,13 @@ void SimBackend::step_device(Slave& s) noexcept {
         }
     }
 
+    // #47-P3b (DA no-lunge probe): snapshot the 0x607A the master wrote THIS cycle -- the seed (§6 step 2:
+    // PP-side target = actual) / the PV over-map mirror. A test asserts it tracks actual (never a stale
+    // target that would lunge). Guarded: only when 0x607A is really mapped (past the ctrlword, in-bounds).
+    if (s.model.target_off >= 2 && static_cast<std::size_t>(s.model.target_off) + 4 <= s.model.output_bytes) {
+        s.target_written = load_le<std::int32_t>(out.subspan(static_cast<std::size_t>(s.model.target_off), 4));
+    }
+
     // CiA402 command decode (controlword masks).
     const bool shutdown = (cw & 0x87U) == 0x06U;
     const bool switch_on = (cw & 0x8FU) == 0x07U;
@@ -587,6 +594,15 @@ std::uint16_t SimBackend::received_controlword(std::uint16_t slave) const noexce
     // test observe the stop-sequence cw disposition (0x0B Quick-Stop while ramping -> 0x00 disable at rest).
     if (slave >= 1 && slave <= slaves_.size()) {
         return slaves_[slave - 1].prev_ctrlword;
+    }
+    return 0;
+}
+
+std::int32_t SimBackend::received_target_position(std::uint16_t slave) const noexcept {
+    // The last 0x607A the master wrote (call AFTER stop/join -- race-free). #47-P3b DA no-lunge: a test
+    // asserts the seeded/mirrored target tracks the drive's actual, never a stale value that would lunge.
+    if (slave >= 1 && slave <= slaves_.size()) {
+        return slaves_[slave - 1].target_written;
     }
     return 0;
 }

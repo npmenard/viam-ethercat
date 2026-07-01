@@ -368,7 +368,12 @@ TEST("#47-P3b P3c: runtime PP->PV mode-switch confirms (0x6061=PV) + gives up sa
     CHECK(ctrl.switched_to_vel());       // A6Control latched PP-reached -> requested the switch
     CHECK_EQ(ctrl.confirmed_mode(), 3);  // policy's last 0x6061 read == PV(3)
     CHECK(!ctrl.mode_switch_failed());   // clean success, no give-up
-    (void)simp;
+    // DA NO-LUNGE (§6 step 2 seed): the switch must NOT jump the axis. The over-mapped 0x607A tracks the
+    // drive's ACTUAL every cycle (the PV mirror), so it is NEVER a stale target that would lunge on the
+    // switch -- |0x607A - actual| stays within ONE control cycle's jog motion (the drive is jogging at
+    // pv_vel_cps counts/cycle here). A stale/coast regression parks 0x607A tens of thousands of counts
+    // from actual -> this bound (2 cycles' jog) catches it; the 1-cycle skew is deterministic (post-join).
+    CHECK(std::abs(simp->received_target_position(1) - tel.pos.load()) < 2 * o.pv_vel_cps);
 }
 
 TEST("#47-P3b P3c: mode-switch FAILURE -- 0x6061 never echoes (silent-mismatch, #45) -> 'mode-switch failed' + SAFE") {
@@ -401,7 +406,13 @@ TEST("#47-P3b P3c: mode-switch FAILURE -- 0x6061 never echoes (silent-mismatch, 
     CHECK(ctrl.mode_switch_failed());         // the switch reported failure (silent-mismatch)
     CHECK_EQ(ctrl.confirmed_mode(), 1);       // still PP(1) -- never entered PV
     CHECK_EQ(tel.mode.load(), 1);             // 0x6061 held PP the whole time (energized, no mode change)
-    (void)simp;
+    // DA NO-LUNGE: the FAILED switch must not jump the axis either. Direct checks (post-join): the drive
+    // was NEVER commanded a non-zero velocity (0x60FF stayed at the seeded 0 -- no velocity lunge), the
+    // last-written 0x607A tracks actual (no stale positional target), and the axis HELD its reached
+    // position (~pos_target) -- it did not lunge/drift while the switch failed + reverted.
+    CHECK_EQ(simp->received_target_velocity(1), 0);
+    CHECK(std::abs(simp->received_target_position(1) - tel.pos.load()) < 200);
+    CHECK(std::abs(tel.pos.load() - o.pos_target) < o.pos_tol);
 }
 
 // --- #47-P3b M56S: THE GENERICITY PAYOFF -- a SECOND device via a PROFILE SWAP, no policy/consumer code.

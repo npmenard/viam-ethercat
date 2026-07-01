@@ -150,6 +150,7 @@ class SimBackend final : public EcatBackend {
     std::int32_t received_target_velocity(std::uint16_t slave) const noexcept;
     std::uint16_t received_controlword(std::uint16_t slave) const noexcept;  // #47-P3b 5d: last cw consumed (stop-sequence disposition)
     Cia402Mode effective_mode(std::uint16_t slave) const noexcept;           // #47-P3b M6: drive's current runtime mode (PV->PP hold-switch proof)
+    std::int32_t received_target_position(std::uint16_t slave) const noexcept;  // #47-P3b: last 0x607A the master wrote (DA no-lunge: seeded/mirrored target == actual, never a stale jump)
     std::int32_t velocity_at_qsa_exit(std::uint16_t slave) const noexcept;
     bool entered_qsa(std::uint16_t slave) const noexcept;
     // Toggle whether a slave asserts the PP set-point-acknowledge (bit12). When
@@ -193,6 +194,7 @@ class SimBackend final : public EcatBackend {
         Cia402State device_state = Cia402State::NotReadyToSwitchOn;
         std::uint16_t prev_ctrlword = 0;
         std::int32_t target = 0;
+        std::int32_t target_written = 0;  // #47-P3b: the last 0x607A the master WROTE this cycle (seed/mirror wire value, latched-or-not) -- DA no-lunge probe
         std::int32_t actual = 0;
         bool setpoint_ack = false;  // PP bit12 latch
         // ATOMIC: written by a non-RT test hook (inject_fault/set_fault_code/
