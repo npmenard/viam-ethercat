@@ -65,6 +65,7 @@ ServoConfig make_config(ControlMode mode, bool feedback = false) {
     c.require_realtime = false;  // CI has no CAP_SYS_NICE
     c.command_queue_capacity = 64;
     c.handshake_timeout_cycles = 1000;
+    c.quick_stop_decel = 500'000;  // #47-P3b: enable the policy's quick-stop configure (0x605A assert + 0x6085 write/readback)
     return c;
 }
 

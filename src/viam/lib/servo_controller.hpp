@@ -42,6 +42,7 @@
 
 #include "ethercat/backend.hpp"
 #include "ethercat/cia402.hpp"
+#include "ethercat/cia402_policy.hpp"
 #include "ethercat/master.hpp"
 #include "ethercat/pdo_cache.hpp"
 #include "ethercat/runner.hpp"
@@ -171,8 +172,9 @@ class ServoController : public SlaveControl {
     struct Disabled {};
     using Lifecycle = std::variant<Init, Enabling, Operational, Resetting, Faulted, Disabled>;
 
-    // PP new-set-point handshake sub-FSM (cycle-stepped, with a timeout).
-    enum class Handshake : std::uint8_t { Idle, WriteTarget, AwaitAck, ClearBit4, AwaitAckClear };
+    // The PP new-setpoint handshake now lives in the shared Cia402Policy (#47-P3b): the wrapper
+    // delegates the Operational healthy-path to policy_.step() and reads its handshake-idle /
+    // handshake-timeout signals (completion gate / abort). No wrapper-side handshake sub-FSM.
 
     // CONTROLLER-tier fault reasons (the CTRL tier only -- spec #16 moved the BUS
     // WkcFault out to state_.wkc_faulted). The RT thread only STORES the enum (no
@@ -226,6 +228,15 @@ class ServoController : public SlaveControl {
     FieldLocation f_fault_code_;       // 0x603F U16 drive error code (last_error gloss)
     FieldLocation f_velocity_actual_;  // 0x606C S32 velocity-actual (wire velocity; else estimate)
 
+    // #47-P3b: the GENERIC CiA402 motion policy (shared with a6_validate's A6Control). The
+    // module's Operational healthy-path (enable-hold + PP handshake + PV stream + Halt) delegates
+    // HERE; the wrapper keeps the two-tier fault + #18 fault-reset machine + completion-generations
+    // + stall watchdog (rev-6 signed boundary). Parameterized by a DeviceProfile mapped from
+    // ServoConfig (module flags: bit8 Halt, no PV pos-mirror, 4-phase handshake + ack timeout).
+    static DeviceProfile make_module_profile(const ServoConfig& c) noexcept;
+    Cia402Policy policy_;
+    std::uint32_t qs_decel_echoed_ = 0;  // 0x6085 readback from policy_.configure (0 = quick-stop not configured)
+
     Cia402Fsm fsm_;
     ControllerState state_;
     std::atomic<RtError> rt_error_{RtError::None};
@@ -249,9 +260,7 @@ class ServoController : public SlaveControl {
 
     // --- RT-ONLY working state (single-thread; plain members, no atomics/locks).
     // Touched exclusively by run_rt_loop() / the lifecycle step()s. ---
-    std::uint16_t last_cw_ = 0;              // for the fault-reset rising-edge re-arm
-    Handshake handshake_ = Handshake::Idle;  // PP set-point handshake sub-state
-    std::uint32_t handshake_cycles_remaining_ = 0;
+    std::uint16_t last_cw_ = 0;                 // for the fault-reset rising-edge re-arm
     std::uint32_t reset_cycles_remaining_ = 0;  // Resetting-window countdown, RT-only (spec #18)
     std::uint32_t clear_streak_ = 0;            // consecutive dev!=Fault cycles in Resetting (type-c debounce; RT-only, #18)
     std::int32_t target_counts_ = 0;            // latched PP target
@@ -272,7 +281,6 @@ class ServoController : public SlaveControl {
     // FSM helpers (RT-only). Defined in the .cpp. ctx replaces the old direct master_
     // output writes / master_->fault() reads (the Runner is the sole Master toucher).
     std::uint16_t step_lifecycle(CycleContext& ctx, Status status, const CommandBatch& batch, std::int32_t actual) noexcept;
-    std::uint16_t step_handshake(CycleContext& ctx, std::uint16_t base_cw, Status status) noexcept;
     std::uint16_t fault_reset_with_rearm(Status status) noexcept;
     // Reads THIS cycle's owned input snapshot via ctx (0x603F, statusword, etc. all from
     // the same latched image the Runner copied in -- structurally consistent, as before).
