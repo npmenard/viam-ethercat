@@ -49,7 +49,9 @@ for which of the behaviors below are A6-specific vs generic CiA402).
   explicit 0x6061-echo verification is the pending code-fix.
 - **Guidance:** after any mode change, confirm `0x6061 == commanded mode`
   before commanding motion. If 0x6061 stays at its previous value, the mode
-  write did not take.
+  write did not take. ⚠ **If 0x6060 is RxPDO-mapped, this gate will trip unless
+  the cyclic PDO mode byte is seeded** — the per-cycle PDO value overrides the
+  SDO-set mode (see **Q14**); seed 0x6060 in the RxPDO from cycle 0.
 
 ---
 
@@ -253,6 +255,39 @@ for which of the behaviors below are A6-specific vs generic CiA402).
   it must not. Cross-refs: **Q4** (quick-stop → SwitchOnDisabled, the state this
   occurs in), **Q10** (the counts/s unit + noise magnitude), **Q12** (fault-class
   stop behavior — a related "what the shaft physically does" safety concern).
+
+### Q14. If 0x6060 is RxPDO-mapped, the *PDO* mode byte wins — the SDO-set default is IGNORED once cycling
+- **This is standard CiA402, not an A6 special.** A CoE object that is mapped
+  into a cyclic RxPDO is written **every cycle** by the master; that per-cycle PDO
+  value **overrides** any value previously set by SDO. So if you both (a) set the
+  mode once by SDO at configure *and* (b) map 0x6060 into the RxPDO but leave its
+  cyclic byte at 0, the drive follows the **PDO 0** and discards the SDO mode.
+  The A6 is just where we observed it — it bites on **any** drive the moment you
+  add 0x6060 to the PDO map.
+- **Wire-confirmed (A6, energized P3c run, tcpdump `/tmp/p3c.pcap`):** with the
+  15-byte map (0x6060 in the RxPDO), the RxPDO 0x6060 byte was **0** during the
+  enable ladder (the control policy hadn't seeded it yet). 0x6061 briefly read
+  **PP=1** (the SDO default set at configure) then **reverted to 8 (CSP)** — the
+  drive's power-on default — as soon as it consumed the PDO's 0x6060=0. The
+  enable-time **mode-echo gate** (Q2/#45: require `0x6061 == commanded PP`) then
+  correctly **refused to enable** — the controlword climbed `0x00 → 0x06 → 0x07`
+  and **stopped, never reaching 0x0F**. Correct gate behavior; wrong seed.
+- **Contrast with the SDO-only map:** the earlier 14-byte map (0x6060 **not** in
+  the PDO, mode set by SDO only) did **not** have this — the SDO mode stuck
+  because nothing overwrote it each cycle. Adding 0x6060 to the PDO is what
+  introduced the requirement.
+- **CONSUMER RULE:** when 0x6060 is PDO-mapped, the controller **must seed
+  0x6060 = the desired mode in the RxPDO from cycle 0** — *before* the enable-time
+  mode-echo gate, not only after OperationEnabled. Treat the mode byte as a
+  first-class cyclic command that must hold the right value throughout bring-up,
+  the enable ladder, and steady state. (The SDO-at-configure set is then belt-and-
+  suspenders / redundant, but harmless.)
+- **Cross-refs:** **Q2/#45** (the 0x6061-echo mode-verify gate — it did its job
+  here, catching the un-seeded mode; the fix is seeding, not loosening the gate),
+  **Q10** (0x6060 is one of the RxPDO-mapped objects). Also see
+  [`m56s-profile.md`](./m56s-profile.md) §4.2.3 — the generic mode-switch pattern
+  says "update the new mode's RxPDO command objects first," of which "seed 0x6060
+  in the PDO before relying on it" is the specific instance.
 
 ---
 
