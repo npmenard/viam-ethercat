@@ -199,6 +199,16 @@ void SimBackend::step_device(Slave& s) noexcept {
     const std::uint16_t cw = load_le<std::uint16_t>(out.subspan(s.model.ctrlword_off, 2));
     const std::uint16_t prev = s.prev_ctrlword;
 
+    // #47-P3b sub-step 5: when 0x6060 is RxPDO-mapped, the RUNTIME mode-of-operation comes from the
+    // wire each cycle (the mode-switch drives it), not just the configure-time SDO. A byte of 0 (the
+    // field mapped but not yet written) leaves effective_mode unchanged -- the drive keeps its mode.
+    if (s.model.mode_of_op_off >= 0) {
+        const auto m = static_cast<std::int8_t>(out[static_cast<std::size_t>(s.model.mode_of_op_off)]);
+        if (m != 0) {
+            s.effective_mode = static_cast<Cia402Mode>(m);
+        }
+    }
+
     // CiA402 command decode (controlword masks).
     const bool shutdown = (cw & 0x87U) == 0x06U;
     const bool switch_on = (cw & 0x8FU) == 0x07U;

@@ -42,10 +42,13 @@ ServoConfig make_config(ControlMode mode, bool feedback = false) {
     c.rxpdo.pdo_indices = {0x1600};
     // Authoritative A6 maps per mode: PP = ctrl + target position + profile velocity
     // (10 B); PV = ctrl + target velocity (6 B).
+    // #47-P3b sub-step 5: 0x6060 (mode-of-operation, i8) is RxPDO-mapped so the runtime mode-switch
+    // can write it cyclically (SDO in step() is illegal). Appended last so existing field offsets
+    // are unchanged.
     if (mode == ControlMode::ProfileVelocity) {
-        c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x60FF, 0, 32}};
+        c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x60FF, 0, 32}, PdoEntry{0x6060, 0, 8}};
     } else {
-        c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6081, 0, 32}};
+        c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6081, 0, 32}, PdoEntry{0x6060, 0, 8}};
     }
     c.txpdo.pdo_indices = {0x1A00};
     // #16 feedback variant: add 0x603F (fault code) + 0x606C (velocity actual) to the
@@ -86,13 +89,15 @@ SimSlaveModel make_model(ControlMode mode, bool feedback = false) {
     }
     if (mode == ControlMode::ProfileVelocity) {
         m.mode = ethercat::Cia402Mode::ProfileVelocity;
-        m.output_bytes = 6;  // ctrl@0, target velocity@2
+        m.output_bytes = 7;  // ctrl@0, target velocity@2, mode-of-op@6 (#47-P3b sub-step 5)
         m.velocity_off = 2;
+        m.mode_of_op_off = 6;
     } else {
         m.mode = ethercat::Cia402Mode::ProfilePosition;
-        m.output_bytes = 10;  // ctrl@0, target@2, profile velocity@6
+        m.output_bytes = 11;  // ctrl@0, target@2, profile velocity@6, mode-of-op@10 (#47-P3b sub-step 5)
         m.target_off = 2;
         m.profile_velocity_off = 6;  // de-masked: PP chases at the 0x6081 the RT loop writes
+        m.mode_of_op_off = 10;
     }
     return m;
 }

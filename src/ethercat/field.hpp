@@ -35,6 +35,7 @@ namespace cia402 {
 
 using ControlWord = Field<0x6040, 0, std::uint16_t>;
 using Statusword = Field<0x6041, 0, std::uint16_t>;
+using ModeOfOperation = Field<0x6060, 0, std::int8_t>;  // #47-P3b sub-step 5: RxPDO-mapped for the RUNTIME mode-switch (§6)
 using ModeDisplay = Field<0x6061, 0, std::int8_t>;
 using FaultCode = Field<0x603F, 0, std::uint16_t>;
 using TargetPosition = Field<0x607A, 0, std::int32_t>;

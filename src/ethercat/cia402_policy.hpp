@@ -122,6 +122,7 @@ class Cia402Policy {
         target_loc_ = cfg.resolve_rx_optional<cia402::TargetPosition>();
         pv_loc_ = cfg.resolve_rx_optional<cia402::ProfileVelocity>();
         tv_loc_ = cfg.resolve_rx_optional<cia402::TargetVelocity>();
+        mode_wr_loc_ = cfg.resolve_rx_optional<cia402::ModeOfOperation>();  // 0x6060 RxPDO (sub-step 5 runtime mode-switch); absent -> mode is SDO-set only
         vel_loc_ = cfg.resolve_tx_optional<cia402::VelocityActual>();
         fc_loc_ = cfg.resolve_tx_optional<cia402::FaultCode>();
         mode_loc_ = cfg.resolve_tx_optional<cia402::ModeDisplay>();
@@ -279,6 +280,11 @@ class Cia402Policy {
     // Halt (R1 HOLD). Pure counts; the reached predicate is actual-vs-target + vel~0 (NEVER bit10).
     std::uint16_t drive_operational_(CycleContext& ctx, const PolicyCommand& cmd, Status status, std::int32_t pos, std::int32_t vel) noexcept {
         std::uint16_t base = ControlWord::enable_operation();  // 0x0F
+        // sub-step 5: when 0x6060 is RxPDO-mapped, keep it = the commanded mode on the wire each
+        // cycle (the runtime mode-switch, §6, drives this; here it just holds the steady mode).
+        if (mode_wr_loc_.mapped()) {
+            ctx.store<cia402::ModeOfOperation::type>(mode_wr_loc_, static_cast<std::int8_t>(cmd.mode));
+        }
         const bool bit8_halt = cmd.halt && profile_.halt_uses_bit8;
         if (cmd.mode == Cia402Mode::ProfileVelocity) {
             // PV: stream target velocity. Halt: setpoint-halt (halt_uses_bit8==false) ramps the
@@ -423,7 +429,7 @@ class Cia402Policy {
     Handshake handshake_ = Handshake::Idle;
     std::uint32_t handshake_cycles_remaining_ = 0;
 
-    FieldLocation cw_loc_, target_loc_, pv_loc_, tv_loc_;
+    FieldLocation cw_loc_, target_loc_, pv_loc_, tv_loc_, mode_wr_loc_;
     FieldLocation sw_loc_, pos_loc_, vel_loc_, fc_loc_, mode_loc_;
 
     std::uint32_t qs_decel_echoed_ = 0;

@@ -43,6 +43,7 @@ struct SimSlaveModel {
     std::int32_t counts_per_step = 1000;     // PP: how fast actual chases target per cycle
     std::int32_t velocity_off = -1;          // optional: 0x60FF target velocity offset in outputs (i32); <0 = none
     std::int32_t profile_velocity_off = -1;  // optional: 0x6081 PP profile-velocity offset in outputs (u32); <0 = none
+    std::int32_t mode_of_op_off = -1;        // optional: 0x6060 mode-of-operation (i8) offset in OUTPUTS; <0 = mode set by SDO only (#47-P3b sub-step 5: RxPDO runtime mode-switch)
     std::int32_t mode_display_off = -1;      // optional: 0x6061 mode-display (i8) offset in INPUTS; <0 = not emitted (#53)
 
     // --- #53 PV / quick-stop modeling (all default to a conformant A6 that PASSES the gates) ---

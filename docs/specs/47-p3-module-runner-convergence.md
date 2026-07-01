@@ -267,6 +267,12 @@ re-bring-up; the Runner being one-shot is a FEATURE — it guarantees the `close
   TRACE** (like #53's decel capture), not just "0x6061 confirms": the `0x6060` switch must show `0x606C`/torque
   with **NO coast / output-drop** across the switch cycles — i.e. the drive holds torque through its own mode change
   (a per-switch coast on a load axis = a position drop). Criterion: continuous `0x606C` ≈ 0, no transient spike/drop, energized throughout.
+  - **P3c PREREQUISITE (sub-step 5 groundwork):** sub-step 5 maps `0x6060` (mode-of-operation, i8) into the **RxPDO**
+    so the runtime switch can write it cyclically (SDO in `step()` is illegal, M1). This CHANGES the wire layout the
+    #53 bring-up proved on hardware (A6 PP map 14 B → 15 B; `0x6060` is standard RxPDO-mappable, so the A6 should
+    accept it). **P3c MUST FIRST re-verify A6 bring-up with the mode-in-RxPDO map** (DC → OP, WKC 3/3, no Er74) —
+    add `0x6060` to `etc/a6-hardware.example.json` and confirm bring-up survives — **BEFORE** the energized
+    mode-switch test. Do NOT assume the #53 bring-up carries to the new map.
 
 **Confirmed:** PV-hold = PP-at-current-counts ✓ · fault-retry cap = 3 + backoff ✓ · ready-for-DA ✓.
 **Open (small, §S2):** `set_rpm(0)` under a blocking move → throws "operation ongoing" (`halt()` is the stop verb) — confirm or prefer set_rpm(0)=stop.
