@@ -235,7 +235,9 @@ class ServoController : public SlaveControl {
     // ServoConfig (module flags: bit8 Halt, no PV pos-mirror, 4-phase handshake + ack timeout).
     static DeviceProfile make_module_profile(const ServoConfig& c) noexcept;
     Cia402Policy policy_;
-    std::uint32_t qs_decel_echoed_ = 0;  // 0x6085 readback from policy_.configure (0 = quick-stop not configured)
+    // 0x6085 readback from policy_.configure (0 = quick-stop not configured). WRITTEN once by the
+    // RT thread in on_configured (pre-steady), READ by the non-RT set_rpm velocity guard -> atomic.
+    std::atomic<std::uint32_t> qs_decel_echoed_{0};
 
     Cia402Fsm fsm_;
     ControllerState state_;

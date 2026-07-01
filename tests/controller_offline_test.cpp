@@ -250,6 +250,31 @@ TEST("ServoController: Stop (Halt) is sticky -- motor stays stopped, then re-com
     CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);
 }
 
+TEST("ServoController(PV): the velocity guard clamps a command the quick-stop can't ramp down (#47-P3b R1)") {
+    // A commanded velocity must be STOPPABLE within the controlled-stop ramp budget: the guard
+    // clamps set_rpm to what quick_stop_decel can null in (ramp_stop_timeout - margin). CLAMP not
+    // reject -- the motor turns at the ceiling, observably below the request.
+    ServoConfig cfg = make_config(ControlMode::ProfileVelocity);
+    cfg.quick_stop_decel = 100'000;   // counts/s^2 (echoed back by the sim)
+    cfg.ramp_stop_timeout_ms = 100;   // budget window; margin 50ms -> effective 50ms
+    cfg.velocity_threshold = 1;       // is_moving = |vel| > 1
+    // budget = 100000 * (0.100 - 0.050) = 5000 counts/s. set_rpm(60 rpm) = 131072 counts/s, FAR
+    // above budget -> must clamp to ~5000, never the requested 131072.
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfileVelocity, nullptr)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.set_rpm(60.0);
+    CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(300)));
+    // Settle, then the device velocity must sit at the guard ceiling, not the request.
+    // (velocity_counts() = per-cycle actual-delta x loop_rate; the sim integrates the commanded
+    // device-velocity per cycle, so a clamped dev~=5000 reads ~5000*1000=5e6, while the UNCLAMPED
+    // 131072 request would read ~1.31e8 -- the assertion separates the two by >10x.)
+    CHECK(wait_until([&] { return std::abs(ctrl.velocity_counts()) > 100; }, std::chrono::milliseconds(300)));
+    const std::int32_t v = std::abs(ctrl.velocity_counts());
+    CHECK(v > 0);              // still moving -- clamped, not rejected
+    CHECK(v <= 10'000'000);    // ~budget (5e6) + slack; DEFINITELY below the ~1.31e8 unclamped request
+}
+
 TEST("ServoController(PV): a displaced, stopped motor reports is_moving == false") {
     // Regression for the PP-predicate-in-PV bug: target_counts_ is never set in PV,
     // so the old position-tolerance predicate reported a stopped-but-displaced PV

@@ -92,6 +92,11 @@ struct ServoConfig {
     // SKIPPED (the drive falls back to disable-voltage on stop). >0 -> configured + asserted at
     // bring-up. Standard CiA402 tunable; from the hardware JSON (never a hardcoded device value).
     std::uint32_t quick_stop_decel = 0;
+    // Controlled-stop ramp budget (ms): the time the drive is allowed to ramp to a stop under
+    // Quick-Stop before the SM/sync watchdog would bite. Backs the PV velocity guard: a commanded
+    // velocity is clamped to what quick_stop_decel can ramp to 0 within this window (§6 step 1;
+    // #47-P3b R1). Only bites when quick_stop_decel > 0 (controlled stop configured).
+    std::uint32_t ramp_stop_timeout_ms = 1000;
     // Fault-reset recovery window: cycles to hold the reset intent waiting for the drive
     // to reflect Fault->Switch-On-Disabled before giving up (type-(b) persistent cause).
     // Must exceed the drive's real clear-reflect latency; a too-large N only delays the

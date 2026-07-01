@@ -543,7 +543,7 @@ void ServoController::on_configured(ConfigContext& cfg) {
     // start()/reconfigure(); this ADDS the policy's resolution (same Master, same SAFE-OP phase).
     // needs_quick_stop gated on a configured 0x6085 (quick_stop_decel > 0); the echoed value backs
     // the future velocity-window guard. A mode-mismatched 0x605A / absent 0x6085 THROWS (fail-closed).
-    qs_decel_echoed_ = policy_.configure(cfg, /*needs_quick_stop=*/config_.quick_stop_decel > 0);
+    qs_decel_echoed_.store(policy_.configure(cfg, /*needs_quick_stop=*/config_.quick_stop_decel > 0), std::memory_order_release);
 }
 
 void ServoController::on_operational(CycleContext& ctx) noexcept {
@@ -563,12 +563,12 @@ bool ServoController::sync_faulted(const CycleContext& ctx) const noexcept {
 
 void ServoController::step(CycleContext& ctx) noexcept {
     if (ctx.stopping()) {
-        // The Runner enters its stopping window on ANY stop cause -- including a BUS fault
-        // (master_.fault()), which the OLD loop did NOT treat as an exit: it kept running +
-        // publishing the fault tiers every cycle. So during stopping we still DISABLE (safe)
-        // but KEEP PUBLISHING, so last_error() composes the bus/drive fault that triggered the
-        // stop (behavior-preserving: the #16 compose-both tier liveness). The Runner ships the
-        // disable (final process) + close()->INIT after the window.
+        // LIFECYCLE-stop (spec §A R1 / FOLD 4): the Runner enters its stopping window on ANY stop
+        // cause -- including a BUS fault (master_.fault()), which the OLD loop did NOT treat as an
+        // exit: it kept running + publishing the fault tiers every cycle. So during stopping we
+        // de-energize (safe) but KEEP PUBLISHING, so last_error() composes the bus/drive fault
+        // that triggered the stop (#16 compose-both tier liveness). The Runner ships the final
+        // process + close()->INIT after the window.
         const Status sstatus{ctx.load<std::uint16_t>(f_statusword_)};
         const std::int32_t sactual = ctx.load<std::int32_t>(f_actual_);
         const std::int32_t svel =
@@ -576,7 +576,20 @@ void ServoController::step(CycleContext& ctx) noexcept {
                 ? ctx.load<std::int32_t>(f_velocity_actual_)
                 : static_cast<std::int32_t>(static_cast<std::int64_t>(sactual - prev_actual_) * config_.target_loop_rate_hz);
         prev_actual_ = sactual;
-        ctx.store<std::uint16_t>(f_ctrlword_, ControlWord::disable_voltage());
+        // #47-P3b R1 TWO-LEVEL stop: when quick-stop is configured (quick_stop_decel>0), delegate
+        // to the policy's controlled Quick-Stop (ramp via 0x6085 -> auto SwitchOnDisabled ->
+        // disable-voltage BACKSTOP once |vel| is sub-threshold for the debounce). OPT-OUT (no
+        // decel): P3a straight disable-voltage coast -- both are defined safe stops; the controlled
+        // one is opt-in. The policy's step() takes its ctx.stopping() branch and writes the cw.
+        if (config_.quick_stop_decel > 0) {
+            PolicyCommand scmd;
+            scmd.mode = (config_.mode == ControlMode::ProfilePosition) ? Cia402Mode::ProfilePosition : Cia402Mode::ProfileVelocity;
+            scmd.enable = false;  // stopping is not a motion intent; the policy's stopping branch owns the cw
+            scmd.token = state_.active_generation.load(std::memory_order_relaxed);
+            (void)policy_.step(ctx, scmd);  // writes cw (kQuickStopCw / disable backstop) into ctx
+        } else {
+            ctx.store<std::uint16_t>(f_ctrlword_, ControlWord::disable_voltage());
+        }
         publish_state(ctx, sstatus, sactual, svel);
         return;
     }
@@ -639,7 +652,21 @@ void ServoController::set_rpm(double rpm) {
         throw ConfigError("set_rpm requires Profile Velocity (PV) mode; this servo is configured PP -- use go_to/go_for");
     }
     const double clamped = clamp_rpm(rpm, config_.max_motor_speed_rpm);
-    const std::int32_t dev = rpm_to_device_velocity(clamped, config_.counts_per_rev, config_.gear_ratio);
+    std::int32_t dev = rpm_to_device_velocity(clamped, config_.counts_per_rev, config_.gear_ratio);
+    // #47-P3b R1 VEL guard: when a controlled Quick-Stop is configured (echoed 0x6085 > 0), a
+    // commanded velocity must be STOPPABLE within the ramp budget -- clamp to what the decel can
+    // ramp to 0 in (ramp_stop_timeout - margin). CLAMP not reject: the motor turns at the ceiling,
+    // observably below the request (never a silent no-op). No effect when quick-stop isn't
+    // configured. Lands WITH the two-level Quick-Stop so no window has QS without the budget guard.
+    constexpr double kStopWindowMarginS = 0.05;  // watchdog headroom (A6 sync watchdog ~50ms, CLAUDE.md)
+    const std::uint32_t decel = qs_decel_echoed_.load(std::memory_order_acquire);
+    if (decel > 0) {
+        const double t_s = std::max(0.0, static_cast<double>(config_.ramp_stop_timeout_ms) / 1000.0 - kStopWindowMarginS);
+        const double budget = static_cast<double>(decel) * t_s;  // counts/s the decel can null within the window
+        if (static_cast<double>(std::abs(dev)) > budget) {
+            dev = dev >= 0 ? static_cast<std::int32_t>(budget) : -static_cast<std::int32_t>(budget);
+        }
+    }
     (void)commands_.push(Command{SetVelocity{dev}});
 }
 
