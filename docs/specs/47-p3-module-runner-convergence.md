@@ -75,6 +75,10 @@ One active motion intent. Blocking moves (`go_to`/`go_for`) take an exclusive sl
 | `disable` | ACCEPT → de-energize | **CANCEL → waiter throws "motor disabled"** → de-energize (operator override, S1) | ACCEPT → de-energize |
 | `enable` / `fault_reset` | ACCEPT (control) | ACCEPT | ACCEPT |
 
+> **"operation ongoing"** above is the matrix shorthand; the actual thrown `BusError` string is the
+> clearer user-facing **"{verb}: a motion operation is already in progress"** (e.g. `go_to:`, `set_rpm:`)
+> — `servo_controller.cpp`. Same semantics, spec shorthand vs API text.
+
 **Completion + slot races (M7 — get these right):**
 - **(a) lost wakeup:** the gen-keyed waiter uses a **predicate loop** — `while(!terminal(gen)) cv.wait(...)` — re-checking completed/failed/stopped_gen AFTER arming, so a notify between check-and-sleep isn't lost.
 - **(b) slot reclaim:** `claim_motion_slot()` **reclaims a slot whose active gen is already TERMINAL** via a SINGLE CAS (`compare_exchange(expected = FREE | terminal-gen, desired = new-gen)`) — not check-then-claim (TOCTOU between two gRPC claimers). Claim reclaims-if-terminal; the waiter does not own release.
