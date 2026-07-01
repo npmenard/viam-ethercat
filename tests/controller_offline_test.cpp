@@ -20,6 +20,7 @@
 #include "viam/lib/servo_config.hpp"
 #include "viam/lib/servo_controller.hpp"
 
+using ethercat::BusError;
 using ethercat::ConfigError;
 using ethercat::EcatBackend;
 using ethercat::PdoEntry;
@@ -281,25 +282,24 @@ TEST("ServoController(PV): the velocity guard clamps a command the quick-stop ca
     // A commanded velocity must be STOPPABLE within the controlled-stop teardown window: the guard
     // clamps set_rpm to what quick_stop_decel can null in (controlled_stop_window - margin). CLAMP
     // not reject -- the motor turns at the ceiling, observably below the request.
-    ServoConfig cfg = make_config(ControlMode::ProfileVelocity);
+    // FEEDBACK mode: velocity_counts() reads the exact wire 0x606C (the sim's per-cycle advance =
+    // the commanded device velocity), NOT the noisy delta-estimate -> a DETERMINISTIC read.
+    ServoConfig cfg = make_config(ControlMode::ProfileVelocity, /*feedback=*/true);
     cfg.quick_stop_decel = 100'000;   // counts/s^2 (echoed back by the sim)
     cfg.controlled_stop_window_ms = 100;   // budget window; margin 50ms -> effective 50ms
     cfg.velocity_threshold = 1;       // is_moving = |vel| > 1
     // budget = 100000 * (0.100 - 0.050) = 5000 counts/s. set_rpm(60 rpm) = 131072 counts/s, FAR
     // above budget -> must clamp to ~5000, never the requested 131072.
-    ServoController ctrl{cfg, sim_factory(ControlMode::ProfileVelocity, nullptr)};
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfileVelocity, nullptr, /*feedback=*/true)};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
     ctrl.set_rpm(60.0);
     CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(300)));
-    // Settle, then the device velocity must sit at the guard ceiling, not the request.
-    // (velocity_counts() = per-cycle actual-delta x loop_rate; the sim integrates the commanded
-    // device-velocity per cycle, so a clamped dev~=5000 reads ~5000*1000=5e6, while the UNCLAMPED
-    // 131072 request would read ~1.31e8 -- the assertion separates the two by >10x.)
+    // The device velocity (0x606C) sits at the guard ceiling (~5000), NOT the requested 131072.
     CHECK(wait_until([&] { return std::abs(ctrl.velocity_counts()) > 100; }, std::chrono::milliseconds(300)));
     const std::int32_t v = std::abs(ctrl.velocity_counts());
-    CHECK(v > 0);              // still moving -- clamped, not rejected
-    CHECK(v <= 10'000'000);    // ~budget (5e6) + slack; DEFINITELY below the ~1.31e8 unclamped request
+    CHECK(v > 0);         // still moving -- clamped, not rejected
+    CHECK(v <= 8'000);    // ~budget (5000) + slack; DEFINITELY below the 131072 unclamped request
 }
 
 TEST("ServoController: quick-stop OPT-OUT (no decel) -- configure skips the 0x605A/0x6085 SDO, stop coasts (#47-P3b R1)") {
@@ -332,7 +332,7 @@ TEST("ServoController(PV): LIFECYCLE-stop is a RAMP-then-disable, not a torque-c
     // 200000 x (0.100 - 0.050) = 10000 counts/s; the sim ramps at 150/cycle -> ~67 cycles to reach
     // rest (>> 2, < the 100-cycle sized window). set_rpm(3000) clamps to the 10000 ceiling.
     SimSlaveModel m = make_model(ControlMode::ProfileVelocity, /*feedback=*/true);
-    m.quick_stop_decel_step = 150;  // ~67 cycles to ramp the 10000 max-clamped velocity to 0
+    m.quick_stop_decel_step = 500;  // ~20 cycles to ramp the 10000 max-clamped velocity to 0 (>>2, << the 100-cycle window)
     SimBackend* simp = nullptr;
     ServoController::BackendFactory factory = [m, &simp] {
         auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m});
@@ -841,6 +841,74 @@ TEST("#39: SDO refused while the controller's RT phase is declared; allowed afte
     ctrl.master_for_sdo()->sdo_write(1, 0x2031, 0x01, one);
     CHECK(sim != nullptr);
     CHECK_EQ(sim->recorded_sdo(1, 0x2031, 0x01).size(), std::size_t{2});
+}
+
+TEST("ServoController(PP): R3 single-in-flight -- a 2nd blocking move is rejected; halt cancels the 1st (#47-P3b R3)") {
+    // Keep the first move reliably IN-FLIGHT (the unpaced sim finishes a real move instantly): a
+    // ZERO-speed go_to freezes the sim's chase (0x6081=0 -> never advances -> never at_target), and
+    // a huge stall threshold disables the no-progress abort. The move parks until WE cancel it.
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition);
+    cfg.stall_threshold_cycles = 1'000'000'000;
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, nullptr)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    std::string first_msg;
+    std::thread mover([&] {
+        try {
+            ctrl.go_to(0.0, 100.0);  // 0 rpm -> frozen chase -> parks in-flight; we cancel it below
+        } catch (const std::exception& e) {
+            first_msg = e.what();
+        }
+    });
+
+    CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(500)));  // 1st move is live
+    // M7b: a 2nd blocking move CANNOT claim the slot while one is live -> "operation ongoing"
+    // (deterministic: the frozen move stays parked). Both go_to AND go_for reject.
+    CHECK_THROWS_MSG(ctrl.go_to(500.0, 1.0), BusError, "already in progress");
+    CHECK_THROWS_MSG(ctrl.go_for(500.0, 1.0), BusError, "already in progress");
+
+    ctrl.halt();  // R3 cancel -> the 1st move's waiter throws "motor stopped"
+    mover.join();
+    CHECK(first_msg.find("motor stopped") != std::string::npos);
+    // (slot-reclaim after a terminal move is covered deterministically by the first-terminal-wins
+    //  test's sequential go_to -> halt -> go_to -> go_to.)
+}
+
+TEST("ServoController(PP): R3 disable cancels an in-flight move -> waiter throws 'motor disabled' (#47-P3b R3)") {
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition);
+    cfg.stall_threshold_cycles = 1'000'000'000;  // frozen 0-speed move parks in-flight (see the single-in-flight test)
+    ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, nullptr)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    std::string msg;
+    std::thread mover([&] {
+        try {
+            ctrl.go_to(0.0, 100.0);  // frozen -> parks in-flight
+        } catch (const std::exception& e) {
+            msg = e.what();
+        }
+    });
+    CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(500)));
+    ctrl.disable();  // operator de-energize cancels the move (S1)
+    mover.join();
+    CHECK(msg.find("motor disabled") != std::string::npos);
+}
+
+TEST("ServoController(PP): R3 first-terminal-wins -- cancel AFTER completion is a no-op (#47-P3b R3)") {
+    // A halt issued once the move has already COMPLETED must NOT retro-fail it: the go_to already
+    // returned success, and the next move still works (the completed gen's terminal state is
+    // immutable). Also exercises slot-RECLAIM: sequential go_to -> halt -> go_to -> go_to.
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, nullptr)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    ctrl.go_to(1000.0, 1.0);  // completes (blocking) -> success
+    CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);
+    ctrl.halt();              // cancel of an already-completed move: no-op (abort sees completed==gen)
+    ctrl.go_to(1000.0, 2.0);  // slot reclaimed (terminal) -> a new move succeeds, no stuck "stopped" latch
+    CHECK(std::abs(ctrl.position_revs() - 2.0) < 0.01);
 }
 
 TEST_MAIN()

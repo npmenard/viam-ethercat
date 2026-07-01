@@ -179,7 +179,15 @@ class ServoController : public SlaveControl {
     // CONTROLLER-tier fault reasons (the CTRL tier only -- spec #16 moved the BUS
     // WkcFault out to state_.wkc_faulted). The RT thread only STORES the enum (no
     // string alloc, no mutex on the hot path); last_error() composes the text non-RT.
-    enum class RtError : std::uint8_t { None, HandshakeTimeout, MoveStalled, NotOperational, FaultResetFailed };
+    enum class RtError : std::uint8_t {
+        None,
+        HandshakeTimeout,
+        MoveStalled,
+        NotOperational,
+        FaultResetFailed,
+        MotorStopped,   // #47-P3b R3: an in-flight move CANCELLED by stop()/halt() -> waiter throws
+        MotorDisabled,  // #47-P3b R3: an in-flight move CANCELLED by disable() (operator de-energize) -> waiter throws
+    };
 
     // The RT thread body (loop while !st.stop_requested()). `started` is fulfilled
     // after a clean prelude (or set to an InitError exception on RT-sched failure
@@ -265,6 +273,11 @@ class ServoController : public SlaveControl {
     // drives the go_to/go_for wait predicate + the accessors' fail-safe.
     std::atomic<bool> stopping_{false};
     std::atomic<std::uint32_t> next_generation_{0};  // non-RT: assigns unique move ids
+    // #47-P3b R3 SINGLE-IN-FLIGHT slot: the generation of the ACTIVE blocking move (go_to/go_for),
+    // or 0 = FREE. A new blocking move CLAIMS it via a SINGLE CAS that reclaims a slot whose gen is
+    // already TERMINAL (completed/failed) -- no check-then-claim TOCTOU between two gRPC callers. The
+    // waiter does NOT release it (reclaim-if-terminal on the next claim). Non-RT (API-thread) owned.
+    std::atomic<std::uint32_t> motion_slot_{0};
     std::atomic<std::uint64_t> watchdog_ns_{0};      // RT-liveness window (set at start; config-free reads)
     // #54 P3a §8 Degraded-but-alive: set when start()/bring-up fails (RT-spawn / on_configured
     // refusal / drive AL-reject) -- motion APIs throw "{degraded_reason_}", accessors fail-safe,
@@ -314,6 +327,15 @@ class ServoController : public SlaveControl {
     // then classify the wake and THROW on stop/abort/fault/timeout. Shared by
     // go_to (absolute) and go_for (relative) so both get identical semantics.
     void await_move(std::uint32_t generation, std::chrono::milliseconds timeout);
+    // #47-P3b R3 single-in-flight slot (non-RT / API thread). gen_terminal: has this move reached a
+    // terminal (completed|failed) state? try_claim_motion_slot: CAS the slot to `gen`, reclaiming it
+    // only if FREE or holding a TERMINAL gen -> false if a LIVE blocking move owns it (M7b, no TOCTOU).
+    bool gen_terminal(std::uint32_t gen) const noexcept;
+    bool try_claim_motion_slot(std::uint32_t gen) noexcept;
+    bool motion_slot_busy() const noexcept;  // a LIVE (non-terminal) blocking move holds the slot
+    // Submit a PV velocity setpoint (rpm -> guarded device counts) WITHOUT the slot check -- for
+    // set_rpm (post its own check) and go_for(PV) (which owns the slot for its whole timed run).
+    void push_velocity(double rpm) noexcept;
 
     // commands_ BY VALUE -> never reset until dtor (no stop-time push-vs-destroy
     // UAF). master_ unique_ptr -> rebuilt by reconfigure() AFTER join (RT thread

@@ -169,6 +169,7 @@ void ServoController::reset_run_state() {
     state_.completed_generation.store(0, std::memory_order_relaxed);
     state_.failed_generation.store(0, std::memory_order_relaxed);
     next_generation_.store(0, std::memory_order_relaxed);
+    motion_slot_.store(0, std::memory_order_relaxed);  // R3: free the single-in-flight slot on (re)start
     state_.expected_wkc.store(master_->expected_wkc(), std::memory_order_relaxed);  // constant; read lock-free by last_error()
     lifecycle_ = Init{};
     last_cw_ = 0;
@@ -363,8 +364,14 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         halted_ = false;
     }
     if (batch.halt) {
-        halted_ = true;  // STICKY: stays asserted across cycles until a new motion command
+        halted_ = true;                             // STICKY: stays asserted across cycles until a new motion command
+        abort_active_move(RtError::MotorStopped);   // R3: CANCEL any in-flight blocking move -> its waiter throws "motor stopped"
     }
+    if (batch.disable) {
+        abort_active_move(RtError::MotorDisabled);  // R3: CANCEL any in-flight blocking move -> its waiter throws "motor disabled"
+    }
+    // (abort_active_move is a no-op when no move is live -- gen 0 or already terminal -- so a
+    //  cancel of an already-completed move does NOT overwrite its success: first-terminal-wins.)
 
     // Adopt a new PP target (generation rides in the command, post-coalescing).
     if (config_.mode == ControlMode::ProfilePosition && batch.set_target.has_value()) {
@@ -707,6 +714,18 @@ void ServoController::set_rpm(double rpm) {
     if (config_.mode != ControlMode::ProfileVelocity) {
         throw ConfigError("set_rpm requires Profile Velocity (PV) mode; this servo is configured PP -- use go_to/go_for");
     }
+    // R3 exclusion matrix (§3): a PV setpoint yields to a LIVE blocking move (a go_for timed run) --
+    // reject "operation ongoing" (set_rpm(0) too; halt() is the stop verb). PV setpoints are
+    // latest-wins AMONG THEMSELVES (no slot), so this rejects ONLY under a live blocking move.
+    if (motion_slot_busy()) {
+        throw BusError("set_rpm: a motion operation is already in progress");
+    }
+    push_velocity(rpm);
+}
+
+// Private: convert rpm -> guarded device velocity + submit. NO slot check / NO lock (the caller --
+// set_rpm after its slot check, or go_for(PV) which OWNS the slot for its whole run -- holds both).
+void ServoController::push_velocity(double rpm) noexcept {
     const double clamped = clamp_rpm(rpm, config_.max_motor_speed_rpm);
     std::int32_t dev = rpm_to_device_velocity(clamped, config_.counts_per_rev, config_.gear_ratio);
     dev = clamp_to_stop_budget(dev);  // #47-P3b R1: stoppable-within-teardown-window guard (0x60FF)
@@ -725,6 +744,35 @@ std::int32_t ServoController::clamp_to_stop_budget(std::int32_t vel_cps) const n
         return vel_cps;
     }
     return vel_cps >= 0 ? static_cast<std::int32_t>(budget) : -static_cast<std::int32_t>(budget);
+}
+
+bool ServoController::gen_terminal(std::uint32_t gen) const noexcept {
+    // A blocking move is terminal once the RT publishes its completion OR its failure for that gen.
+    // Generations are monotonic and completed/failed hold the LAST terminal gen, so equality is the
+    // test (a stale earlier terminal never masks a live later gen).
+    return gen != 0 && (state_.completed_generation.load(std::memory_order_acquire) == gen ||
+                        state_.failed_generation.load(std::memory_order_acquire) == gen);
+}
+
+bool ServoController::motion_slot_busy() const noexcept {
+    const std::uint32_t cur = motion_slot_.load(std::memory_order_acquire);
+    return cur != 0 && !gen_terminal(cur);  // a LIVE (non-terminal) blocking move owns the slot
+}
+
+bool ServoController::try_claim_motion_slot(std::uint32_t gen) noexcept {
+    // SINGLE-CAS claim (M7b): succeed only if the slot is FREE or holds an ALREADY-TERMINAL gen
+    // (reclaim). A concurrent second claimer that read the same terminal `cur` loses the CAS ->
+    // reloads a live gen -> returns false ("operation ongoing"). No check-then-claim TOCTOU.
+    std::uint32_t cur = motion_slot_.load(std::memory_order_acquire);
+    for (;;) {
+        if (cur != 0 && !gen_terminal(cur)) {
+            return false;  // a LIVE blocking move owns it
+        }
+        if (motion_slot_.compare_exchange_weak(cur, gen, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return true;
+        }
+        // CAS failed -> `cur` reloaded with the winner's gen; loop re-evaluates (live -> reject).
+    }
 }
 
 void ServoController::await_move(std::uint32_t generation, std::chrono::milliseconds timeout) {
@@ -783,6 +831,9 @@ void ServoController::go_to(double rpm, double position) {
         const double clamped_rpm = clamp_rpm(rpm, config_.max_motor_speed_rpm);
         const std::int32_t prof = clamp_to_stop_budget(rpm_to_device_velocity(clamped_rpm, config_.counts_per_rev, config_.gear_ratio));
         g = next_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!try_claim_motion_slot(g)) {  // R3 single-in-flight: a live blocking move already owns the slot
+            throw BusError("go_to: a motion operation is already in progress");
+        }
         move_timeout = config_.move_timeout_ms != 0 ? std::chrono::milliseconds(config_.move_timeout_ms) : std::chrono::milliseconds(30000);
         (void)commands_.push(Command{SetTarget{counts, static_cast<std::uint32_t>(std::abs(prof)), false, g}});
     }  // release the shared lock BEFORE parking (so reconfigure isn't blocked for the whole move)
@@ -806,6 +857,9 @@ void ServoController::go_for(double rpm, double revs) {
             const double clamped_rpm = clamp_rpm(rpm, config_.max_motor_speed_rpm);
             const std::int32_t prof = rpm_to_device_velocity(clamped_rpm, config_.counts_per_rev, config_.gear_ratio);
             g = next_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (!try_claim_motion_slot(g)) {  // R3 single-in-flight
+                throw BusError("go_for: a motion operation is already in progress");
+            }
             move_timeout =
                 config_.move_timeout_ms != 0 ? std::chrono::milliseconds(config_.move_timeout_ms) : std::chrono::milliseconds(30000);
             (void)commands_.push(Command{SetTarget{delta, static_cast<std::uint32_t>(std::abs(prof)), true, g}});
@@ -813,23 +867,36 @@ void ServoController::go_for(double rpm, double revs) {
         await_move(g, move_timeout);
         return;
     }
-    // PV: run at rpm for the time to cover `revs`, then halt.
+    // PV: run at rpm for the time to cover `revs`, then halt. R3: HOLD the single-in-flight slot for
+    // the whole timed run (a concurrent go_to/go_for/set_rpm rejects "operation ongoing"), releasing
+    // it at the end. Uses push_velocity (bypasses set_rpm's slot check -- we OWN the slot).
     double duration_s = 0.0;
+    std::uint32_t g = 0;
     {
         const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+        if (degraded_.load(std::memory_order_acquire)) {  // §8
+            throw BusError("go_for unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
+        }
+        g = next_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!try_claim_motion_slot(g)) {
+            throw BusError("go_for: a motion operation is already in progress");
+        }
         const double effective_rpm = clamp_rpm(rpm, config_.max_motor_speed_rpm);
         if (effective_rpm != 0.0) {
             duration_s = std::abs(revs / (effective_rpm / 60.0));
         }
+        push_velocity(rpm);
     }
-    set_rpm(rpm);
     if (duration_s > 0.0) {
         std::this_thread::sleep_for(std::chrono::duration<double>(duration_s));
     }
     {
         const std::shared_lock<std::shared_mutex> lk(api_mutex_);
-        (void)commands_.push(Command{SetVelocity{0}});  // command zero velocity so the run actually stops
+        push_velocity(0.0);  // command zero velocity so the run actually stops
     }
+    // Release the slot -- a timed PV run has no gen-terminal, so we (the single owner) free it via a
+    // CAS that clears ONLY our own claim (a concurrent reconfigure that reset it doesn't get clobbered).
+    motion_slot_.compare_exchange_strong(g, 0, std::memory_order_acq_rel, std::memory_order_relaxed);
     halt();
 }
 
@@ -946,6 +1013,12 @@ std::string ServoController::last_error() const {
             break;
         case RtError::FaultResetFailed:
             append("fault-reset ineffective -- cause persists");
+            break;
+        case RtError::MotorStopped:
+            append("motor stopped");
+            break;
+        case RtError::MotorDisabled:
+            append("motor disabled");
             break;
         case RtError::None:
             break;
