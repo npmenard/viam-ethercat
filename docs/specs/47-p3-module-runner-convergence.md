@@ -169,6 +169,7 @@ Wrapper catches all start-time failures (on_configured refusal | realtime setup 
 ### R1 — "always energized EXCEPT during a fault" (M4: the honest contract)
 A fault is an INVOLUNTARY de-energize (the drive drops its own torque); R2's job is re-energize-or-latch. Otherwise, two levels of stop:
 - **MOTION-stop** (Halt / cancel / idle) → **HOLD-ENERGIZED**: ramp vel→0; PV then **switches to PP-at-current-counts** (M6, below); `cw` stays `0x0F`; never de-energizes.
+  - **INTERIM (until sub-step 5, #47-P3b):** the module's PV motion-hold currently holds zero **VELOCITY** (bit8 Halt), NOT zero **POSITION** — under an external load the axis **drifts** (ramps to 0 rpm but doesn't lock the shaft to a target). Sub-step 5's canonical mode-switch (M6) closes this by switching PV motion-hold to PP-at-current-counts. **Ordering guarantee:** sub-step 5 lands **before P3c** (the loaded-HW mode-switch bench), so the load-drift never reaches real hardware; the sim has no load, so R1/offline is unaffected.
 - **LIFECYCLE-stop** (resource remove / respawn-reconfigure / exit) → de-energize via Runner teardown.
 - **`disable()`** → explicit **operator** de-energize (its own disposition; overrides the hold contract, S1).
 

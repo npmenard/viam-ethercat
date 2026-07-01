@@ -296,6 +296,43 @@ TEST("ServoController: quick-stop OPT-OUT (no decel) -- configure skips the 0x60
     CHECK(!ctrl.is_powered());  // de-energized after the stop
 }
 
+TEST("ServoController(PV): LIFECYCLE-stop is a RAMP-then-disable, not a torque-cut (#47-P3b R1, #53 landmark)") {
+    // The controlled two-level stop must be a ramp-then-disable: on ctx.stopping the policy commands
+    // CiA402 Quick-Stop, the drive stays ENERGIZED while |vel| ramps toward 0 (0x6085 decel), then
+    // auto-disables at its own zero (0x605A==2). Assert entered_qsa (it Quick-Stopped, NOT a
+    // straight torque-cut / disable-voltage) AND it left QuickStopActive with |vel| <= threshold
+    // (de-energized only AFTER the ramp -- the #53 landmark). The VEL guard makes the command
+    // rampable-in-window, so the ramp completes inside the teardown window.
+    SimSlaveModel m = make_model(ControlMode::ProfileVelocity, /*feedback=*/true);
+    m.quick_stop_decel_step = 2500;  // ramp 5000 -> 2500 -> 0 (reaches its zero + auto-disables well inside teardown)
+    SimBackend* simp = nullptr;
+    ServoController::BackendFactory factory = [m, &simp] {
+        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m});
+        simp = be.get();
+        return std::unique_ptr<EcatBackend>(std::move(be));
+    };
+    ServoConfig cfg = make_config(ControlMode::ProfileVelocity, /*feedback=*/true);
+    cfg.quick_stop_decel = 100'000;  // budget = 100000 * (0.100 - 0.050) = 5000 counts/s
+    cfg.ramp_stop_timeout_ms = 100;
+    cfg.velocity_threshold = 2000;
+    ServoController ctrl{cfg, factory};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.set_rpm(60.0);  // clamped to ~5000 counts/s by the guard (velocity_counts reads ~5000 in feedback mode)
+    CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(300)));
+    ctrl.stop();  // LIFECYCLE-stop -> Quick-Stop (ramp, energized) -> de-energize at rest
+    CHECK(simp != nullptr);
+    // entered_qsa is THE landmark: the drive reached QuickStopActive -> the stop engaged the
+    // controlled Quick-Stop (energized decel ramp), NOT a torque-cut / straight disable-voltage.
+    // The opt-out path (quick_stop_decel==0) would NEVER enter QSA (entered_qsa==false) -> this
+    // non-vacuously distinguishes the two-level controlled stop from a coast. (The exact
+    // vel-at-de-energize is the #53 a6_control_test's finer landmark; QSA auto-disable timing
+    // inside the module teardown window is the Runner's, not asserted here.)
+    CHECK(simp->entered_qsa(1));
+    CHECK(!ctrl.is_powered());  // de-energized after the controlled stop
+}
+
+
 TEST("ServoController(PV): a displaced, stopped motor reports is_moving == false") {
     // Regression for the PP-predicate-in-PV bug: target_counts_ is never set in PV,
     // so the old position-tolerance predicate reported a stopped-but-displaced PV

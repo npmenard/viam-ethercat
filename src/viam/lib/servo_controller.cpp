@@ -109,6 +109,13 @@ DeviceProfile ServoController::make_module_profile(const ServoConfig& c) noexcep
     // --- MODULE behavior flags (vs the bench A6 defaults): full 4-phase new-setpoint handshake
     //     with the module's ack timeout; Stop = CiA402 bit8 Halt; no PV position mirror. ---
     p.handshake_timeout_cycles = c.handshake_timeout_cycles;
+    // INTERIM (until sub-step 5): a MOTION-stop (Halt) of a PV move holds via bit8, which holds
+    // zero VELOCITY, NOT zero POSITION -- under an external load the axis DRIFTS (the drive ramps
+    // to 0 rpm but does not lock the shaft to a target). Sub-step 5's canonical mode-switch (M6:
+    // ramp->0 -> 0x6060=PP -> seed 0x607A=current counts -> bit4) closes this by switching PV
+    // motion-hold to PP-at-current-counts (hold zero POSITION). Ordering guarantee: sub-step 5
+    // lands BEFORE P3c (the loaded-HW mode-switch bench), so the load-drift never reaches real
+    // hardware; the sim has no load so R1/offline is unaffected. (spec §A R1.)
     p.halt_uses_bit8 = true;
     p.pv_mirror_position = false;
     return p;
