@@ -96,8 +96,29 @@ MasterConfig build_master_config(const ServoConfig& c) {
 ServoController::ServoController(ServoConfig config)
     : ServoController(std::move(config), [] { return std::unique_ptr<EcatBackend>(std::make_unique<SoemBackend>()); }) {}
 
+DeviceProfile ServoController::make_module_profile(const ServoConfig& c) noexcept {
+    DeviceProfile p;
+    // Fault-reset mechanism: a vendor SDO (e.g. A6 0x2031:01) when the config carries one, else the
+    // standard CiA402 controlword bit7. (The module runs its own #18 fault machine in the wrapper;
+    // this field is for the policy's future in-loop reset -- R2/sub-step-4.)
+    p.fault_reset = c.vendor_fault_reset.has_value() ? DeviceProfile::FaultReset::VendorSdo : DeviceProfile::FaultReset::Cia402Bit7;
+    p.vendor_fault_reset = c.vendor_fault_reset;
+    p.position_tolerance = c.position_tolerance_counts;
+    p.zero_vel_threshold = c.velocity_threshold;
+    p.quick_stop_decel = c.quick_stop_decel;  // 0 => configure() skips the quick-stop SDO setup
+    // --- MODULE behavior flags (vs the bench A6 defaults): full 4-phase new-setpoint handshake
+    //     with the module's ack timeout; Stop = CiA402 bit8 Halt; no PV position mirror. ---
+    p.handshake_timeout_cycles = c.handshake_timeout_cycles;
+    p.halt_uses_bit8 = true;
+    p.pv_mirror_position = false;
+    return p;
+}
+
 ServoController::ServoController(ServoConfig config, BackendFactory backend_factory)
-    : config_(validated(std::move(config))), backend_factory_(std::move(backend_factory)), commands_(config_.command_queue_capacity) {
+    : config_(validated(std::move(config))),
+      backend_factory_(std::move(backend_factory)),
+      policy_(make_module_profile(config_)),
+      commands_(config_.command_queue_capacity) {
     if (!backend_factory_) {
         throw ConfigError("ServoController: null backend factory");
     }
@@ -141,7 +162,7 @@ void ServoController::reset_run_state() {
     state_.expected_wkc.store(master_->expected_wkc(), std::memory_order_relaxed);  // constant; read lock-free by last_error()
     lifecycle_ = Init{};
     last_cw_ = 0;
-    handshake_ = Handshake::Idle;
+    policy_.reset();  // #47-P3b: clear the shared policy's per-run sequencing state (handshake/latches) for reuse
     prev_actual_ = 0;
     first_cycle_ = true;
     halted_ = false;
@@ -294,45 +315,6 @@ void ServoController::abort_active_move(RtError reason) noexcept {
     }
 }
 
-std::uint16_t ServoController::step_handshake(CycleContext& ctx, std::uint16_t base_cw, Status status) noexcept {
-    switch (handshake_) {
-        case Handshake::Idle:
-            return base_cw;
-        case Handshake::WriteTarget:
-            ctx.store<std::int32_t>(f_target_, target_counts_);
-            handshake_ = Handshake::AwaitAck;
-            handshake_cycles_remaining_ = config_.handshake_timeout_cycles;
-            return ControlWord::with_new_setpoint(base_cw, true);  // raise bit4
-        case Handshake::AwaitAck:
-            if (status.setpoint_acknowledged()) {
-                handshake_ = Handshake::ClearBit4;
-                return ControlWord::with_new_setpoint(base_cw, true);
-            }
-            if (handshake_cycles_remaining_ == 0) {
-                abort_active_move(RtError::HandshakeTimeout);  // latch + wake the waiter PROMPTLY (correct reason)
-                handshake_ = Handshake::Idle;
-                return base_cw;  // drop bit4
-            }
-            --handshake_cycles_remaining_;
-            return ControlWord::with_new_setpoint(base_cw, true);
-        case Handshake::ClearBit4:
-            handshake_ = Handshake::AwaitAckClear;
-            handshake_cycles_remaining_ = config_.handshake_timeout_cycles;
-            return base_cw;  // drop bit4
-        case Handshake::AwaitAckClear:
-            if (!status.setpoint_acknowledged()) {
-                handshake_ = Handshake::Idle;
-            } else if (handshake_cycles_remaining_ == 0) {
-                abort_active_move(RtError::HandshakeTimeout);  // latch + wake the waiter PROMPTLY (correct reason)
-                handshake_ = Handshake::Idle;
-            } else {
-                --handshake_cycles_remaining_;
-            }
-            return base_cw;
-    }
-    return base_cw;
-}
-
 std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, const CommandBatch& batch, std::int32_t actual) noexcept {
     const Cia402State dev = status.decode();
     const bool bus_fault = ctx.fault();
@@ -355,7 +337,8 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             stall_cycles_ = 0;
             latched_ctrl_error_ = RtError::None;  // a fresh move starts with a clean diagnostic slate
             state_.active_generation.store(t.generation, std::memory_order_release);
-            handshake_ = Handshake::WriteTarget;  // restart the PP handshake for the new target
+            // The policy restarts its new-setpoint handshake off the token (= this generation)
+            // change on the next step() -- no wrapper-side handshake state to prime (#47-P3b).
         }
     }
     if (config_.mode == ControlMode::ProfileVelocity && batch.set_velocity.has_value()) {
@@ -392,20 +375,27 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         if (batch.quick_stop) {
             return ControlWord::quick_stop();
         }
-        std::uint16_t cw = ControlWord::enable_operation();
-        if (config_.mode == ControlMode::ProfilePosition) {
-            cw = step_handshake(ctx, cw, status);
-            // Write the commanded move speed to profile velocity (0x6081) every cycle
-            // when it's mapped -- else the drive uses its default speed and the rpm
-            // passed to go_to/go_for is silently ignored on hardware.
-            if (f_profile_velocity_.mapped()) {
-                ctx.store<std::uint32_t>(f_profile_velocity_, profile_vel_);
-            }
-        } else if (f_velocity_.mapped()) {
-            ctx.store<std::int32_t>(f_velocity_, pv_velocity_);
-        }
-        if (halted_) {
-            cw = ControlWord::with_halt(cw, true);  // Stop = Halt (bit8, sticky), NOT QuickStop
+        // #47-P3b: DELEGATE the Operational healthy-path (enable-hold + PP new-setpoint handshake +
+        // 0x6081 move-speed / PV 0x60FF stream + Halt) to the shared generic policy. The wrapper
+        // KEEPS completion-generations, the two-tier fault, #18 fault-reset, and the stall watchdog
+        // (rev-6 boundary). The opaque token = the active move generation (the policy resets its
+        // reached-latch + restarts the handshake when it changes -- FOLD 3). The policy writes the
+        // controlword + command objects into ctx and returns the cw; publish_state below reads its
+        // handshake-idle for the completion gate.
+        PolicyCommand pcmd;
+        pcmd.mode = (config_.mode == ControlMode::ProfilePosition) ? Cia402Mode::ProfilePosition : Cia402Mode::ProfileVelocity;
+        pcmd.target_counts = target_counts_;
+        pcmd.profile_velocity = profile_vel_;
+        pcmd.target_velocity = pv_velocity_;
+        pcmd.enable = true;
+        pcmd.halt = halted_;
+        pcmd.token = state_.active_generation.load(std::memory_order_relaxed);
+        const std::uint16_t cw = policy_.step(ctx, pcmd);
+        // The 4-phase handshake's ack (or ack-clear) timeout is the policy's per-cycle signal; the
+        // WRAPPER owns the disposition -> abort the in-flight move (latch + wake the waiter), same as
+        // the old step_handshake abort_active_move(HandshakeTimeout).
+        if (policy_.state().handshake_timed_out) {
+            abort_active_move(RtError::HandshakeTimeout);
         }
         return cw;
     }
@@ -492,7 +482,7 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
     state_.moving.store(moving, std::memory_order_relaxed);
 
     // PP generation protocol: completion + no-progress watchdog (PP-only via move_active).
-    if (powered && move_active && at_target && handshake_ == Handshake::Idle) {
+    if (powered && move_active && at_target && policy_.state().handshake_idle) {
         state_.completed_generation.store(g, std::memory_order_release);  // publish BEFORE notify
         completion_cv_.notify_all();                                      // no completion_mutex_ held
     } else if (move_active) {
@@ -547,10 +537,13 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
 // pacing + the steady cadence + the stopping window + master.close(). What remains is POLICY.
 
 void ServoController::on_configured(ConfigContext& cfg) {
-    // No-op: field resolution + the #39 vendor fault-reset run in start()/reconfigure()
-    // (pre-Runner-start, single port owner) -- behavior-identical to today, and keeps this
-    // hook free of a throwing SDO mid-Runner-start. (P3b moves the SDO setup here.)
-    (void)cfg;
+    // #47-P3b: resolve the policy's typed fields + run its quick-stop SDO setup here (NON-RT,
+    // pre-spawn, single port owner -- the ONE hook that may throw; a throw aborts start() cleanly
+    // -> Degraded §8). The module's own f_* offsets + #39 vendor reset still resolve in
+    // start()/reconfigure(); this ADDS the policy's resolution (same Master, same SAFE-OP phase).
+    // needs_quick_stop gated on a configured 0x6085 (quick_stop_decel > 0); the echoed value backs
+    // the future velocity-window guard. A mode-mismatched 0x605A / absent 0x6085 THROWS (fail-closed).
+    qs_decel_echoed_ = policy_.configure(cfg, /*needs_quick_stop=*/config_.quick_stop_decel > 0);
 }
 
 void ServoController::on_operational(CycleContext& ctx) noexcept {

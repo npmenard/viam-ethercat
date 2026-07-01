@@ -264,6 +264,27 @@ class Master {
     FieldLocation resolve_tx(std::uint16_t slave) const {
         return resolve_field(runtime_for(slave).tx_fields, F::index, F::sub, sizeof(typename F::type), slave, /*is_tx=*/true);
     }
+    // OPTIONAL resolve (a field a GENERIC consumer maps only in some modes -- e.g. 0x60FF is
+    // absent in a PP-only map, 0x607A in a PV-only map). Returns an UNMAPPED FieldLocation
+    // (mapped()==false) when the object isn't in the map, instead of throwing -- the caller
+    // guards its per-cycle load/store on mapped(). A mapped-but-WRONG-WIDTH object still throws
+    // PdoAccessError (a real misconfig, never silently tolerated). Configure-time only.
+    template <class F>
+    FieldLocation resolve_rx_optional(std::uint16_t slave) const {
+        try {
+            return resolve_rx<F>(slave);
+        } catch (const PdoMappingError&) {
+            return FieldLocation{};
+        }
+    }
+    template <class F>
+    FieldLocation resolve_tx_optional(std::uint16_t slave) const {
+        try {
+            return resolve_tx<F>(slave);
+        } catch (const PdoMappingError&) {
+            return FieldLocation{};
+        }
+    }
 
     // --- narrow public SDO primitive (#39: vendor POLICY is consumer-side) -------------
     // #23 removed the public SDO surface to stop ad-hoc CoE poking; #39 partially reverses

@@ -87,6 +87,11 @@ struct ServoConfig {
     std::uint64_t stall_threshold_cycles = 10;     // cycle-stall -> stale
     std::size_t command_queue_capacity = 64;       // > 0
     std::uint32_t handshake_timeout_cycles = 100;  // PP bit12 ack timeout
+    // Quick-stop deceleration (0x6085, counts/s^2) for the R1 controlled stop. 0 = quick-stop not
+    // configured -> the policy's quick-stop SDO setup (0x605A assert + 0x6085 write/readback) is
+    // SKIPPED (the drive falls back to disable-voltage on stop). >0 -> configured + asserted at
+    // bring-up. Standard CiA402 tunable; from the hardware JSON (never a hardcoded device value).
+    std::uint32_t quick_stop_decel = 0;
     // Fault-reset recovery window: cycles to hold the reset intent waiting for the drive
     // to reflect Fault->Switch-On-Disabled before giving up (type-(b) persistent cause).
     // Must exceed the drive's real clear-reflect latency; a too-large N only delays the
