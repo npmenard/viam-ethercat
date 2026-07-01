@@ -100,10 +100,12 @@ One active motion intent. Blocking moves (`go_to`/`go_for`) take an exclusive sl
 
 _Live-apply vs respawn (M5):_ live-apply = an atomic POINTER-swap to an IMMUTABLE config snapshot (RT `step()`
 acquire-loads the pointer ONCE at cycle-top, uses that snapshot the whole step — no in-place mutation / torn read).
-**SOFT (live-appliable, no teardown, load HELD):** `position_tolerance`, `zero_vel_threshold`, `quick_stop_decel`/`option`,
-`max_motor_speed_rpm`, `fault_recovery_max_attempts`/`backoff`. **STRUCTURAL (FORCE respawn = a documented LOAD-DROP
-window; brake/support first on a load axis):** `counts_per_rev`, `gear_ratio` (mis-live-applying corrupts an in-flight
-move's units mid-run), `ifname`, dc/sync0/loop-rate/rt params, PDO map, `fault_reset_mechanism`.
+**SOFT (live-appliable, no teardown, load HELD):** `position_tolerance`, `zero_vel_threshold`, `max_motor_speed_rpm`,
+`fault_recovery_max_attempts`/`backoff` (all RT-consumed values, no drive-side write). **STRUCTURAL (FORCE respawn =
+a documented LOAD-DROP window; brake/support first on a load axis):** `counts_per_rev`, `gear_ratio` (mis-live-applying
+corrupts an in-flight move's units mid-run), `quick_stop_decel` (0x6085) / `quick_stop_option` (0x605A) — **these are
+configure-time SDO writes/asserts (on_configured), NOT RT-mutable, so changing them requires a respawn** (DA sub-step-2
+finding) — `ifname`, dc/sync0/loop-rate/rt params, PDO map, `fault_reset_mechanism`.
 
 ---
 
