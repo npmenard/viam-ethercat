@@ -574,6 +574,15 @@ std::uint16_t SimBackend::received_controlword(std::uint16_t slave) const noexce
     return 0;
 }
 
+Cia402Mode SimBackend::effective_mode(std::uint16_t slave) const noexcept {
+    // The drive's CURRENT runtime mode-of-operation (from the 0x6060 the master wrote, or SDO-set).
+    // #47-P3b M6: lets a test confirm a PV motion-hold actually switched the drive to PP (position lock).
+    if (slave >= 1 && slave <= slaves_.size()) {
+        return slaves_[slave - 1].effective_mode;
+    }
+    return Cia402Mode::None;
+}
+
 std::int32_t SimBackend::velocity_at_qsa_exit(std::uint16_t slave) const noexcept {
     if (slave >= 1 && slave <= slaves_.size()) {
         return slaves_[slave - 1].velocity_at_qsa_exit;

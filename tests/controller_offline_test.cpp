@@ -375,6 +375,98 @@ TEST("ServoController(PV): LIFECYCLE-stop is a RAMP-then-disable, not a torque-c
     CHECK_EQ(simp->received_controlword(1), std::uint16_t{0x000B});
 }
 
+TEST("ServoController(PV): M6 -- a switch-capable PV motion-hold LOCKS position via PP-at-current-counts (#47-P3b M6)") {
+    // The interim R1 PV-hold held zero VELOCITY (bit8) -> under load the axis DRIFTS (PV has no position
+    // loop). M6: when the map is switch-capable (0x6060 + 0x607A both RxPDO-mapped), a Halt of a PV move
+    // runs the GENERIC mode-switch (ramp PV->0 -> write 0x6060=PP) then latches the AT-HALT position as
+    // the PP setpoint, so the drive's POSITION loop LOCKS the shaft. Proven by: the drive's runtime mode
+    // becomes PP, |vel|~0, the axis is HELD (position stable = no drift), and it stays ENERGIZED (R1).
+    SimSlaveModel m = make_model(ControlMode::ProfileVelocity, /*feedback=*/true);
+    m.output_bytes = 11;  // ctrl@0, target-velocity@2, target-position@6, mode-of-op@10 (switch-capable PV map)
+    m.velocity_off = 2;
+    m.target_off = 6;
+    m.mode_of_op_off = 10;
+    m.input_bytes = 13;       // feedback (sw@0,actual@2,fault@6,vel@8) + 0x6061 mode-display @12
+    m.mode_display_off = 12;  // 0x6061 echo -- REQUIRED so the mode-switch Settle can CONFIRM the new mode
+    SimBackend* simp = nullptr;
+    ServoController::BackendFactory factory = [m, &simp] {
+        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m});
+        simp = be.get();
+        return std::unique_ptr<EcatBackend>(std::move(be));
+    };
+    ServoConfig cfg = make_config(ControlMode::ProfileVelocity, /*feedback=*/true);
+    // Switch-capable RxPDO: add 0x607A (PP target) so pv_hold_capable_ latches (else the interim bit8 hold).
+    cfg.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x60FF, 0, 32}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6060, 0, 8}};
+    // 0x6061 mode-display in the TxPDO -> the policy's Settle confirms 0x6061==PP (a real switch, not a hang).
+    cfg.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16}, PdoEntry{0x606C, 0, 32}, PdoEntry{0x6061, 0, 8}};
+    cfg.quick_stop_decel = 100'000;
+    cfg.controlled_stop_window_ms = 100;  // VEL budget = 100000*(0.100-0.050) = 5000 counts/s
+    cfg.velocity_threshold = 50;
+    ServoController ctrl{cfg, factory};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.set_rpm(1.0);  // ~2184 counts/s (< 5000 budget -> unclamped), well above the 50 threshold
+    CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(300)));
+    CHECK(simp != nullptr);
+    // MOTION-stop (Halt) -> M6: the drive switches to PP-at-current-counts and LOCKS position. The
+    // observation split is deliberate: is_powered/is_moving/velocity_counts/position_revs are CONTROLLER
+    // atomics (race-free to poll during the run); simp->effective_mode() reads SIM-internal state, so it
+    // is read ONLY after ctrl.stop() has JOINED the RT thread (mirrors the entered_qsa/received_* tests).
+    ctrl.halt();
+    CHECK(wait_until([&] { return std::abs(ctrl.velocity_counts()) <= cfg.velocity_threshold; },
+                     std::chrono::milliseconds(500)));       // ramped to rest (StopFirst)
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));  // >> the ~10-cycle switch -> the PP hold is established
+    CHECK(ctrl.is_powered());  // R1: the HOLD is ENERGIZED -- never de-energizes
+    CHECK(!ctrl.is_moving());
+    // HELD: position is STABLE (the PP position loop locks the shaft at REST -> zero drift, no back-jump).
+    const double p0 = ctrl.position_revs();
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    CHECK(std::abs(ctrl.position_revs() - p0) < 1e-6);
+    ctrl.stop();  // JOIN the RT thread -> the sim accessor below is race-free
+    CHECK(simp->effective_mode(1) == ethercat::Cia402Mode::ProfilePosition);  // the drive DID switch to PP (not bit8-PV)
+}
+
+TEST("ServoController(PV): M6 -- a PV->PP hold-switch that can't confirm stays ENERGIZED in PV, no throw/de-energize (#47-P3b M6 failure)") {
+    // Failure disposition (spec §A R1): if the hold-switch can't confirm the mode (0x6061 never echoes PP
+    // -- the #45 silent-ignore shape), the module does NOT throw (it's an INTERNAL hold, not an operator
+    // command) and does NOT de-energize -- it reverts to the interim PV-at-0 hold. Proven by: after the
+    // settle window the drive is back in PV and still ENERGIZED (the load-bearing safety property).
+    SimSlaveModel m = make_model(ControlMode::ProfileVelocity, /*feedback=*/true);
+    m.output_bytes = 11;
+    m.velocity_off = 2;
+    m.target_off = 6;
+    m.mode_of_op_off = 10;
+    m.input_bytes = 13;
+    m.mode_display_off = 12;
+    m.mode_echo_forced = true;
+    m.mode_echo_value = static_cast<std::int8_t>(ethercat::Cia402Mode::ProfileVelocity);  // 0x6061 ALWAYS says PV -> switch never confirms
+    SimBackend* simp = nullptr;
+    ServoController::BackendFactory factory = [m, &simp] {
+        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m});
+        simp = be.get();
+        return std::unique_ptr<EcatBackend>(std::move(be));
+    };
+    ServoConfig cfg = make_config(ControlMode::ProfileVelocity, /*feedback=*/true);
+    cfg.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x60FF, 0, 32}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6060, 0, 8}};
+    cfg.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16}, PdoEntry{0x606C, 0, 32}, PdoEntry{0x6061, 0, 8}};
+    cfg.quick_stop_decel = 100'000;
+    cfg.velocity_threshold = 50;
+    ServoController ctrl{cfg, factory};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.set_rpm(1.0);
+    CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(300)));
+    ctrl.halt();  // attempts PV->PP; Settle never confirms (echo forced PV) -> mode_switch_failed -> revert
+    // Wait past the settle-timeout window (default 200 cycles ~200ms @1kHz) for the failure + revert to
+    // settle. The end-state is STABLE (reverted PV-at-0 hold), so this post-condition never flakes.
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    CHECK(ctrl.is_powered());  // THE safety property: stayed ENERGIZED through a failed switch (never de-energized)
+    CHECK(std::abs(ctrl.velocity_counts()) <= cfg.velocity_threshold);  // reverted PV-at-0 -> at rest (atomic, race-free)
+    ctrl.stop();  // JOIN the RT thread -> the sim accessor below is race-free
+    CHECK(simp != nullptr);
+    CHECK(simp->effective_mode(1) == ethercat::Cia402Mode::ProfileVelocity);  // reverted to PV (interim bit8 hold), not stuck in PP
+}
+
 TEST("ServoController(PV): a displaced, stopped motor reports is_moving == false") {
     // Regression for the PP-predicate-in-PV bug: target_counts_ is never set in PV,
     // so the old position-tolerance predicate reported a stopped-but-displaced PV

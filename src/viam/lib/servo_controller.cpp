@@ -25,6 +25,7 @@ constexpr std::uint16_t kTargetPos = 0x607A;
 constexpr std::uint16_t kActualPos = 0x6064;
 constexpr std::uint16_t kTargetVel = 0x60FF;
 constexpr std::uint16_t kProfileVel = 0x6081;  // PP move speed (carries the GoTo/GoFor rpm); optional in the map
+constexpr std::uint16_t kModeOfOp = 0x6060;    // runtime mode-of-operation (RxPDO); present => PV->PP hold-switch (M6)
 constexpr std::uint16_t kFaultCode = 0x603F;   // drive error code (TxPDO, optional feedback)
 // #TODO-4: the A6's "no-SYNC0" code (0x8700 / Er74.1) is NO LONGER a constant here --
 // it's CONFIG DATA (ServoConfig::sync_fault_code), so this generic core carries no
@@ -112,13 +113,11 @@ DeviceProfile ServoController::make_module_profile(const ServoConfig& c) noexcep
     // --- MODULE behavior flags (vs the bench A6 defaults): full 4-phase new-setpoint handshake
     //     with the module's ack timeout; Stop = CiA402 bit8 Halt; no PV position mirror. ---
     p.handshake_timeout_cycles = c.handshake_timeout_cycles;
-    // INTERIM (until sub-step 5): a MOTION-stop (Halt) of a PV move holds via bit8, which holds
-    // zero VELOCITY, NOT zero POSITION -- under an external load the axis DRIFTS (the drive ramps
-    // to 0 rpm but does not lock the shaft to a target). Sub-step 5's canonical mode-switch (M6:
-    // ramp->0 -> 0x6060=PP -> seed 0x607A=current counts -> bit4) closes this by switching PV
-    // motion-hold to PP-at-current-counts (hold zero POSITION). Ordering guarantee: sub-step 5
-    // lands BEFORE P3c (the loaded-HW mode-switch bench), so the load-drift never reaches real
-    // hardware; the sim has no load so R1/offline is unaffected. (spec §A R1.)
+    // A MOTION-stop (Halt) of a PV move. On a SWITCH-CAPABLE map (0x6060 + 0x607A mapped) the wrapper
+    // instead switches the drive to PP-at-current-counts (M6, resolve_fields/step_lifecycle) so the
+    // POSITION loop locks the shaft. This bit8 setting is the FALLBACK for a NON-switch-capable PV map:
+    // Halt asserts CiA402 bit8 (the drive's own halt ramp) -> holds zero VELOCITY, not zero POSITION, so
+    // under an external load the axis drifts (safe on the no-load sim / bench). (spec §A R1 / M6.)
     p.halt_uses_bit8 = true;
     p.pv_mirror_position = false;
     return p;
@@ -277,6 +276,12 @@ void ServoController::resolve_fields() {
         f_profile_velocity_ = rxpdo_has(kProfileVel) ? master_->rx_field(s, kProfileVel, 0) : FieldLocation{};
     } else {
         f_velocity_ = master_->rx_field(s, kTargetVel, 0);
+        // #47-P3b M6: a PV motion-hold can lock POSITION (not just zero velocity) ONLY if the map is
+        // switch-capable -- 0x6060 (runtime mode-of-operation) AND 0x607A (PP target) both present, so
+        // the policy can switch PV->PP and seed the hold target. Absent either, Halt stays the interim
+        // bit8 zero-VELOCITY hold (drifts under load; safe on the sim / no-load bench). The policy also
+        // guards every switch write on mapped(), so this gate only picks hold STRATEGY, never safety.
+        pv_hold_capable_ = rxpdo_has(kModeOfOp) && rxpdo_has(kTargetPos);
     }
     // OPTIONAL TxPDO feedback (spec #16) -- both modes. !mapped() => not in the map, so the
     // RT loop falls back (velocity estimate) / omits the tier (fault code).
@@ -362,10 +367,21 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
     // A new motion command (or enable) clears the sticky Halt.
     if (batch.set_target.has_value() || batch.set_velocity.has_value() || batch.enable) {
         halted_ = false;
+        pv_hold_as_pp_ = false;  // M6: a fresh motion intent ends the PV->PP position hold (switches back to PV)
     }
     if (batch.halt) {
         halted_ = true;                             // STICKY: stays asserted across cycles until a new motion command
         abort_active_move(RtError::MotorStopped);   // R3: CANCEL any in-flight blocking move -> its waiter throws "motor stopped"
+        // M6: on a switch-capable PV map, hold POSITION via PP (below). pv_hold_token_ kicks the policy's
+        // PP handshake for the hold target WITHOUT disturbing the move-generation space. The hold target is
+        // the LIVE actual (passed each cycle) -- the PP handshake latches it once, on its bit4 edge, which
+        // fires only AFTER the mode-switch stop-first ramp has brought the motor to REST -> the latched
+        // target IS the rest position (spec M6 "seed 0x607A=ACTUAL counts"), so no back-jump/lunge. Not
+        // switch-capable -> pv_hold_as_pp_ stays false -> interim bit8 zero-velocity hold.
+        if (pv_hold_capable_) {
+            pv_hold_as_pp_ = true;
+            ++pv_hold_token_;
+        }
     }
     if (batch.disable) {
         abort_active_move(RtError::MotorDisabled);  // R3: CANCEL any in-flight blocking move -> its waiter throws "motor disabled"
@@ -429,19 +445,42 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // controlword + command objects into ctx and returns the cw; publish_state below reads its
         // handshake-idle for the completion gate.
         PolicyCommand pcmd;
-        pcmd.mode = (config_.mode == ControlMode::ProfilePosition) ? Cia402Mode::ProfilePosition : Cia402Mode::ProfileVelocity;
-        pcmd.target_counts = target_counts_;
-        pcmd.profile_velocity = profile_vel_;
-        pcmd.target_velocity = pv_velocity_;
-        pcmd.enable = true;
-        pcmd.halt = halted_;
-        pcmd.token = state_.active_generation.load(std::memory_order_relaxed);
+        if (pv_hold_as_pp_) {
+            // M6: PV motion-hold as PP-at-current-counts. Command PP with target = the position latched
+            // at the halt; the generic mode-switch ramps PV->0, switches 0x6060=PP, then the PP handshake
+            // (kicked by pv_hold_token_) latches the hold target so the drive's position loop LOCKS the
+            // shaft (no drift). halt=false so the handshake actually runs (a bit8 halt would freeze the
+            // profile generator and never latch the setpoint). Not a completable move -> pv_hold_token_,
+            // not active_generation, so completion tracking is untouched (the halt already failed it).
+            pcmd.mode = Cia402Mode::ProfilePosition;
+            pcmd.target_counts = actual;  // LIVE actual: the handshake latches it at REST (post ramp) -> no lunge
+            pcmd.profile_velocity = profile_vel_;
+            pcmd.enable = true;
+            pcmd.halt = false;
+            pcmd.token = pv_hold_token_;
+        } else {
+            pcmd.mode = (config_.mode == ControlMode::ProfilePosition) ? Cia402Mode::ProfilePosition : Cia402Mode::ProfileVelocity;
+            pcmd.target_counts = target_counts_;
+            pcmd.profile_velocity = profile_vel_;
+            pcmd.target_velocity = pv_velocity_;
+            pcmd.enable = true;
+            pcmd.halt = halted_;
+            pcmd.token = state_.active_generation.load(std::memory_order_relaxed);
+        }
         const std::uint16_t cw = policy_.step(ctx, pcmd);
         // The 4-phase handshake's ack (or ack-clear) timeout is the policy's per-cycle signal; the
         // WRAPPER owns the disposition -> abort the in-flight move (latch + wake the waiter), same as
         // the old step_handshake abort_active_move(HandshakeTimeout).
-        if (policy_.state().handshake_timed_out) {
+        if (policy_.state().handshake_timed_out && !pv_hold_as_pp_) {
             abort_active_move(RtError::HandshakeTimeout);
+        }
+        // M6 failure disposition (spec §A R1): if the PV->PP hold-switch can't confirm (motor won't
+        // stop / 0x6061 never echoes PP), DON'T throw -- this is an internal hold, not an operator
+        // command. Revert to the interim PV-at-0 bit8 hold (accept small drift, stay energized). Next
+        // cycle commands PV+halt; current_mode is still PV (switch failed pre-echo) so no re-switch.
+        if (policy_.state().mode_switch_failed && pv_hold_as_pp_) {
+            pv_hold_as_pp_ = false;
+            pv_velocity_ = 0;  // spec §A R1 "PV-AT-0": command zero velocity for the reverted hold (don't resume the pre-halt rpm)
         }
         return cw;
     }

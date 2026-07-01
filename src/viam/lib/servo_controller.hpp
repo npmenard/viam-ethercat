@@ -304,6 +304,17 @@ class ServoController : public SlaveControl {
     std::int32_t prev_actual_ = 0;  // previous-cycle actual (instantaneous velocity estimate)
     bool first_cycle_ = true;       // skip the velocity estimate on the first cycle
     bool halted_ = false;           // STICKY Stop: Halt stays asserted until a new motion command
+    // #47-P3b M6 (PV->PP hold-switch): a PV motion-hold that holds zero VELOCITY (bit8) drifts under
+    // load -- the drive has no position loop in PV. When the map is switch-capable (0x6060 + 0x607A both
+    // RxPDO-mapped), a Halt of a PV move instead switches the drive to PP-at-current-counts (the generic
+    // mode-switch, then a PP setpoint = the position latched AT the halt) so the drive's position loop
+    // LOCKS the shaft. pv_hold_token_ (high-bit base, never collides with real move gens which start at
+    // 1) kicks the policy's PP handshake for the hold WITHOUT touching active_generation (the halt already
+    // failed the in-flight move -- the hold is not a completable move). On mode_switch_failed the hold
+    // reverts to the interim PV-at-0 bit8 hold (accept small drift, never de-energize -- spec §A R1).
+    bool pv_hold_capable_ = false;  // set at resolve: PV mode AND 0x6060 AND 0x607A both mapped
+    bool pv_hold_as_pp_ = false;    // STICKY: currently holding a halted PV motor via PP-at-counts
+    std::uint32_t pv_hold_token_ = 0x80000000u;  // policy token that kicks the PP hold handshake (never a real gen)
     bool stop_at_rest_ = false;     // RT-only (#47-P3b R1): drive reached SwitchOnDisabled during the stopping window -> teardown early-out
     // Controller-error tier: one-shot latches (HandshakeTimeout/MoveStalled) set by
     // the FSM, cleared ONLY by an explicit fault_reset. The bus WkcFault tier is
