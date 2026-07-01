@@ -103,9 +103,15 @@ acquire-loads the pointer ONCE at cycle-top, uses that snapshot the whole step �
 **SOFT (live-appliable, no teardown, load HELD):** `position_tolerance`, `zero_vel_threshold`, `max_motor_speed_rpm`,
 `fault_recovery_max_attempts`/`backoff` (all RT-consumed values, no drive-side write). **STRUCTURAL (FORCE respawn =
 a documented LOAD-DROP window; brake/support first on a load axis):** `counts_per_rev`, `gear_ratio` (mis-live-applying
-corrupts an in-flight move's units mid-run), `quick_stop_decel` (0x6085) / `quick_stop_option` (0x605A) — **these are
-configure-time SDO writes/asserts (on_configured), NOT RT-mutable, so changing them requires a respawn** (DA sub-step-2
-finding) — `ifname`, dc/sync0/loop-rate/rt params, PDO map, `fault_reset_mechanism`.
+corrupts an in-flight move's units mid-run), `quick_stop_decel` (0x6085) — configure-time SDO write; A6 manual Effective Time = "Immediately", so a RESPAWN
+re-applies it, but we treat it STRUCTURAL by POLICY (live-shrinking it under a streaming velocity breaks the PV
+window-budget safety invariant — same class as counts_per_rev); `ifname`, dc/sync0/loop-rate/rt params, PDO map,
+`fault_reset_mechanism`.
+- **ASSERT-ONLY (neither live nor respawn can change it — operator control-power-cycle only):** `quick_stop_option`
+  (0x605A) — A6 manual Effective Time = **"Upon re-power-on"** (verified, a6 manual §11.2.2 605Ah row); a warm SDO
+  write is silently latched-old, and our respawn (close()→INIT keeps control power ON) is NOT a re-power-on, so it
+  won't apply a change either. The driver READS + asserts the expected value at configure and refuses with
+  "power-cycle the drive after changing 0x605A" if wrong — it NEVER writes it.
 
 ---
 
