@@ -205,7 +205,24 @@ void SimBackend::step_device(Slave& s) noexcept {
     if (s.model.mode_of_op_off >= 0) {
         const auto m = static_cast<std::int8_t>(out[static_cast<std::size_t>(s.model.mode_of_op_off)]);
         if (m != 0) {
-            s.effective_mode = static_cast<Cia402Mode>(m);
+            const auto requested = static_cast<Cia402Mode>(m);
+            if (requested == s.model.unsupported_mode) {
+                // #47-P3b M56S: the drive REJECTS an unsupported mode -- effective_mode does NOT change,
+                // so 0x6061 never echoes it and the policy's confirm times out (mode_switch_failed).
+                s.mode_pending = Cia402Mode::None;
+            } else if (requested == s.effective_mode) {
+                s.mode_pending = Cia402Mode::None;  // already there -- nothing pending
+            } else if (s.effective_mode == Cia402Mode::None || s.model.mode_switch_latency == 0) {
+                // Initial establishment (None -> first mode) is ALWAYS instant so the enable-time mode-echo
+                // gate isn't tripped; the latency models a RUNTIME mode CHANGE. mode_switch_latency==0 = A6.
+                s.effective_mode = requested;
+            } else if (s.mode_pending != requested) {
+                s.mode_pending = requested;  // #47-P3b M56S: start the slow-transition countdown
+                s.mode_pending_cycles = s.model.mode_switch_latency;
+            } else if (--s.mode_pending_cycles == 0) {
+                s.effective_mode = requested;  // latency elapsed -> the switch APPLIES; 0x6061 now echoes it
+                s.mode_pending = Cia402Mode::None;
+            }
         }
     }
 

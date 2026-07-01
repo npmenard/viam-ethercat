@@ -404,4 +404,82 @@ TEST("#47-P3b P3c: mode-switch FAILURE -- 0x6061 never echoes (silent-mismatch, 
     (void)simp;
 }
 
+// --- #47-P3b M56S: THE GENERICITY PAYOFF -- a SECOND device via a PROFILE SWAP, no policy/consumer code.
+// The SAME A6Control + SAME generic Cia402Policy drive a DIFFERENT servo (M56S: its runtime mode-switch
+// "takes time" -> 0x6061 lags the 0x6060 write). Only the DeviceProfile changes (longer T_switch). ---
+namespace {
+Options make_switch_opts() {
+    Options o;
+    o.enable = true;
+    o.move_pos = true;
+    o.pos_target = 20000;
+    o.pp_vel_cps = 4000;
+    o.pos_tol = 300;
+    o.then_jog_vel = true;  // PP move -> reach -> §6 switch to PV -> jog
+    o.pv_vel_cps = 3000;
+    return o;
+}
+}  // namespace
+
+TEST("#47-P3b M56S: SECOND device via PROFILE SWAP -- a SLOW runtime mode-switch confirms under the M56S T_switch") {
+    // The M56S transition "takes time": 0x6061 lags the 0x6060=PV write by 40 cycles. The SAME generic
+    // policy + A6Control confirm the switch because the M56S PROFILE's longer T_switch (60) covers the lag.
+    SimSlaveModel model = make_model_switch();
+    model.mode_switch_latency = 40;  // M56S: a RUNTIME mode change applies 40 cycles after the 0x6060 write
+    auto sim = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{model});
+    Master m{make_cfg_switch(), std::move(sim)};
+    m.init();
+    m.configure();
+    Options o = make_switch_opts();
+    Telemetry tel;
+    // THE profile swap -- the ONLY per-device code. Everything else is byte-identical to the A6 path.
+    A6Control ctrl(o, tel, Cia402Mode::ProfilePosition, A6Control::make_m56s_profile(o));
+    const bool confirmed = run_and_stop(m, ctrl, tel, fast_rc(), [](Telemetry& t) { return t.mode.load() == 3; }, 3000, /*settle_ms=*/20);
+    CHECK(confirmed);                    // slow switch confirmed 0x6061=PV within the M56S T_switch
+    CHECK(ctrl.switched_to_vel());
+    CHECK_EQ(ctrl.confirmed_mode(), 3);  // PV(3)
+    CHECK(!ctrl.mode_switch_failed());   // no give-up -- the profile's window was sized for the slow device
+}
+
+TEST("#47-P3b M56S: the T_switch knob is LOAD-BEARING -- the SAME slow device FAILS under a too-short window") {
+    // Same slow-M56S sim (40-cycle lag), but a profile whose T_switch (20) is SHORTER than the lag ->
+    // the confirm times out before 0x6061 echoes PV -> mode_switch_failed + SAFE. Proves the generic
+    // policy adapts to the device by DATA ALONE: the one differing number decides success vs failure.
+    SimSlaveModel model = make_model_switch();
+    model.mode_switch_latency = 40;
+    auto sim = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{model});
+    Master m{make_cfg_switch(), std::move(sim)};
+    m.init();
+    m.configure();
+    Options o = make_switch_opts();
+    ethercat::DeviceProfile too_short = A6Control::make_m56s_profile(o);
+    too_short.mode_switch_settle_cycles = 20;  // < the 40-cycle device lag -> the switch cannot confirm in time
+    Telemetry tel;
+    A6Control ctrl(o, tel, Cia402Mode::ProfilePosition, too_short);
+    run_and_stop(m, ctrl, tel, fast_rc(), [](Telemetry&) { return false; }, 800);
+    CHECK(ctrl.mode_switch_failed());        // timed out before the slow 0x6061 echo -> failed
+    CHECK(ctrl.switched_to_vel() == false);  // gave up: reverted to the confirmed (PP) mode
+    CHECK_EQ(ctrl.confirmed_mode(), 1);      // still PP(1)
+}
+
+TEST("#47-P3b M56S: errors-on-unsupported-mode -> mode-switch FAILED + SAFE (the drive-error failure shape)") {
+    // The OTHER §6-step-5 failure shape: the M56S REJECTS an unsupported mode (never applies it -> 0x6061
+    // never echoes PV), distinct from the A6 SILENT-ignore. The generic policy catches BOTH the same way:
+    // no confirm within T_switch -> mode_switch_failed -> give up, stay energized in the confirmed mode.
+    SimSlaveModel model = make_model_switch();
+    model.unsupported_mode = Cia402Mode::ProfileVelocity;  // M56S: PV is not supported here -> rejected
+    auto sim = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{model});
+    Master m{make_cfg_switch(), std::move(sim)};
+    m.init();
+    m.configure();
+    Options o = make_switch_opts();
+    Telemetry tel;
+    A6Control ctrl(o, tel, Cia402Mode::ProfilePosition, A6Control::make_m56s_profile(o));
+    run_and_stop(m, ctrl, tel, fast_rc(), [](Telemetry&) { return false; }, 800);
+    CHECK(ctrl.mode_switch_failed());        // rejected mode never confirmed -> failed (error shape)
+    CHECK(ctrl.switched_to_vel() == false);  // gave up SAFE
+    CHECK_EQ(ctrl.confirmed_mode(), 1);      // still PP(1) -- energized, no de-energize/lunge
+    CHECK_EQ(tel.mode.load(), 1);            // 0x6061 held PP the whole time
+}
+
 TEST_MAIN()

@@ -130,8 +130,12 @@ class A6Control final : public SlaveControl {
    public:
     // `mode` is the commanded 0x6060 (the CLI mode); its int8 value is what 0x6061 must
     // echo before we enable (#53 DA-B). build_a6_config() set the SAME mode at configure.
-    A6Control(const Options& opt, Telemetry& tel, Cia402Mode mode) noexcept
-        : opt_(opt), tel_(tel), policy_(make_a6_profile(opt)) {
+    // `profile_override` swaps the DeviceProfile without touching ANY other code -- the genericity
+    // thesis in one parameter (#47-P3b M56S): the SAME A6Control + SAME generic policy drive a second
+    // device by data alone. Default (nullopt) = the A6 profile.
+    A6Control(const Options& opt, Telemetry& tel, Cia402Mode mode,
+              std::optional<DeviceProfile> profile_override = std::nullopt) noexcept
+        : opt_(opt), tel_(tel), policy_(profile_override ? *profile_override : make_a6_profile(opt)) {
         goal_ = opt_.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
         profile_vel_ = static_cast<std::uint32_t>(opt_.move_rpm / 60.0 * kCountsPerRev);
         commanded_mode_disp_ = static_cast<std::int8_t>(mode);  // 0x6061 echo target (PP=1, PV=3, CSP=8)
@@ -544,6 +548,27 @@ class A6Control final : public SlaveControl {
         return p;
     }
 
+    // The M56S DeviceProfile -- THE genericity payoff (#47-P3b, spec §6). A second, DIFFERENT servo
+    // (M56S/MDX+ manual §4.2.3: stop-before-switch + tolerate-undefined-transition + errors-on-
+    // unsupported-mode) drives the SAME generic Cia402Policy by DATA ALONE. Only two knobs differ from
+    // the A6: (1) a LONGER mode_switch_settle window -- the M56S transition "takes time" (its 0x6061 lags
+    // the 0x6060 write), so T_switch must cover it; (2) a LONGER ramp-stop bound to match. Everything else
+    // is standard CiA402. NO M56S codes leak into the policy -- the drive-specific residual is this struct.
+   public:
+    static DeviceProfile make_m56s_profile(const Options& opt) noexcept {
+        DeviceProfile p;
+        p.fault_reset = DeviceProfile::FaultReset::Cia402Bit7;
+        p.position_tolerance = opt.pos_tol;
+        p.zero_vel_threshold = kZeroVelThresh;
+        p.zero_vel_debounce = kZeroVelDebounce;
+        p.quick_stop_decel = kQuickStopDecelDefault;
+        p.quick_stop_option = kQuickStopOptionRequired;
+        p.mode_switch_settle_cycles = 60;      // T_switch: covers the M56S slow transition (the A6 default 200 also would; 60 is the tuned-to-device value)
+        p.mode_switch_ramp_stop_cycles = 2000;  // the M56S ramps slower -> a longer stop-first bound
+        return p;
+    }
+
+   private:
     const Options& opt_;
     Telemetry& tel_;
     Cia402Policy policy_;

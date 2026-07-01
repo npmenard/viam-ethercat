@@ -54,6 +54,10 @@ struct SimSlaveModel {
     bool quick_stop_suppress_auto_disable = false;  // model a drive that reports 0x605A=2 but does NOT auto-transition QSA->SwitchOnDisabled at zero (forces the control's cw->0x00 BACKSTOP to do the disable -- tests that path while configure still passes)
     std::int8_t mode_echo_value = 0;             // forced 0x6061 echo (wrong-mode refuse test) when mode_echo_forced
     bool mode_echo_forced = false;               // true -> 0x6061 reports mode_echo_value; else it echoes effective_mode (#53 DA-B)
+    // --- #47-P3b M56S: a SECOND device's runtime mode-switch quirks (the generic mode-switch's T_switch
+    //     knob adapts the SAME policy to these -- no per-device policy code). ---
+    std::uint32_t mode_switch_latency = 0;       // cycles the drive TAKES to apply a new 0x6060 (0x6061 lags this many cycles); models M56S "transition takes time" (undefined-feedback window). 0 = instant (the A6).
+    Cia402Mode unsupported_mode = Cia402Mode::None;  // a mode the drive REJECTS (never applies -> 0x6061 never echoes it); models M56S "errors on an unsupported mode". None = accept all.
     // De-mask of the #16 TxPDO FEEDBACK fields (offsets into the INPUT image; <0 = not
     // mapped, so the controller's read path falls back -- exercises the optional guard).
     std::int32_t fault_code_off = -1;       // 0x603F drive error code (u16) in inputs
@@ -215,6 +219,10 @@ class SimBackend final : public EcatBackend {
         // from model.mode), so a missing/wrong mode set leaves it None and the motor never
         // moves (mode-0 guard), catching the "forgot to set 0x6060" bug offline.
         Cia402Mode effective_mode = Cia402Mode::None;
+        // #47-P3b M56S: pending (not-yet-applied) mode + its remaining latency countdown -- a new 0x6060
+        // is applied to effective_mode only after model.mode_switch_latency cycles (the slow-device window).
+        Cia402Mode mode_pending = Cia402Mode::None;
+        std::uint32_t mode_pending_cycles = 0;
     };
 
     static void step_device(Slave& s) noexcept;

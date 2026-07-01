@@ -95,6 +95,29 @@ Driver implications (the generic mode-switch contract):
 
 ---
 
+## Realized in code (#47-P3b M56S) — the profile swap, exercised
+
+The thesis above is now a **working, tested artifact**, not just a plan:
+
+- **The profile:** `a6_control.hpp::make_m56s_profile()` — the entire per-device residual, next to
+  `make_a6_profile()`. Only two knobs differ from the A6: a longer `mode_switch_settle_cycles`
+  (T_switch, covers the §4.2.3.3 "transition takes time" undefined-feedback window) and a longer
+  `mode_switch_ramp_stop_cycles`. `fault_reset` = `Cia402Bit7` (the generic default, the *opposite* of
+  the A6's vendor SDO). No M56S codes in `Cia402Policy`.
+- **The one-parameter swap:** `A6Control(opt, tel, mode, A6Control::make_m56s_profile(opt))` — the SAME
+  consumer + SAME generic policy, one optional `DeviceProfile` argument. (The module wrapper does the
+  same via `make_module_profile(config)` — the JSON config is the profile source.)
+- **The device modelled in the sim** (drive-side behavior, not policy code) via two `SimSlaveModel`
+  quirks: `mode_switch_latency` (0x6061 lags the 0x6060 write — §4.2.3.3) and `unsupported_mode` (the
+  drive rejects it — §4.2.3.5).
+- **Tests** (`a6_control_test.cpp`, all green): (1) *SECOND device via profile swap* — the slow M56S
+  runtime PP→PV switch **confirms** under the M56S T_switch; (2) *T_switch is load-bearing* — the SAME
+  slow device under a too-short window **fails** (`mode_switch_failed`), proving the policy adapts by
+  data alone; (3) *errors-on-unsupported-mode* — a rejected PV switch fails **SAFE** (stays energized in
+  PP), the §4.2.3.5 loud-reject failure shape, caught by the *same* generic path as the A6's silent
+  ignore (#45). This is exactly the "belt-and-suspenders covers both devices through one code path" of
+  the §4.2.3 flag below, now verified.
+
 ## Cross-references
 - [`a6-quirks.md`](./a6-quirks.md) — the A6's quirk list. The M56S column above maps each A6 quirk to its M56S (mostly standard) counterpart: A6 Q7↔M56S bit7 fault-reset, A6 DC-mandatory↔M56S DC-optional, A6 Q5 bit10↔M56S bit10-normal, A6 Q4 quick-stop↔M56S same-objects, A6 Q10 units↔M56S 10000/rev, A6 Q2/#45 silent-mode-ignore↔M56S §4.2.3.5 mode-error.
 - The genericity payoff: the only per-device data the M56S needs are `counts_per_rev=10000`, `fault_reset_mechanism=bit7` (the default), DC-optional (off for PP/PV), and the quick-stop/torque magnitudes — all through the **same** `SlaveConfig` surface the A6 uses, with *opposite values*. No M56S-specific code.
