@@ -496,6 +496,7 @@ if (ETHERCAT_SANITIZE_THREAD AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     src/ethercat/sim_backend.cpp
     src/ethercat/soem_backend.cpp
     src/ethercat/master.cpp
+    src/ethercat/runner.cpp  # #54 P3a: ServoController drives the library Runner (~Runner) -- required to link
     src/ethercat/realtime.cpp
     src/viam/lib/motion_profile.cpp
     src/viam/lib/servo_config.cpp
