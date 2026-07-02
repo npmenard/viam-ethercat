@@ -14,16 +14,21 @@ Scenario variants for the "What to test" list:
   wrong            - fails config validation (bogus control_mode) -> error in logs
   wrong_interface  - parses, but the NIC doesn't exist -> runtime init error in logs
   dc_validation    - loop_rate_hz 300 -> cycle 3.333 ms, NOT a multiple of the
-                     declared 250 us SYNC0 granularity -> rejected at config time
+                     declared 250 us SYNC0 granularity -> rejected at COMPONENT
+                     CONSTRUCTION (Master ctor ConfigError in the logs; validate()
+                     itself passes -- 300 is in range; no bus contact either way)
   dc_drive         - passes OUR validation but the DRIVE rejects it on the wire:
                      use_distributed_clocks=false -> A6 refuses free-run
                      (AL 0x0027 "Freerun not supported").
                      SAFE variant: no repeated Er74 OP faults, so no drive wedge.
-  dc_drive_sync0   - alternate on-wire variant: sync_cycle_granularity_ns
-                     deliberately mis-declared as 125 us + loop_rate_hz 8000 ->
-                     our validation passes, drive sees a 125 us SYNC0 it doesn't
-                     support. WEDGE RISK (repeated Er74 can require a control
-                     power cycle) -- run ONCE, only if dc_drive isn't accepted.
+  dc_drive_cycle   - alternate on-wire variant: loop_rate_hz 700 with the
+                     granularity declaration OMITTED -> passes our validation
+                     (no #44 check without the declaration), drive gets a
+                     1,428,571 ns SYNC0 cycle that is not a 250 us multiple ->
+                     rejects on the wire (Er74.0 cycle error). WEDGE RISK
+                     (repeated Er74 can require a control power cycle) -- run
+                     ONCE, only if dc_drive isn't accepted. (A sub-ms SYNC0 is
+                     inexpressible: loop_rate_hz is hard-capped at 1000.)
 """
 
 MODULE_PATH = "/home/viam/ethercat-servo-module/bin/ethercat-servo"
@@ -56,6 +61,13 @@ def _base_attributes() -> dict:
         "stall_threshold_cycles": 2000,
         "command_queue_capacity": 64,
         "max_consecutive_wkc_errors": 5,
+        # Test 6 DoCommands: the A6 does NOT implement CiA402 0x6079/0x6078 (CoE abort
+        # 0x06020000); its bus voltage / RMS phase current live in vendor 0x2040:07/:0D,
+        # 0.1-unit scaled (live-confirmed via slaveinfo). Absent block = standard objects.
+        "sdo_monitors": {
+            "voltage": {"index": "0x2040", "subindex": "0x07", "type": "u16", "scale": 10},
+            "current": {"index": "0x2040", "subindex": "0x0D", "type": "i16", "scale": 10},
+        },
         "fault_code_labels": [{"code": 34560, "label": "Er74.1 / no SYNC0"}],
     }
 
@@ -106,10 +118,10 @@ def dc_drive() -> dict:
     return _machine(a)
 
 
-def dc_drive_sync0() -> dict:
+def dc_drive_cycle() -> dict:
     a = _base_attributes()
-    a["sync_cycle_granularity_ns"] = 125000  # lie: drive granularity is 250 us
-    a["loop_rate_hz"] = 8000  # 125 us cycle passes OUR check, drive rejects SYNC0 -- WEDGE RISK, run once
+    del a["sync_cycle_granularity_ns"]  # no declaration -> the #44 config check cannot catch it
+    a["loop_rate_hz"] = 700  # 1,428,571 ns cycle: passes validation, NOT a 250 us multiple -> drive Er74.0 -- WEDGE RISK, run once
     return _machine(a)
 
 
@@ -120,7 +132,7 @@ SCENARIOS = {
     "wrong_interface": wrong_interface,
     "dc_validation": dc_validation,
     "dc_drive": dc_drive,
-    "dc_drive_sync0": dc_drive_sync0,
+    "dc_drive_cycle": dc_drive_cycle,
 }
 
 

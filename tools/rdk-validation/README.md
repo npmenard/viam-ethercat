@@ -9,9 +9,10 @@ Python env: `/home/viam/ethercat/.venv-test` (viam-sdk installed).
 
 ## Pieces
 - `scenario_configs.py` — machine configs: `empty`, `valid` (switchable, #61 derived
-  PDO map, #59 default reach tolerance), `wrong`, `wrong_interface`, `dc_validation`,
-  `dc_drive` (freerun → AL 0x0027, safe), `dc_drive_sync0` (125 µs SYNC0 lie — WEDGE
-  RISK, run once and only if needed).
+  PDO map, #59 default reach tolerance), `wrong`, `wrong_interface`, `dc_validation`
+  (rejected at component construction — ConfigError in logs, no bus contact),
+  `dc_drive` (freerun → AL 0x0027, safe), `dc_drive_cycle` (700 Hz, no granularity
+  declaration → on-wire Er74.0 — WEDGE RISK, run once and only if needed).
 - `machine_config.py show|set <scenario>|clear` — config pushes through app. HYBRID per
   user directive (verified: the viam CLI cannot set attributes/module entries — its
   add-resource hardcodes name/model/api): attribute pushes use the same UpdateRobotPart
@@ -26,8 +27,8 @@ Python env: `/home/viam/ethercat/.venv-test` (viam-sdk installed).
 ## Scenario driving (the "What to test" list)
 1. `clear` → start server → confirm no servo → `set valid` (live reconfigure) → Tests 1–6.
 2. `clear` → `set wrong` → error in logs (`server.sh log`).
-3. `set dc_validation` (config-time reject in logs) AND `set dc_drive` (on-wire drive
-   rejection surfaced, no wedge). Both per user decision.
+3. `set dc_validation` (component-construction reject in logs) AND `set dc_drive`
+   (on-wire drive rejection surfaced, no wedge). Both per user decision.
 4. `clear` → `set valid` → tests → `set valid` again (reconfigure) → tests still pass.
 5. `clear` → `set valid` → tests → `set wrong` → error → `set valid` → tests pass.
 

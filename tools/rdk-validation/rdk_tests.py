@@ -51,7 +51,14 @@ async def settle_position(servo: Motor, seconds: float = 2.0, interval: float = 
 
 async def test1_connect(machine: RobotClient) -> bool:
     print("== Test1: Connect ==")
-    names = [n.name for n in machine.resource_names]
+    # poll: after a live config push, module spawn + A6 DC bring-up takes seconds
+    deadline = time.monotonic() + 30
+    while True:
+        names = [n.name for n in machine.resource_names]
+        if "servo" in names or time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(2)
+        await machine.refresh()
     print(f"  resources: {names}")
     ok = "servo" in names
     record("T1 servo in resources", ok, f"resource names: {names}")
@@ -177,10 +184,17 @@ async def test6_docommand(servo: Motor) -> None:
     print("== Test6: DoCommand (SDO reads mid-move) ==")
     task = asyncio.ensure_future(servo.go_to(rpm=2000, position_revolutions=2000))
     await asyncio.sleep(2)
-    for cmd in ("get_motor_voltage", "get_motor_current_actual_value", "get_motor_drive_modes"):
+    # success key per command; a failed SDO read returns {"<key>_error": ...} which must FAIL
+    expect = {
+        "get_motor_voltage": "voltage_volts",
+        "get_motor_current_actual_value": "current_amps",
+        "get_motor_drive_modes": "drive_modes",
+    }
+    for cmd, key in expect.items():
         try:
-            resp = await servo.do_command({cmd: True})
-            record(f"T6 {cmd}", bool(resp), f"response: {resp}")
+            resp = dict(await servo.do_command({cmd: True}))
+            errs = [k for k in resp if k.endswith("_error")]
+            record(f"T6 {cmd}", key in resp and not errs, f"response: {resp}")
         except Exception as e:  # noqa: BLE001
             record(f"T6 {cmd}", False, f"raised {type(e).__name__}: {e}")
     moving = await servo.is_moving()

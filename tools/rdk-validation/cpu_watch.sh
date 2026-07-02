@@ -5,7 +5,8 @@
 set -euo pipefail
 
 DUR="${1:-30}"
-PID=$(pgrep -f 'ethercat-servo' | head -1) || { echo "module not running"; exit 1; }
+PID=$(pgrep -f 'bin/ethercat-servo' | head -1)
+[ -n "$PID" ] || { echo "module not running"; exit 1; }
 echo "watching pid $PID for ${DUR}s"
 if command -v pidstat >/dev/null; then
   pidstat -p "$PID" 1 "$DUR" | tail -n 3
