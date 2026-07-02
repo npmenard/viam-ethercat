@@ -253,7 +253,6 @@ class Cia402Policy {
                 mode_checked_ = true;
             } else {
                 state_.mode_mismatch = true;
-                goal_ = Cia402State::ReadyToSwitchOn;  // REFUSE: hold, do not energize
                 ctx.request_stop();
             }
         }
@@ -267,7 +266,6 @@ class Cia402Policy {
         } else if (cmd.enable && !state_.mode_mismatch && status.operation_enabled()) {
             if (!announced_op_) {
                 announced_op_ = true;
-                enable_pos_ = pos;
             }
             cw = drive_operational_(ctx, cmd, status, pos, vel);
         } else if (!cmd.enable) {
@@ -278,9 +276,7 @@ class Cia402Policy {
         return cw;
     }
 
-    void on_stop(StopReason reason) noexcept {
-        last_stop_reason_ = reason;
-    }
+    void on_stop(StopReason /*reason*/) noexcept {}
 
     // Reset the per-run RT SEQUENCING state (published state + handshake + latches) for REUSE
     // across a wrapper stop/restart. Leaves profile_ + the resolved FieldLocations + qs_decel_echoed_
@@ -289,7 +285,6 @@ class Cia402Policy {
     // ServoController across reconfigure) calls it from reset_run_state().
     void reset() noexcept {
         state_ = PolicyState{};
-        goal_ = Cia402State::OperationEnabled;
         handshake_ = Handshake::Idle;
         handshake_cycles_remaining_ = 0;
         ms_phase_ = ModeSwitch::None;
@@ -301,8 +296,6 @@ class Cia402Policy {
         bit4_high_ = false;
         bit4_edges_ = 0;
         zerovel_cycles_ = 0;
-        enable_pos_ = 0;
-        last_stop_reason_ = StopReason::None;
     }
 
    private:
@@ -541,7 +534,6 @@ class Cia402Policy {
     DeviceProfile profile_;
     Cia402Fsm fsm_;
     PolicyState state_;
-    Cia402State goal_ = Cia402State::OperationEnabled;
     Handshake handshake_ = Handshake::Idle;
     std::uint32_t handshake_cycles_remaining_ = 0;
     ModeSwitch ms_phase_ = ModeSwitch::None;  // §6 runtime mode-switch sub-state
@@ -558,8 +550,6 @@ class Cia402Policy {
     bool bit4_high_ = false;
     int bit4_edges_ = 0;
     std::uint32_t zerovel_cycles_ = 0;
-    std::int32_t enable_pos_ = 0;
-    StopReason last_stop_reason_ = StopReason::None;
 };
 
 }  // namespace ethercat

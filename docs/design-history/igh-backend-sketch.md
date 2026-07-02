@@ -1,7 +1,16 @@
 # IgH EtherCAT master backend — scoping sketch
 
-**Status:** PREP / decision input. Not implemented. Pending user's call on the
-DC pivot (see the team-lead's `a6-dc-blocker.md` for the hardware diagnosis).
+> **⚠ SUPERSEDED — DESIGN HISTORY (2026-07-02). The core premise below is WRONG.**
+> This sketch assumes "SOEM rejects the A6's DC unconditionally (AL `0x0030`) → SOEM
+> cannot bring up this servo class → we may need an IgH backend." That was **disproven
+> by our own #17/#20 work**: the `0x0030` was **self-inflicted** (we were manually forcing
+> `0x1C32:01`), and SOEM **v2** + the ec_sample sequence (arm SYNC0 in PRE-OP, `config_map_group`,
+> never force the SM sync-type) brings the A6 to **DC OP** cleanly — validated energized (P3c).
+> The IgH backend was **never needed and never built**. Kept only as a record of a considered-
+> and-rejected path. Authoritative DC lessons: `CLAUDE.md` + `docs/a6-bringup-runbook.md`.
+
+**Original status (historical):** PREP / decision input. Not implemented. Pending user's call on
+the DC pivot.
 
 ## Why this exists
 
