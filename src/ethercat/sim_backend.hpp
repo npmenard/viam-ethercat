@@ -57,6 +57,11 @@ struct SimSlaveModel {
     // --- #47-P3b M56S: a SECOND device's runtime mode-switch quirks (the generic mode-switch's T_switch
     //     knob adapts the SAME policy to these -- no per-device policy code). ---
     std::uint32_t mode_switch_latency = 0;       // cycles the drive TAKES to apply a new 0x6060 (0x6061 lags this many cycles); models M56S "transition takes time" (undefined-feedback window). 0 = instant (the A6).
+    // #59: encoder READ noise -- the REPORTED 0x6064/0x606C jitter by a ±report_noise square wave (the
+    // physics s.actual stays clean). At rest this makes 0x606C nonzero (defeats an exact-|vel|<=0 reached
+    // predicate) while the position RANGE stays 2*report_noise (a position-delta predicate tolerates it).
+    // 0 = clean (default; all existing tests unaffected).
+    std::int32_t report_noise = 0;
     Cia402Mode unsupported_mode = Cia402Mode::None;  // a mode the drive REJECTS (never applies -> 0x6061 never echoes it); models M56S "errors on an unsupported mode". None = accept all.
     // De-mask of the #16 TxPDO FEEDBACK fields (offsets into the INPUT image; <0 = not
     // mapped, so the controller's read path falls back -- exercises the optional guard).
@@ -151,6 +156,7 @@ class SimBackend final : public EcatBackend {
     std::uint16_t received_controlword(std::uint16_t slave) const noexcept;  // #47-P3b 5d: last cw consumed (stop-sequence disposition)
     Cia402Mode effective_mode(std::uint16_t slave) const noexcept;           // #47-P3b M6: drive's current runtime mode (PV->PP hold-switch proof)
     std::int32_t received_target_position(std::uint16_t slave) const noexcept;  // #47-P3b: last 0x607A the master wrote (DA no-lunge: seeded/mirrored target == actual, never a stale jump)
+    std::uint32_t mode_of_op_write_transitions(std::uint16_t slave) const noexcept;  // #61 (DA): cumulative 0x6060 OUTPUT-byte changes (unconfirmable-switch storm gate; freezes with revert, climbs without)
     std::int32_t velocity_at_qsa_exit(std::uint16_t slave) const noexcept;
     bool entered_qsa(std::uint16_t slave) const noexcept;
     // Toggle whether a slave asserts the PP set-point-acknowledge (bit12). When
@@ -196,6 +202,8 @@ class SimBackend final : public EcatBackend {
         std::int32_t target = 0;
         std::int32_t target_written = 0;  // #47-P3b: the last 0x607A the master WROTE this cycle (seed/mirror wire value, latched-or-not) -- DA no-lunge probe
         std::int32_t actual = 0;
+        bool noise_phase = false;         // #59: encoder-noise square-wave phase (toggles per cycle when model.report_noise>0)
+        std::int32_t reported_prev = 0;   // #59: previous REPORTED (jittered) actual -> the jittered 0x606C delta
         bool setpoint_ack = false;  // PP bit12 latch
         // ATOMIC: written by a non-RT test hook (inject_fault/set_fault_code/
         // set_stale_fault_code) while the RT loop reads them in step_device -- the only
@@ -217,6 +225,14 @@ class SimBackend final : public EcatBackend {
         std::uint32_t clear_countdown_ = 0;                     // #18 RT-only: active type-(a) reflect-delay countdown in Fault
         std::uint32_t refault_countdown_ = 0;                   // #18 RT-only: cycles until the type-(c) re-fault fires
         std::atomic<std::uint32_t> fault_reset_edges{0};        // #18 cumulative bit7 0->1 edges seen (no-spin test: RT-write/test-read)
+        // #61 (DA): monotonic count of 0x6060 OUTPUT-byte value CHANGES (RT-write/test-read). The
+        // unconfirmable-switch STORM gate -- a wrapper that fails to revert switch_intent_ leaves
+        // run_mode_switch_ re-arming FOREVER (StopFirst writes the current mode, Settle writes the
+        // wanted mode -> the byte oscillates every ~settle-window), so this keeps CLIMBING; with the
+        // revert it FREEZES after the single failed attempt. A test polls it twice: stable => no storm.
+        std::atomic<std::uint32_t> mode_out_transitions{0};
+        std::int8_t prev_mode_out = 0;  // RT-only: last 0x6060 byte written (the transition edge detector)
+        bool mode_out_seen = false;     // RT-only: first-write guard (don't count the initial establishment)
         // RUNTIME mode of operation -- set ONLY by the master's 0x6060 SDO write (de-masked
         // from model.mode), so a missing/wrong mode set leaves it None and the motor never
         // moves (mode-0 guard), catching the "forgot to set 0x6060" bug offline.

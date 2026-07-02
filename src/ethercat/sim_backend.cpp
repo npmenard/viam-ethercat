@@ -205,6 +205,18 @@ void SimBackend::step_device(Slave& s) noexcept {
     if (s.model.mode_of_op_off >= 0) {
         const auto m = static_cast<std::int8_t>(out[static_cast<std::size_t>(s.model.mode_of_op_off)]);
         const auto requested = static_cast<Cia402Mode>(m);
+        // #61 (DA): count 0x6060 OUTPUT-byte VALUE CHANGES. A single mode switch is exactly two
+        // transitions (StopFirst holds current, Settle writes wanted, then steady re-writes on
+        // confirm-or-revert); a wrapper that never reverts an unconfirmable switch re-arms every
+        // settle window and this climbs without bound -- the storm signal. First write establishes,
+        // not counts. RT-write / test-read (relaxed; the test polls twice for stability).
+        if (!s.mode_out_seen) {
+            s.mode_out_seen = true;
+            s.prev_mode_out = m;
+        } else if (m != s.prev_mode_out) {
+            s.mode_out_transitions.fetch_add(1, std::memory_order_relaxed);
+            s.prev_mode_out = m;
+        }
         // #47-P3c FIDELITY -- GENERIC CiA402, NOT a device flag (DA device-agnostic check): when 0x6060 is
         // RxPDO-MAPPED, a PDO value OVERRIDES the SDO-set default for ANY drive (PDO-overrides-SDO for a
         // mapped object is standard CoE), so ModeDisplay(0x6061) FOLLOWS the PDO byte -- a wire 0 means
@@ -441,14 +453,26 @@ void SimBackend::step_device(Slave& s) noexcept {
         sw |= 0x1000U;  // bit12 set-point acknowledge
     }
 
+    // #59 encoder READ noise (gated: report_noise>0): jitter the REPORTED actual by a ±report_noise
+    // square wave -- physics s.actual stays clean. Reported velocity = the jittered delta (nonzero at
+    // rest). Off by default -> reported_actual == s.actual, reported_vel == s.velocity (all tests as-is).
+    std::int32_t reported_actual = s.actual;
+    std::int32_t reported_vel = s.velocity;
+    if (s.model.report_noise > 0) {
+        s.noise_phase = !s.noise_phase;
+        reported_actual = s.actual + (s.noise_phase ? s.model.report_noise : -s.model.report_noise);
+        reported_vel = reported_actual - s.reported_prev;
+        s.reported_prev = reported_actual;
+    }
+
     const auto in = std::span<std::byte>(s.input_image);
     store_le<std::uint16_t>(in.subspan(s.model.statusword_off, 2), static_cast<std::uint16_t>(sw));
-    store_le<std::int32_t>(in.subspan(s.model.actual_off, 4), s.actual);
+    store_le<std::int32_t>(in.subspan(s.model.actual_off, 4), reported_actual);
     // #16 TxPDO feedback de-mask (only when the field is mapped): velocity-actual
     // (0x606C) every cycle from the wire-driven motion; drive error code (0x603F) =
     // the configured code WHILE in Fault, else 0 (so the flag gates the payload).
     if (s.model.velocity_actual_off >= 0) {
-        store_le<std::int32_t>(in.subspan(static_cast<std::size_t>(s.model.velocity_actual_off), 4), s.velocity);
+        store_le<std::int32_t>(in.subspan(static_cast<std::size_t>(s.model.velocity_actual_off), 4), reported_vel);
     }
     if (s.model.fault_code_off >= 0) {
         // A forced stale code (test hook) overrides the gating -> 0x603F is nonzero
@@ -612,6 +636,16 @@ std::int32_t SimBackend::received_target_position(std::uint16_t slave) const noe
     // asserts the seeded/mirrored target tracks the drive's actual, never a stale value that would lunge.
     if (slave >= 1 && slave <= slaves_.size()) {
         return slaves_[slave - 1].target_written;
+    }
+    return 0;
+}
+
+std::uint32_t SimBackend::mode_of_op_write_transitions(std::uint16_t slave) const noexcept {
+    // #61 (DA): cumulative 0x6060 OUTPUT-byte value changes -- the unconfirmable-switch storm gate.
+    // Poll it twice with a wait between: STABLE => the wrapper reverted (single attempt, then frozen);
+    // CLIMBING => run_mode_switch_ re-arms forever (no revert). Atomic (RT-write/test-read).
+    if (slave >= 1 && slave <= slaves_.size()) {
+        return slaves_[slave - 1].mode_out_transitions.load(std::memory_order_relaxed);
     }
     return 0;
 }

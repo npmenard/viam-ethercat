@@ -312,6 +312,28 @@ if (ETHERCAT_BUILD_MODULE)
   install(
     TARGETS
       ethercat-servo
+    RUNTIME_DEPENDENCY_SET ethercat_servo_deps
+  )
+
+  # #37 Finding B(a): SELF-BUNDLE the module's shared-library dependencies (viam-cpp-sdk +
+  # gRPC/absl/protobuf/re2/... -- ~250 .so) into the package's lib/ so module.tar.gz is PORTABLE:
+  # it loads on any host (whatever viam-server env the user runs) via ethercat-servo's own RUNPATH
+  # ($ORIGIN/../lib), with NO Viam-SDK/gRPC install required on the target. This is what a registry
+  # deploy needs (and replaces the manual .so copy used to prove the sim RDK smoke).
+  # EXCLUDE the base glibc/loader set (those MUST come from the target host's own glibc, which is
+  # backward-compatible); libstdc++/libgcc are already static-linked (-static-libstdc++/-libgcc above),
+  # so they never appear as deps. Everything else (the SDK/gRPC/absl tree, ssl/crypto/z) is bundled.
+  install(
+    RUNTIME_DEPENDENCY_SET ethercat_servo_deps
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    PRE_EXCLUDE_REGEXES
+      "^ld-linux.*"      "^libc\\.so.*"       "^libm\\.so.*"        "^libdl\\.so.*"
+      "^libpthread\\.so.*" "^librt\\.so.*"     "^libgcc_s\\.so.*"    "^libstdc\\+\\+\\.so.*"
+      "^libresolv\\.so.*"  "^libnsl\\.so.*"    "^libanl\\.so.*"      "^libutil\\.so.*"
+    POST_EXCLUDE_REGEXES
+      "^/lib/ld-linux" "^/lib64/ld-linux"
+      "/libc\\.so"     "/libm\\.so"           "/libpthread\\.so"    "/libdl\\.so"
+      "/librt\\.so"    "/libgcc_s\\.so"       "/libstdc\\+\\+\\.so"
   )
 
   # Module smoke test: drives a ServoMotor over a SimBackend-backed controller.
@@ -348,6 +370,7 @@ if (ETHERCAT_BUILD_MODULE)
     BOOST_DLL_USE_STD_FS
     "A6_HW_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-hardware.example.json\""
     "A6_SIM_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-servo.example.json\""
+    "A6_MINIMAL_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-minimal.example.json\""
   )
   target_include_directories(a6_config_parse_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   viam_apply_wall_werror(a6_config_parse_test)
