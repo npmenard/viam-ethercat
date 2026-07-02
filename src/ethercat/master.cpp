@@ -514,8 +514,8 @@ void Master::set_rt_active(bool active) noexcept {
     sdo_cv_.notify_all();
 }
 
-std::size_t Master::sdo_read_deferred(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out,
-                                      std::chrono::milliseconds timeout) {
+std::size_t Master::sdo_read_deferred(
+    std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out, std::chrono::milliseconds timeout) {
     const std::string what = "slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" + std::to_string(sub);
     std::unique_lock<std::mutex> lk(sdo_mtx_);
     if (!sdo_service_open_) {

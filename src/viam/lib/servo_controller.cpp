@@ -24,10 +24,10 @@ constexpr std::uint16_t kStatusword = 0x6041;
 constexpr std::uint16_t kTargetPos = 0x607A;
 constexpr std::uint16_t kActualPos = 0x6064;
 constexpr std::uint16_t kTargetVel = 0x60FF;
-constexpr std::uint16_t kProfileVel = 0x6081;  // PP move speed (carries the GoTo/GoFor rpm); optional in the map
-constexpr std::uint16_t kModeOfOp = 0x6060;    // runtime mode-of-operation (RxPDO); present => PV->PP hold-switch (M6)
+constexpr std::uint16_t kProfileVel = 0x6081;   // PP move speed (carries the GoTo/GoFor rpm); optional in the map
+constexpr std::uint16_t kModeOfOp = 0x6060;     // runtime mode-of-operation (RxPDO); present => PV->PP hold-switch (M6)
 constexpr std::uint16_t kModeDisplay = 0x6061;  // mode display (TxPDO); present => enable-time mode-echo gate (#45/#57)
-constexpr std::uint16_t kFaultCode = 0x603F;   // drive error code (TxPDO, optional feedback)
+constexpr std::uint16_t kFaultCode = 0x603F;    // drive error code (TxPDO, optional feedback)
 // #TODO-4: the A6's "no-SYNC0" code (0x8700 / Er74.1) is NO LONGER a constant here --
 // it's CONFIG DATA (ServoConfig::sync_fault_code), so this generic core carries no
 // vendor value. The bring-up gate reads it from config (nullopt ⇒ no detection).
@@ -191,7 +191,7 @@ void ServoController::reset_run_state() {
     state_.completed_generation.store(0, std::memory_order_relaxed);
     state_.failed_generation.store(0, std::memory_order_relaxed);
     next_generation_.store(0, std::memory_order_relaxed);
-    motion_slot_.store(0, std::memory_order_relaxed);  // R3: free the single-in-flight slot on (re)start
+    motion_slot_.store(0, std::memory_order_relaxed);                               // R3: free the single-in-flight slot on (re)start
     state_.expected_wkc.store(master_->expected_wkc(), std::memory_order_relaxed);  // constant; read lock-free by last_error()
     lifecycle_ = Init{};
     last_cw_ = 0;
@@ -439,8 +439,8 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         pv_hold_as_pp_ = false;  // M6: a fresh motion intent ends the PV->PP position hold (switches back to PV)
     }
     if (batch.halt) {
-        halted_ = true;                             // STICKY: stays asserted across cycles until a new motion command
-        abort_active_move(RtError::MotorStopped);   // R3: CANCEL any in-flight blocking move -> its waiter throws "motor stopped"
+        halted_ = true;                            // STICKY: stays asserted across cycles until a new motion command
+        abort_active_move(RtError::MotorStopped);  // R3: CANCEL any in-flight blocking move -> its waiter throws "motor stopped"
         // M6: on a switch-capable PV map, hold POSITION via PP (below). pv_hold_token_ kicks the policy's
         // PP handshake for the hold target WITHOUT disturbing the move-generation space. The hold target is
         // the LIVE actual (passed each cycle) -- the PP handshake latches it once, on its bit4 edge, which
@@ -501,7 +501,8 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // itself -- else on a PDO-mapped-0x6060 map the drive follows the PDO (=0) and enables in mode 0.
         // Inert when 0x6060 is SDO-set only (production): f_mode_wr_ !mapped().
         if (f_mode_wr_.mapped()) {
-            ctx.store<cia402::ModeOfOperation::type>(f_mode_wr_, static_cast<std::int8_t>(commanded_cia402_mode()));  // #61: switchable -> current intent
+            ctx.store<cia402::ModeOfOperation::type>(
+                f_mode_wr_, static_cast<std::int8_t>(commanded_cia402_mode()));  // #61: switchable -> current intent
         }
         // #47-P3c/#57 MODE-ECHO GATE (#45 fail-closed, in the module's OWN ladder): once the drive is
         // SwitchedOn the commanded mode should be adopted (SDO-set at configure, or PDO-seeded above), so
@@ -563,7 +564,8 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             pcmd.halt = false;
             pcmd.token = pv_hold_token_;
         } else {
-            pcmd.mode = commanded_cia402_mode();  // #61: switchable -> current intent (policy runs the §6 switch when it differs from 0x6061)
+            pcmd.mode =
+                commanded_cia402_mode();  // #61: switchable -> current intent (policy runs the §6 switch when it differs from 0x6061)
             pcmd.target_counts = target_counts_;
             pcmd.profile_velocity = profile_vel_;
             pcmd.target_velocity = pv_velocity_;
@@ -796,7 +798,7 @@ void ServoController::step(CycleContext& ctx) noexcept {
         if (config_.quick_stop_decel > 0) {
             PolicyCommand scmd;
             scmd.mode = commanded_cia402_mode();  // #61
-            scmd.enable = false;  // stopping is not a motion intent; the policy's stopping branch owns the cw
+            scmd.enable = false;                  // stopping is not a motion intent; the policy's stopping branch owns the cw
             scmd.token = state_.active_generation.load(std::memory_order_relaxed);
             (void)policy_.step(ctx, scmd);  // writes cw (kQuickStopCw / disable backstop) into ctx
         } else {

@@ -1,9 +1,13 @@
 #include "viam/module/servo_motor.hpp"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -327,6 +331,41 @@ bool command_flag(const ProtoStruct& command, const char* key) {
     return b != nullptr && *b;
 }
 
+// --- #22/#68 do_command SDO reads (CONVERTED VALUES ONLY) ---------------------
+// STANDARD CiA402 objects (not A6-vendor: these indices are fixed DS402 assignments), read
+// via the controller's steady-state marshaled SDO path (single-port-owner safe). Unit
+// conversion lives HERE (the module = Viam-unit layer), not in the generic controller.
+constexpr std::uint16_t kDcLinkVoltage = 0x6079;        // U32, unit mV (CiA402); DC-link circuit voltage
+constexpr std::uint16_t kCurrentActual = 0x6078;        // I16, per-mille of motor rated current
+constexpr std::uint16_t kSupportedDriveModes = 0x6502;  // U32 bitmask of supported modes
+constexpr std::chrono::milliseconds kSdoTimeout{200};
+
+// Decode the 0x6502 supported-drive-modes bitmask into CiA402 mode-name strings.
+std::vector<ProtoValue> decode_drive_modes(std::uint32_t bits) {
+    struct Bit {
+        unsigned bit;
+        const char* name;
+    };
+    static constexpr std::array<Bit, 9> kModeBits{{
+        {0, "PP"},
+        {1, "VL"},
+        {2, "PV"},
+        {3, "TQ"},
+        {5, "HM"},
+        {6, "IP"},
+        {7, "CSP"},
+        {8, "CSV"},
+        {9, "CST"},
+    }};
+    std::vector<ProtoValue> modes;
+    for (const Bit& b : kModeBits) {
+        if ((bits & (1U << b.bit)) != 0U) {
+            modes.emplace_back(std::string(b.name));
+        }
+    }
+    return modes;
+}
+
 }  // namespace
 
 ServoConfig parse_servo_config(const ProtoStruct& attributes) {
@@ -450,8 +489,45 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
         status.emplace("last_error", ProtoValue(controller_->last_error()));
         result.emplace("status", ProtoValue(std::move(status)));
     }
+    // #22/#68 converted SDO reads. Each: on success -> the converted value under a clear key;
+    // on SDO failure -> a clear "<key>_error" string (so a batch never loses its siblings and
+    // the failure is discoverable). A read requires the RT loop to be operational (the marshaled
+    // servicer); pre-operational -> a clean ConfigError captured into the *_error key.
+    if (command_flag(command, "get_motor_voltage")) {
+        try {
+            std::array<std::byte, 4> buf{};
+            controller_->sdo_read(kDcLinkVoltage, 0, buf, kSdoTimeout);
+            const double volts = static_cast<double>(ethercat::load_le<std::uint32_t>(std::span<const std::byte>(buf.data(), 4))) / 1000.0;
+            result.emplace("voltage_volts", ProtoValue(volts));  // 0x6079 unit = mV (CiA402)
+        } catch (const ethercat::Error& e) {
+            result.emplace("voltage_volts_error", ProtoValue(std::string("get_motor_voltage failed: ") + e.what()));
+        }
+    }
+    if (command_flag(command, "get_motor_current_actual_value")) {
+        try {
+            std::array<std::byte, 2> buf{};
+            controller_->sdo_read(kCurrentActual, 0, buf, kSdoTimeout);
+            const std::int16_t permille = ethercat::load_le<std::int16_t>(std::span<const std::byte>(buf.data(), 2));
+            const double amps = (static_cast<double>(permille) / 1000.0) * controller_->rated_current_amps();  // 0x6078 per-mille of rated
+            result.emplace("current_amps", ProtoValue(amps));
+        } catch (const ethercat::Error& e) {
+            result.emplace("current_amps_error", ProtoValue(std::string("get_motor_current_actual_value failed: ") + e.what()));
+        }
+    }
+    if (command_flag(command, "get_motor_drive_modes")) {
+        try {
+            std::array<std::byte, 4> buf{};
+            controller_->sdo_read(kSupportedDriveModes, 0, buf, kSdoTimeout);
+            const std::uint32_t bits = ethercat::load_le<std::uint32_t>(std::span<const std::byte>(buf.data(), 4));
+            result.emplace("drive_modes", ProtoValue(decode_drive_modes(bits)));
+        } catch (const ethercat::Error& e) {
+            result.emplace("drive_modes_error", ProtoValue(std::string("get_motor_drive_modes failed: ") + e.what()));
+        }
+    }
     if (result.empty()) {
-        throw std::runtime_error("unknown do_command; supported keys: fault_reset, enable, disable, status (each a bool)");
+        throw std::runtime_error(
+            "unknown do_command; supported keys (each a bool): fault_reset, enable, disable, status; "
+            "get_motor_voltage, get_motor_current_actual_value, get_motor_drive_modes (converted SDO reads)");
     }
     return result;
 }

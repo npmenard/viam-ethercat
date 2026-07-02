@@ -335,8 +335,8 @@ class Master {
     // `timeout` for the RT thread to service it; returns the byte count read into `out`.
     // Throws ConfigError if no RT servicer is running (call this only while operational;
     // pre-/post-RT use the guarded sdo_read above), SdoError on a CoE abort or on timeout.
-    std::size_t sdo_read_deferred(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out,
-                                  std::chrono::milliseconds timeout);
+    std::size_t sdo_read_deferred(
+        std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out, std::chrono::milliseconds timeout);
     // RT hot path: service AT MOST ONE pending SDO request, else return immediately. Called
     // ONCE per steady cycle by the Runner (the single port owner). noexcept: a CoE abort is
     // captured into the request's result, never thrown across the RT boundary. The idle path
@@ -433,18 +433,19 @@ class Master {
         std::uint16_t slave = 0;
         std::uint16_t index = 0;
         std::uint8_t sub = 0;
-        std::size_t want = 0;                              // bytes requested (out.size())
-        std::size_t got = 0;                               // bytes actually read
-        bool ok = false;                                   // false => `error` holds the reason
-        std::string error;                                 // set by the RT servicer on abort (jitter-window alloc, never the idle path)
-        std::array<std::byte, kMaxSdoReadBytes> buf{};     // RT reads INTO here; the waiter copies OUT (caller buffer lifetime is irrelevant to RT)
+        std::size_t want = 0;  // bytes requested (out.size())
+        std::size_t got = 0;   // bytes actually read
+        bool ok = false;       // false => `error` holds the reason
+        std::string error;     // set by the RT servicer on abort (jitter-window alloc, never the idle path)
+        std::array<std::byte, kMaxSdoReadBytes>
+            buf{};  // RT reads INTO here; the waiter copies OUT (caller buffer lifetime is irrelevant to RT)
     };
     std::mutex sdo_mtx_;
     std::condition_variable sdo_cv_;
-    std::atomic<bool> sdo_pending_{false};       // RT fast path: is there a Requested job to service?
-    bool sdo_service_open_ = false;              // guarded by sdo_mtx_: an RT loop is running to service (mirrors rt_active_)
-    SdoPhase sdo_phase_ = SdoPhase::Idle;        // guarded by sdo_mtx_
-    SdoJob sdo_job_;                             // guarded by sdo_mtx_ (RT holds the lock across its transfer)
+    std::atomic<bool> sdo_pending_{false};  // RT fast path: is there a Requested job to service?
+    bool sdo_service_open_ = false;         // guarded by sdo_mtx_: an RT loop is running to service (mirrors rt_active_)
+    SdoPhase sdo_phase_ = SdoPhase::Idle;   // guarded by sdo_mtx_
+    SdoJob sdo_job_;                        // guarded by sdo_mtx_ (RT holds the lock across its transfer)
 };
 
 // ---------------------------------------------------------------------------

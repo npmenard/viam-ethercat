@@ -43,26 +43,32 @@ struct SimSlaveModel {
     std::int32_t counts_per_step = 1000;     // PP: how fast actual chases target per cycle
     std::int32_t velocity_off = -1;          // optional: 0x60FF target velocity offset in outputs (i32); <0 = none
     std::int32_t profile_velocity_off = -1;  // optional: 0x6081 PP profile-velocity offset in outputs (u32); <0 = none
-    std::int32_t mode_of_op_off = -1;        // optional: 0x6060 mode-of-operation (i8) offset in OUTPUTS; <0 = mode set by SDO only (#47-P3b sub-step 5: RxPDO runtime mode-switch)
-    std::int32_t mode_display_off = -1;      // optional: 0x6061 mode-display (i8) offset in INPUTS; <0 = not emitted (#53)
+    std::int32_t mode_of_op_off = -1;    // optional: 0x6060 mode-of-operation (i8) offset in OUTPUTS; <0 = mode set by SDO only (#47-P3b
+                                         // sub-step 5: RxPDO runtime mode-switch)
+    std::int32_t mode_display_off = -1;  // optional: 0x6061 mode-display (i8) offset in INPUTS; <0 = not emitted (#53)
 
     // --- #53 PV / quick-stop modeling (all default to a conformant A6 that PASSES the gates) ---
-    std::int16_t quick_stop_option = 2;          // 0x605A read value (must be 2 for the control to energize PV)
-    std::uint32_t quick_stop_decel_echo = 0;     // 0x6085 sdo_read OVERRIDE (clamp / absent model) when *_forced
-    bool quick_stop_decel_echo_forced = false;   // true -> sdo_read(0x6085) returns quick_stop_decel_echo (0 = absent/refuse, or a clamped value)
-    std::int32_t quick_stop_decel_step = 0;      // QuickStopActive: |velocity| ramp-down PER CYCLE (toy counts/cycle); 0 = instant stop
-    bool quick_stop_suppress_auto_disable = false;  // model a drive that reports 0x605A=2 but does NOT auto-transition QSA->SwitchOnDisabled at zero (forces the control's cw->0x00 BACKSTOP to do the disable -- tests that path while configure still passes)
-    std::int8_t mode_echo_value = 0;             // forced 0x6061 echo (wrong-mode refuse test) when mode_echo_forced
-    bool mode_echo_forced = false;               // true -> 0x6061 reports mode_echo_value; else it echoes effective_mode (#53 DA-B)
+    std::int16_t quick_stop_option = 2;       // 0x605A read value (must be 2 for the control to energize PV)
+    std::uint32_t quick_stop_decel_echo = 0;  // 0x6085 sdo_read OVERRIDE (clamp / absent model) when *_forced
+    bool quick_stop_decel_echo_forced =
+        false;  // true -> sdo_read(0x6085) returns quick_stop_decel_echo (0 = absent/refuse, or a clamped value)
+    std::int32_t quick_stop_decel_step = 0;  // QuickStopActive: |velocity| ramp-down PER CYCLE (toy counts/cycle); 0 = instant stop
+    bool quick_stop_suppress_auto_disable =
+        false;  // model a drive that reports 0x605A=2 but does NOT auto-transition QSA->SwitchOnDisabled at zero (forces the control's
+                // cw->0x00 BACKSTOP to do the disable -- tests that path while configure still passes)
+    std::int8_t mode_echo_value = 0;  // forced 0x6061 echo (wrong-mode refuse test) when mode_echo_forced
+    bool mode_echo_forced = false;    // true -> 0x6061 reports mode_echo_value; else it echoes effective_mode (#53 DA-B)
     // --- #47-P3b M56S: a SECOND device's runtime mode-switch quirks (the generic mode-switch's T_switch
     //     knob adapts the SAME policy to these -- no per-device policy code). ---
-    std::uint32_t mode_switch_latency = 0;       // cycles the drive TAKES to apply a new 0x6060 (0x6061 lags this many cycles); models M56S "transition takes time" (undefined-feedback window). 0 = instant (the A6).
+    std::uint32_t mode_switch_latency = 0;  // cycles the drive TAKES to apply a new 0x6060 (0x6061 lags this many cycles); models M56S
+                                            // "transition takes time" (undefined-feedback window). 0 = instant (the A6).
     // #59: encoder READ noise -- the REPORTED 0x6064/0x606C jitter by a ±report_noise square wave (the
     // physics s.actual stays clean). At rest this makes 0x606C nonzero (defeats an exact-|vel|<=0 reached
     // predicate) while the position RANGE stays 2*report_noise (a position-delta predicate tolerates it).
     // 0 = clean (default; all existing tests unaffected).
     std::int32_t report_noise = 0;
-    Cia402Mode unsupported_mode = Cia402Mode::None;  // a mode the drive REJECTS (never applies -> 0x6061 never echoes it); models M56S "errors on an unsupported mode". None = accept all.
+    Cia402Mode unsupported_mode = Cia402Mode::None;  // a mode the drive REJECTS (never applies -> 0x6061 never echoes it); models M56S
+                                                     // "errors on an unsupported mode". None = accept all.
     // De-mask of the #16 TxPDO FEEDBACK fields (offsets into the INPUT image; <0 = not
     // mapped, so the controller's read path falls back -- exercises the optional guard).
     std::int32_t fault_code_off = -1;       // 0x603F drive error code (u16) in inputs
@@ -82,9 +88,9 @@ struct SimSlaveModel {
     //   0x6079:00 U32 DC-link circuit voltage, unit mV  (310 V rectified 220 VAC -> 310000)
     //   0x6078:00 I16 current actual value, per-mille of rated current (0 at hold)
     //   0x6502:00 U32 supported drive modes bitmask (bit0 PP, bit2 PV, bit7 CSP, bit8 CSV)
-    std::uint32_t dc_link_voltage_mv = 310'000;         // 0x6079
-    std::int16_t current_actual_permille = 0;           // 0x6078
-    std::uint32_t supported_drive_modes = 0x0000'0185U; // 0x6502: PP|PV|CSP|CSV = bits 0,2,7,8
+    std::uint32_t dc_link_voltage_mv = 310'000;          // 0x6079
+    std::int16_t current_actual_permille = 0;            // 0x6078
+    std::uint32_t supported_drive_modes = 0x0000'0185U;  // 0x6502: PP|PV|CSP|CSV = bits 0,2,7,8
 
     std::uint32_t vendor_id = 0;
     std::uint32_t product_code = 0;
@@ -164,9 +170,11 @@ class SimBackend final : public EcatBackend {
     // the device ever entered QuickStopActive (proves a CiA402 Quick-Stop, not a torque-cut).
     std::int32_t received_target_velocity(std::uint16_t slave) const noexcept;
     std::uint16_t received_controlword(std::uint16_t slave) const noexcept;  // #47-P3b 5d: last cw consumed (stop-sequence disposition)
-    Cia402Mode effective_mode(std::uint16_t slave) const noexcept;           // #47-P3b M6: drive's current runtime mode (PV->PP hold-switch proof)
-    std::int32_t received_target_position(std::uint16_t slave) const noexcept;  // #47-P3b: last 0x607A the master wrote (DA no-lunge: seeded/mirrored target == actual, never a stale jump)
-    std::uint32_t mode_of_op_write_transitions(std::uint16_t slave) const noexcept;  // #61 (DA): cumulative 0x6060 OUTPUT-byte changes (unconfirmable-switch storm gate; freezes with revert, climbs without)
+    Cia402Mode effective_mode(std::uint16_t slave) const noexcept;  // #47-P3b M6: drive's current runtime mode (PV->PP hold-switch proof)
+    std::int32_t received_target_position(std::uint16_t slave)
+        const noexcept;  // #47-P3b: last 0x607A the master wrote (DA no-lunge: seeded/mirrored target == actual, never a stale jump)
+    std::uint32_t mode_of_op_write_transitions(std::uint16_t slave) const
+        noexcept;  // #61 (DA): cumulative 0x6060 OUTPUT-byte changes (unconfirmable-switch storm gate; freezes with revert, climbs without)
     std::int32_t velocity_at_qsa_exit(std::uint16_t slave) const noexcept;
     bool entered_qsa(std::uint16_t slave) const noexcept;
     // Toggle whether a slave asserts the PP set-point-acknowledge (bit12). When
@@ -210,24 +218,26 @@ class SimBackend final : public EcatBackend {
         Cia402State device_state = Cia402State::NotReadyToSwitchOn;
         std::uint16_t prev_ctrlword = 0;
         std::int32_t target = 0;
-        std::int32_t target_written = 0;  // #47-P3b: the last 0x607A the master WROTE this cycle (seed/mirror wire value, latched-or-not) -- DA no-lunge probe
+        std::int32_t target_written =
+            0;  // #47-P3b: the last 0x607A the master WROTE this cycle (seed/mirror wire value, latched-or-not) -- DA no-lunge probe
         std::int32_t actual = 0;
-        bool noise_phase = false;         // #59: encoder-noise square-wave phase (toggles per cycle when model.report_noise>0)
-        std::int32_t reported_prev = 0;   // #59: previous REPORTED (jittered) actual -> the jittered 0x606C delta
-        bool setpoint_ack = false;  // PP bit12 latch
+        bool noise_phase = false;        // #59: encoder-noise square-wave phase (toggles per cycle when model.report_noise>0)
+        std::int32_t reported_prev = 0;  // #59: previous REPORTED (jittered) actual -> the jittered 0x606C delta
+        bool setpoint_ack = false;       // PP bit12 latch
         // ATOMIC: written by a non-RT test hook (inject_fault/set_fault_code/
         // set_stale_fault_code) while the RT loop reads them in step_device -- the only
         // cross-thread Slave fields. Relaxed is sufficient (independent test signals).
         std::atomic<bool> faulted{false};
-        std::atomic<std::uint16_t> fault_code{0};               // 0x603F code reported while faulted (set_fault_code)
-        std::atomic<std::uint16_t> stale_fault_code{0};         // forces 0x603F = this REGARDLESS of fault state (flag-gating test)
-        std::int32_t profile_velocity = 0;                      // last 0x6081 seen in the command image (test visibility; RT-only)
-        std::int32_t velocity = 0;                              // per-cycle actual delta (0x606C de-mask; RT-only)
+        std::atomic<std::uint16_t> fault_code{0};        // 0x603F code reported while faulted (set_fault_code)
+        std::atomic<std::uint16_t> stale_fault_code{0};  // forces 0x603F = this REGARDLESS of fault state (flag-gating test)
+        std::int32_t profile_velocity = 0;               // last 0x6081 seen in the command image (test visibility; RT-only)
+        std::int32_t velocity = 0;                       // per-cycle actual delta (0x606C de-mask; RT-only)
         // #53 PV/quick-stop state (RT-only; read by tests AFTER stop/join):
-        std::int32_t pv_velocity = 0;                       // current PV/QSA velocity (toy counts/cycle == 0x606C)
-        std::int32_t target_velocity = 0;                   // last 0x60FF seen in the command image (test visibility)
-        std::int32_t velocity_at_qsa_exit = 0x7fffffff;     // 0x606C the cycle the device left QuickStopActive -> SwitchOnDisabled (proves ramp-then-disable)
-        bool entered_qsa = false;                           // device ever reached QuickStopActive (proves Quick-Stop, not torque-cut)
+        std::int32_t pv_velocity = 0;      // current PV/QSA velocity (toy counts/cycle == 0x606C)
+        std::int32_t target_velocity = 0;  // last 0x60FF seen in the command image (test visibility)
+        std::int32_t velocity_at_qsa_exit =
+            0x7fffffff;            // 0x606C the cycle the device left QuickStopActive -> SwitchOnDisabled (proves ramp-then-disable)
+        bool entered_qsa = false;  // device ever reached QuickStopActive (proves Quick-Stop, not torque-cut)
         std::atomic<bool> suppress_ack{false};                  // test hook (toggled live during a handshake): never assert bit12
         std::atomic<std::uint32_t> fault_clear_delay{0};        // #18 type-(a) reflect latency (cycles); 0 = instant
         std::atomic<bool> fault_persistent{false};              // #18 type-(b) cause-persists: reset edge ignored
@@ -267,7 +277,8 @@ class SimBackend final : public EcatBackend {
     std::int64_t synthetic_dc_ns_ = 0;    // synthetic DC clock, advanced each exchange() (dc_time())
     bool open_ = false;
     bool short_wkc_once_ = false;
-    int op_requests_ = 0;  // #47: set_state(_, Op) call count (no-hammer metric)                // one-shot (master_test drives it synchronously; RT-only)
+    int op_requests_ =
+        0;  // #47: set_state(_, Op) call count (no-hammer metric)                // one-shot (master_test drives it synchronously; RT-only)
     std::atomic<bool> short_wkc_sticky_{false};  // toggled non-RT while the RT loop reads it in exchange() -> atomic
 };
 

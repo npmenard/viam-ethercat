@@ -360,9 +360,9 @@ TEST("ServoController(PV): the velocity guard clamps a command the quick-stop ca
     // FEEDBACK mode: velocity_counts() reads the exact wire 0x606C (the sim's per-cycle advance =
     // the commanded device velocity), NOT the noisy delta-estimate -> a DETERMINISTIC read.
     ServoConfig cfg = make_config(ControlMode::ProfileVelocity, /*feedback=*/true);
-    cfg.quick_stop_decel = 100'000;   // counts/s^2 (echoed back by the sim)
-    cfg.controlled_stop_window_ms = 100;   // budget window; margin 50ms -> effective 50ms
-    cfg.velocity_threshold = 1;       // is_moving = |vel| > 1
+    cfg.quick_stop_decel = 100'000;       // counts/s^2 (echoed back by the sim)
+    cfg.controlled_stop_window_ms = 100;  // budget window; margin 50ms -> effective 50ms
+    cfg.velocity_threshold = 1;           // is_moving = |vel| > 1
     // budget = 100000 * (0.100 - 0.050) = 5000 counts/s. set_rpm(60 rpm) = 131072 counts/s, FAR
     // above budget -> must clamp to ~5000, never the requested 131072.
     ServoController ctrl{cfg, sim_factory(ControlMode::ProfileVelocity, nullptr, /*feedback=*/true)};
@@ -373,8 +373,8 @@ TEST("ServoController(PV): the velocity guard clamps a command the quick-stop ca
     // The device velocity (0x606C) sits at the guard ceiling (~5000), NOT the requested 131072.
     CHECK(wait_until([&] { return std::abs(ctrl.velocity_counts()) > 100; }, std::chrono::milliseconds(300)));
     const std::int32_t v = std::abs(ctrl.velocity_counts());
-    CHECK(v > 0);         // still moving -- clamped, not rejected
-    CHECK(v <= 8'000);    // ~budget (5000) + slack; DEFINITELY below the 131072 unclamped request
+    CHECK(v > 0);       // still moving -- clamped, not rejected
+    CHECK(v <= 8'000);  // ~budget (5000) + slack; DEFINITELY below the 131072 unclamped request
 }
 
 TEST("ServoController: quick-stop OPT-OUT (no decel) -- configure skips the 0x605A/0x6085 SDO, stop coasts (#47-P3b R1)") {
@@ -390,7 +390,7 @@ TEST("ServoController: quick-stop OPT-OUT (no decel) -- configure skips the 0x60
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
     ctrl.go_to(1000.0, 1.0);
     CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);
-    ctrl.stop();  // LIFECYCLE-stop -> disable-voltage coast; must tear down cleanly (no hang/throw)
+    ctrl.stop();                // LIFECYCLE-stop -> disable-voltage coast; must tear down cleanly (no hang/throw)
     CHECK(!ctrl.is_powered());  // de-energized after the stop
 }
 
@@ -415,8 +415,8 @@ TEST("ServoController(PV): LIFECYCLE-stop is a RAMP-then-disable, not a torque-c
         return std::unique_ptr<EcatBackend>(std::move(be));
     };
     ServoConfig cfg = make_config(ControlMode::ProfileVelocity, /*feedback=*/true);
-    cfg.quick_stop_decel = 200'000;         // budget = 200000 * (0.100 - 0.050) = 10000 counts/s
-    cfg.controlled_stop_window_ms = 100;    // teardown window = 100 cycles @1kHz (>> the ~67-cycle ramp)
+    cfg.quick_stop_decel = 200'000;       // budget = 200000 * (0.100 - 0.050) = 10000 counts/s
+    cfg.controlled_stop_window_ms = 100;  // teardown window = 100 cycles @1kHz (>> the ~67-cycle ramp)
     cfg.velocity_threshold = 2000;
     ServoController ctrl{cfg, factory};
     ctrl.start();
@@ -468,7 +468,8 @@ TEST("ServoController(PV): M6 -- a switch-capable PV motion-hold LOCKS position 
     // Switch-capable RxPDO: add 0x607A (PP target) so pv_hold_capable_ latches (else the interim bit8 hold).
     cfg.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x60FF, 0, 32}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6060, 0, 8}};
     // 0x6061 mode-display in the TxPDO -> the policy's Settle confirms 0x6061==PP (a real switch, not a hang).
-    cfg.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16}, PdoEntry{0x606C, 0, 32}, PdoEntry{0x6061, 0, 8}};
+    cfg.txpdo.entries[0x1A00] = {
+        PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16}, PdoEntry{0x606C, 0, 32}, PdoEntry{0x6061, 0, 8}};
     cfg.quick_stop_decel = 100'000;
     cfg.controlled_stop_window_ms = 100;  // VEL budget = 100000*(0.100-0.050) = 5000 counts/s
     cfg.velocity_threshold = 50;
@@ -484,19 +485,20 @@ TEST("ServoController(PV): M6 -- a switch-capable PV motion-hold LOCKS position 
     // is read ONLY after ctrl.stop() has JOINED the RT thread (mirrors the entered_qsa/received_* tests).
     ctrl.halt();
     CHECK(wait_until([&] { return std::abs(ctrl.velocity_counts()) <= cfg.velocity_threshold; },
-                     std::chrono::milliseconds(500)));       // ramped to rest (StopFirst)
+                     std::chrono::milliseconds(500)));           // ramped to rest (StopFirst)
     std::this_thread::sleep_for(std::chrono::milliseconds(60));  // >> the ~10-cycle switch -> the PP hold is established
-    CHECK(ctrl.is_powered());  // R1: the HOLD is ENERGIZED -- never de-energizes
+    CHECK(ctrl.is_powered());                                    // R1: the HOLD is ENERGIZED -- never de-energizes
     CHECK(!ctrl.is_moving());
     // HELD: position is STABLE (the PP position loop locks the shaft at REST -> zero drift, no back-jump).
     const double p0 = ctrl.position_revs();
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
     CHECK(std::abs(ctrl.position_revs() - p0) < 1e-6);
-    ctrl.stop();  // JOIN the RT thread -> the sim accessor below is race-free
+    ctrl.stop();                                                              // JOIN the RT thread -> the sim accessor below is race-free
     CHECK(simp->effective_mode(1) == ethercat::Cia402Mode::ProfilePosition);  // the drive DID switch to PP (not bit8-PV)
 }
 
-TEST("ServoController(PV): M6 -- a PV->PP hold-switch that can't confirm stays ENERGIZED in PV, no throw/de-energize (#47-P3b M6 failure)") {
+TEST(
+    "ServoController(PV): M6 -- a PV->PP hold-switch that can't confirm stays ENERGIZED in PV, no throw/de-energize (#47-P3b M6 failure)") {
     // Failure disposition (spec §A R1): if the hold-switch can't confirm the mode (0x6061 never echoes PP
     // -- the #45 silent-ignore shape), the module does NOT throw (it's an INTERNAL hold, not an operator
     // command) and does NOT de-energize -- it reverts to the interim PV-at-0 hold. Proven by: after the
@@ -518,7 +520,8 @@ TEST("ServoController(PV): M6 -- a PV->PP hold-switch that can't confirm stays E
     };
     ServoConfig cfg = make_config(ControlMode::ProfileVelocity, /*feedback=*/true);
     cfg.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x60FF, 0, 32}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6060, 0, 8}};
-    cfg.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16}, PdoEntry{0x606C, 0, 32}, PdoEntry{0x6061, 0, 8}};
+    cfg.txpdo.entries[0x1A00] = {
+        PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16}, PdoEntry{0x606C, 0, 32}, PdoEntry{0x6061, 0, 8}};
     cfg.quick_stop_decel = 100'000;
     cfg.velocity_threshold = 50;
     ServoController ctrl{cfg, factory};
@@ -532,7 +535,7 @@ TEST("ServoController(PV): M6 -- a PV->PP hold-switch that can't confirm stays E
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
     CHECK(ctrl.is_powered());  // THE safety property: stayed ENERGIZED through a failed switch (never de-energized)
     CHECK(std::abs(ctrl.velocity_counts()) <= cfg.velocity_threshold);  // reverted PV-at-0 -> at rest (atomic, race-free)
-    ctrl.stop();  // JOIN the RT thread -> the sim accessor below is race-free
+    ctrl.stop();                                                        // JOIN the RT thread -> the sim accessor below is race-free
     CHECK(simp != nullptr);
     CHECK(simp->effective_mode(1) == ethercat::Cia402Mode::ProfileVelocity);  // reverted to PV (interim bit8 hold), not stuck in PP
 }
@@ -543,8 +546,8 @@ namespace {
 // offline. 0x6061 @12 in the feedback TxPDO (status@0, actual@2, 603F@6, 606C@8, 6061@12 -> 13 B).
 ServoConfig make_config_modegate() {
     ServoConfig c = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
-    c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16},
-                              PdoEntry{0x606C, 0, 32}, PdoEntry{0x6061, 0, 8}};
+    c.txpdo.entries[0x1A00] = {
+        PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16}, PdoEntry{0x606C, 0, 32}, PdoEntry{0x6061, 0, 8}};
     return c;
 }
 SimSlaveModel make_model_modegate() {
@@ -589,8 +592,8 @@ TEST("#47-P3c/#57: module mode-echo MISMATCH (0x6061 != commanded) REFUSES to en
     ServoController ctrl{make_config_modegate(), factory};
     ctrl.start();
     const bool powered = wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(400));
-    CHECK(!powered);                                                              // REFUSED: never energized into the wrong mode
-    CHECK(ctrl.last_error().find("mode-of-operation") != std::string::npos);      // diagnosable: last_error names the mismatch
+    CHECK(!powered);                                                          // REFUSED: never energized into the wrong mode
+    CHECK(ctrl.last_error().find("mode-of-operation") != std::string::npos);  // diagnosable: last_error names the mismatch
     (void)sim;
 }
 
@@ -1227,12 +1230,12 @@ TEST("#61: switchable -- go_to runs PP, then set_rpm switches the drive to PV (0
     ServoController ctrl{make_config_switchable(), factory};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));  // enables in PP (intent default)
-    ctrl.go_to(1000.0, 0.5);  // PP move (accepted for switchable) completes
+    ctrl.go_to(1000.0, 0.5);                                                               // PP move (accepted for switchable) completes
     CHECK(std::abs(ctrl.position_revs() - 0.5) < 0.02);
     ctrl.set_rpm(120.0);  // accepted for switchable -> §6 switch PP->PV, then jog
     CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(800)));  // PV jog started (switch confirmed)
-    ctrl.stop();          // JOIN -> race-free sim read
-    CHECK(sim->effective_mode(1) == ethercat::Cia402Mode::ProfileVelocity);  // the drive DID switch to PV
+    ctrl.stop();                                                                          // JOIN -> race-free sim read
+    CHECK(sim->effective_mode(1) == ethercat::Cia402Mode::ProfileVelocity);               // the drive DID switch to PV
 }
 
 TEST("#61: switchable -- an unconfirmable switch reverts SAFE (energized, no throw, no retry storm)") {
@@ -1250,8 +1253,8 @@ TEST("#61: switchable -- an unconfirmable switch reverts SAFE (energized, no thr
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
     ctrl.set_rpm(120.0);  // request PV; 0x6061 never echoes PV -> mode_switch_failed -> revert intent to PP
     std::this_thread::sleep_for(std::chrono::milliseconds(400));  // past T_switch; revert settled
-    CHECK(ctrl.is_powered());          // SAFE: stayed ENERGIZED through the failed switch (no de-energize, no throw)
-    CHECK(!ctrl.is_moving());           // reverted to PP at rest (not jogging in an unconfirmed PV)
+    CHECK(ctrl.is_powered());  // SAFE: stayed ENERGIZED through the failed switch (no de-energize, no throw)
+    CHECK(!ctrl.is_moving());  // reverted to PP at rest (not jogging in an unconfirmed PV)
     // NON-VACUITY (DA): the wrapper's switch_intent_ revert is the SOLE storm-limiter -- the policy
     // re-enters run_mode_switch_ every cycle current!=want and give-up does NOT latch `want`, so
     // WITHOUT the revert an unconfirmable switch re-arms forever (0x6060 oscillates PP<->PV each
@@ -1303,7 +1306,7 @@ TEST("#64: a MINIMAL config (no rxpdo/txpdo, no tolerances) derives the PP map +
     ServoController ctrl{c, factory};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));  // derived map + gate -> OE
-    ctrl.go_to(1000.0, 1.0);  // field resolution + move on the DERIVED map
+    ctrl.go_to(1000.0, 1.0);                                                               // field resolution + move on the DERIVED map
     CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.02);
     CHECK(!ctrl.is_moving());
 }
@@ -1317,9 +1320,9 @@ TEST("#64: a MINIMAL config (no rxpdo/txpdo, no tolerances) derives the PP map +
 // successful read proves the value threads end-to-end (not a coincidental default).
 SimSlaveModel make_model_sdo() {
     SimSlaveModel m = make_model(ControlMode::ProfilePosition, /*feedback=*/true);
-    m.dc_link_voltage_mv = 322'000;             // 0x6079 -> 322.0 V
-    m.current_actual_permille = 400;            // 0x6078 -> 0.4 * rated
-    m.supported_drive_modes = 0x0000'0185U;     // 0x6502 -> bits 0,2,7,8 = PP,PV,CSP,CSV
+    m.dc_link_voltage_mv = 322'000;          // 0x6079 -> 322.0 V
+    m.current_actual_permille = 400;         // 0x6078 -> 0.4 * rated
+    m.supported_drive_modes = 0x0000'0185U;  // 0x6502 -> bits 0,2,7,8 = PP,PV,CSP,CSV
     return m;
 }
 
@@ -1364,11 +1367,9 @@ TEST("#22: steady-state SDO read succeeds mid-run; values correct; RT loop keeps
 }
 
 TEST("#22: SDO reads succeed CONCURRENTLY with an in-flight move; the move still completes") {
-    ServoController ctrl{make_config(ControlMode::ProfilePosition, /*feedback=*/true),
-                         [] {
-                             return std::unique_ptr<EcatBackend>(
-                                 std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_sdo()}));
-                         }};
+    ServoController ctrl{
+        make_config(ControlMode::ProfilePosition, /*feedback=*/true),
+        [] { return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_sdo()})); }};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
 
@@ -1393,16 +1394,14 @@ TEST("#22: SDO reads succeed CONCURRENTLY with an in-flight move; the move still
     }
     mover.join();
     CHECK(mover_done.load(std::memory_order_acquire));
-    CHECK(reads_ok.load() > 0);                       // at least one interleaved read succeeded mid-move
+    CHECK(reads_ok.load() > 0);                          // at least one interleaved read succeeded mid-move
     CHECK(std::abs(ctrl.position_revs() - 8.0) < 0.05);  // the move converged despite the SDO interleave
 }
 
 TEST("#22: an SDO read after stop() fails cleanly (no servicer) and does not hang") {
-    ServoController ctrl{make_config(ControlMode::ProfilePosition, /*feedback=*/true),
-                         [] {
-                             return std::unique_ptr<EcatBackend>(
-                                 std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_sdo()}));
-                         }};
+    ServoController ctrl{
+        make_config(ControlMode::ProfilePosition, /*feedback=*/true),
+        [] { return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_sdo()})); }};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
     ctrl.stop();  // joins the RT thread + closes the servicer window (set_rt_active(false))
@@ -1416,11 +1415,9 @@ TEST("#22: an SDO read after stop() fails cleanly (no servicer) and does not han
 }
 
 TEST("#22: a reader racing stop() unblocks cleanly (waiter woken by the servicer close)") {
-    ServoController ctrl{make_config(ControlMode::ProfilePosition, /*feedback=*/true),
-                         [] {
-                             return std::unique_ptr<EcatBackend>(
-                                 std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_sdo()}));
-                         }};
+    ServoController ctrl{
+        make_config(ControlMode::ProfilePosition, /*feedback=*/true),
+        [] { return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_sdo()})); }};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
 

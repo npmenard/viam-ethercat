@@ -170,7 +170,9 @@ class ServoController : public SlaveControl {
     // master_; the wait is bounded by `timeout`, so a mid-flight reconfigure blocks only that
     // long (unlike a multi-second move, which releases the lock). Throws ConfigError if not
     // started / no RT servicer, SdoError on a CoE abort or timeout. Returns bytes read.
-    std::size_t sdo_read(std::uint16_t index, std::uint8_t sub, std::span<std::byte> out,
+    std::size_t sdo_read(std::uint16_t index,
+                         std::uint8_t sub,
+                         std::span<std::byte> out,
                          std::chrono::milliseconds timeout = std::chrono::milliseconds(200));
     // Motor rated current (amps), for the module's 0x6078 per-mille -> amps conversion. Read
     // under the shared lock (reconfigure() rewrites config_ under the exclusive lock).
@@ -306,7 +308,7 @@ class ServoController : public SlaveControl {
     // already TERMINAL (completed/failed) -- no check-then-claim TOCTOU between two gRPC callers. The
     // waiter does NOT release it (reclaim-if-terminal on the next claim). Non-RT (API-thread) owned.
     std::atomic<std::uint32_t> motion_slot_{0};
-    std::atomic<std::uint64_t> watchdog_ns_{0};      // RT-liveness window (set at start; config-free reads)
+    std::atomic<std::uint64_t> watchdog_ns_{0};  // RT-liveness window (set at start; config-free reads)
     // #54 P3a §8 Degraded-but-alive: set when start()/bring-up fails (RT-spawn / on_configured
     // refusal / drive AL-reject) -- motion APIs throw "{degraded_reason_}", accessors fail-safe,
     // the process NEVER crashes; reconfigure()/start() clear it on a clean retry. degraded_
@@ -342,8 +344,10 @@ class ServoController : public SlaveControl {
     // #61: the Cia402 mode to command THIS cycle -- the fixed config mode (PP/PV) or, for a switchable
     // config, the current switch_intent_. RT-only (reads switch_intent_).
     Cia402Mode commanded_cia402_mode() const noexcept;
-    bool commanded_is_pp() const noexcept { return commanded_cia402_mode() == Cia402Mode::ProfilePosition; }
-    bool halted_ = false;           // STICKY Stop: Halt stays asserted until a new motion command
+    bool commanded_is_pp() const noexcept {
+        return commanded_cia402_mode() == Cia402Mode::ProfilePosition;
+    }
+    bool halted_ = false;  // STICKY Stop: Halt stays asserted until a new motion command
     // #47-P3b M6 (PV->PP hold-switch): a PV motion-hold that holds zero VELOCITY (bit8) drifts under
     // load -- the drive has no position loop in PV. When the map is switch-capable (0x6060 + 0x607A both
     // RxPDO-mapped), a Halt of a PV move instead switches the drive to PP-at-current-counts (the generic
@@ -356,10 +360,10 @@ class ServoController : public SlaveControl {
     // the command batch sets it (go_to/go_for -> PP, set_rpm -> PV). PP/PV configs ignore it. Default PP
     // so a switchable drive enables in PP. commanded_cia402_mode() folds it with the fixed config modes.
     ControlMode switch_intent_ = ControlMode::ProfilePosition;
-    bool pv_hold_capable_ = false;  // set at resolve: PV mode AND 0x6060 AND 0x607A both mapped
-    bool pv_hold_as_pp_ = false;    // STICKY: currently holding a halted PV motor via PP-at-counts
+    bool pv_hold_capable_ = false;               // set at resolve: PV mode AND 0x6060 AND 0x607A both mapped
+    bool pv_hold_as_pp_ = false;                 // STICKY: currently holding a halted PV motor via PP-at-counts
     std::uint32_t pv_hold_token_ = 0x80000000u;  // policy token that kicks the PP hold handshake (never a real gen)
-    bool stop_at_rest_ = false;     // RT-only (#47-P3b R1): drive reached SwitchOnDisabled during the stopping window -> teardown early-out
+    bool stop_at_rest_ = false;  // RT-only (#47-P3b R1): drive reached SwitchOnDisabled during the stopping window -> teardown early-out
     // Controller-error tier: one-shot latches (HandshakeTimeout/MoveStalled) set by
     // the FSM, cleared ONLY by an explicit fault_reset. The bus WkcFault tier is
     // LIVE (recomputed from master_->fault() each cycle) and is NOT stored here, so a
