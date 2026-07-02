@@ -174,9 +174,14 @@ class ServoController : public SlaveControl {
                          std::uint8_t sub,
                          std::span<std::byte> out,
                          std::chrono::milliseconds timeout = std::chrono::milliseconds(200));
-    // Motor rated current (amps), for the module's 0x6078 per-mille -> amps conversion. Read
+    // Motor rated current (amps), for the module's per-mille -> amps conversion. Read
     // under the shared lock (reconfigure() rewrites config_ under the exclusive lock).
     double rated_current_amps() const noexcept;
+    // #68 do_command SDO monitor specs (config data; standard-CiA402 defaults or a vendor
+    // override). The module reads the target via sdo_read() then converts with
+    // convert_sdo_monitor(). Shared-lock reads -> reconfigure-safe.
+    SdoMonitor voltage_monitor() const noexcept;
+    SdoMonitor current_monitor() const noexcept;
 
    private:
     // --- lifecycle FSM (std::variant; each state's step() in the .cpp) ---

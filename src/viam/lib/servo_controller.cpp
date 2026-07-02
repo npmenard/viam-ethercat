@@ -1136,6 +1136,16 @@ double ServoController::rated_current_amps() const noexcept {
     return config_.motor_rated_current_amps;
 }
 
+SdoMonitor ServoController::voltage_monitor() const noexcept {
+    const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    return config_.voltage_monitor;
+}
+
+SdoMonitor ServoController::current_monitor() const noexcept {
+    const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    return config_.current_monitor;
+}
+
 std::string ServoController::fault_gloss(std::uint16_t code) const {
     // Config-data lookup (NOT a hardcoded A6 table): 0x603F code -> human label.
     // Unknown code -> empty, so last_error() shows just the bare hex. Cold path.
