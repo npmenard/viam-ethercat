@@ -439,19 +439,28 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         pv_hold_as_pp_ = false;  // M6: a fresh motion intent ends the PV->PP position hold (switches back to PV)
     }
     if (batch.halt) {
-        halted_ = true;                            // STICKY: stays asserted across cycles until a new motion command
-        abort_active_move(RtError::MotorStopped);  // R3: CANCEL any in-flight blocking move -> its waiter throws "motor stopped"
-        // M6: on a switch-capable PV map, hold POSITION via PP (below). pv_hold_token_ kicks the policy's
-        // PP handshake for the hold target WITHOUT disturbing the move-generation space. The hold target is
-        // the LIVE actual (passed each cycle) -- the PP handshake latches it once, on its bit4 edge, which
-        // fires only AFTER the mode-switch stop-first ramp has brought the motor to REST -> the latched
-        // target IS the rest position (spec M6 "seed 0x607A=ACTUAL counts"), so no back-jump/lunge. Not
-        // switch-capable -> pv_hold_as_pp_ stays false -> interim bit8 zero-velocity hold.
-        // #61: only when the drive is currently in PV (fixed-PV always; switchable only after set_rpm) --
-        // a PP-intent halt already holds in PP, no switch. commanded_is_pp() reads the live switch_intent_.
-        if (pv_hold_capable_ && !commanded_is_pp()) {
-            pv_hold_as_pp_ = true;
-            ++pv_hold_token_;
+        abort_active_move(RtError::MotorStopped);  // R3: CANCEL any in-flight blocking move -> its waiter throws "motor stopped".
+                                                   // Fires on ANY halt (the halt cancels whatever is running), regardless of order.
+        // #70 ORDER-PRESERVING: the STICKY halt latches (and the M6 PV->PP hold arms) ONLY when the halt is
+        // the LATEST stop-relevant command in this batch. If a motion command was issued AFTER the halt in
+        // the SAME drain (Stop() then GoTo() coalesced), that move supersedes the halt -- so halted_ stays
+        // clear (already set false above) and the move runs, instead of being wedged UNDER halt (cw 0x011F,
+        // which the A6 never acks -- wire-proven #70 sibling). A halt in its own batch => halt_supersedes ==
+        // true (the common case) => behavior UNCHANGED.
+        if (batch.halt_supersedes) {
+            halted_ = true;  // STICKY: stays asserted across cycles until a new motion command
+            // M6: on a switch-capable PV map, hold POSITION via PP (below). pv_hold_token_ kicks the policy's
+            // PP handshake for the hold target WITHOUT disturbing the move-generation space. The hold target is
+            // the LIVE actual (passed each cycle) -- the PP handshake latches it once, on its bit4 edge, which
+            // fires only AFTER the mode-switch stop-first ramp has brought the motor to REST -> the latched
+            // target IS the rest position (spec M6 "seed 0x607A=ACTUAL counts"), so no back-jump/lunge. Not
+            // switch-capable -> pv_hold_as_pp_ stays false -> interim bit8 zero-velocity hold.
+            // #61: only when the drive is currently in PV (fixed-PV always; switchable only after set_rpm) --
+            // a PP-intent halt already holds in PP, no switch. commanded_is_pp() reads the live switch_intent_.
+            if (pv_hold_capable_ && !commanded_is_pp()) {
+                pv_hold_as_pp_ = true;
+                ++pv_hold_token_;
+            }
         }
     }
     if (batch.disable) {

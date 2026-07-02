@@ -142,6 +142,13 @@ struct CommandBatch {
     bool quick_stop = false;
     bool fault_reset = false;
     bool set_zero = false;
+    // #70 ORDER-PRESERVING sticky-Halt disposition: when a Halt and a new motion command
+    // (SetTarget/SetVelocity) coalesce into one drain, the STICKY halt must stick only if the
+    // Halt was the LATEST of the two -- a motion issued AFTER a halt (Stop() then GoTo()) means
+    // the caller wants to move, so the halt is superseded. drain() sets this to the disposition
+    // of the last stop-relevant command. (A Halt still CANCELS any in-flight move regardless; only
+    // whether the sticky-halt LATCHES is order-dependent.) Default false = no superseding halt.
+    bool halt_supersedes = false;
 
     bool any() const noexcept {
         return set_target.has_value() || set_velocity.has_value() || enable || disable || halt || quick_stop || fault_reset || set_zero;

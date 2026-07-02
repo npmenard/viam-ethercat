@@ -397,7 +397,15 @@ void SimBackend::step_device(Slave& s) noexcept {
     if (s.effective_mode == Cia402Mode::ProfilePosition && s.device_state == St::OperationEnabled) {
         const bool bit4 = (cw & 0x10U) != 0U;
         const bool prev_bit4 = (prev & 0x10U) != 0U;
-        if (bit4 && !prev_bit4) {
+        // #70 fidelity (WIRE-PROVEN, task #9): the A6 ignores a new-setpoint (bit4) rising edge unless
+        // it has observed Halt (bit8) CLEAR in BOTH the previous cycle and this one -- a bit4 edge
+        // coincident with (or one cycle after) halt release is dropped, so a PP move issued right
+        // after Stop() never acks. Model that here: without it the sim would ack a post-halt move the
+        // real drive rejects (the #70 coverage gap -- same sim-fidelity class as #56). Target latch is
+        // gated too (an unacknowledged edge doesn't latch 0x607A on the drive either).
+        const bool halt_now = (cw & ControlWord::kHaltBit) != 0U;
+        const bool halt_prev = (prev & ControlWord::kHaltBit) != 0U;
+        if (bit4 && !prev_bit4 && !halt_now && !halt_prev) {
             s.target = load_le<std::int32_t>(out.subspan(s.model.target_off, 4));
             s.setpoint_ack = !s.suppress_ack.load(std::memory_order_relaxed);  // test hook: withhold bit12 -> handshake times out
         } else if (!bit4 && prev_bit4) {

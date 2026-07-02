@@ -140,15 +140,18 @@ CommandBatch CommandQueue::drain() noexcept {
             [&batch](const auto& cmd) {
                 using T = std::decay_t<decltype(cmd)>;
                 if constexpr (std::is_same_v<T, SetTarget>) {
-                    batch.set_target = cmd;  // latest-wins
+                    batch.set_target = cmd;         // latest-wins
+                    batch.halt_supersedes = false;  // #70: a motion command AFTER a halt supersedes it
                 } else if constexpr (std::is_same_v<T, SetVelocity>) {
-                    batch.set_velocity = cmd;  // latest-wins
+                    batch.set_velocity = cmd;       // latest-wins
+                    batch.halt_supersedes = false;  // #70: a motion command AFTER a halt supersedes it
                 } else if constexpr (std::is_same_v<T, Enable>) {
                     batch.enable = true;
                 } else if constexpr (std::is_same_v<T, Disable>) {
                     batch.disable = true;
                 } else if constexpr (std::is_same_v<T, Halt>) {
                     batch.halt = true;
+                    batch.halt_supersedes = true;  // #70: a halt AFTER any prior motion -> the sticky halt latches
                 } else if constexpr (std::is_same_v<T, QuickStop>) {
                     batch.quick_stop = true;
                 } else if constexpr (std::is_same_v<T, FaultReset>) {
