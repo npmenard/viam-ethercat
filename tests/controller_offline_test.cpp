@@ -1210,7 +1210,18 @@ TEST("#61: switchable -- an unconfirmable switch reverts SAFE (energized, no thr
     std::this_thread::sleep_for(std::chrono::milliseconds(400));  // past T_switch; revert settled
     CHECK(ctrl.is_powered());          // SAFE: stayed ENERGIZED through the failed switch (no de-energize, no throw)
     CHECK(!ctrl.is_moving());           // reverted to PP at rest (not jogging in an unconfirmed PV)
-    (void)sim;
+    // NON-VACUITY (DA): the wrapper's switch_intent_ revert is the SOLE storm-limiter -- the policy
+    // re-enters run_mode_switch_ every cycle current!=want and give-up does NOT latch `want`, so
+    // WITHOUT the revert an unconfirmable switch re-arms forever (0x6060 oscillates PP<->PV each
+    // settle window -> A6-wedge hazard). Prove the revert STOPS it: the sim's 0x6060-write transition
+    // count must FREEZE after the single attempt. Rate-independent (no absolute bound): poll twice
+    // across a full switch window and assert no growth. Dead-code the revert -> it climbs -> FAILS.
+    // (Do NOT read effective_mode/switch_intent_ here: the former is masked by stop()'s intent reset,
+    // the latter is a non-atomic live-RT read -- the sim counter is the race-free observable.)
+    const std::uint32_t t1 = sim->mode_of_op_write_transitions(1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));  // > one settle window (200 cyc) at any sane rate
+    const std::uint32_t t2 = sim->mode_of_op_write_transitions(1);
+    CHECK_EQ(t2, t1);  // FROZEN: no re-arm storm (a non-reverting wrapper would keep transitioning)
 }
 
 TEST("#61: a fixed PP config still REJECTS set_rpm (switchable is opt-in)") {

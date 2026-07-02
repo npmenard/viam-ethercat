@@ -205,6 +205,18 @@ void SimBackend::step_device(Slave& s) noexcept {
     if (s.model.mode_of_op_off >= 0) {
         const auto m = static_cast<std::int8_t>(out[static_cast<std::size_t>(s.model.mode_of_op_off)]);
         const auto requested = static_cast<Cia402Mode>(m);
+        // #61 (DA): count 0x6060 OUTPUT-byte VALUE CHANGES. A single mode switch is exactly two
+        // transitions (StopFirst holds current, Settle writes wanted, then steady re-writes on
+        // confirm-or-revert); a wrapper that never reverts an unconfirmable switch re-arms every
+        // settle window and this climbs without bound -- the storm signal. First write establishes,
+        // not counts. RT-write / test-read (relaxed; the test polls twice for stability).
+        if (!s.mode_out_seen) {
+            s.mode_out_seen = true;
+            s.prev_mode_out = m;
+        } else if (m != s.prev_mode_out) {
+            s.mode_out_transitions.fetch_add(1, std::memory_order_relaxed);
+            s.prev_mode_out = m;
+        }
         // #47-P3c FIDELITY -- GENERIC CiA402, NOT a device flag (DA device-agnostic check): when 0x6060 is
         // RxPDO-MAPPED, a PDO value OVERRIDES the SDO-set default for ANY drive (PDO-overrides-SDO for a
         // mapped object is standard CoE), so ModeDisplay(0x6061) FOLLOWS the PDO byte -- a wire 0 means
@@ -624,6 +636,16 @@ std::int32_t SimBackend::received_target_position(std::uint16_t slave) const noe
     // asserts the seeded/mirrored target tracks the drive's actual, never a stale value that would lunge.
     if (slave >= 1 && slave <= slaves_.size()) {
         return slaves_[slave - 1].target_written;
+    }
+    return 0;
+}
+
+std::uint32_t SimBackend::mode_of_op_write_transitions(std::uint16_t slave) const noexcept {
+    // #61 (DA): cumulative 0x6060 OUTPUT-byte value changes -- the unconfirmable-switch storm gate.
+    // Poll it twice with a wait between: STABLE => the wrapper reverted (single attempt, then frozen);
+    // CLIMBING => run_mode_switch_ re-arms forever (no revert). Atomic (RT-write/test-read).
+    if (slave >= 1 && slave <= slaves_.size()) {
+        return slaves_[slave - 1].mode_out_transitions.load(std::memory_order_relaxed);
     }
     return 0;
 }
