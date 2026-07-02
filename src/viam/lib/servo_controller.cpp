@@ -1116,6 +1116,24 @@ std::int32_t ServoController::velocity_counts() const noexcept {
     return state_.velocity.load(std::memory_order_relaxed);
 }
 
+std::size_t ServoController::sdo_read(std::uint16_t index, std::uint8_t sub, std::span<std::byte> out, std::chrono::milliseconds timeout) {
+    // Shared lock: serializes against reconfigure()'s exclusive master_.reset(), so master_
+    // can't be reset mid-call. The marshaled read blocks up to `timeout` HOLDING the shared
+    // lock -- bounded, so reconfigure() waits at most that long (unlike go_to, which releases
+    // before its multi-second park). master_-guarded, NOT part of the master_-free accessor
+    // contract; #22 steady-state SDO is a deliberate, bounded exception.
+    const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    if (master_ == nullptr) {
+        throw ConfigError("ServoController::sdo_read: not started (object " + std::to_string(index) + ":" + std::to_string(sub) + ")");
+    }
+    return master_->sdo_read_deferred(config_.slave_id, index, sub, out, timeout);
+}
+
+double ServoController::rated_current_amps() const noexcept {
+    const std::shared_lock<std::shared_mutex> lk(api_mutex_);
+    return config_.motor_rated_current_amps;
+}
+
 std::string ServoController::fault_gloss(std::uint16_t code) const {
     // Config-data lookup (NOT a hardcoded A6 table): 0x603F code -> human label.
     // Unknown code -> empty, so last_error() shows just the bare hex. Cold path.

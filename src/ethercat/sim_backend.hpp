@@ -76,6 +76,16 @@ struct SimSlaveModel {
     // header's own principle above).
     bool target_reached_always_set = false;
 
+    // #22 steady-state SDO read targets (served by sdo_read; a real drive holds these in its
+    // OD, not the PDO image). Plausible A6-at-hold values so the full do_command -> controller
+    // -> marshaled SDO -> backend path runs offline. Standard CiA402 objects:
+    //   0x6079:00 U32 DC-link circuit voltage, unit mV  (310 V rectified 220 VAC -> 310000)
+    //   0x6078:00 I16 current actual value, per-mille of rated current (0 at hold)
+    //   0x6502:00 U32 supported drive modes bitmask (bit0 PP, bit2 PV, bit7 CSP, bit8 CSV)
+    std::uint32_t dc_link_voltage_mv = 310'000;         // 0x6079
+    std::int16_t current_actual_permille = 0;           // 0x6078
+    std::uint32_t supported_drive_modes = 0x0000'0185U; // 0x6502: PP|PV|CSP|CSV = bits 0,2,7,8
+
     std::uint32_t vendor_id = 0;
     std::uint32_t product_code = 0;
     std::string name = "sim-slave";

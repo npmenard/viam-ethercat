@@ -163,6 +163,19 @@ class ServoController : public SlaveControl {
         return master_.get();
     }
 
+    // #22 STEADY-STATE SDO read: read a CoE object on THIS servo's slave WHILE the RT loop
+    // runs, marshaled through the RT thread (Master::sdo_read_deferred) so SOEM's port keeps
+    // a single owner. Generic raw-bytes surface -- unit conversion is the module layer's job
+    // (do_command). Takes the SHARED api_mutex_ so it can't race reconfigure() resetting
+    // master_; the wait is bounded by `timeout`, so a mid-flight reconfigure blocks only that
+    // long (unlike a multi-second move, which releases the lock). Throws ConfigError if not
+    // started / no RT servicer, SdoError on a CoE abort or timeout. Returns bytes read.
+    std::size_t sdo_read(std::uint16_t index, std::uint8_t sub, std::span<std::byte> out,
+                         std::chrono::milliseconds timeout = std::chrono::milliseconds(200));
+    // Motor rated current (amps), for the module's 0x6078 per-mille -> amps conversion. Read
+    // under the shared lock (reconfigure() rewrites config_ under the exclusive lock).
+    double rated_current_amps() const noexcept;
+
    private:
     // --- lifecycle FSM (std::variant; each state's step() in the .cpp) ---
     struct Init {};

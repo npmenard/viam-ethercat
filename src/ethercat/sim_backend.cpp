@@ -119,6 +119,21 @@ std::size_t SimBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::
         store_le<std::uint32_t>(out.subspan(0, 4), s.model.quick_stop_decel_echo);
         return 4;
     }
+    // #22 steady-state SDO read targets (the module's do_command reads these mid-run). Served
+    // from the model so the marshaled path is exercised offline; a real drive holds them in
+    // its OD. Standard CiA402 objects, not in the PDO map.
+    if (index == 0x6079 && sub == 0 && out.size() >= 4) {  // DC-link circuit voltage, U32, mV
+        store_le<std::uint32_t>(out.subspan(0, 4), s.model.dc_link_voltage_mv);
+        return 4;
+    }
+    if (index == 0x6078 && sub == 0 && out.size() >= 2) {  // current actual value, I16, per-mille of rated
+        store_le<std::int16_t>(out.subspan(0, 2), s.model.current_actual_permille);
+        return 2;
+    }
+    if (index == 0x6502 && sub == 0 && out.size() >= 4) {  // supported drive modes, U32 bitmask
+        store_le<std::uint32_t>(out.subspan(0, 4), s.model.supported_drive_modes);
+        return 4;
+    }
     const auto it = s.dictionary.find(sdo_key(index, sub));
     if (it == s.dictionary.end()) {
         return 0;
