@@ -12,7 +12,11 @@ Python env: `/home/viam/ethercat/.venv-test` (viam-sdk installed).
   PDO map, #59 default reach tolerance), `wrong`, `wrong_interface`, `dc_validation`,
   `dc_drive` (freerun → AL 0x0027, safe), `dc_drive_sync0` (125 µs SYNC0 lie — WEDGE
   RISK, run once and only if needed).
-- `machine_config.py show|set <scenario>|clear` — pushes configs via the app API.
+- `machine_config.py show|set <scenario>|clear` — config pushes through app. HYBRID per
+  user directive (verified: the viam CLI cannot set attributes/module entries — its
+  add-resource hardcodes name/model/api): attribute pushes use the same UpdateRobotPart
+  app endpoint via the Python app client, each confirmed via `viam machines part history`;
+  status/logs/restart/remove-resource use the CLI directly.
 - `server.sh start|stop|status|log` — runs viam-server-static as root (module inherits
   caps); logs under `/home/viam/rdk/logs/`.
 - `rdk_tests.py [n…]` — Tests 1–6. Test5-1 is characterize-only (client cancel likely

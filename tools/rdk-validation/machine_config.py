@@ -1,8 +1,16 @@
 """Machine-config management for the RDK validation campaign (docs/viam-driven-validation.md).
 
-Pushes scenario configs to the ethercat-test machine part via the Viam app API
-(the CLI's add-resource can't carry attribute JSON). Credentials are the machine
-API key from /home/viam/rdk/viam.json.
+User directive: config changes go THROUGH APP, using the viam CLI where possible.
+VERIFIED LIMITATION (2026-07-02, CLI 0.132.0 + rdk head): the CLI cannot set
+component attributes or module entries -- `machines part add-resource` hardcodes
+only {name, model, api} (cli/client.go robotsPartAddResourceAction) and there is
+no config-set/fragment-authoring command. So this helper is the HYBRID:
+  - attribute-rich pushes call the SAME UpdateRobotPart app endpoint the CLI
+    uses internally (via the Python app client);
+  - every push is then CONFIRMED through the CLI (`machines part history`), and
+    all observability/structural ops in the campaign (status, logs, restart,
+    remove-resource) use the CLI directly.
+Credentials: the machine API key from /home/viam/rdk/viam.json.
 
 Usage:
     python machine_config.py show
@@ -12,6 +20,7 @@ Usage:
 
 import asyncio
 import json
+import subprocess
 import sys
 
 from viam.app.viam_client import ViamClient
@@ -46,6 +55,13 @@ async def set_config(config: dict, label: str) -> None:
         print(f"config '{label}' pushed to part {part.name} ({PART_ID})")
     finally:
         client.close()
+    # confirm through the CLI that the edit landed in app config history
+    out = subprocess.run(
+        ["viam", "machines", "part", "history", "--part", PART_ID],
+        capture_output=True, text=True, check=False,
+    )
+    latest = (out.stdout or out.stderr).splitlines()[:1]
+    print(f"app history (viam cli): {latest[0] if latest else '<unavailable>'}")
 
 
 def main() -> None:
