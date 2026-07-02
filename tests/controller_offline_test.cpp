@@ -27,6 +27,10 @@ using ethercat::PdoEntry;
 using ethercat::SimBackend;
 using ethercat::SimSlaveModel;
 using ethercat::servo::ControlMode;
+using ethercat::servo::convert_sdo_monitor;
+using ethercat::servo::SdoMonitor;
+using ethercat::servo::SdoScaleKind;
+using ethercat::servo::SdoValueType;
 using ethercat::servo::ServoConfig;
 using ethercat::servo::ServoController;
 
@@ -1396,6 +1400,53 @@ TEST("#22: SDO reads succeed CONCURRENTLY with an in-flight move; the move still
     CHECK(mover_done.load(std::memory_order_acquire));
     CHECK(reads_ok.load() > 0);                          // at least one interleaved read succeeded mid-move
     CHECK(std::abs(ctrl.position_revs() - 8.0) < 0.05);  // the move converged despite the SDO interleave
+}
+
+TEST("#68: config-driven monitors read+convert end-to-end for BOTH default-standard and vendor-override") {
+    // The FULL do_command path exercised without the SDK: controller.<monitor>() spec ->
+    // sdo_read(spec) -> convert_sdo_monitor(spec). Two configs: the standard-CiA402 defaults
+    // (sim OD serves 0x6079/0x6078) and a vendor override (sim OD serves 0x2040:07/:0D).
+    const auto read_convert = [](ServoController& ctrl, const SdoMonitor& m) {
+        std::array<std::byte, 8> buf{};
+        const std::size_t n = ctrl.sdo_read(m.index, m.subindex, std::span<std::byte>(buf.data(), m.byte_width()), std::chrono::milliseconds(200));
+        CHECK_EQ(n, m.byte_width());
+        return convert_sdo_monitor(m, std::span<const std::byte>(buf.data(), n), ctrl.rated_current_amps());
+    };
+
+    // (1) DEFAULTS: standard CiA402 objects. Sim serves 0x6079=310000mV, 0x6078=400 permille.
+    {
+        SimSlaveModel model = make_model(ControlMode::ProfilePosition, /*feedback=*/true);
+        model.dc_link_voltage_mv = 310'000;      // -> 310.0 V (÷1000)
+        model.current_actual_permille = 400;     // -> 400 * 2.5 / 1000 = 1.0 A
+        ServoController::BackendFactory f = [model] {
+            return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{model}));
+        };
+        ServoConfig c = make_config(ControlMode::ProfilePosition, /*feedback=*/true);  // rated 2.5 A; monitors default
+        ServoController ctrl{c, f};
+        ctrl.start();
+        CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+        CHECK(std::abs(read_convert(ctrl, ctrl.voltage_monitor()) - 310.0) < 1e-6);
+        CHECK(std::abs(read_convert(ctrl, ctrl.current_monitor()) - 1.0) < 1e-6);
+    }
+
+    // (2) VENDOR OVERRIDE: point the monitors at 0x2040:07 (÷10 V) and 0x2040:0D (÷10 A), as the
+    // A6 config does. Sim serves 0x2040:07=3154 (315.4V), 0x2040:0D=-55 (-5.5A).
+    {
+        SimSlaveModel model = make_model(ControlMode::ProfilePosition, /*feedback=*/true);
+        model.vendor_bus_voltage_dV = 3154;      // -> 315.4 V (÷10)
+        model.vendor_phase_current_dA = -55;     // -> -5.5 A  (÷10, signed)
+        ServoController::BackendFactory f = [model] {
+            return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{model}));
+        };
+        ServoConfig c = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
+        c.voltage_monitor = SdoMonitor{0x2040, 0x07, SdoValueType::U16, SdoScaleKind::Divisor, 10.0};
+        c.current_monitor = SdoMonitor{0x2040, 0x0D, SdoValueType::I16, SdoScaleKind::Divisor, 10.0};
+        ServoController ctrl{c, f};
+        ctrl.start();
+        CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+        CHECK(std::abs(read_convert(ctrl, ctrl.voltage_monitor()) - 315.4) < 1e-6);
+        CHECK(std::abs(read_convert(ctrl, ctrl.current_monitor()) - (-5.5)) < 1e-6);
+    }
 }
 
 TEST("#22: an SDO read after stop() fails cleanly (no servicer) and does not hang") {
