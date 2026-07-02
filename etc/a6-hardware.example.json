@@ -67,6 +67,12 @@
     "_comment_vendor_reset": "#39 CONSUMER-side vendor fault-reset, run once pre-RT-spawn: the A6 clears a latent fault via vendor object 0x2031:01 = 1 (a U16; NOT CiA402 controlword bit7). index 8241 = 0x2031 in decimal. Remove this block for a drive with no vendor reset (the generic bit7 path still runs). NOTE: the old per-slave 'fault_reset' attribute is OBSOLETE and rejected.",
     "vendor_fault_reset": { "index": 8241, "subindex": 1, "value": 1, "value_bytes": 2 },
 
+    "_comment_sdo_monitors": "OPTIONAL (#68). Overrides the do_command converted-SDO read targets: get_motor_voltage and get_motor_current_actual_value. OMIT for a generic CiA402 drive -> defaults to the standard 0x6079 (DC-link voltage, mV -> V) and 0x6078 (current, per-mille of motor_rated_current_amps). The A6 does NOT implement 0x6079/0x6078 (SDO-verified: CoE abort 0x06020000); it exposes these ONLY via VENDOR object 0x2040 'Operation monitoring' (the U40 group): 0x2040:07 bus voltage (U16, 0.1 V) and 0x2040:0D RMS U-phase current (I16, 0.1 A) -- so the A6 MUST set this block or those two do_commands return an error. Fields: index/subindex accept a decimal number OR a hex string ('0x2040'); type in {u8,i8,u16,i16,u32,i32}; scale is a NUMBER divisor (value = raw/scale) or the string 'rated_permille' (value = raw/1000 * motor_rated_current_amps). get_motor_drive_modes (0x6502) is standard + fixed, not configured here.",
+    "sdo_monitors": {
+      "voltage": { "index": "0x2040", "subindex": "0x07", "type": "u16", "scale": 10 },
+      "current": { "index": "0x2040", "subindex": "0x0D", "type": "i16", "scale": 10 }
+    },
+
     "_comment_tuning": "reached/is_moving is POSITION-STABILITY based (#59): stopped/reached = actual position (0x6064) not changing beyond position_tolerance_counts over N cycles -- NOT a velocity threshold, so there is NO velocity-noise-floor tuning to do (the A6's 0x606C carries a +/-2000-4000 c/s noise floor; see a6-quirks Q13). position_tolerance_counts is OPTIONAL, default = counts_per_rev/720 (~0.5 deg); the 200 below is an explicit example (~0.55 deg at 131072 c/rev). velocity_threshold is now an OPTIONAL OVERRIDE (most configs omit it); shown here for illustration only.",
     "position_tolerance_counts": 200,
     "velocity_threshold": 50000,
