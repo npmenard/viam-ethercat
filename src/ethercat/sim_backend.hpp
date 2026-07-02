@@ -91,6 +91,11 @@ struct SimSlaveModel {
     std::uint32_t dc_link_voltage_mv = 310'000;          // 0x6079
     std::int16_t current_actual_permille = 0;            // 0x6078
     std::uint32_t supported_drive_modes = 0x0000'0185U;  // 0x6502: PP|PV|CSP|CSV = bits 0,2,7,8
+    // #68 vendor-override targets (the A6's 0x2040 "Operation monitoring" record): bus voltage
+    // U16 @0.1V, RMS phase current I16 @0.1A. Lets an sdo_monitors override read a vendor object
+    // offline (the A6 lacks 0x6079/0x6078). Served at sub-index 0x07 / 0x0D.
+    std::uint16_t vendor_bus_voltage_dV = 3154;  // 0x2040:07 -> 315.4 V (matches the bench read)
+    std::int16_t vendor_phase_current_dA = 0;    // 0x2040:0D -> 0.0 A
 
     std::uint32_t vendor_id = 0;
     std::uint32_t product_code = 0;

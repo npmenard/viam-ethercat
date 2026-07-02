@@ -134,6 +134,15 @@ std::size_t SimBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::
         store_le<std::uint32_t>(out.subspan(0, 4), s.model.supported_drive_modes);
         return 4;
     }
+    // #68 A6 vendor monitoring object 0x2040 (the sdo_monitors-override targets).
+    if (index == 0x2040 && sub == 0x07 && out.size() >= 2) {  // bus voltage, U16, 0.1 V
+        store_le<std::uint16_t>(out.subspan(0, 2), s.model.vendor_bus_voltage_dV);
+        return 2;
+    }
+    if (index == 0x2040 && sub == 0x0D && out.size() >= 2) {  // RMS phase current, I16, 0.1 A
+        store_le<std::int16_t>(out.subspan(0, 2), s.model.vendor_phase_current_dA);
+        return 2;
+    }
     const auto it = s.dictionary.find(sdo_key(index, sub));
     if (it == s.dictionary.end()) {
         return 0;
