@@ -33,6 +33,7 @@
 
 #include <array>
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -124,136 +125,33 @@ MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode, bool us
     return cfg;
 }
 
-}  // namespace
+// #72: run ONE full bring-up -> hold -> teardown lifecycle. --cycle repeats this back-to-back on the
+// SAME NIC, each iteration constructing a FRESH Master + Runner and destroying them (the in-place
+// reconfigure the module does when its config changes). A re-bring-up that leaves DC marginal shows up
+// as a mid-hold badWKC climb / OP loss (StopReason::BusFault) on cycle >= 2, or a re-bring-up that no
+// longer reaches OP. `hold`.count()==0 => run until SIGINT/abort (the single-run default, unchanged).
+struct CycleOutcome {
+    StopReason reason = StopReason::None;
+    std::uint64_t bad_cycles = 0;
+    std::uint64_t total_cycles = 0;
+    std::uint16_t al_code = 0;
+    bool reached_op = false;
+};
 
-int main(int argc, char** argv) {
-    Options opt;
-    bool no_dc = false;  // #71: --no-dc -> free-run bring-up (the A6 refuses OP; AL-status give-up check)
-    std::vector<std::string> args(argv + 1, argv + argc);
-    for (std::size_t i = 0; i < args.size(); ++i) {
-        const std::string& a = args[i];
-        if (a == "--enable") {
-            opt.enable = true;
-        } else if (a == "--no-dc") {
-            no_dc = true;  // #71: bring up under free-run (no SYNC0) -> the A6 refuses OP (AL 0x0027)
-        } else if (a == "--reset-fault") {
-            opt.reset_fault = true;
-        } else if (a == "--move-pp" && i + 1 < args.size()) {
-            opt.move_pp = true;  // requires an EXPLICIT --enable (checked below) -- no implicit energize
-            opt.move_revs = std::stod(args[++i]);
-            if (i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0) {
-                opt.move_rpm = std::stod(args[++i]);
-            }
-        } else if (a == "--move-pos" && i + 1 < args.size()) {
-            opt.move_pos = true;  // #53 absolute PP move-to; requires --enable (checked below)
-            opt.pos_target = std::stoi(args[++i]);
-            if (i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0) {
-                opt.pp_vel_cps = std::stoi(args[++i]);  // optional profile velocity (counts/s)
-            }
-        } else if (a == "--move-vel" && i + 1 < args.size()) {
-            opt.move_vel = true;  // #53 continuous PV until Ctrl-C; requires --enable
-            opt.pv_vel_cps = std::stoi(args[++i]);
-        } else if (a == "--then-jog-vel" && i + 1 < args.size()) {
-            opt.then_jog_vel = true;  // #47-P3b P3c: after the --move-pos reaches, SWITCH PP->PV (§6) + jog at VEL until Ctrl-C
-            opt.pv_vel_cps = std::stoi(args[++i]);
-        } else if (a == "--pos-tol" && i + 1 < args.size()) {
-            opt.pos_tol = std::stoi(args[++i]);  // #53 DA-C: reached tolerance (counts); default 300
-        } else if (a == "--move-sine") {
-            opt.move_sine = true;  // requires an EXPLICIT --enable (checked below) -- no implicit energize
-        } else if (a == "--sdo-probe") {
-            opt.sdo_probe = true;  // #22: read 0x6079/0x6078/0x6502 via the marshaled steady-state SDO while Running
-        } else if (a == "--csp-probe") {
-            opt.csp_probe = true;  // CSP mode, NO enable -- read+print feedback only (diagnostic)
-        } else if (a == "--sine-amplitude" && i + 1 < args.size()) {
-            opt.sine_amplitude = std::stod(args[++i]);
-        } else if (a == "--sine-period" && i + 1 < args.size()) {
-            opt.sine_period = std::stod(args[++i]);
-        } else if (a == "--follow-err-limit" && i + 1 < args.size()) {
-            opt.follow_err_limit = std::stoi(args[++i]);
-        } else if (a.rfind("--", 0) != 0) {
-            opt.ifname = a;
-        } else {
-            std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]]\n"
-                      << "                   [--move-pos POS [VEL]] [--move-vel VEL] [--pos-tol N]\n"
-                      << "                   [--move-sine [--sine-amplitude N] [--sine-period S]] [--csp-probe]\n"
-                      << "  --move-pos POS [VEL]: *** MOTION (needs --enable) *** absolute PP move-to POS counts at VEL\n"
-                      << "               counts/s (profile vel; default from --move-pp RPM if omitted). Reached = |POS-actual|\n"
-                      << "               <= --pos-tol (default 300 counts, #53 DA-C) AND velocity ~0; then holds.\n"
-                      << "  --move-pos POS --then-jog-vel VEL: *** MOTION (needs --enable) *** move to POS (PP), then at\n"
-                      << "                   reach SWITCH PP->PV (runtime 0x6060 mode-switch, P3c) and jog at VEL counts/s until Ctrl-C\n"
-                      << "  --move-vel VEL: *** CONTINUOUS MOTION (needs --enable) *** Profile-Velocity at VEL counts/s until\n"
-                      << "               Ctrl-C. On stop: CiA402 Quick-Stop (cw=0x0B) -> drive ramps via 0x6085 -> de-energizes\n"
-                      << "               at zero (requires 0x605A=2, asserted at configure; 0x6085 written + readback-checked).\n"
-                      << "  The DC bring-up is automatic (Runner-owned, #47): configure() arms SYNC0 in PRE-OP, the\n"
-                      << "  Runner's pump runs SETTLE -> request OP once -> AWAIT_OP, gapless + phase-locked.\n"
-                      << "  Er74.1 in SAFE-OP is normal pre-sync, clears at OP.\n"
-                      << "  --enable: energize to OperationEnabled (holding torque). REQUIRED for any move below --\n"
-                      << "            --move-pp/--move-sine no longer imply it, so a forgotten --enable fails closed.\n"
-                      << "  --move-sine: *** ENERGIZED MOTION (needs --enable) *** CSP-mode soft-started position sine,\n"
-                      << "               relative to the enable position. pos(t)=pos_enable + A*min(1,t/T)*sin(2*pi*t/T);\n"
-                      << "               A=--sine-amplitude (counts, def 20000), T=--sine-period (s, def 4.0). CSP-safe\n"
-                      << "               (no jump) + ramped (no velocity step). --follow-err-limit N (counts, def 5000):\n"
-                      << "               abort+disable if |commanded-actual| exceeds it. Mutually exclusive with --move-pp.\n"
-                      << "  --move-pp REVS [RPM]: *** MOTION (needs --enable) *** PP-mode relative move via the bit4 handshake.\n"
-                      << "  --csp-probe: NON-energizing diagnostic -- bring up in CSP mode (0x6060=8), hold at\n"
-                      << "               ReadyToSwitchOn (NO enable), print feedback.\n"
-                      << "  --sdo-probe: #22 steady-state SDO -- while Running, read 0x6079 (DC-link V), 0x6078 (current),\n"
-                      << "               0x6502 (supported modes) every ~500ms via the RT-serviced marshaled path; print\n"
-                      << "               raw + converted. Safe with a plain hold (no --enable); exercises mid-run mailbox reads.\n"
-                      << "  --reset-fault: clear a latent drive fault at bring-up via the A6 vendor SDO 0x2031:01=1.\n";
-            return 2;
-        }
-    }
-
-    const int mode_flags = mode_flag_count(opt);
-    if (mode_flags > 1) {
-        std::cerr << "error: --move-pp / --move-pos / --move-vel / --move-sine / --csp-probe are mutually exclusive "
-                     "(one mode of operation at a time)\n";
-        return 2;
-    }
-    // SAFETY: a move must NOT silently energize. The move flags require an explicit
-    // --enable, so a forgotten --enable FAILS CLOSED instead of moving the shaft.
-    if ((opt.move_pp || opt.move_sine || opt.move_pos || opt.move_vel) && !opt.enable) {
-        std::cerr << "error: --move-pp / --move-pos / --move-vel / --move-sine command ENERGIZED MOTION and require an "
-                     "explicit --enable\n"
-                  << "       (safety: motion must be a deliberate opt-in -- a forgotten --enable will not silently move the shaft).\n"
-                  << "       For a non-energizing CSP feedback read, use --csp-probe instead.\n";
-        return 2;
-    }
-    const Cia402Mode mode = opt.move_vel                       ? Cia402Mode::ProfileVelocity
-                            : (opt.move_sine || opt.csp_probe) ? Cia402Mode::CyclicSyncPosition
-                                                               : Cia402Mode::ProfilePosition;  // move_pos / move_pp / plain hold
-
-    (void)std::signal(SIGINT, on_sigint);
-
-    std::cout << "=== A6-EC validation on '" << opt.ifname << "' (Runner-based, #47 P2) ===\n"
-              << "mode: " << to_string(mode) << " | enable=" << (opt.enable ? "YES (motor energizes)" : "no") << " | move="
-              << (opt.move_sine ? "SINE A=" + std::to_string(static_cast<long>(opt.sine_amplitude)) +
-                                      "ct T=" + std::to_string(opt.sine_period) + "s (CSP, soft-started)"
-                  : opt.move_vel ? "VEL " + std::to_string(opt.pv_vel_cps) + " counts/s (PV, until Ctrl-C)"
-                  : opt.move_pos ? "POS " + std::to_string(opt.pos_target) + " counts @ " +
-                                       std::to_string(opt.pp_vel_cps > 0 ? opt.pp_vel_cps : 0) + " counts/s (PP move-to)"
-                  : opt.move_pp ? std::to_string(opt.move_revs) + " rev @ " + std::to_string(opt.move_rpm) + " rpm (PP)"
-                                : "none (hold)")
-              << "\n\n";
-
-    // DC SYNC0 cycle = loop period; the A6 requires an integer multiple of 250 us.
-    constexpr std::uint32_t kCycleNs = 1'000'000'000U / kLoopHz;
-    static_assert(kCycleNs % 250'000U == 0, "SYNC0 cycle must be a 250us multiple for the A6");
-
-    std::cout << "[rt] realtime setup (mlockall/SCHED_FIFO prio 80) is Runner-owned now (#47); best-effort\n"
-              << "     (require_realtime=false) -- run with sudo for DC-safe timing.\n"
-              << "[dc] phase-lock target = auto(mid-cycle) | SYNC0 CyclShift = 0ns (config knob)"
-              << " | fault-reset at bring-up = " << (opt.reset_fault ? "ON (vendor 0x2031:01=1)" : "off") << "\n\n";
+CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc,
+                           std::chrono::seconds hold, int cyc, int ncycles) {
+    CycleOutcome oc;
+    const std::uint16_t slave = 1;
 
     Master master(build_a6_config(opt.ifname, mode, /*use_dc=*/!no_dc), std::make_unique<SoemBackend>());
 
-    // --- Stage A: open + enumerate + read-only SDO identity (PRE-OP) ---
+    // --- Stage A: open + enumerate (re-init on cycle >= 2 re-opens the NIC after the prior close()).
     try {
         master.init();
     } catch (const Error& e) {
         std::cerr << "init failed: " << e.what() << '\n';
-        return 1;
+        oc.reason = StopReason::RtSetupFailed;
+        return oc;
     }
     std::cout << "[A] bus up: A6 enumerated (1 slave, matches config).\n";
     const SlaveInfo info = master.slave_info(1);
@@ -261,23 +159,18 @@ int main(int argc, char** argv) {
               << std::dec << " name=\"" << info.name << "\" (Rx " << info.output_bytes << "B / Tx " << info.input_bytes << "B)\n"
               << "[A] OK -- EtherCAT enumeration confirmed.\n\n";
 
-    const std::uint16_t slave = 1;
-
     // --- Stage B: configure to SAFE-OP + DC; the Runner owns everything after start().
     try {
         master.configure();
     } catch (const Error& e) {
         std::cerr << "[B] configure failed: " << e.what() << "\n"
                   << "    (an AL-reject at the SAFE-OP transition lands here; the AL status code in the message names why.)\n";
-        return 1;
+        oc.reason = StopReason::BringupAborted;
+        return oc;
     }
     std::cout << "[B] configured to SAFE-OP, DC enabled (expected WKC=" << master.expected_wkc()
               << "); handing the bus to the Runner (bring-up pump: SETTLE -> request OP -> AWAIT_OP)...\n";
 
-    // #39 consumer-side vendor fault-reset: BEFORE Runner::start() this thread is the
-    // single port owner, so a plain blocking SDO is safe (after start() the #39
-    // rt_active bracket -- Runner-owned -- makes it throw). Read 0x603F; if a latent
-    // fault is present, clear it via the A6 VENDOR SDO 0x2031:01 = 1 (NOT CiA402 bit7).
     if (opt.reset_fault) {
         try {
             std::array<std::byte, 2> fc_raw{};
@@ -295,44 +188,31 @@ int main(int argc, char** argv) {
         }
     }
 
-    // --- the Runner (#47 P2): library-owned RT thread / pacer / bring-up / window / close.
     Telemetry tel;
     A6Control control(opt, tel, mode);
     RunnerConfig rc;
     rc.rt_priority = 80;
-    rc.require_realtime = false;  // validation tool runs best-effort (matches the old behavior)
+    rc.require_realtime = false;
     rc.bringup_timeout = std::chrono::milliseconds(120'000);
-    // 150 stopping cycles: the CSP clean stop holds the last commanded position for the
-    // first 100 (no shaft yank), then 50 of cw=0x00 disable -- the old two teardown loops
-    // as window policy inside A6Control::step().
     rc.teardown_cycles = 150;
-    // #53 PV needs a GENEROUS window: Ctrl-C -> Quick-Stop -> the drive ramps via 0x6085 ->
-    // de-energizes at its zero. kPvTeardownCycles (~2 s @ 1 kHz) is an upper bound; the
-    // control disables EARLY on the velocity event. (Tool, not module -- the #47-C2 grace
-    // upper bound doesn't apply; a 2 s SIGINT-to-exit is fine.)
     if (opt.move_vel) {
         rc.teardown_cycles = kPvTeardownCycles;
     }
 
-    // #TODO-3: stop() is no longer public -- the owner stops by DROPPING the Runner, whose
-    // dtor runs the bounded teardown (join -> rt_active(false) -> master.close()). Scope the
-    // Runner so its destructor fires before we read the final WkcStats off the (still-alive)
-    // master. `reason` is read inside the scope, before the dtor.
     StopReason reason = StopReason::None;
-    std::uint16_t al_code = 0;  // #71: ESC AL status at a bring-up give-up (captured before ~Runner close())
     std::string al_msg;
     {
         Runner runner(master, rc);
         try {
             runner.attach(slave, control);
-            runner.start();  // on_configured (field resolution) runs here; throws abort cleanly
+            runner.start();
         } catch (const Error& e) {
             std::cerr << "[B] runner start failed: " << e.what() << '\n';
             master.close();
-            return 1;
+            oc.reason = StopReason::RtSetupFailed;
+            return oc;
         }
 
-        // #22 steady-state SDO probe: decode the 0x6502 supported-modes bitmask to names.
         const auto decode_modes = [](std::uint32_t bits) {
             static const std::pair<unsigned, const char*> kBits[] = {
                 {0, "PP"}, {1, "VL"}, {2, "PV"}, {3, "TQ"}, {5, "HM"}, {6, "IP"}, {7, "CSP"}, {8, "CSV"}, {9, "CST"}};
@@ -346,16 +226,48 @@ int main(int argc, char** argv) {
             return out.empty() ? std::string("(none)") : out;
         };
 
-        // --- main = the NON-RT printer + SIGINT relay (the old in-loop prints, off-thread).
         auto last_print = std::chrono::steady_clock::now() - std::chrono::seconds(1);
         auto last_sdo = std::chrono::steady_clock::now();
+        // #72 hold tracking: mark when Running first begins, then hold a fixed wall time and emit a
+        // per-minute health line (badWKC delta since OP + dcPhase) so a slow DC drift is visible.
+        bool saw_running = false;
+        std::chrono::steady_clock::time_point op_start;
+        std::uint64_t bad_at_op = 0;
+        auto last_health = std::chrono::steady_clock::now();
         while (runner.status().phase != RunnerPhase::Stopped) {
             if (g_stop.load()) {
                 runner.request_stop();  // SIGINT -> graceful stop (the window runs the disable policy)
             }
+            const RunnerStatus st0 = runner.status();
+            if (st0.phase == RunnerPhase::Running && !saw_running) {
+                saw_running = true;
+                oc.reached_op = true;
+                op_start = std::chrono::steady_clock::now();
+                bad_at_op = tel.bad_wkc.load(std::memory_order_relaxed);
+                last_health = op_start;
+                if (hold.count() > 0) {
+                    std::cout << "[cycle " << cyc << "/" << ncycles << "] OP reached; holding " << hold.count()
+                              << "s, per-minute health below...\n";
+                }
+            }
+            if (hold.count() > 0 && saw_running && st0.phase == RunnerPhase::Running) {
+                const auto now2 = std::chrono::steady_clock::now();
+                const auto held = std::chrono::duration_cast<std::chrono::seconds>(now2 - op_start);
+                if (now2 - last_health >= std::chrono::seconds(60)) {
+                    last_health = now2;
+                    const Status status{tel.sw.load(std::memory_order_relaxed)};
+                    const std::uint64_t bad_now = tel.bad_wkc.load(std::memory_order_relaxed);
+                    std::cout << "[cycle " << cyc << "/" << ncycles << "] +" << held.count() << "s OP-HOLD: "
+                              << to_string(status.decode()) << " sw=0x" << std::hex << status.raw << std::dec
+                              << " 0x603F=0x" << std::hex << tel.fc.load(std::memory_order_relaxed) << std::dec
+                              << " badWKC=" << bad_now << " (+" << (bad_now - bad_at_op) << " since OP)"
+                              << " dcPhase=" << tel.dc_phase_ns.load(std::memory_order_relaxed) << "ns\n";
+                }
+                if (held >= hold) {
+                    runner.request_stop();  // #72: hold elapsed -> teardown -> next cycle re-brings-up
+                }
+            }
             // #22 mid-run marshaled SDO reads (only while Running; the RT loop services them).
-            // Each object read INDEPENDENTLY (per-object try) so one drive-rejected object doesn't
-            // mask the others -- mirrors the module do_command's per-key error capture.
             if (opt.sdo_probe && runner.status().phase == RunnerPhase::Running &&
                 std::chrono::steady_clock::now() - last_sdo >= std::chrono::milliseconds(500)) {
                 last_sdo = std::chrono::steady_clock::now();
@@ -417,29 +329,212 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         reason = runner.status().reason;  // read before the dtor teardown
-        // #71: on a bring-up give-up, capture the ESC AL status code BEFORE ~Runner's close()
-        // (INIT teardown) can clear it -- the standard "why the drive refused OP" (free-run -> 0x0027).
         if (reason == StopReason::BringupAborted) {
             // Prefer the LATCHED last-non-zero AL code from AWAIT (#71/#25): the live al_status_code()
             // can read 0 at the give-up (reack_op ACKs the SAFE_OP+ERROR on the timeout cycle), which
             // is exactly what defeated the first cut of this diagnostic (printed "0x0 No error").
-            al_code = master.bringup_al_code();
-            if (al_code == 0) {  // no non-zero code was seen the whole bring-up -- fall back to the live read
-                al_code = master.al_status_code(slave);
+            oc.al_code = master.bringup_al_code();
+            if (oc.al_code == 0) {  // no non-zero code was seen the whole bring-up -- fall back to the live read
+                oc.al_code = master.al_status_code(slave);
             }
-            al_msg = master.describe_al_code(al_code);
+            al_msg = master.describe_al_code(oc.al_code);
         }
     }  // <-- ~Runner: bounded stop -> join -> rt_active(false) -> master.close()
 
-    const WkcStats stats = master.wkc_stats();  // library-side tally (incl. window cycles)
-    std::cout << "\n=== done. stop=" << to_string(reason) << (control.safety_abort() ? " (CSP SAFETY ABORT)" : "")
+    const WkcStats stats = master.wkc_stats();
+    oc.reason = reason;
+    oc.bad_cycles = stats.bad_cycles;
+    oc.total_cycles = stats.total_cycles;
+    std::cout << "\n=== cycle " << cyc << "/" << ncycles << " done. stop=" << to_string(reason)
+              << (control.safety_abort() ? " (CSP SAFETY ABORT)" : "")
               << " | bad-WKC cycles: " << stats.bad_cycles << " / " << stats.total_cycles << " ===\n";
     if (reason == StopReason::BringupAborted) {
-        std::cout << "[#71] bring-up gave up. AL status = 0x" << std::hex << al_code << std::dec << " (" << al_msg << ")"
-                  << (al_code == 0x0027 ? " -- FREERUN NOT SUPPORTED: this drive requires DC (drop --no-dc)" : "") << '\n';
+        std::cout << "[#71] bring-up gave up. AL status = 0x" << std::hex << oc.al_code << std::dec << " (" << al_msg << ")"
+                  << (oc.al_code == 0x0027 ? " -- FREERUN NOT SUPPORTED: this drive requires DC (drop --no-dc)" : "") << '\n';
     }
-    // Exit code: bring-up/rt-setup failures are hard errors (the old return 1 paths);
-    // a completed run -- including a safety abort that cleanly disabled -- reports 0
-    // with the cause printed (matches the old tool's behavior).
-    return (reason == StopReason::BringupAborted || reason == StopReason::RtSetupFailed) ? 1 : 0;
+    return oc;
+}  // <-- master dtor here (close already ran in ~Runner); NIC port released for the next cycle's init()
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    Options opt;
+    bool no_dc = false;  // #71: --no-dc -> free-run bring-up (the A6 refuses OP; AL-status give-up check)
+    std::vector<std::string> args(argv + 1, argv + argc);
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        if (a == "--enable") {
+            opt.enable = true;
+        } else if (a == "--no-dc") {
+            no_dc = true;  // #71: bring up under free-run (no SYNC0) -> the A6 refuses OP (AL 0x0027)
+        } else if (a == "--reset-fault") {
+            opt.reset_fault = true;
+        } else if (a == "--move-pp" && i + 1 < args.size()) {
+            opt.move_pp = true;  // requires an EXPLICIT --enable (checked below) -- no implicit energize
+            opt.move_revs = std::stod(args[++i]);
+            if (i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0) {
+                opt.move_rpm = std::stod(args[++i]);
+            }
+        } else if (a == "--move-pos" && i + 1 < args.size()) {
+            opt.move_pos = true;  // #53 absolute PP move-to; requires --enable (checked below)
+            opt.pos_target = std::stoi(args[++i]);
+            if (i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0) {
+                opt.pp_vel_cps = std::stoi(args[++i]);  // optional profile velocity (counts/s)
+            }
+        } else if (a == "--move-vel" && i + 1 < args.size()) {
+            opt.move_vel = true;  // #53 continuous PV until Ctrl-C; requires --enable
+            opt.pv_vel_cps = std::stoi(args[++i]);
+        } else if (a == "--then-jog-vel" && i + 1 < args.size()) {
+            opt.then_jog_vel = true;  // #47-P3b P3c: after the --move-pos reaches, SWITCH PP->PV (§6) + jog at VEL until Ctrl-C
+            opt.pv_vel_cps = std::stoi(args[++i]);
+        } else if (a == "--pos-tol" && i + 1 < args.size()) {
+            opt.pos_tol = std::stoi(args[++i]);  // #53 DA-C: reached tolerance (counts); default 300
+        } else if (a == "--move-sine") {
+            opt.move_sine = true;  // requires an EXPLICIT --enable (checked below) -- no implicit energize
+        } else if (a == "--sdo-probe") {
+            opt.sdo_probe = true;  // #22: read 0x6079/0x6078/0x6502 via the marshaled steady-state SDO while Running
+        } else if (a == "--csp-probe") {
+            opt.csp_probe = true;  // CSP mode, NO enable -- read+print feedback only (diagnostic)
+        } else if (a == "--sine-amplitude" && i + 1 < args.size()) {
+            opt.sine_amplitude = std::stod(args[++i]);
+        } else if (a == "--sine-period" && i + 1 < args.size()) {
+            opt.sine_period = std::stod(args[++i]);
+        } else if (a == "--follow-err-limit" && i + 1 < args.size()) {
+            opt.follow_err_limit = std::stoi(args[++i]);
+        } else if (a == "--cycle" && i + 1 < args.size()) {
+            opt.cycle_count = std::stoi(args[++i]);  // #72: N back-to-back reconfigure cycles
+        } else if (a == "--hold-seconds" && i + 1 < args.size()) {
+            opt.hold_seconds = std::stoi(args[++i]);  // #72: final-cycle soak seconds
+        } else if (a == "--early-hold" && i + 1 < args.size()) {
+            opt.early_hold_seconds = std::stoi(args[++i]);  // #72: per-early-cycle hold seconds
+        } else if (a.rfind("--", 0) != 0) {
+            opt.ifname = a;
+        } else {
+            std::cerr << "usage: a6_validate [ifname] [--enable] [--reset-fault] [--move-pp REVS [RPM]]\n"
+                      << "                   [--move-pos POS [VEL]] [--move-vel VEL] [--pos-tol N]\n"
+                      << "                   [--move-sine [--sine-amplitude N] [--sine-period S]] [--csp-probe]\n"
+                      << "  --move-pos POS [VEL]: *** MOTION (needs --enable) *** absolute PP move-to POS counts at VEL\n"
+                      << "               counts/s (profile vel; default from --move-pp RPM if omitted). Reached = |POS-actual|\n"
+                      << "               <= --pos-tol (default 300 counts, #53 DA-C) AND velocity ~0; then holds.\n"
+                      << "  --move-pos POS --then-jog-vel VEL: *** MOTION (needs --enable) *** move to POS (PP), then at\n"
+                      << "                   reach SWITCH PP->PV (runtime 0x6060 mode-switch, P3c) and jog at VEL counts/s until Ctrl-C\n"
+                      << "  --move-vel VEL: *** CONTINUOUS MOTION (needs --enable) *** Profile-Velocity at VEL counts/s until\n"
+                      << "               Ctrl-C. On stop: CiA402 Quick-Stop (cw=0x0B) -> drive ramps via 0x6085 -> de-energizes\n"
+                      << "               at zero (requires 0x605A=2, asserted at configure; 0x6085 written + readback-checked).\n"
+                      << "  The DC bring-up is automatic (Runner-owned, #47): configure() arms SYNC0 in PRE-OP, the\n"
+                      << "  Runner's pump runs SETTLE -> request OP once -> AWAIT_OP, gapless + phase-locked.\n"
+                      << "  Er74.1 in SAFE-OP is normal pre-sync, clears at OP.\n"
+                      << "  --enable: energize to OperationEnabled (holding torque). REQUIRED for any move below --\n"
+                      << "            --move-pp/--move-sine no longer imply it, so a forgotten --enable fails closed.\n"
+                      << "  --move-sine: *** ENERGIZED MOTION (needs --enable) *** CSP-mode soft-started position sine,\n"
+                      << "               relative to the enable position. pos(t)=pos_enable + A*min(1,t/T)*sin(2*pi*t/T);\n"
+                      << "               A=--sine-amplitude (counts, def 20000), T=--sine-period (s, def 4.0). CSP-safe\n"
+                      << "               (no jump) + ramped (no velocity step). --follow-err-limit N (counts, def 5000):\n"
+                      << "               abort+disable if |commanded-actual| exceeds it. Mutually exclusive with --move-pp.\n"
+                      << "  --move-pp REVS [RPM]: *** MOTION (needs --enable) *** PP-mode relative move via the bit4 handshake.\n"
+                      << "  --csp-probe: NON-energizing diagnostic -- bring up in CSP mode (0x6060=8), hold at\n"
+                      << "               ReadyToSwitchOn (NO enable), print feedback.\n"
+                      << "  --sdo-probe: #22 steady-state SDO -- while Running, read 0x6079 (DC-link V), 0x6078 (current),\n"
+                      << "               0x6502 (supported modes) every ~500ms via the RT-serviced marshaled path; print\n"
+                      << "               raw + converted. Safe with a plain hold (no --enable); exercises mid-run mailbox reads.\n"
+                      << "  --reset-fault: clear a latent drive fault at bring-up via the A6 vendor SDO 0x2031:01=1.\n"
+                      << "  --cycle N [--early-hold S] [--hold-seconds S]: #72 in-place-reconfigure repro -- run N\n"
+                      << "               back-to-back bring-up->hold->teardown lifecycles on the same NIC (no power cycle,\n"
+                      << "               the module's reconfigure). Early cycles hold --early-hold s (def 20); the LAST holds\n"
+                      << "               --hold-seconds s (def 600 = 10min soak). Per-minute WKC/dcPhase health line; a\n"
+                      << "               mid-hold WKC drop-out or a re-bring-up that won't reach OP is flagged [#72].\n";
+            return 2;
+        }
+    }
+
+    const int mode_flags = mode_flag_count(opt);
+    if (mode_flags > 1) {
+        std::cerr << "error: --move-pp / --move-pos / --move-vel / --move-sine / --csp-probe are mutually exclusive "
+                     "(one mode of operation at a time)\n";
+        return 2;
+    }
+    // SAFETY: a move must NOT silently energize. The move flags require an explicit
+    // --enable, so a forgotten --enable FAILS CLOSED instead of moving the shaft.
+    if ((opt.move_pp || opt.move_sine || opt.move_pos || opt.move_vel) && !opt.enable) {
+        std::cerr << "error: --move-pp / --move-pos / --move-vel / --move-sine command ENERGIZED MOTION and require an "
+                     "explicit --enable\n"
+                  << "       (safety: motion must be a deliberate opt-in -- a forgotten --enable will not silently move the shaft).\n"
+                  << "       For a non-energizing CSP feedback read, use --csp-probe instead.\n";
+        return 2;
+    }
+    const Cia402Mode mode = opt.move_vel                       ? Cia402Mode::ProfileVelocity
+                            : (opt.move_sine || opt.csp_probe) ? Cia402Mode::CyclicSyncPosition
+                                                               : Cia402Mode::ProfilePosition;  // move_pos / move_pp / plain hold
+
+    (void)std::signal(SIGINT, on_sigint);
+
+    std::cout << "=== A6-EC validation on '" << opt.ifname << "' (Runner-based, #47 P2) ===\n"
+              << "mode: " << to_string(mode) << " | enable=" << (opt.enable ? "YES (motor energizes)" : "no") << " | move="
+              << (opt.move_sine ? "SINE A=" + std::to_string(static_cast<long>(opt.sine_amplitude)) +
+                                      "ct T=" + std::to_string(opt.sine_period) + "s (CSP, soft-started)"
+                  : opt.move_vel ? "VEL " + std::to_string(opt.pv_vel_cps) + " counts/s (PV, until Ctrl-C)"
+                  : opt.move_pos ? "POS " + std::to_string(opt.pos_target) + " counts @ " +
+                                       std::to_string(opt.pp_vel_cps > 0 ? opt.pp_vel_cps : 0) + " counts/s (PP move-to)"
+                  : opt.move_pp ? std::to_string(opt.move_revs) + " rev @ " + std::to_string(opt.move_rpm) + " rpm (PP)"
+                                : "none (hold)")
+              << "\n\n";
+
+    // DC SYNC0 cycle = loop period; the A6 requires an integer multiple of 250 us.
+    constexpr std::uint32_t kCycleNs = 1'000'000'000U / kLoopHz;
+    static_assert(kCycleNs % 250'000U == 0, "SYNC0 cycle must be a 250us multiple for the A6");
+
+    std::cout << "[rt] realtime setup (mlockall/SCHED_FIFO prio 80) is Runner-owned now (#47); best-effort\n"
+              << "     (require_realtime=false) -- run with sudo for DC-safe timing.\n"
+              << "[dc] phase-lock target = auto(mid-cycle) | SYNC0 CyclShift = 0ns (config knob)"
+              << " | fault-reset at bring-up = " << (opt.reset_fault ? "ON (vendor 0x2031:01=1)" : "off") << "\n\n";
+
+    const int ncycles = std::max(1, opt.cycle_count);
+    const std::chrono::seconds early_hold{opt.early_hold_seconds};
+    const std::chrono::seconds final_hold{opt.hold_seconds};
+    CycleOutcome last;
+    int worst_rc = 0;
+    for (int cyc = 1; cyc <= ncycles; ++cyc) {
+        if (opt.cycle_count > 0) {
+            std::cout << "\n========== CYCLE " << cyc << "/" << ncycles
+                      << (cyc == 1 ? " (fresh bring-up)"
+                                   : " (in-place re-bring-up, NO power cycle -- #72 reconfigure repro)")
+                      << " ==========\n";
+        }
+        // #72: --cycle holds each cycle a fixed wall time -- short on early cycles, the long soak on the
+        // last -- then tears down and re-brings-up. Single-run (no --cycle) => hold 0 = run until
+        // SIGINT/abort (unchanged behavior).
+        const std::chrono::seconds hold = opt.cycle_count == 0 ? std::chrono::seconds{0}
+                                          : (cyc == ncycles ? final_hold : early_hold);
+        last = run_one_cycle(opt, mode, no_dc, hold, cyc, ncycles);
+        if (last.reason == StopReason::BringupAborted || last.reason == StopReason::RtSetupFailed) {
+            worst_rc = 1;
+        }
+        if (last.reason == StopReason::BusFault) {
+            worst_rc = 1;
+            std::cout << "[#72] *** DROP-OUT on cycle " << cyc << "/" << ncycles
+                      << ": bus fault (WKC latch) mid-hold -- the reconfigure-DC-drift signature. ***\n";
+        }
+        if (opt.cycle_count > 0 && cyc >= 2 && !last.reached_op) {
+            worst_rc = 1;
+            std::cout << "[#72] *** re-bring-up on cycle " << cyc << "/" << ncycles
+                      << " never reached OP (stop=" << to_string(last.reason)
+                      << ") -- residual DC/config poisoning from the prior teardown. ***\n";
+        }
+        if (g_stop.load()) {
+            std::cout << "[cycle] SIGINT -- stopping the cycle loop.\n";
+            break;
+        }
+        if (cyc < ncycles) {
+            // Brief settle between teardown and the next init() -- the A6's enumeration is intermittent
+            // right after a close() (a known retry quirk); this does NOT mask the DC drift, which shows
+            // during the multi-minute OP hold, not at enumerate.
+            std::cout << "[cycle] teardown complete; re-bring-up next (no power cycle)...\n";
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+    if (opt.cycle_count > 0) {
+        std::cout << "\n========== --cycle SUMMARY: " << ncycles << " cycles, final stop="
+                  << to_string(last.reason) << " ==========\n";
+    }
+    return worst_rc;
 }

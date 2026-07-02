@@ -102,6 +102,13 @@ struct Options {
     // Exercises the exact steady-state SDO path on real hardware WHILE PD flows -- the HW
     // evidence for #22 (WKC/Er74/LRW-gap intact around each mid-run mailbox read).
     bool sdo_probe = false;  // --sdo-probe
+    // #72 in-place-reconfigure reproduction: --cycle N runs N back-to-back bring-up -> hold -> teardown
+    // lifecycles on the same NIC (no power cycle) -- the module's reconfigure. Early cycles hold
+    // early_hold_seconds (prove the re-bring-up works); the LAST holds hold_seconds (the long soak that
+    // surfaces the ~150s DC drift). 0 = single run (default, unchanged).
+    int cycle_count = 0;           // --cycle N
+    int hold_seconds = 600;        // --hold-seconds S : final-cycle soak (>=10min default)
+    int early_hold_seconds = 20;   // --early-hold S   : per-early-cycle hold
 };
 
 // Count the mutually-exclusive move modes set (>1 => CLI conflict). Pure + testable.
