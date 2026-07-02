@@ -414,11 +414,17 @@ constexpr std::uint16_t kSupportedDriveModes = 0x6502;  // U32 bitmask of suppor
 constexpr std::chrono::milliseconds kSdoTimeout{200};
 
 // Read a config-driven SDO monitor via the controller and convert to its reported double.
-// Throws ethercat::Error on SDO abort/timeout (caller captures into a *_error key).
+// Throws ethercat::Error on SDO abort/timeout/short-read (caller captures into a *_error key).
 double read_monitor(ServoController& ctrl, const SdoMonitor& m) {
     std::array<std::byte, 8> buf{};  // >= any monitor width (<=4 B)
     const std::size_t n = ctrl.sdo_read(m.index, m.subindex, std::span<std::byte>(buf.data(), m.byte_width()), kSdoTimeout);
-    return convert_sdo_monitor(m, std::span<const std::byte>(buf.data(), n), ctrl.rated_current_amps());
+    // N3: a drive that returns FEWER bytes than the declared width would otherwise decode a
+    // truncated (garbage) value. Reject it loudly, like a6_validate's n>=width check.
+    if (n < m.byte_width()) {
+        throw ethercat::SdoError("SDO monitor object 0x" + std::to_string(m.index) + ":" + std::to_string(m.subindex) +
+                                 " short read: " + std::to_string(n) + " of " + std::to_string(m.byte_width()) + " byte(s)");
+    }
+    return convert_sdo_monitor(m, std::span<const std::byte>(buf.data(), m.byte_width()), ctrl.rated_current_amps());
 }
 
 // Decode the 0x6502 supported-drive-modes bitmask into CiA402 mode-name strings.

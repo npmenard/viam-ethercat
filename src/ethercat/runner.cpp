@@ -346,7 +346,7 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
             }
             // #22 steady-state SDO: the Runner is the single port owner, so it is the ONLY
             // place a marshaled SDO transfer may run. Service AT MOST ONE pending request per
-            // steady cycle, right after process()/publish. No-op (one relaxed atomic load)
+            // steady cycle, right after process()/publish. No-op (one acquire atomic load)
             // when none is pending. NOT during the stopping window -- the controlled-stop ramp
             // has its own tight de-energize deadline that a mailbox round-trip must not eat.
             master_.service_sdo();

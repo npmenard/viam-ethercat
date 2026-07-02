@@ -1,9 +1,12 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <span>
+#include <thread>
 #include <vector>
 
 #include "ethercat/cia402.hpp"
@@ -535,6 +538,53 @@ TEST("#32.4: dc_sync0_shift_ns threads through configure() to the backend arm ca
     m.init();
     m.configure();  // arms SYNC0 in PRE-OP (DC on) -> backend records the CyclShift it received
     CHECK_EQ(raw->configured_dc_sync0_shift_ns(), std::int32_t{12345});
+}
+
+// #22 (N1): GATE THE WAKE PATH. A non-RT caller blocked inside sdo_read_deferred (request
+// POSTED, waiting for the RT servicer to complete it) must be WOKEN by set_rt_active(false),
+// not left to its own timeout. The controller-level "reader racing stop()" test can pass via
+// early-throw-on-next-read (the window is already closed when the NEXT read starts), so it does
+// NOT gate the wake. This probes the wake directly: open the servicer window but run NO
+// servicer, so the waiter genuinely blocks in wait-for-Done; then close the window and require
+// it to return in << its timeout. With the notify_all removed from set_rt_active(false) this
+// blocks the full 3 s and fails the <1 s assert.
+TEST("#22 (N1): set_rt_active(false) WAKES a blocked SDO waiter (not left to time out)") {
+    Master master{make_config(), std::make_unique<SimBackend>(make_models())};
+    master.set_rt_active(true);  // opens the servicer window -- but NOTHING services (no RT loop)
+
+    std::atomic<bool> done{false};
+    std::atomic<bool> threw{false};
+    std::thread reader([&] {
+        std::array<std::byte, 4> buf{};
+        try {
+            // 3 s timeout: if the close-wake is broken this blocks the whole 3 s; with the wake
+            // it returns in ~ms. Nothing ever services it, so it can ONLY exit via the close.
+            master.sdo_read_deferred(1, 0x6079, 0, buf, std::chrono::seconds(3));
+        } catch (const ethercat::Error&) {
+            threw.store(true);  // ConfigError: servicer stopped before completion
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    // Let the reader POST its request and block in wait-for-Done.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CHECK(!done.load(std::memory_order_acquire));  // genuinely blocked, not early-returned
+
+    const auto t0 = std::chrono::steady_clock::now();
+    master.set_rt_active(false);  // MUST wake the blocked waiter
+    bool woke = false;
+    for (int i = 0; i < 100 && !woke; ++i) {
+        if (done.load(std::memory_order_acquire)) {
+            woke = true;
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    reader.join();
+    CHECK(woke);  // returned within ~1 s (broken wake -> 3 s -> fail)
+    CHECK(elapsed < std::chrono::milliseconds(1000));
+    CHECK(threw.load(std::memory_order_acquire));  // threw ConfigError (servicer stopped), not a value
 }
 
 TEST_MAIN()
