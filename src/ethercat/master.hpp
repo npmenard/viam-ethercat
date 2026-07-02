@@ -13,12 +13,15 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 
@@ -306,15 +309,39 @@ class Master {
     // (a release-mode throw, not a debug assert -- the module ships release). For external
     // library users the flag is part of the documented contract; the doc-contract stays
     // primary. Single-threaded tools (a6_validate) never set it.
-    void set_rt_active(bool active) noexcept {
-        rt_active_.store(active, std::memory_order_release);
-    }
+    //
+    // It ALSO opens/closes the #22 steady-state SDO SERVICER WINDOW (below): set_rt_active(true)
+    // means "the RT loop will service marshaled SDO requests"; set_rt_active(false) (after the
+    // join) FAILS any in-flight request + wakes every waiter cleanly (no hang across stop()).
+    void set_rt_active(bool active) noexcept;
     // Write/read one CoE object via the backend (blocking mailbox transfer). Throws
     // ConfigError while a consumer-declared RT phase is active (the guard above); the
     // backend's own error tiers (SdoError on a CoE abort, ConfigError on a bad slave id)
     // pass through unchanged. sdo_read returns the number of bytes read into `out`.
     void sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data);
     std::size_t sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out);
+
+    // --- #22 STEADY-STATE SDO: RT-serviced request queue -----------------------------
+    // The complement to the guarded pre-/post-RT primitive above: read a CoE object WHILE
+    // the RT loop is running, WITHOUT a second thread ever driving SOEM's (non-thread-safe)
+    // port. A non-RT caller MARSHALS the request to the RT thread, which executes exactly
+    // ONE blocking mailbox transfer per cycle at a designated point (Runner steady loop ->
+    // service_sdo()) and posts the result back. The single-port-owner invariant holds by
+    // construction; the cost is a bounded, occasional PD gap on the servicing cycle (the
+    // mailbox round-trip, ~1-2 ms), absorbed by the pacer's phase-preserving catch-up and
+    // tolerated by the drive's SM watchdog (>=50 ms) -- HW-verified (#22).
+    //
+    // Single request in flight (a submit mutex serializes concurrent callers). Blocks up to
+    // `timeout` for the RT thread to service it; returns the byte count read into `out`.
+    // Throws ConfigError if no RT servicer is running (call this only while operational;
+    // pre-/post-RT use the guarded sdo_read above), SdoError on a CoE abort or on timeout.
+    std::size_t sdo_read_deferred(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out,
+                                  std::chrono::milliseconds timeout);
+    // RT hot path: service AT MOST ONE pending SDO request, else return immediately. Called
+    // ONCE per steady cycle by the Runner (the single port owner). noexcept: a CoE abort is
+    // captured into the request's result, never thrown across the RT boundary. The idle path
+    // is a single acquire-load of an atomic -- no lock, no alloc when nothing is pending.
+    void service_sdo() noexcept;
 
    private:
     // INTERNAL per-object mapping record (#30 §5): byte offset + mapped width in bits.
@@ -393,6 +420,31 @@ class Master {
     // Consumer-declared RT phase (#39): while true, the public sdo_read/sdo_write throw
     // (port-ownership guard). Set/cleared by the consumer around its RT thread spawn/join.
     std::atomic<bool> rt_active_{false};
+
+    // --- #22 steady-state SDO request slot (single in-flight) ------------------------
+    // The marshaling handoff between a non-RT caller (sdo_read_deferred) and the RT thread
+    // (service_sdo). sdo_pending_ is the RT hot-path fast check (acquire-load; skip the lock
+    // entirely when Idle). Everything else is under sdo_mtx_ -- taken only off the idle path
+    // (a submit, a completion, or the bounded jitter window of the actual transfer), so the
+    // 1 kHz idle cycle never locks/allocs.
+    static constexpr std::size_t kMaxSdoReadBytes = 64;  // these objects are <=4 B; 64 is ample headroom
+    enum class SdoPhase : std::uint8_t { Idle, Requested, Done };
+    struct SdoJob {
+        std::uint16_t slave = 0;
+        std::uint16_t index = 0;
+        std::uint8_t sub = 0;
+        std::size_t want = 0;                              // bytes requested (out.size())
+        std::size_t got = 0;                               // bytes actually read
+        bool ok = false;                                   // false => `error` holds the reason
+        std::string error;                                 // set by the RT servicer on abort (jitter-window alloc, never the idle path)
+        std::array<std::byte, kMaxSdoReadBytes> buf{};     // RT reads INTO here; the waiter copies OUT (caller buffer lifetime is irrelevant to RT)
+    };
+    std::mutex sdo_mtx_;
+    std::condition_variable sdo_cv_;
+    std::atomic<bool> sdo_pending_{false};       // RT fast path: is there a Requested job to service?
+    bool sdo_service_open_ = false;              // guarded by sdo_mtx_: an RT loop is running to service (mirrors rt_active_)
+    SdoPhase sdo_phase_ = SdoPhase::Idle;        // guarded by sdo_mtx_
+    SdoJob sdo_job_;                             // guarded by sdo_mtx_ (RT holds the lock across its transfer)
 };
 
 // ---------------------------------------------------------------------------

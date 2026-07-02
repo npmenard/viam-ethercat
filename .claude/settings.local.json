@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ninja -C build ec_scan)",
+      "Bash(git ls-tree *)",
+      "Bash(grep -E \"\\(soem\\\\.h|ethercat\\\\.h|^cmake/|^samples/|CMakeLists.txt|osal\\\\.h\\)$\")",
+      "Bash(cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -DCMAKE_PREFIX_PATH=\"/home/nicolas/dev/cpp/viam-cpp-sdk/local/\" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -S . -B build -G Ninja)",
+      "Bash(git -C build/_deps/soem-src describe --tags)",
+      "Bash(git -C build/_deps/soem-src rev-parse HEAD)",
+      "Bash(cmake -DETHERCAT_SOEM_GIT_TAG=304d1c05eab77dc0d426f1a5cf09c8cc7dc03713 -DCMAKE_EXPORT_COMPILE_COMMANDS=1 -DCMAKE_PREFIX_PATH=\"/home/nicolas/dev/cpp/viam-cpp-sdk/local/\" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -S . -B build -G Ninja)",
+      "Bash(cmake *)"
+    ]
+  }
+}
