@@ -171,6 +171,48 @@ TEST("#59: reached/is_moving is noise-robust (position-delta) — omitting toler
     (void)sim;
 }
 
+TEST("#67: a frozen drive FAR from target must NOT report reached (the |actual-target|<=tol guard)") {
+    // GAP (DA, run-proven): the move-complete predicate at servo_controller.cpp gates on
+    //   at_target = |actual - target| <= tol  AND  stopped
+    // Dead-code the position factor (at_target = stopped) and the FULL suite still passes --
+    // a false-reached (reporting a move DONE while still far from target) goes uncaught. The
+    // go_to tests assert only the FINAL position; the stall watchdog trips regardless of
+    // at_target. Neither isolates "did NOT report reached while far." This test does.
+    //
+    // Frozen drive: profile_velocity_off=-1 => the sim does NOT read 0x6081 and falls back to
+    // counts_per_step, which is 0 => the PP chase step is 0 => `actual` never leaves its start
+    // while go_to commands a FAR target. WITH the guard, |Δ| >> tol forever, so the move NEVER
+    // reports reached and go_to throws (stall / move-timeout). WITHOUT the guard, the frozen
+    // (hence position-STABLE) drive reads at_target=true the instant the setpoint handshake
+    // idles => completed_generation is set => go_to RETURNS SUCCESS -- the false-reached bug.
+    // So CHECK_THROWS is the exact, sole distinguisher of the guard.
+    //
+    // DETERMINISTIC BY CONSTRUCTION (DA caveat: the naive thread+is_moving-poll shape aborts
+    // NONDETERMINISTICALLY under the mutation -- a completion-timing UB). This test is
+    // SINGLE-THREADED: it asserts on go_to's own OUTCOME (throw vs. return) on the calling
+    // thread, leaving NO background poll thread joinable at teardown. move_timeout_ms bounds
+    // BOTH the stall limit and the wait, so clean code throws within ~1.5 s while the mutant
+    // returns within a few tens of cycles (handshake latency) -- a wide, race-free margin.
+    SimSlaveModel m = make_model(ControlMode::ProfilePosition, /*feedback=*/true);
+    m.profile_velocity_off = -1;  // don't read 0x6081 -> fall back to counts_per_step ...
+    m.counts_per_step = 0;        // ... which is 0 -> the drive is FROZEN (never chases the target)
+    SimBackend* sim = nullptr;
+    ServoController::BackendFactory factory = [m, &sim] {
+        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m});
+        sim = be.get();
+        return std::unique_ptr<EcatBackend>(std::move(be));
+    };
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
+    cfg.move_timeout_ms = 1500;  // bound the clean-code throw (stall/timeout) ~1.5s; mutant returns in ~tens of cycles
+    ServoController ctrl{cfg, factory};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    // FAR target (5 rev = 655360 counts; tol = 20): the frozen drive stays put -> |Δ| >> tol.
+    // Correct: NEVER report reached -> go_to throws. False-reached (dropped guard): go_to returns.
+    CHECK_THROWS(ctrl.go_to(1000.0, 5.0), BusError);
+    (void)sim;
+}
+
 TEST("ServoController: mode guards reject the wrong API with clear errors") {
     {
         ServoController pp{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, nullptr)};
