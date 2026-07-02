@@ -395,6 +395,12 @@ bool ServoController::position_stable(std::int32_t actual) noexcept {
     // #59: push `actual` into the ring; STABLE once the window is full AND its range (max-min) is within
     // position_tolerance_counts -- encoder jitter at rest stays within tol => stable; real motion widens
     // the range => not stable. Not-yet-full => not stable (still settling). O(N), N ~ 20ms of cycles.
+    // NOTE (DA): N (~20ms) and tolerance (0.5deg) JOINTLY set two floors: (1) noise-immunity -- the drive's
+    // POSITION jitter over the window must stay < tolerance (true for the A6: sub-count position dither <<
+    // 182 counts), else at-rest would read "moving"; (2) min-detectable velocity ~ tolerance/(N*cycle) ~
+    // 182/(20ms) ~ 9100 c/s ~ 4 rpm -- a creep slower than that reads "stopped". 4rpm~=stopped is intended
+    // for a servo (reached is still guarded by |actual-target|<=tol, so a slow move FAR from target is not
+    // false-reached). Widen N or tighten tolerance if a use-case needs finer slow-creep detection.
     if (pos_hist_.empty()) {
         return false;  // never sized (pre-start) -- treat as moving, fail-safe
     }

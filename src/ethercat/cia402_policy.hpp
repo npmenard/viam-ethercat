@@ -45,6 +45,13 @@ struct DeviceProfile {
 
     // Standard CiA402 tunables (VALUES arrive here; the standard OBJECTS are in the policy).
     std::int32_t position_tolerance = 300;      // reached: |target-actual| <= this
+    // Quick-stop-at-rest de-energize gate (:209/:335). NOTE (#59/DA): 500 c/s is BELOW a real drive's
+    // velocity-estimate noise floor (A6 dithers ~+/-3300 c/s at rest), so this |vel|-debounce rarely
+    // completes -- it is a DECORATIVE backstop, NOT the live de-energize. The PRIMARY quick-stop disable
+    // is 0x605A=2 auto-SwitchOnDisabled (asserted-==2 at configure, P3c-proven), with the Runner's
+    // close()->INIT as the ultimate fallback. Kept velocity-based on purpose (the wrapper owns the
+    // position-delta rest detection, #59; the pure-counts policy stays position-history-free, #41). If a
+    // future device ever needed this FUNCTIONAL, raise it above that device's noise floor (~5-10k c/s).
     std::int32_t zero_vel_threshold = 500;      // reached / quick-stop: |vel| <= this (counts/s)
     std::uint32_t zero_vel_debounce = 5;        // consecutive sub-thresh cycles before disable/reached latch
     std::uint32_t quick_stop_decel = 0;  // 0x6085 write (counts/s^2); 0 = unset -> a quick-stop consumer MUST set it (fail-closed at configure)
