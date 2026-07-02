@@ -496,6 +496,7 @@ if (ETHERCAT_SANITIZE_THREAD AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     src/ethercat/sim_backend.cpp
     src/ethercat/soem_backend.cpp
     src/ethercat/master.cpp
+    src/ethercat/runner.cpp  # #54 P3a: ServoController drives the library Runner (~Runner) -- required to link
     src/ethercat/realtime.cpp
     src/viam/lib/motion_profile.cpp
     src/viam/lib/servo_config.cpp
@@ -584,6 +585,38 @@ if (ETHERCAT_SANITIZE_THREAD AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   viam_apply_wall_werror(pdo_access_test_tsan)
   add_test(NAME pdo_access_test_tsan COMMAND pdo_access_test_tsan)
   set_tests_properties(pdo_access_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
+
+  # ThreadSanitizer build of the Master tests. The #22 marshaled steady-state SDO wake (N1) is a
+  # real cross-thread handoff -- a non-RT waiter blocked in sdo_read_deferred woken by
+  # set_rt_active(false) via the sdo_mtx_/sdo_cv_ + sdo_pending_ atomic. Compile the Master + sim
+  # stack directly under -fsanitize=thread so that handoff (and every threaded Master test) is
+  # instrumented, not merely covered by-argument. SOEM referenced (SoemBackend ctor), never executed.
+  add_executable(master_test_tsan
+    tests/master_test.cpp
+    src/ethercat/cia402.cpp
+    src/ethercat/pdo_cache.cpp
+    src/ethercat/pdo_mapping.cpp
+    src/ethercat/backend.cpp
+    src/ethercat/sim_backend.cpp
+    src/ethercat/soem_backend.cpp
+    src/ethercat/master.cpp
+  )
+  target_include_directories(master_test_tsan
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  )
+  target_link_libraries(master_test_tsan
+    PRIVATE
+      soem
+      Threads::Threads
+      Boost::headers
+  )
+  target_compile_options(master_test_tsan PRIVATE -fsanitize=thread -O1 -g)
+  target_link_options(master_test_tsan PRIVATE -fsanitize=thread)
+  viam_apply_wall_werror(master_test_tsan)
+  add_test(NAME master_test_tsan COMMAND master_test_tsan)
+  set_tests_properties(master_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
 
   # ThreadSanitizer build of the #47 Runner tests. The Runner spawns the RT thread
   # while the test thread calls status()/stop()/request_stop()/contract_violations()
