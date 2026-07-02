@@ -1148,6 +1148,35 @@ TEST("ServoController(PP): R3 first-terminal-wins -- cancel AFTER completion is 
     CHECK(std::abs(ctrl.position_revs() - 2.0) < 0.01);
 }
 
+TEST("#70: a PP move AFTER a SETTLED Stop() completes (bit4 gated past halt release)") {
+    // WIRE-PROVEN (task #9): after Stop() the A6 holds Halt (bit8, cw 0x010F). A move issued once
+    // the halt has SETTLED (a SEPARATE batch) clears halt AND raises the new-setpoint bit4 -- but if
+    // both happen in ONE cycle (cw 0x010F->0x001F) the A6 ignores the coincident edge and the move
+    // never acks -> "set-point acknowledge timed out". The policy's halt-settle gate delays bit4
+    // until the drive has observed halt clear >= a full cycle. This test drives the SEPARATE-batch
+    // (coincident-RELEASE) path -- distinct from R3's coalescing -- against the now-faithful sim.
+    // BROKEN-BASELINE: revert the policy gate (kSetpointHaltSettleCycles handling) -> the coincident
+    // 0x010F->0x001F edge is rejected by the sim and this go_to times out.
+    ServoController ctrl{make_config(ControlMode::ProfilePosition, /*feedback=*/true),
+                         sim_factory(ControlMode::ProfilePosition, nullptr, /*feedback=*/true)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    ctrl.go_to(1000.0, 1.0);
+    CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.02);
+
+    // Stop() in its OWN batch: let it drain and HOLD Halt (bit8) on the wire for several cycles, so
+    // the next go_to is a SEPARATE batch (the halt has SETTLED) -- the wire-proven release path, not
+    // the coalescing R3 covers.
+    const std::uint64_t c0 = ctrl.loop_cycle();
+    ctrl.halt();
+    CHECK(wait_until([&] { return ctrl.loop_cycle() > c0 + 15; }, std::chrono::milliseconds(500)));
+
+    ctrl.go_to(1000.0, 2.0);  // move after a SETTLED halt -- must complete (bit4 raised only past halt release)
+    CHECK(!ctrl.is_moving());
+    CHECK(std::abs(ctrl.position_revs() - 2.0) < 0.02);
+}
+
 // --- #61: control_mode INTENT derives the map; switchable auto-routes GoTo->PP / SetRPM->PV ------------
 namespace {
 // A switchable module config with NO explicit rxpdo/txpdo -> the ctor (validated()) derives the superset.
