@@ -218,16 +218,19 @@ async def main() -> int:
             return 1
         if wanted - {1}:
             servo = Motor.from_robot(machine, "servo")
-            if 2 in wanted:
-                await test2_setrpm(servo)
-            if 3 in wanted:
-                await test3_gofor(servo)
-            if 4 in wanted:
-                await test4_goto(servo)
-            if 5 in wanted:
-                await test5_cancel_stop_reject(servo)
-            if 6 in wanted:
-                await test6_docommand(servo)
+            tests = {2: test2_setrpm, 3: test3_gofor, 4: test4_goto,
+                     5: test5_cancel_stop_reject, 6: test6_docommand}
+            for n, fn in tests.items():
+                if n not in wanted:
+                    continue
+                try:
+                    await fn(servo)
+                except Exception as e:  # noqa: BLE001 - one test crashing must not kill the run (bug #70 did)
+                    record(f"T{n} ABORTED", False, f"unhandled {type(e).__name__}: {e}")
+                    try:
+                        await servo.stop()  # leave the axis stopped before the next test
+                    except Exception:  # noqa: BLE001
+                        pass
 
     print("\n==== SUMMARY ====")
     fails = 0
