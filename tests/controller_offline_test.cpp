@@ -1308,4 +1308,143 @@ TEST("#64: a MINIMAL config (no rxpdo/txpdo, no tolerances) derives the PP map +
     CHECK(!ctrl.is_moving());
 }
 
+// ---------------------------------------------------------------------------
+// #22 steady-state SDO: read a CoE object WHILE the RT loop runs (marshaled
+// through the RT thread; the single-port-owner invariant holds by construction).
+// ---------------------------------------------------------------------------
+
+// A PP model carrying distinctive OD values for the three do_command objects, so a
+// successful read proves the value threads end-to-end (not a coincidental default).
+SimSlaveModel make_model_sdo() {
+    SimSlaveModel m = make_model(ControlMode::ProfilePosition, /*feedback=*/true);
+    m.dc_link_voltage_mv = 322'000;             // 0x6079 -> 322.0 V
+    m.current_actual_permille = 400;            // 0x6078 -> 0.4 * rated
+    m.supported_drive_modes = 0x0000'0185U;     // 0x6502 -> bits 0,2,7,8 = PP,PV,CSP,CSV
+    return m;
+}
+
+TEST("#22: steady-state SDO read succeeds mid-run; values correct; RT loop keeps cycling") {
+    SimBackend* sim = nullptr;
+    ServoController::BackendFactory factory = [&sim] {
+        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_sdo()});
+        sim = be.get();
+        return std::unique_ptr<EcatBackend>(std::move(be));
+    };
+    ServoController ctrl{make_config(ControlMode::ProfilePosition, /*feedback=*/true), factory};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    (void)sim;
+
+    // Heartbeat BEFORE the read: a working servicer must NOT stall the RT loop -- process()
+    // keeps flowing across the (deliberately blocking) mailbox cycle.
+    const std::uint64_t cyc0 = ctrl.loop_cycle();
+
+    std::array<std::byte, 4> buf{};
+    const std::size_t n_v = ctrl.sdo_read(0x6079, 0, buf, std::chrono::milliseconds(200));
+    CHECK_EQ(n_v, std::size_t{4});
+    const double volts = ethercat::load_le<std::uint32_t>(std::span<const std::byte>(buf.data(), 4)) / 1000.0;
+    CHECK(std::abs(volts - 322.0) < 0.001);
+
+    std::array<std::byte, 2> cbuf{};
+    const std::size_t n_c = ctrl.sdo_read(0x6078, 0, cbuf, std::chrono::milliseconds(200));
+    CHECK_EQ(n_c, std::size_t{2});
+    const std::int16_t permille = ethercat::load_le<std::int16_t>(std::span<const std::byte>(cbuf.data(), 2));
+    const double amps = (permille / 1000.0) * ctrl.rated_current_amps();  // rated 2.5 A -> 0.4*2.5 = 1.0 A
+    CHECK(std::abs(amps - 1.0) < 0.001);
+
+    std::array<std::byte, 4> mbuf{};
+    CHECK_EQ(ctrl.sdo_read(0x6502, 0, mbuf, std::chrono::milliseconds(200)), std::size_t{4});
+    CHECK_EQ(ethercat::load_le<std::uint32_t>(std::span<const std::byte>(mbuf.data(), 4)), std::uint32_t{0x0000'0185U});
+
+    // The RT loop advanced across the three reads -> PD never stalled (a dead servicer would
+    // have timed the reads out above, so reaching here already proves servicing; this pins the
+    // "loop keeps cycling" claim explicitly).
+    CHECK(wait_until([&] { return ctrl.loop_cycle() > cyc0 + 2; }, std::chrono::milliseconds(500)));
+    CHECK(!ctrl.is_disconnected());
+}
+
+TEST("#22: SDO reads succeed CONCURRENTLY with an in-flight move; the move still completes") {
+    ServoController ctrl{make_config(ControlMode::ProfilePosition, /*feedback=*/true),
+                         [] {
+                             return std::unique_ptr<EcatBackend>(
+                                 std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_sdo()}));
+                         }};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    std::atomic<bool> mover_done{false};
+    std::atomic<int> reads_ok{0};
+    std::thread mover([&] {
+        ctrl.go_to(300.0, 8.0);  // a multi-count move; runs while the reader hammers SDO reads
+        mover_done.store(true, std::memory_order_release);
+    });
+    // Hammer SDO reads until the move finishes (or a generous cap) -- all must succeed, and the
+    // RT loop must keep servicing PD (the move converges) WHILE the mailbox reads interleave.
+    for (int i = 0; i < 200 && !mover_done.load(std::memory_order_acquire); ++i) {
+        std::array<std::byte, 4> buf{};
+        try {
+            if (ctrl.sdo_read(0x6079, 0, buf, std::chrono::milliseconds(200)) == 4) {
+                ++reads_ok;
+            }
+        } catch (const ethercat::Error&) {
+            // A read racing the very end of the move / teardown may fail cleanly -- never hang.
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    mover.join();
+    CHECK(mover_done.load(std::memory_order_acquire));
+    CHECK(reads_ok.load() > 0);                       // at least one interleaved read succeeded mid-move
+    CHECK(std::abs(ctrl.position_revs() - 8.0) < 0.05);  // the move converged despite the SDO interleave
+}
+
+TEST("#22: an SDO read after stop() fails cleanly (no servicer) and does not hang") {
+    ServoController ctrl{make_config(ControlMode::ProfilePosition, /*feedback=*/true),
+                         [] {
+                             return std::unique_ptr<EcatBackend>(
+                                 std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_sdo()}));
+                         }};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.stop();  // joins the RT thread + closes the servicer window (set_rt_active(false))
+
+    // The window is closed: the read must throw PROMPTLY (ConfigError), never block on the
+    // absent servicer. Bound the whole call to prove no hang.
+    std::array<std::byte, 4> buf{};
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_THROWS(ctrl.sdo_read(0x6079, 0, buf, std::chrono::milliseconds(500)), ethercat::Error);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(200));  // immediate, not a 500ms timeout
+}
+
+TEST("#22: a reader racing stop() unblocks cleanly (waiter woken by the servicer close)") {
+    ServoController ctrl{make_config(ControlMode::ProfilePosition, /*feedback=*/true),
+                         [] {
+                             return std::unique_ptr<EcatBackend>(
+                                 std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_sdo()}));
+                         }};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    // A reader looping SDO reads with a long timeout, while the main thread stops the
+    // controller. The reader must never HANG past stop(): a request in flight when the
+    // servicer window closes is failed + woken (not left to its full timeout). Bound the join.
+    std::atomic<bool> reader_exited{false};
+    std::thread reader([&] {
+        for (int i = 0; i < 1000; ++i) {
+            std::array<std::byte, 4> buf{};
+            try {
+                (void)ctrl.sdo_read(0x6079, 0, buf, std::chrono::milliseconds(2000));
+            } catch (const ethercat::Error&) {
+                break;  // window closed -> clean throw -> exit
+            }
+        }
+        reader_exited.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));  // let the reader get going
+    ctrl.stop();
+    // The reader must exit well within the 2s per-read timeout -- proving it was WOKEN by the
+    // close, not left to time out.
+    CHECK(wait_until([&] { return reader_exited.load(std::memory_order_acquire); }, std::chrono::milliseconds(500)));
+    reader.join();
+}
+
 TEST_MAIN()
