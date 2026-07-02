@@ -40,8 +40,11 @@ constexpr std::uint16_t kProfileVelocity = 0x6081;
 constexpr std::uint16_t kVelocityActual = 0x606C;
 constexpr std::uint16_t kTorqueActual = 0x6077;
 constexpr std::uint16_t kFaultCode = 0x603F;
-constexpr std::uint16_t kQuickStopDecel = 0x6085;    // PV quick-stop deceleration (counts/s^2)
-constexpr std::uint16_t kQuickStopOption = 0x605A;   // quick-stop option code (must read == 2)
+constexpr std::uint16_t kQuickStopDecel = 0x6085;   // PV quick-stop deceleration (counts/s^2)
+constexpr std::uint16_t kQuickStopOption = 0x605A;  // quick-stop option code (must read == 2)
+constexpr std::uint16_t kDcLinkVoltage = 0x6079;    // #22 probe: DC-link circuit voltage (U32, mV per CiA402)
+constexpr std::uint16_t kCurrentActual = 0x6078;    // #22 probe: current actual value (I16, per-mille of rated)
+constexpr std::uint16_t kSupportedModes = 0x6502;   // #22 probe: supported drive modes (U32 bitmask)
 
 constexpr std::uint16_t kErr741NoSync = 0x8700;  // A6 Er74.1 "no sync signal" (normal pre-OP)
 
@@ -55,8 +58,8 @@ constexpr std::uint32_t kLoopHz = 1000;
 // textbook-minimal exact value; if the A6 decodes QS by exact match it's the fallback.)
 constexpr std::uint16_t kQuickStopCw = ControlWord::enable_operation() & ~std::uint16_t{0x0004};
 // 0x606C velocity-estimate "stopped" threshold (just above the noise floor, DA) + debounce.
-constexpr std::int32_t kZeroVelThresh = 500;       // counts/s (~0.23 rev/s @ 2^17 c/rev)
-constexpr std::uint32_t kZeroVelDebounce = 5;      // consecutive sub-thresh cycles before the disable backstop
+constexpr std::int32_t kZeroVelThresh = 500;   // counts/s (~0.23 rev/s @ 2^17 c/rev)
+constexpr std::uint32_t kZeroVelDebounce = 5;  // consecutive sub-thresh cycles before the disable backstop
 // 0x6085 quick-stop decel default = 50 rev/s^2 (stops 600 rpm in ~200 ms; well inside W).
 constexpr std::uint32_t kQuickStopDecelDefault = 6'553'600;  // counts/s^2
 constexpr std::int16_t kQuickStopOptionRequired = 2;         // 0x605A must read == 2 (decel on 0x6085 -> auto SwitchOnDisabled)
@@ -85,20 +88,26 @@ struct Options {
     double sine_period = 4.0;              // seconds; --sine-period
     std::int32_t follow_err_limit = 5000;  // counts; CSP tool-level following-error abort
     // --- #53 new modes ---
-    bool move_pos = false;            // --move-pos POS [VEL]: absolute Profile-Position move-to (PP)
-    bool move_vel = false;           // --move-vel VEL: continuous Profile-Velocity until Ctrl-C (PV)
-    std::int32_t pos_target = 0;     // --move-pos POS (absolute, counts)
-    std::int32_t pp_vel_cps = 0;     // --move-pos optional VEL (profile velocity, counts/s); 0 => default from move_rpm
-    std::int32_t pv_vel_cps = 0;     // --move-vel VEL (counts/s)
-    std::int32_t pos_tol = 300;      // --pos-tol (DA-C: proven HW default 300; tighten only with a bench deadband measurement)
+    bool move_pos = false;        // --move-pos POS [VEL]: absolute Profile-Position move-to (PP)
+    bool move_vel = false;        // --move-vel VEL: continuous Profile-Velocity until Ctrl-C (PV)
+    std::int32_t pos_target = 0;  // --move-pos POS (absolute, counts)
+    std::int32_t pp_vel_cps = 0;  // --move-pos optional VEL (profile velocity, counts/s); 0 => default from move_rpm
+    std::int32_t pv_vel_cps = 0;  // --move-vel VEL (counts/s)
+    std::int32_t pos_tol = 300;   // --pos-tol (DA-C: proven HW default 300; tighten only with a bench deadband measurement)
     // --- #47-P3b sub-step 5 (P3c) runtime mode-switch exercise ---
-    bool then_jog_vel = false;       // --move-pos POS --then-jog-vel VEL: after the PP move REACHES, SWITCH to PV (§6) and jog at VEL until Ctrl-C (drives the canonical mode-switch on the wire)
+    bool then_jog_vel = false;  // --move-pos POS --then-jog-vel VEL: after the PP move REACHES, SWITCH to PV (§6) and jog at VEL until
+                                // Ctrl-C (drives the canonical mode-switch on the wire)
+    // #22 steady-state SDO probe: while Running, issue Master::sdo_read_deferred (marshaled
+    // through the RT loop) for 0x6079/0x6078/0x6502 every ~500ms and print raw + converted.
+    // Exercises the exact steady-state SDO path on real hardware WHILE PD flows -- the HW
+    // evidence for #22 (WKC/Er74/LRW-gap intact around each mid-run mailbox read).
+    bool sdo_probe = false;  // --sdo-probe
 };
 
 // Count the mutually-exclusive move modes set (>1 => CLI conflict). Pure + testable.
 inline int mode_flag_count(const Options& o) noexcept {
-    return static_cast<int>(o.move_pp) + static_cast<int>(o.move_sine) + static_cast<int>(o.csp_probe) +
-           static_cast<int>(o.move_pos) + static_cast<int>(o.move_vel);
+    return static_cast<int>(o.move_pp) + static_cast<int>(o.move_sine) + static_cast<int>(o.csp_probe) + static_cast<int>(o.move_pos) +
+           static_cast<int>(o.move_vel);
 }
 
 // RT->main telemetry: each field is an independent relaxed atomic. Cross-field skew
@@ -133,8 +142,7 @@ class A6Control final : public SlaveControl {
     // `profile_override` swaps the DeviceProfile without touching ANY other code -- the genericity
     // thesis in one parameter (#47-P3b M56S): the SAME A6Control + SAME generic policy drive a second
     // device by data alone. Default (nullopt) = the A6 profile.
-    A6Control(const Options& opt, Telemetry& tel, Cia402Mode mode,
-              std::optional<DeviceProfile> profile_override = std::nullopt) noexcept
+    A6Control(const Options& opt, Telemetry& tel, Cia402Mode mode, std::optional<DeviceProfile> profile_override = std::nullopt) noexcept
         : opt_(opt), tel_(tel), policy_(profile_override ? *profile_override : make_a6_profile(opt)) {
         goal_ = opt_.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
         profile_vel_ = static_cast<std::uint32_t>(opt_.move_rpm / 60.0 * kCountsPerRev);
@@ -169,8 +177,8 @@ class A6Control final : public SlaveControl {
                 if (std::abs(static_cast<double>(opt_.pv_vel_cps)) > vel_max) {
                     throw ConfigError("A6Control: --move-vel " + std::to_string(opt_.pv_vel_cps) +
                                       " counts/s exceeds the quick-stop window budget (|VEL| <= 0x6085 * (W - margin) = " +
-                                      std::to_string(static_cast<long long>(vel_max)) + " counts/s for 0x6085=" +
-                                      std::to_string(echoed) + ", W=" + std::to_string(window_s) +
+                                      std::to_string(static_cast<long long>(vel_max)) + " counts/s for 0x6085=" + std::to_string(echoed) +
+                                      ", W=" + std::to_string(window_s) +
                                       "s). Refusing to energize -- it could not ramp to 0 before de-energize.");
                 }
             }
@@ -234,8 +242,8 @@ class A6Control final : public SlaveControl {
             ++stopping_steps_;
             // #53 PV clean stop = CiA402 Quick-Stop (NOT torque-cut-at-speed): command
             // cw=0x0B (T11 OperationEnabled->QuickStopActive); the drive ramps via 0x6085.
-            const bool clean_pv_stop = opt_.move_vel && announced_op_ && !safety_abort_ &&
-                                       stop_reason_ == StopReason::Requested && !status.fault();
+            const bool clean_pv_stop =
+                opt_.move_vel && announced_op_ && !safety_abort_ && stop_reason_ == StopReason::Requested && !status.fault();
             const bool clean_csp_hold = opt_.move_sine && announced_op_ && !safety_abort_ && stop_reason_ == StopReason::Requested &&
                                         !status.fault() && stopping_steps_ <= 100;
             if (clean_pv_stop) {
@@ -314,8 +322,8 @@ class A6Control final : public SlaveControl {
             } else {
                 mode_refused_ = true;
                 goal_ = Cia402State::ReadyToSwitchOn;  // REFUSE: do NOT energize
-                std::cerr << "[B] !!! MODE ECHO MISMATCH: 0x6061=" << static_cast<int>(md) << " != commanded 0x6060="
-                          << static_cast<int>(commanded_mode_disp_)
+                std::cerr << "[B] !!! MODE ECHO MISMATCH: 0x6061=" << static_cast<int>(md)
+                          << " != commanded 0x6060=" << static_cast<int>(commanded_mode_disp_)
                           << " -- the A6 did not accept the commanded mode (#45); REFUSING to enable.\n";
                 ctx.request_stop();
             }
@@ -350,7 +358,7 @@ class A6Control final : public SlaveControl {
                 // benign if the A6 cross-supervises position. cw held at 0x0F.
                 ctx.store<cia402::TargetVelocity::type>(tv_loc_, opt_.pv_vel_cps);
                 ctx.store<cia402::TargetPosition::type>(target_loc_, pos);
-                target_ = opt_.pv_vel_cps;  // telemetry shows the commanded velocity
+                target_ = opt_.pv_vel_cps;             // telemetry shows the commanded velocity
                 cw = ControlWord::enable_operation();  // 0x0F
             } else if (opt_.move_pos) {
                 // #53 absolute Profile-Position move-to: bit6 = 0 (NOT relative -- with_new_setpoint
@@ -563,7 +571,8 @@ class A6Control final : public SlaveControl {
         p.zero_vel_debounce = kZeroVelDebounce;
         p.quick_stop_decel = kQuickStopDecelDefault;
         p.quick_stop_option = kQuickStopOptionRequired;
-        p.mode_switch_settle_cycles = 60;      // T_switch: covers the M56S slow transition (the A6 default 200 also would; 60 is the tuned-to-device value)
+        p.mode_switch_settle_cycles =
+            60;  // T_switch: covers the M56S slow transition (the A6 default 200 also would; 60 is the tuned-to-device value)
         p.mode_switch_ramp_stop_cycles = 2000;  // the M56S ramps slower -> a longer stop-first bound
         return p;
     }
@@ -601,13 +610,13 @@ class A6Control final : public SlaveControl {
     std::uint32_t stopping_steps_ = 0;
     StopReason stop_reason_ = StopReason::None;
     // #53 mode-echo gate + PP-abs handshake-edge + zero-vel debounce
-    bool mode_checked_ = false;          // 0x6061 echo confirmed -> enable allowed
-    bool mode_refused_ = false;          // echo mismatch -> refused to enable (one-shot)
-    bool switched_to_vel_ = false;       // #47-P3b P3c: the PP move reached -> latched the switch to PV (--then-jog-vel)
+    bool mode_checked_ = false;             // 0x6061 echo confirmed -> enable allowed
+    bool mode_refused_ = false;             // echo mismatch -> refused to enable (one-shot)
+    bool switched_to_vel_ = false;          // #47-P3b P3c: the PP move reached -> latched the switch to PV (--then-jog-vel)
     bool mode_switch_failed_seen_ = false;  // sticky: the policy reported a mode-switch failure at least once
-    bool bit4_high_ = false;             // tracks the bit4 level for edge counting
-    int bit4_edges_ = 0;                 // count of bit4 0->1 rising edges (#53 PP, DA-I: must be 1)
-    std::uint32_t zerovel_cycles_ = 0;   // consecutive |vel|<thresh cycles (PV stop backstop + PP reached)
+    bool bit4_high_ = false;                // tracks the bit4 level for edge counting
+    int bit4_edges_ = 0;                    // count of bit4 0->1 rising edges (#53 PP, DA-I: must be 1)
+    std::uint32_t zerovel_cycles_ = 0;      // consecutive |vel|<thresh cycles (PV stop backstop + PP reached)
 };
 
 }  // namespace ethercat::tools

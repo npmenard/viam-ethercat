@@ -101,8 +101,10 @@ MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
         {kControlword, 0, 16},
         {kTargetPosition, 0, 32},
         {kProfileVelocity, 0, 32},
-        {kTargetVelocity, 0, 32},  // #53: superset RxPDO -- mapped for the PV mode (target consumed by the held PV path); appended so PP/CSP offsets are unchanged
-        {kModeOfOperation, 0, 8},  // #47-P3b 5a (P3c): mode-of-operation in the RxPDO so the runtime PP<->PV mode-switch can write 0x6060 cyclically (14->15 B; P3c HW step-1 = bring-up re-verify with this map)
+        {kTargetVelocity, 0, 32},  // #53: superset RxPDO -- mapped for the PV mode (target consumed by the held PV path); appended so
+                                   // PP/CSP offsets are unchanged
+        {kModeOfOperation, 0, 8},  // #47-P3b 5a (P3c): mode-of-operation in the RxPDO so the runtime PP<->PV mode-switch can write 0x6060
+                                   // cyclically (14->15 B; P3c HW step-1 = bring-up re-verify with this map)
     };
 
     a6.txpdo.pdo_indices = {0x1A00};
@@ -118,8 +120,6 @@ MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
     cfg.slaves.push_back(std::move(a6));
     return cfg;
 }
-
-
 
 }  // namespace
 
@@ -154,6 +154,8 @@ int main(int argc, char** argv) {
             opt.pos_tol = std::stoi(args[++i]);  // #53 DA-C: reached tolerance (counts); default 300
         } else if (a == "--move-sine") {
             opt.move_sine = true;  // requires an EXPLICIT --enable (checked below) -- no implicit energize
+        } else if (a == "--sdo-probe") {
+            opt.sdo_probe = true;  // #22: read 0x6079/0x6078/0x6502 via the marshaled steady-state SDO while Running
         } else if (a == "--csp-probe") {
             opt.csp_probe = true;  // CSP mode, NO enable -- read+print feedback only (diagnostic)
         } else if (a == "--sine-amplitude" && i + 1 < args.size()) {
@@ -189,6 +191,9 @@ int main(int argc, char** argv) {
                       << "  --move-pp REVS [RPM]: *** MOTION (needs --enable) *** PP-mode relative move via the bit4 handshake.\n"
                       << "  --csp-probe: NON-energizing diagnostic -- bring up in CSP mode (0x6060=8), hold at\n"
                       << "               ReadyToSwitchOn (NO enable), print feedback.\n"
+                      << "  --sdo-probe: #22 steady-state SDO -- while Running, read 0x6079 (DC-link V), 0x6078 (current),\n"
+                      << "               0x6502 (supported modes) every ~500ms via the RT-serviced marshaled path; print\n"
+                      << "               raw + converted. Safe with a plain hold (no --enable); exercises mid-run mailbox reads.\n"
                       << "  --reset-fault: clear a latent drive fault at bring-up via the A6 vendor SDO 0x2031:01=1.\n";
             return 2;
         }
@@ -222,8 +227,8 @@ int main(int argc, char** argv) {
                   : opt.move_vel ? "VEL " + std::to_string(opt.pv_vel_cps) + " counts/s (PV, until Ctrl-C)"
                   : opt.move_pos ? "POS " + std::to_string(opt.pos_target) + " counts @ " +
                                        std::to_string(opt.pp_vel_cps > 0 ? opt.pp_vel_cps : 0) + " counts/s (PP move-to)"
-                  : opt.move_pp  ? std::to_string(opt.move_revs) + " rev @ " + std::to_string(opt.move_rpm) + " rpm (PP)"
-                                 : "none (hold)")
+                  : opt.move_pp ? std::to_string(opt.move_revs) + " rev @ " + std::to_string(opt.move_rpm) + " rpm (PP)"
+                                : "none (hold)")
               << "\n\n";
 
     // DC SYNC0 cycle = loop period; the A6 requires an integer multiple of 250 us.
@@ -319,11 +324,48 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // #22 steady-state SDO probe: decode the 0x6502 supported-modes bitmask to names.
+        const auto decode_modes = [](std::uint32_t bits) {
+            static const std::pair<unsigned, const char*> kBits[] = {
+                {0, "PP"}, {1, "VL"}, {2, "PV"}, {3, "TQ"}, {5, "HM"}, {6, "IP"}, {7, "CSP"}, {8, "CSV"}, {9, "CST"}};
+            std::string out;
+            for (const auto& [bit, name] : kBits) {
+                if ((bits & (1U << bit)) != 0U) {
+                    out += (out.empty() ? "" : ",");
+                    out += name;
+                }
+            }
+            return out.empty() ? std::string("(none)") : out;
+        };
+
         // --- main = the NON-RT printer + SIGINT relay (the old in-loop prints, off-thread).
         auto last_print = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        auto last_sdo = std::chrono::steady_clock::now();
         while (runner.status().phase != RunnerPhase::Stopped) {
             if (g_stop.load()) {
                 runner.request_stop();  // SIGINT -> graceful stop (the window runs the disable policy)
+            }
+            // #22 mid-run marshaled SDO reads (only while Running; the RT loop services them).
+            if (opt.sdo_probe && runner.status().phase == RunnerPhase::Running &&
+                std::chrono::steady_clock::now() - last_sdo >= std::chrono::milliseconds(500)) {
+                last_sdo = std::chrono::steady_clock::now();
+                try {
+                    std::array<std::byte, 4> vbuf{};
+                    std::array<std::byte, 2> cbuf{};
+                    std::array<std::byte, 4> mbuf{};
+                    const std::size_t nv = master.sdo_read_deferred(slave, kDcLinkVoltage, 0, vbuf, std::chrono::milliseconds(200));
+                    const std::size_t nc = master.sdo_read_deferred(slave, kCurrentActual, 0, cbuf, std::chrono::milliseconds(200));
+                    const std::size_t nm = master.sdo_read_deferred(slave, kSupportedModes, 0, mbuf, std::chrono::milliseconds(200));
+                    const std::uint32_t v_mv = nv >= 4 ? load_le<std::uint32_t>(vbuf) : 0;
+                    const std::int16_t c_permille = nc >= 2 ? load_le<std::int16_t>(cbuf) : 0;
+                    const std::uint32_t modes = nm >= 4 ? load_le<std::uint32_t>(mbuf) : 0;
+                    std::cout << "[sdo] 0x6079 DC-link=" << (v_mv / 1000.0) << "V (raw " << v_mv << "mV)"
+                              << " | 0x6078 current=" << c_permille << " per-mille-of-rated"
+                              << " | 0x6502 modes=0x" << std::hex << modes << std::dec << " {" << decode_modes(modes) << "}"
+                              << " badWKC=" << tel.bad_wkc.load(std::memory_order_relaxed) << '\n';
+                } catch (const Error& e) {
+                    std::cout << "[sdo] probe read FAILED (drive may not implement the object, or timeout): " << e.what() << '\n';
+                }
             }
             const auto now = std::chrono::steady_clock::now();
             if (now - last_print >= std::chrono::milliseconds(200)) {  // ~5 Hz
