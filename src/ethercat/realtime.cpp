@@ -5,6 +5,10 @@
 #include <sched.h>     // sched_param, SCHED_FIFO
 #include <sys/mman.h>  // mlockall, MCL_CURRENT, MCL_FUTURE
 
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+
 #include "ethercat/master.hpp"
 
 namespace ethercat::realtime {
@@ -41,8 +45,19 @@ bool setup(int priority, std::size_t prefault_bytes) noexcept {
     // NOLINTBEGIN(concurrency-mt-unsafe)
     // Order matters: lock (incl. MCL_FUTURE) BEFORE pre-faulting, so the freshly
     // faulted stack pages are locked as they map in.
-    (void)mlockall(MCL_CURRENT | MCL_FUTURE);  // best-effort (needs CAP_IPC_LOCK)
-    (void)mallopt(M_TRIM_THRESHOLD, -1);       // keep the heap -- no fault from trimming
+    // #72 audit: mlockall is load-bearing for RT determinism -- if the RT working set can be paged
+    // out, a fault under host memory pressure stalls the loop (a candidate cause of the ~26ms gap).
+    // It USED to be silently (void)-cast; surface a failure so a missing CAP_IPC_LOCK / too-low
+    // 'ulimit -l' is visible in the log instead of degrading determinism invisibly. One line, once.
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {  // needs CAP_IPC_LOCK
+        (void)std::fprintf(stderr,
+                           "[ethercat] WARNING: mlockall(MCL_CURRENT|MCL_FUTURE) failed (%s) -- RT memory NOT locked; "
+                           "page faults under memory pressure can stall the RT loop. Needs CAP_IPC_LOCK and adequate "
+                           "'ulimit -l'.\n",
+                           std::strerror(errno));
+        (void)std::fflush(stderr);
+    }
+    (void)mallopt(M_TRIM_THRESHOLD, -1);  // keep the heap -- no fault from trimming
     (void)mallopt(M_MMAP_MAX, 0);
     prefault_stack(prefault_bytes);
 

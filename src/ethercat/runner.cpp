@@ -328,6 +328,14 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
     std::uint64_t cycle = 0;
     bool stopping = false;
     std::uint32_t window_left = 0;
+    // #72 RT-overrun instrument: pace() returns how many WHOLE periods it had to skip to catch up
+    // (0 = healthy). A multi-cycle skip means the SCHED_FIFO RT thread was starved (host contention,
+    // page fault, priority inversion) and PD gapped that long -- exactly the ~26ms stall that gaps
+    // LRW and drops SYNC0 (Er74.1). Surface the first significant one to stderr (the smoking-gun log
+    // line this bug lacked); worst-so-far is tracked for the post-run summary.
+    constexpr std::uint64_t kRtOverrunReportNs = 5'000'000;  // >=5ms starvation is abnormal at any sane rate
+    bool rt_overrun_logged = false;
+    std::uint32_t rt_overrun_worst = 0;
     for (;;) {
         master_.process();
         // ONE selection feeds BOTH the ctx contract (dc_time_ns()==0 when DC is off)
@@ -363,7 +371,20 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
         for (Attached& a : controls_) {
             dispatch(a, cycle, dct, stopping, [&](CycleContext& ctx) { a.control->step(ctx); });
         }
-        pacer.pace(dct);
+        const std::uint32_t skipped = pacer.pace(dct);
+        if (skipped > rt_overrun_worst) {
+            rt_overrun_worst = skipped;
+        }
+        if (static_cast<std::uint64_t>(skipped) * period_ns >= kRtOverrunReportNs && !rt_overrun_logged) {
+            rt_overrun_logged = true;  // one-shot -- a fault/teardown typically follows within cycles
+            (void)std::fprintf(
+                stderr,
+                "[ethercat] RT cycle overrun %.1fms (%u cycles) at cycle %llu -- the SCHED_FIFO RT thread was "
+                "starved (host contention / page fault / priority inversion); PD gapped, SYNC0 may drop (Er74.1).\n",
+                static_cast<double>(static_cast<std::uint64_t>(skipped) * period_ns) / 1e6, skipped,
+                static_cast<unsigned long long>(cycle));
+            (void)std::fflush(stderr);
+        }
         ++cycle;
         if (stopping) {
             // EVENT-DRIVEN early-out (#47-P3b R1): a control doing a CONTROLLED ramp-stop signals

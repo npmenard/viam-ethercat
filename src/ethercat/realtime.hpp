@@ -130,10 +130,15 @@ class DcPacer {
     // noexcept + alloc-free (the callable inlines; NOT std::function). No sleep; returns
     // the new absolute deadline. Mutates the integral + deadline.
     template <class NowFn>
-    std::uint64_t advance_to_deadline(std::int64_t dc_time_ns, NowFn now) noexcept {
+    std::uint64_t advance_to_deadline(std::int64_t dc_time_ns, NowFn now, std::uint32_t* skipped = nullptr) noexcept {
         advance(dc_time_ns);
+        std::uint32_t n = 0;  // WHOLE periods skipped = how many cycles late the thread woke (overrun magnitude)
         for (std::uint64_t t = now(); next_ <= t; t = now()) {
             next_ += period_ns_;
+            ++n;
+        }
+        if (skipped != nullptr) {
+            *skipped = n;
         }
         return next_;
     }
@@ -148,13 +153,19 @@ class DcPacer {
 
     // One cyclic iteration (production): advance + skip-catch-up RE-READING monotonic_ns()
     // each iteration (byte-equivalent to the ServoController RT loop), then sleep
-    // (CLOCK_MONOTONIC, TIMER_ABSTIME) to the absolute deadline.
-    void pace(std::int64_t dc_time_ns) noexcept {
-        (void)advance_to_deadline(dc_time_ns, []() noexcept { return monotonic_ns(); });
+    // (CLOCK_MONOTONIC, TIMER_ABSTIME) to the absolute deadline. RETURNS the number of WHOLE
+    // periods that had to be skipped to catch up -- i.e. how many cycles late the thread woke
+    // (0 on a healthy cycle). A non-zero value means the RT thread was starved (host contention,
+    // priority inversion, page fault) and PD gapped that long; the caller surfaces it (#72).
+    std::uint32_t pace(std::int64_t dc_time_ns) noexcept {
+        std::uint32_t skipped = 0;
+        (void)advance_to_deadline(
+            dc_time_ns, []() noexcept { return monotonic_ns(); }, &skipped);
         timespec ts{};
         ts.tv_sec = static_cast<std::time_t>(next_ / kNsPerSec);
         ts.tv_nsec = static_cast<long>(next_ % kNsPerSec);
         (void)clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
+        return skipped;
     }
 
     std::uint64_t deadline() const noexcept {
