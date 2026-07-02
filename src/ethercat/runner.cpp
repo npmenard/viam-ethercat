@@ -336,6 +336,12 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
         if (!stopping) {
             if (master_.fault()) {
                 latch_reason(StopReason::BusFault);  // steady health = the WKC latch (no AL polling here)
+                // #72: the WKC-latch moment used to print NOTHING to stderr (an operator saw the drive
+                // go dead with no log line -- the same surfacing gap as #71). Emit a ONE-SHOT line
+                // naming the fault. master_.last_error() is lock-free (reads the fault atomics), and this
+                // fires exactly once -- the next cycle takes the stopping path, skipping this block.
+                (void)std::fprintf(stderr, "[ethercat] BUS FAULT -- %s. Entering teardown.\n", master_.last_error().c_str());
+                (void)std::fflush(stderr);
                 stop_flag_.store(true, std::memory_order_release);
             }
             if (stop_flag_.load(std::memory_order_acquire)) {
