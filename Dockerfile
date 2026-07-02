@@ -27,6 +27,7 @@ RUN apt-get -y --no-install-recommends install \
     libssl-dev \
     lsb-release \
     ninja-build \
+    patchelf \
     pkg-config \
     protobuf-compiler-grpc \
     software-properties-common \

@@ -336,6 +336,43 @@ if (ETHERCAT_BUILD_MODULE)
       "/librt\\.so"    "/libgcc_s\\.so"       "/libstdc\\+\\+\\.so"
   )
 
+  # #69 RUNPATH IS NOT TRANSITIVE: the RUNTIME_DEPENDENCY_SET above copies the third-party .so
+  # files (viam-cpp-sdk + gRPC/absl/protobuf/re2/...) into lib/ VERBATIM -- each keeps its OWN
+  # build/system RUNPATH. So when the loader resolves a BUNDLED lib's own NEEDED entries (e.g. an
+  # absl lib -> libabsl_raw_hash_set, libupb -> absl), it uses that lib's RUNPATH, which points at
+  # system paths only -- NOT the sibling libs sitting right next to it in lib/. The exe's
+  # $ORIGIN/../lib RUNPATH is NOT inherited by the libs it pulls in. On a clean host with no system
+  # gRPC/absl this is a loader failure (a prior bundle "worked" only by accident, when the exe
+  # directly NEEDed every lib -- a flat SDK-vendored dep tree; it broke once the build image gained
+  # system gRPC/absl, which links a transitive-NEEDED universe).
+  #
+  # Make the bundle DETERMINISTICALLY self-resolving: stamp $ORIGIN into the RUNPATH of every
+  # bundled REAL .so at install time, so each finds its siblings in the same lib/ dir regardless of
+  # the host. Runs under BOTH `cmake --install` (DESTDIR) AND `cpack` (staging prefix) via
+  # $ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}. Symlinks are skipped (patchelf the real files only).
+  # patchelf is a build-image dep (see Dockerfile).
+  install(CODE [==[
+    find_program(_ethercat_patchelf patchelf)
+    if(NOT _ethercat_patchelf)
+      message(FATAL_ERROR "#69: patchelf is required to stamp $ORIGIN into the bundled deps -- install it in the build image")
+    endif()
+    set(_ethercat_root "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}")
+    file(GLOB_RECURSE _ethercat_bundled LIST_DIRECTORIES false "${_ethercat_root}/*.so*")
+    set(_ethercat_n 0)
+    foreach(_so IN LISTS _ethercat_bundled)
+      if(NOT IS_SYMLINK "${_so}")
+        execute_process(
+          COMMAND "${_ethercat_patchelf}" --set-rpath "$ORIGIN" "${_so}"
+          RESULT_VARIABLE _ethercat_rc)
+        if(NOT _ethercat_rc EQUAL 0)
+          message(FATAL_ERROR "#69: patchelf --set-rpath failed on ${_so}")
+        endif()
+        math(EXPR _ethercat_n "${_ethercat_n}+1")
+      endif()
+    endforeach()
+    message(STATUS "#69: stamped $ORIGIN RUNPATH into ${_ethercat_n} bundled lib file(s) under ${_ethercat_root}")
+  ]==])
+
   # Module smoke test: drives a ServoMotor over a SimBackend-backed controller.
   # Lives here (not viam_add_test) because it needs the Viam SDK link.
   add_executable(servo_motor_test
