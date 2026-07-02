@@ -168,6 +168,16 @@ class Master {
     SlaveInfo slave_info(std::uint16_t slave) const {
         return backend_->slave_info(slave);
     }
+    // #71: the ESC AL status code / SOEM message for a slave (1-based) -- the standard EtherCAT
+    // "why the drive refused an AL transition" (e.g. 0x0027 "Freerun not supported" on a DC-only
+    // drive requested into OP without SYNC0). A cached read (no port I/O), so a consumer can read
+    // it at a bring-up give-up to name the cause. 0/empty = no error. Delegates to the backend.
+    std::uint16_t al_status_code(std::uint16_t slave) const noexcept {
+        return backend_->al_status_code(slave);
+    }
+    std::string al_status_message(std::uint16_t slave) const {
+        return backend_->al_status_message(slave);
+    }
     bool all_operational() const noexcept {
         return operational_.load(std::memory_order_relaxed);
     }

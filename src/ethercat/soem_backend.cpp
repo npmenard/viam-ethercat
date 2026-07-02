@@ -334,6 +334,22 @@ EcatState SoemBackend::slave_state(std::uint16_t slave) const {
     return from_soem_state(impl_->ctx.slavelist[slave].state);
 }
 
+std::uint16_t SoemBackend::al_status_code(std::uint16_t slave) const noexcept {
+    // #71: the ESC AL status code cached from the last state check -- WHY the drive refused an AL
+    // transition (e.g. 0x0027 free-run not supported on the DC-only A6). A plain field read, no I/O.
+    if (slave < 1 || slave > impl_->slave_count) {
+        return 0;
+    }
+    return impl_->ctx.slavelist[slave].ALstatuscode;
+}
+
+std::string SoemBackend::al_status_message(std::uint16_t slave) const {
+    if (slave < 1 || slave > impl_->slave_count) {
+        return {};
+    }
+    return ec_ALstatuscode2string(impl_->ctx.slavelist[slave].ALstatuscode);
+}
+
 SlaveIo SoemBackend::slave_io(std::uint16_t slave) noexcept {
     if (slave < 1 || slave > impl_->slave_count) {
         return {};

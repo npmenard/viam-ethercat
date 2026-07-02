@@ -34,6 +34,8 @@ class SoemBackend final : public EcatBackend {
     void set_state(std::uint16_t slave, EcatState target) noexcept override;
     void reack_op(std::uint16_t slave) noexcept override;
     EcatState slave_state(std::uint16_t slave) const override;
+    std::uint16_t al_status_code(std::uint16_t slave) const noexcept override;  // #71: cached ESC AL status code
+    std::string al_status_message(std::uint16_t slave) const override;          // #71: SOEM human string for it
     void configure_dc_configdc() override;
     void arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) override;
     std::int64_t dc_time() const noexcept override;

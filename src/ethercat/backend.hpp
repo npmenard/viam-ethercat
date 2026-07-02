@@ -106,6 +106,19 @@ class EcatBackend {
     // slave + target (and the state actually reached) on timeout.
     virtual void request_state(std::uint16_t slave, EcatState target) = 0;
     virtual EcatState slave_state(std::uint16_t slave) const = 0;
+    // #71: the ESC AL STATUS CODE for a slave (1-based) -- the standard EtherCAT "why the drive
+    // refused an AL state transition" (e.g. 0x0027 "Freerun not supported", 0x0030 "Invalid DC
+    // sync config", 0x001B "SM watchdog"). Cached from the last state check (no port I/O), so it
+    // is safe to read at a bring-up give-up. 0 = no error. al_status_message returns SOEM's
+    // human string for it. Default 0/empty (the sim overrides to model a refusal).
+    virtual std::uint16_t al_status_code(std::uint16_t slave) const noexcept {
+        (void)slave;
+        return 0;
+    }
+    virtual std::string al_status_message(std::uint16_t slave) const {
+        (void)slave;
+        return {};
+    }
     // REQUEST `slave` (0 = all) to `target` -- writes the state request only; does
     // NOT pump process data, wait, or throw. The caller's cyclic loop drives the
     // transition (so a DC drive sees CONTINUOUS process data through SAFE-OP->OP,
