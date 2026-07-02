@@ -37,6 +37,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -346,26 +347,44 @@ int main(int argc, char** argv) {
                 runner.request_stop();  // SIGINT -> graceful stop (the window runs the disable policy)
             }
             // #22 mid-run marshaled SDO reads (only while Running; the RT loop services them).
+            // Each object read INDEPENDENTLY (per-object try) so one drive-rejected object doesn't
+            // mask the others -- mirrors the module do_command's per-key error capture.
             if (opt.sdo_probe && runner.status().phase == RunnerPhase::Running &&
                 std::chrono::steady_clock::now() - last_sdo >= std::chrono::milliseconds(500)) {
                 last_sdo = std::chrono::steady_clock::now();
-                try {
+                std::string line = "[sdo] ";
+                {
                     std::array<std::byte, 4> vbuf{};
-                    std::array<std::byte, 2> cbuf{};
-                    std::array<std::byte, 4> mbuf{};
-                    const std::size_t nv = master.sdo_read_deferred(slave, kDcLinkVoltage, 0, vbuf, std::chrono::milliseconds(200));
-                    const std::size_t nc = master.sdo_read_deferred(slave, kCurrentActual, 0, cbuf, std::chrono::milliseconds(200));
-                    const std::size_t nm = master.sdo_read_deferred(slave, kSupportedModes, 0, mbuf, std::chrono::milliseconds(200));
-                    const std::uint32_t v_mv = nv >= 4 ? load_le<std::uint32_t>(vbuf) : 0;
-                    const std::int16_t c_permille = nc >= 2 ? load_le<std::int16_t>(cbuf) : 0;
-                    const std::uint32_t modes = nm >= 4 ? load_le<std::uint32_t>(mbuf) : 0;
-                    std::cout << "[sdo] 0x6079 DC-link=" << (v_mv / 1000.0) << "V (raw " << v_mv << "mV)"
-                              << " | 0x6078 current=" << c_permille << " per-mille-of-rated"
-                              << " | 0x6502 modes=0x" << std::hex << modes << std::dec << " {" << decode_modes(modes) << "}"
-                              << " badWKC=" << tel.bad_wkc.load(std::memory_order_relaxed) << '\n';
-                } catch (const Error& e) {
-                    std::cout << "[sdo] probe read FAILED (drive may not implement the object, or timeout): " << e.what() << '\n';
+                    try {
+                        const std::size_t n = master.sdo_read_deferred(slave, kDcLinkVoltage, 0, vbuf, std::chrono::milliseconds(200));
+                        line += "0x6079 DC-link=" + std::to_string((n >= 4 ? load_le<std::uint32_t>(vbuf) : 0) / 1000.0) + "V";
+                    } catch (const Error& e) {
+                        line += std::string("0x6079 ERR{") + e.what() + "}";
+                    }
                 }
+                {
+                    std::array<std::byte, 2> cbuf{};
+                    try {
+                        const std::size_t n = master.sdo_read_deferred(slave, kCurrentActual, 0, cbuf, std::chrono::milliseconds(200));
+                        line += " | 0x6078 current=" + std::to_string(n >= 2 ? load_le<std::int16_t>(cbuf) : 0) + "permille";
+                    } catch (const Error& e) {
+                        line += std::string(" | 0x6078 ERR{") + e.what() + "}";
+                    }
+                }
+                {
+                    std::array<std::byte, 4> mbuf{};
+                    try {
+                        const std::size_t n = master.sdo_read_deferred(slave, kSupportedModes, 0, mbuf, std::chrono::milliseconds(200));
+                        const std::uint32_t modes = n >= 4 ? load_le<std::uint32_t>(mbuf) : 0;
+                        char hex[16];
+                        (void)std::snprintf(hex, sizeof(hex), "0x%X", modes);
+                        line += " | 0x6502 modes=" + std::string(hex) + " {" + decode_modes(modes) + "}";
+                    } catch (const Error& e) {
+                        line += std::string(" | 0x6502 ERR{") + e.what() + "}";
+                    }
+                }
+                line += " badWKC=" + std::to_string(tel.bad_wkc.load(std::memory_order_relaxed));
+                std::cout << line << '\n';
             }
             const auto now = std::chrono::steady_clock::now();
             if (now - last_print >= std::chrono::milliseconds(200)) {  // ~5 Hz
