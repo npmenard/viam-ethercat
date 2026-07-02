@@ -236,6 +236,7 @@ void Master::configure() {
     bringup_settle_count_ = 0;
     bringup_await_count_ = 0;
     bringup_op_hold_streak_ = 0;
+    bringup_al_code_ = 0;
     fault_.store(false, std::memory_order_relaxed);
     consecutive_wkc_errors_ = 0;
     settle_remaining_ = 0;
@@ -244,7 +245,7 @@ void Master::configure() {
     operational_.store(false, std::memory_order_relaxed);
 }
 
-BringupStatus Master::bringup_step(bool drive_sync_faulted) noexcept {
+BringupStatus Master::bringup_step(bool drive_sync_faulted, bool drive_present) noexcept {
     // The caller owns the cadence (clock_nanosleep + dc_phase_correction on dc_time());
     // this does the one cyclic exchange + advances the FSM. SYNC0 was already armed in
     // configure() (PRE-OP, per ec_sample): SETTLE pumps phase-locked PD a bounded settle,
@@ -281,10 +282,23 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted) noexcept {
             // the generous wall-time give-up window (op_await_timeout_ms, converted to cycles in
             // the ctor) without the held-synced state do we give up. Bounds are MasterConfig (#42).
             ++bringup_await_count_;
+            // #71/#25: latch the last NON-ZERO AL status code across AWAIT so a give-up can name the
+            // cause. Read it BEFORE reack_op(0) below -- reack ACKs the SAFE_OP+ERROR, momentarily
+            // clearing the code, so the value read on the timeout cycle (post-reack) is often 0. This
+            // pre-reack read holds the real cause (e.g. 0x0027 "Freerun not supported").
+            if (const std::uint16_t al = backend_->al_status_code(1); al != 0) {
+                bringup_al_code_ = al;
+            }
             if (bringup_await_count_ % op_nudge_interval_cycles_ == 0) {
                 backend_->reack_op(0);
             }
-            if (wkc == expected_wkc_ && !drive_sync_faulted) {
+            // #71/#25: OP is confirmed by a HELD full WKC AND no sync fault AND plausible drive
+            // feedback (drive_present). The last gate is load-bearing: the A6 under free-run gives a
+            // FULL WKC while zombie-PDOing (dead statusword) -- without drive_present, WKC alone would
+            // declare OP on a dead drive and the enable ladder would spin forever. A dead drive keeps
+            // drive_present false through the whole window -> the streak never builds -> AWAIT times
+            // out -> Aborted (and the caller's AL-status diagnostic names AL 0x0027).
+            if (wkc == expected_wkc_ && !drive_sync_faulted && drive_present) {
                 ++bringup_op_hold_streak_;
             } else {
                 bringup_op_hold_streak_ = 0;

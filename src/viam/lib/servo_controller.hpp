@@ -224,6 +224,7 @@ class ServoController : public SlaveControl {
     // on_stop: map the Runner's StopReason to the two-tier fault (bring-up abort / bus / clean).
     void on_configured(ConfigContext& cfg) override;
     bool sync_faulted(const CycleContext& ctx) const noexcept override;
+    bool drive_present(const CycleContext& ctx) const noexcept override;  // #71/#25: statusword != 0 (live PDO)
     void on_operational(CycleContext& ctx) noexcept override;
     void step(CycleContext& ctx) noexcept override;
     void on_stop(StopReason reason) noexcept override;

@@ -196,6 +196,12 @@ class A6Control final : public SlaveControl {
         return ctx.load<cia402::FaultCode::type>(fc_loc_) == kErr741NoSync;
     }
 
+    // #71/#25: a live A6 always populates a non-zero statusword (bit10 held); a zombie-PDO drive
+    // (free-run OP refusal) leaves it 0x0. Gate OP-confirm on it so bring-up gives up on a dead drive.
+    bool drive_present(const CycleContext& ctx) const noexcept override {
+        return ctx.load<cia402::Statusword::type>(sw_loc_) != 0;
+    }
+
     void on_operational(CycleContext& ctx) noexcept override {
         std::cout << "[B] *** OPERATIONAL *** wkc=" << ctx.wkc().last << "/" << ctx.wkc().expected
                   << " -- DC bring-up complete (no Er74.1), entering CiA402 control\n";

@@ -311,6 +311,18 @@ class SlaveControl {
         (void)ctx;
         return false;
     }
+    // RT, every BRING-UP cycle: "does the drive's feedback look PLAUSIBLE / alive?" -- an ADDITIONAL
+    // OP-confirm gate for bringup_step, beyond the working counter. WIRE-PROVEN (#71/#25): a DC-only
+    // A6 requested into OP under free-run does NOT visibly refuse -- it sits at SAFE-OP (AL 0x0027)
+    // yet contributes a FULL working counter while ZOMBIE-PDOing (statusword stuck 0x0, dead inputs).
+    // WKC-alone then wrongly declares OP and the enable ladder spins forever on a dead drive. DEFAULT
+    // true (WKC-only, the old behavior); the device-aware control implements it (e.g. statusword != 0).
+    // A control that returns false through the whole OP-await window makes bring-up GIVE UP
+    // (BringupAborted -> the AL-status diagnostic names AL 0x0027) instead of enabling a dead drive.
+    virtual bool drive_present(const CycleContext& ctx) const noexcept {
+        (void)ctx;
+        return true;
+    }
     // RT, every STOPPING cycle (after step()): "is this control safely torn down -- de-energized
     // AT REST -- so the Runner may end the teardown window EARLY?" The window (teardown_cycles) is
     // the CAP; this is the event-driven early-out. DEFAULT false -> run the full window (unchanged

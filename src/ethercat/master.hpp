@@ -137,7 +137,14 @@ class Master {
     // ServoController and the thin #21 program reuse this. Never throws. On Operational
     // the caller switches to its steady loop; on Aborted it must surface the fault and
     // NOT immediately re-enter bring-up (bounded -- repeated Er74 OP-entry wedges the A6).
-    BringupStatus bringup_step(bool drive_sync_faulted) noexcept;
+    //
+    // `drive_present` (#71/#25): a caller read of whether the drive's feedback looks PLAUSIBLE/alive
+    // (e.g. statusword != 0). It is an ADDITIONAL OP-confirm gate beyond the working counter -- a
+    // DC-only A6 under free-run passes the WKC gate (full WKC) while ZOMBIE-PDOing (dead statusword),
+    // so WKC alone wrongly declares OP; requiring drive_present makes bring-up give up (BringupAborted)
+    // on a dead drive instead. Defaults true (WKC-only, the old behavior) so single-signal callers and
+    // tests are unaffected; the Runner passes the controls' drive_present() AND.
+    BringupStatus bringup_step(bool drive_sync_faulted, bool drive_present = true) noexcept;
 
     void close() noexcept;
 
@@ -177,6 +184,20 @@ class Master {
     }
     std::string al_status_message(std::uint16_t slave) const {
         return backend_->al_status_message(slave);
+    }
+    // #71/#25: the last NON-ZERO ESC AL status code observed during AWAIT_OP, latched across the
+    // whole bring-up. At a give-up the LIVE al_status_code(slave) can read 0 (reack_op ACKs the
+    // SAFE_OP+ERROR on the very cycle we time out), so a consumer surfacing "why bring-up failed"
+    // must read THIS to reliably name the cause (e.g. 0x0027 on a DC-only drive under free-run).
+    // 0 = no AL error was seen the whole bring-up. RT-written, plain read after the RT thread joins.
+    std::uint16_t bringup_al_code() const noexcept {
+        return bringup_al_code_;
+    }
+    // Human-readable text for an arbitrary AL status code (delegates to the backend / SOEM's
+    // ec_ALstatuscode2string) -- lets a consumer describe the LATCHED bringup_al_code(), not just
+    // the live per-slave one. Non-RT (allocates); call it at the give-up, off the RT path.
+    std::string describe_al_code(std::uint16_t code) const {
+        return backend_->describe_al_code(code);
     }
     bool all_operational() const noexcept {
         return operational_.load(std::memory_order_relaxed);
@@ -403,6 +424,7 @@ class Master {
     std::uint32_t bringup_settle_count_ = 0;             // RT-only: SETTLE cycles elapsed before requesting OP
     std::uint32_t bringup_await_count_ = 0;              // RT-only: AWAIT_OP cycles since requesting OP
     std::uint32_t bringup_op_hold_streak_ = 0;           // RT-only: consecutive (full-WKC && !Er74.1) cycles at OP
+    std::uint16_t bringup_al_code_ = 0;                  // RT-written: last non-zero AL status code seen during AWAIT_OP (#71/#25)
     // AWAIT_OP bounds derived ONCE from MasterConfig in the ctor (#42): pre-clamped cycle
     // counts the bring-up FSM compares against (the counts clamp 0->1; the give-up bound
     // is op_await_timeout_ms converted at target_loop_rate_hz -- rate-independent patience).

@@ -420,8 +420,14 @@ int main(int argc, char** argv) {
         // #71: on a bring-up give-up, capture the ESC AL status code BEFORE ~Runner's close()
         // (INIT teardown) can clear it -- the standard "why the drive refused OP" (free-run -> 0x0027).
         if (reason == StopReason::BringupAborted) {
-            al_code = master.al_status_code(slave);
-            al_msg = master.al_status_message(slave);
+            // Prefer the LATCHED last-non-zero AL code from AWAIT (#71/#25): the live al_status_code()
+            // can read 0 at the give-up (reack_op ACKs the SAFE_OP+ERROR on the timeout cycle), which
+            // is exactly what defeated the first cut of this diagnostic (printed "0x0 No error").
+            al_code = master.bringup_al_code();
+            if (al_code == 0) {  // no non-zero code was seen the whole bring-up -- fall back to the live read
+                al_code = master.al_status_code(slave);
+            }
+            al_msg = master.describe_al_code(al_code);
         }
     }  // <-- ~Runner: bounded stop -> join -> rt_active(false) -> master.close()
 

@@ -778,6 +778,14 @@ void ServoController::on_operational(CycleContext& ctx) noexcept {
     (void)ctx;
 }
 
+bool ServoController::drive_present(const CycleContext& ctx) const noexcept {
+    // #71/#25 OP-confirm gate: a live drive populates a non-zero statusword; a drive that zombie-PDOs
+    // (a DC-only A6 requested into OP under free-run -- AL 0x0027, dead TxPDO) leaves it 0x0. Gating
+    // OP-confirm on this makes bring-up GIVE UP (BringupAborted -> the AL-status diagnostic) instead
+    // of "reaching OP" on the full-WKC-but-dead drive and spinning the enable ladder forever.
+    return ctx.load<cia402::Statusword::type>(f_statusword_) != 0;
+}
+
 bool ServoController::sync_faulted(const CycleContext& ctx) const noexcept {
     // The old bring-up gate (#TODO-4): drive-sync-faulted = mapped 0x603F == the configured
     // no-sync code; nullopt (none declared) => always false. Stash the read code for on_stop's
@@ -867,8 +875,15 @@ void ServoController::on_stop(StopReason reason) noexcept {
         // #71: read the AL status code (cached, no port I/O -- this runs on the Runner's RT thread,
         // the sole master toucher) and publish it; only attribute the DRIVE (0x603F) tier when the
         // sync code was actually the configured no-sync fault.
-        const std::uint16_t al = master_ != nullptr ? master_->al_status_code(config_.slave_id) : 0;
-        const std::string al_msg = master_ != nullptr ? master_->al_status_message(config_.slave_id) : std::string{};
+        // #71/#25: prefer the LATCHED last-non-zero AL code from AWAIT. The zombie-PDO free-run drive
+        // sits at SAFE-OP+AL-0x0027 but the LIVE code reads 0 at the give-up (reack_op ACKs the error
+        // on the timeout cycle), so the live read alone would surface "drive not operational" with no
+        // cause. bringup_al_code() holds the real 0x0027 seen mid-AWAIT; fall back to the live read.
+        std::uint16_t al = master_ != nullptr ? master_->bringup_al_code() : 0;
+        if (al == 0 && master_ != nullptr) {
+            al = master_->al_status_code(config_.slave_id);
+        }
+        const std::string al_msg = master_ != nullptr ? master_->describe_al_code(al) : std::string{};
         state_.bringup_al_code.store(al, std::memory_order_relaxed);
         const bool sync_fault = config_.sync_fault_code.has_value() && last_sync_code_ != 0 && last_sync_code_ == *config_.sync_fault_code;
         if (sync_fault) {

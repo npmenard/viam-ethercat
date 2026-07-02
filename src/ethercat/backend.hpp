@@ -27,6 +27,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <span>
 #include <string>
 #include <string_view>
@@ -118,6 +119,14 @@ class EcatBackend {
     virtual std::string al_status_message(std::uint16_t slave) const {
         (void)slave;
         return {};
+    }
+    // #71/#25: human string for an ARBITRARY AL code (not a per-slave live read) -- lets a consumer
+    // describe a latched code (Master::bringup_al_code()). Default: a bare hex rendering; SoemBackend
+    // overrides with SOEM's ec_ALstatuscode2string. Non-RT.
+    virtual std::string describe_al_code(std::uint16_t code) const {
+        char b[16];
+        std::snprintf(b, sizeof b, "0x%04X", code);
+        return b;
     }
     // REQUEST `slave` (0 = all) to `target` -- writes the state request only; does
     // NOT pump process data, wait, or throw. The caller's cyclic loop drives the

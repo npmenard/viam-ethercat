@@ -276,13 +276,16 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
     bool operational = false;
     while (!stop_flag_.load(std::memory_order_acquire)) {
         bool any_sync_fault = false;
+        bool all_present = true;  // #71/#25: every control's drive feedback must look alive to confirm OP
         const std::int64_t bring_dct = dc ? master_.dc_time() : 0;  // ctx contract: 0 when DC off
         for (Attached& a : controls_) {
             dispatch(a, 0, bring_dct, false, [&](CycleContext& ctx) {
-                any_sync_fault = any_sync_fault || a.control->sync_faulted(static_cast<const CycleContext&>(ctx));
+                const CycleContext& cctx = static_cast<const CycleContext&>(ctx);
+                any_sync_fault = any_sync_fault || a.control->sync_faulted(cctx);
+                all_present = all_present && a.control->drive_present(cctx);
             });
         }
-        const BringupStatus bs = master_.bringup_step(any_sync_fault);
+        const BringupStatus bs = master_.bringup_step(any_sync_fault, all_present);
         pacer.pace(dc ? master_.dc_time() : 0);
         if (bs == BringupStatus::Operational) {
             operational = true;
