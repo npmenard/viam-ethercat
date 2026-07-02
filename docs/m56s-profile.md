@@ -70,6 +70,21 @@ plain CiA402 — no per-field handling needed.
 ### modes + enable — fully standard
 - 0x6060/0x6061 standard; supported: **PP(1), PV(3), Torque(4), Homing(6), CSP(8), CSV(9), CST(10)** (m56s.txt §4.3+). Enable = standard **0x06 → 0x07 → 0x0F** ladder (controlword tables m56s.txt:1288-1312). No A6-style sequencing quirks.
 
+### `control_mode: switchable` (#61) — supported, but note the re-mode latency
+- The driver's `switchable` mode (derived superset RxPDO with 0x6060 + both
+  targets; `go_to`→PP / `set_rpm`→PV auto-switch) **works on the M56S** — it
+  supports runtime 0x6060 re-selection. BUT §4.2.3 (the mode-switch flag above)
+  is explicit that **switching takes time**: 0x6061 and the mode-related TxPDO are
+  **undefined during the transition** (§4.2.3.3), so a PP↔PV auto-switch has a
+  non-zero **T_switch** where feedback is untrustworthy — the driver must wait for
+  0x6061 to settle to the commanded mode before acting on feedback (and must
+  seed the new mode's RxPDO command objects first, §4.2.3.2 / a6-quirks Q14).
+  ⇒ switchable is functional on the M56S but each auto-switch costs a settle
+  window; for latency-sensitive PP↔PV alternation, prefer a fixed PP or PV config.
+  (Same discipline as the A6; the M56S just states the transition-undefined window
+  explicitly.) ⚠ Needs **energized HW validation** of T_switch before production,
+  as with any switchable-mode deployment.
+
 ---
 
 ## THE ONE BEHAVIORAL FLAG — §4.2.3 Control Mode Switching Precautions

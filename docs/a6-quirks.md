@@ -105,13 +105,29 @@ for which of the behaviors below are A6-specific vs generic CiA402).
   CiA402 consumer that polls bit 10 for move-complete will think every move is
   instantly done.
 - **Manual:** PP statusword table (a6.txt:3194, 3208).
-- **Handled:** the controller's move-complete predicate ignores bit 10 and uses
-  `|target − actual| ≤ tol && |vel| ≤ vthresh` (plus statusword bit 13 as the
-  drive-side cross-check). The sim slave reproduces the bit10-always-1
-  behavior behind a model flag.
-- **Guidance:** never use `target_reached()`/bit 10 on this drive. Use the
-  module's `is_moving`/position readback, or bit 12 (setpoint-acknowledge) for
+- **Handled:** the controller's move-complete / `is_moving` predicate ignores
+  bit 10 and is **position-stability based** (#59): "stopped/reached" = the
+  actual position (0x6064) has not changed by more than `position_tolerance_counts`
+  over a short stability window (N cycles) — **not** a velocity threshold.
+  `position_tolerance_counts` is optional, default `counts_per_rev / 720` (≈0.5°).
+  Statusword bit 13 (deviation) remains the drive-side cross-check. The sim slave
+  reproduces the bit10-always-1 behavior behind a model flag.
+- **Guidance:** never use `target_reached()`/bit 10 on this drive. Reach/stopped
+  is **position-stability based — you do not need to tune a velocity threshold to
+  the drive's velocity-noise floor** (Q13); that was the old predicate. Use the
+  module's `is_moving`/`Position()` readback, or bit 12 (setpoint-acknowledge) for
   the PP handshake and bit 13 (deviation) for runaway detection.
+- **✅ Why this is a SAFETY improvement, not just ergonomics (#59):** position-
+  stability `is_moving` is **safer on a loaded / vertical axis** than the old
+  velocity-threshold predicate. On such an axis a de-energized or under-torqued
+  shaft can **back-drive under gravity** — real motion. The velocity reading is a
+  noisy/meaningless estimate there (Q13), so a `|vel| ≤ threshold` predicate can
+  read "stopped" while the load is actually creeping. Position-stability watches
+  the *encoder position itself*, which moves for real when the load moves — so it
+  correctly reports `is_moving` during gravity back-drive that a velocity threshold
+  would mask. #59 is thus a correctness/safety fix (it converges with Q13's
+  loaded-axis guidance: gate on position, not velocity), not only a config-tuning
+  convenience.
 
 ### Q6. Fault-reset bit 7 masks ALL other control references — pulse it, never hold it
 - **Quirk:** while controlword bit 7 = 1, "**other control references are
@@ -235,8 +251,12 @@ for which of the behaviors below are A6-specific vs generic CiA402).
   simply produces garbage once the drive stops controlling current.
 - **Standstill noise floor:** even **energized and holding position**, 0x606C
   carries a **±~2000–4000 c/s** noise floor (≈ ±0.9–1.8 rpm at 131072 c/rev,
-  Q10). Any "velocity ≈ 0" threshold must sit **above** this band or it will
-  never read stopped.
+  Q10). This noise floor is **why the reach/`is_moving` predicate is
+  position-stability based, not velocity-threshold based** (#59, Q5): a
+  velocity-zero threshold would have to sit above this band (and be tuned per
+  drive), whereas position-stability (Δposition over N cycles) sidesteps the
+  velocity noise entirely. The noise floor still matters for any **raw velocity
+  reporting** (e.g. a `SetRPM` readback), just not for stopped-detection.
 - **⚠ SAFETY COROLLARY (matters for #37 on a real/loaded axis):** on a **loaded
   or vertical axis**, motion *after* de-energize **can be REAL** — gravity or a
   load back-drives the shaft once torque is removed. So 0x606C-after-
@@ -249,11 +269,13 @@ for which of the behaviors below are A6-specific vs generic CiA402).
 - **Manual / source:** velocity-unit basis Q10 (a6.txt:3529-3531); SwitchOnDisabled
   reached per Q4 / 0x605A=2 (a6.txt:13499); the excursion + noise-floor numbers
   are bench-measured (#53), not in the manual.
-- **Handled:** the controller's move-complete predicate already cross-checks
-  position + a velocity *threshold* (Q5), so it tolerates the noise floor; but no
-  code today treats post-SOD velocity as a safety signal — and per the corollary
-  it must not. Cross-refs: **Q4** (quick-stop → SwitchOnDisabled, the state this
-  occurs in), **Q10** (the counts/s unit + noise magnitude), **Q12** (fault-class
+- **Handled:** the controller's reach/`is_moving` predicate is **position-stability
+  based** (#59, Q5) — it never consults post-SOD velocity, so it's inherently
+  robust to this artifact AND aligns with the safety corollary above (position
+  deviation is exactly the right signal). No code treats post-SOD velocity as a
+  safety signal — and per the corollary it must not. Cross-refs: **Q4** (quick-stop
+  → SwitchOnDisabled, the state this occurs in), **Q10** (the counts/s unit +
+  noise magnitude), **Q12** (fault-class
   stop behavior — a related "what the shaft physically does" safety concern).
 
 ### Q14. If 0x6060 is RxPDO-mapped, the *PDO* mode byte wins — the SDO-set default is IGNORED once cycling

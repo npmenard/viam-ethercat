@@ -7,7 +7,13 @@
     "(target position), 0x60FF=24831 (target velocity), 0x6041=24641 (statusword),",
     "0x6064=24676 (actual position); RxPDO 0x1600=5632 on SM 0x1C12=7186, TxPDO",
     "0x1A00=6656 on SM 0x1C13=7187. Set \"simulate\": true (or interface \"sim\") to",
-    "run against the in-memory SimBackend with no NIC/hardware."
+    "run against the in-memory SimBackend with no NIC/hardware.",
+    "#61: control_mode (PP|PV|switchable) is an intent -- the driver DERIVES the",
+    "standard CiA402 map, so rxpdo/txpdo below are an OPTIONAL advanced override",
+    "(shown here as a worked example), not required. #59: reached/is_moving is",
+    "position-stability based (Delta-position over N cycles); position_tolerance_counts",
+    "is optional (default counts_per_rev/720 ~= 0.5deg) and velocity_threshold is an",
+    "optional override -- no velocity-noise-floor tuning needed."
   ],
   "name": "servo",
   "api": "rdk:component:motor",

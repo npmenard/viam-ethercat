@@ -44,7 +44,7 @@
     "interface": "REPLACE_WITH_NIC",
     "slave": 1,
 
-    "_comment_mode": "control_mode PP -> modes-of-operation 0x6060 = 1 (set via SDO from this field).",
+    "_comment_mode": "control_mode is an INTENT: PP | PV | switchable (#61). The driver DERIVES the standard CiA402 PDO map from it -- PP -> 0x6060=1 map {controlword,target-pos,profile-vel}; PV -> 0x6060=3 map {controlword,target-vel}; switchable -> the SUPERSET map {controlword,0x6060,target-pos,target-vel,profile-vel} so GoTo auto-selects PP and SetRPM auto-selects PV at runtime. You normally do NOT specify rxpdo/txpdo (see _comment_pdo). switchable REQUIRES a drive that supports runtime mode re-selection + energized HW validation before production.",
     "control_mode": "PP",
 
     "_comment_motor": "CONFIRM against the MOTOR nameplate (these are motor-, not drive-, specific): rated speed, rated current, peak current.",
@@ -67,7 +67,7 @@
     "_comment_vendor_reset": "#39 CONSUMER-side vendor fault-reset, run once pre-RT-spawn: the A6 clears a latent fault via vendor object 0x2031:01 = 1 (a U16; NOT CiA402 controlword bit7). index 8241 = 0x2031 in decimal. Remove this block for a drive with no vendor reset (the generic bit7 path still runs). NOTE: the old per-slave 'fault_reset' attribute is OBSOLETE and rejected.",
     "vendor_fault_reset": { "index": 8241, "subindex": 1, "value": 1, "value_bytes": 2 },
 
-    "_comment_tuning": "Move-complete + watchdog tuning -- CONFIRM/tune on the bench. velocity_threshold is in device velocity units (counts/s).",
+    "_comment_tuning": "reached/is_moving is POSITION-STABILITY based (#59): stopped/reached = actual position (0x6064) not changing beyond position_tolerance_counts over N cycles -- NOT a velocity threshold, so there is NO velocity-noise-floor tuning to do (the A6's 0x606C carries a +/-2000-4000 c/s noise floor; see a6-quirks Q13). position_tolerance_counts is OPTIONAL, default = counts_per_rev/720 (~0.5 deg); the 200 below is an explicit example (~0.55 deg at 131072 c/rev). velocity_threshold is now an OPTIONAL OVERRIDE (most configs omit it); shown here for illustration only.",
     "position_tolerance_counts": 200,
     "velocity_threshold": 50000,
     "move_timeout_ms": 10000,
@@ -76,7 +76,7 @@
     "command_queue_capacity": 64,
     "max_consecutive_wkc_errors": 5,
 
-    "_comment_pdo": "CONFIRM the entry maps + that the A6 permits CoE PDO remap on these indices (per its ESI). PP RxPDO (command): controlword + target position + profile velocity (the RT loop writes the rpm into 0x6081 each cycle). TxPDO (feedback): fault code + statusword + mode display + position actual + velocity actual + torque actual.",
+    "_comment_pdo": "OPTIONAL ADVANCED OVERRIDE (#61). You normally OMIT rxpdo/txpdo entirely -- the driver derives the standard CiA402 map from control_mode (see _comment_mode). Specify these blocks ONLY for a non-standard drive whose mappable objects/indices differ from the CiA402 defaults. The blocks below are exactly the map the driver would derive for PP, kept as a worked example + to CONFIRM the A6 permits CoE PDO remap on these indices (per its ESI). PP RxPDO (command): controlword + target position + profile velocity (RT loop writes the rpm into 0x6081 each cycle). TxPDO (feedback): fault code + statusword + mode display + position actual + velocity actual + torque actual. NOTE (Q14/#56): if 0x6060 is in the RxPDO (switchable), it MUST be seeded from cycle 0 -- the per-cycle PDO value overrides the SDO-set mode.",
     "rxpdo": {
       "pdos": [
         {
