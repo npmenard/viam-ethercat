@@ -15,3 +15,4 @@ logs
 # tracked in this repo.
 reference-src/
 build-hw/
+.venv*/
