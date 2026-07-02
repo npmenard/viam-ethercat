@@ -76,12 +76,14 @@ extern "C" void on_sigint(int) {
 // bit4-handshake --move-pp) or CyclicSyncPosition (the streamed --move-sine). Both
 // reuse the SAME PDO map -- 0x607A serves the PP target AND the CSP streamed target --
 // so one builder covers both; only the post-enable control semantics differ.
-MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
+MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode, bool use_dc = true) {
     MasterConfig cfg;
     cfg.ifname = ifname;
     cfg.target_loop_rate_hz = kLoopHz;  // 1 ms SYNC0 = 4 x 250 us (A6-legal)
-    cfg.use_distributed_clocks = true;  // A6 supports ONLY DC sync
-    cfg.dc_settle_cycles = 1000;        // ~1 s post-OP grace while the phase finishes locking
+    // #71 bench check: --no-dc requests OP under FREE-RUN. The A6 supports ONLY DC sync, so it
+    // refuses with AL 0x0027 "Freerun not supported" -- exercises the AL-status give-up diagnostic.
+    cfg.use_distributed_clocks = use_dc;  // A6 supports ONLY DC sync (true); --no-dc forces the free-run refusal
+    cfg.dc_settle_cycles = 1000;          // ~1 s post-OP grace while the phase finishes locking
     cfg.max_consecutive_wkc_errors = 5;
     // The bring-up SETTLE bound uses MasterConfig's default (dc_op_gate_cycles). SYNC0 is
     // armed in PRE-OP inside configure() (before config_map_group); the Runner's bring-up
@@ -126,11 +128,14 @@ MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
 
 int main(int argc, char** argv) {
     Options opt;
+    bool no_dc = false;  // #71: --no-dc -> free-run bring-up (the A6 refuses OP; AL-status give-up check)
     std::vector<std::string> args(argv + 1, argv + argc);
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         if (a == "--enable") {
             opt.enable = true;
+        } else if (a == "--no-dc") {
+            no_dc = true;  // #71: bring up under free-run (no SYNC0) -> the A6 refuses OP (AL 0x0027)
         } else if (a == "--reset-fault") {
             opt.reset_fault = true;
         } else if (a == "--move-pp" && i + 1 < args.size()) {
@@ -241,7 +246,7 @@ int main(int argc, char** argv) {
               << "[dc] phase-lock target = auto(mid-cycle) | SYNC0 CyclShift = 0ns (config knob)"
               << " | fault-reset at bring-up = " << (opt.reset_fault ? "ON (vendor 0x2031:01=1)" : "off") << "\n\n";
 
-    Master master(build_a6_config(opt.ifname, mode), std::make_unique<SoemBackend>());
+    Master master(build_a6_config(opt.ifname, mode, /*use_dc=*/!no_dc), std::make_unique<SoemBackend>());
 
     // --- Stage A: open + enumerate + read-only SDO identity (PRE-OP) ---
     try {
@@ -314,6 +319,8 @@ int main(int argc, char** argv) {
     // Runner so its destructor fires before we read the final WkcStats off the (still-alive)
     // master. `reason` is read inside the scope, before the dtor.
     StopReason reason = StopReason::None;
+    std::uint16_t al_code = 0;  // #71: ESC AL status at a bring-up give-up (captured before ~Runner close())
+    std::string al_msg;
     {
         Runner runner(master, rc);
         try {
@@ -410,11 +417,21 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         reason = runner.status().reason;  // read before the dtor teardown
+        // #71: on a bring-up give-up, capture the ESC AL status code BEFORE ~Runner's close()
+        // (INIT teardown) can clear it -- the standard "why the drive refused OP" (free-run -> 0x0027).
+        if (reason == StopReason::BringupAborted) {
+            al_code = master.al_status_code(slave);
+            al_msg = master.al_status_message(slave);
+        }
     }  // <-- ~Runner: bounded stop -> join -> rt_active(false) -> master.close()
 
     const WkcStats stats = master.wkc_stats();  // library-side tally (incl. window cycles)
     std::cout << "\n=== done. stop=" << to_string(reason) << (control.safety_abort() ? " (CSP SAFETY ABORT)" : "")
               << " | bad-WKC cycles: " << stats.bad_cycles << " / " << stats.total_cycles << " ===\n";
+    if (reason == StopReason::BringupAborted) {
+        std::cout << "[#71] bring-up gave up. AL status = 0x" << std::hex << al_code << std::dec << " (" << al_msg << ")"
+                  << (al_code == 0x0027 ? " -- FREERUN NOT SUPPORTED: this drive requires DC (drop --no-dc)" : "") << '\n';
+    }
     // Exit code: bring-up/rt-setup failures are hard errors (the old return 1 paths);
     // a completed run -- including a safety abort that cleanly disabled -- reports 0
     // with the cause printed (matches the old tool's behavior).
