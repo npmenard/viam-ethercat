@@ -370,6 +370,7 @@ if (ETHERCAT_BUILD_MODULE)
     BOOST_DLL_USE_STD_FS
     "A6_HW_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-hardware.example.json\""
     "A6_SIM_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-servo.example.json\""
+    "A6_MINIMAL_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-minimal.example.json\""
   )
   target_include_directories(a6_config_parse_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   viam_apply_wall_werror(a6_config_parse_test)

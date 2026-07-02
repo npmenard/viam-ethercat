@@ -1138,6 +1138,23 @@ bool rx_has(const std::vector<PdoEntry>& v, std::uint16_t index) {
     }
     return false;
 }
+// #64: sim model matching the DERIVED PP map (no user rxpdo/txpdo) -- RxPDO {6040@0,607A@2,6081@6}=10B
+// (PP is SDO-set mode, NO 0x6060), TxPDO {603F@0,6041@2,6061@4,6064@5,606C@9,6077@13}=15B.
+SimSlaveModel make_model_derived_pp() {
+    SimSlaveModel m;
+    m.output_bytes = 10;
+    m.ctrlword_off = 0;
+    m.target_off = 2;
+    m.profile_velocity_off = 6;
+    m.input_bytes = 15;
+    m.fault_code_off = 0;
+    m.statusword_off = 2;
+    m.mode_display_off = 4;
+    m.actual_off = 5;
+    m.velocity_actual_off = 9;
+    m.target_reached_always_set = true;  // A6 bit10 quirk (module never reads bit10)
+    return m;
+}
 }  // namespace
 
 TEST("#61: control_mode=switchable with NO explicit map derives the 0x6060 superset RxPDO + full TxPDO") {
@@ -1201,6 +1218,41 @@ TEST("#61: a fixed PP config still REJECTS set_rpm (switchable is opt-in)") {
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
     CHECK_THROWS_MSG(ctrl.set_rpm(60.0), ConfigError, "PP");  // cross-mode call rejected on a fixed PP config
+}
+
+TEST("#64: a MINIMAL config (no rxpdo/txpdo, no tolerances) derives the PP map + drives end-to-end") {
+    // Mirrors etc/a6-minimal.example.json: only the required fields + empty maps. Proves the #61
+    // default-driven path end-to-end -- derive -> validate -> field-resolve -> move -- with NO explicit
+    // PDO map and NO tolerance knobs (the two things the minimal config omits).
+    ServoConfig c;
+    c.ifname = "sim";
+    c.mode = ControlMode::ProfilePosition;
+    c.max_motor_speed_rpm = 3000.0;
+    c.counts_per_rev = kCountsPerRev;  // 131072
+    c.motor_rated_current_amps = 2.5;
+    c.require_realtime = false;  // offline/CI has no RT sched; the real minimal EXAMPLE keeps the true default
+    // rxpdo/txpdo EMPTY; position_tolerance_counts/velocity_threshold 0 -> validated() defaults them.
+
+    // (1) derivation materializes the standard PP map -- SDO-set mode, so NO 0x6060:
+    ServoConfig d = c;
+    d.apply_derived_pdo_maps();
+    CHECK(d.rxpdo.entries.count(0x1600) == 1);
+    const auto& rx = d.rxpdo.entries.at(0x1600);
+    CHECK_EQ(rx.size(), std::size_t{3});
+    CHECK(rx_has(rx, 0x6040) && rx_has(rx, 0x607A) && rx_has(rx, 0x6081) && !rx_has(rx, 0x6060));
+    CHECK(d.txpdo.entries.count(0x1A00) == 1);
+
+    // (2) end-to-end: the ctor's validated() derives the map + defaults the 0.5deg tolerance; the
+    // controller brings a sim matching the DERIVED layout to OE (via the #45 0x6061 gate) and moves.
+    ServoController::BackendFactory factory = [] {
+        return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_derived_pp()}));
+    };
+    ServoController ctrl{c, factory};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));  // derived map + gate -> OE
+    ctrl.go_to(1000.0, 1.0);  // field resolution + move on the DERIVED map
+    CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.02);
+    CHECK(!ctrl.is_moving());
 }
 
 TEST_MAIN()

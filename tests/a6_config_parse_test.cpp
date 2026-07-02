@@ -104,4 +104,46 @@ TEST("a6-servo.example.json: sim config parses + validates") {
     CHECK(!c.sync_fault_code.has_value());
 }
 
+TEST("a6-minimal.example.json: no rxpdo/txpdo -> parses, derives the PP map (#61/#64), validates") {
+    // The #64 minimal-path proof: the shipped minimal config carries NO rxpdo/txpdo and NO
+    // move-complete tolerances -- it parses, and apply_derived_pdo_maps() materializes the
+    // standard CiA402 PP map (#61) from control_mode alone, then validate() passes.
+    ProtoStruct attrs = load_attributes(A6_MINIMAL_CONFIG_PATH);
+    ServoConfig c = parse_servo_config(attrs);
+    CHECK(c.mode == ControlMode::ProfilePosition);
+    CHECK(c.counts_per_rev == 131072.0);
+    CHECK(c.motor_rated_current_amps == 2.5);
+    // The A6 hardware bits ride in the minimal config (never library constants).
+    CHECK(c.use_distributed_clocks);
+    CHECK(c.sync_cycle_granularity_ns == 250000);
+    CHECK(c.vendor_fault_reset.has_value());
+    CHECK(c.vendor_fault_reset->index == 0x2031);  // 8241
+    // As shipped: the maps are EMPTY (derived, not spelled out).
+    CHECK(c.rxpdo.entries.empty());
+    CHECK(c.txpdo.entries.empty());
+
+    c.apply_derived_pdo_maps();
+
+    // Derived PP RxPDO 0x1600: controlword + target-pos + profile-vel (NO 0x6060 -- PP is fixed).
+    const auto& rx = c.rxpdo.entries.at(0x1600);
+    CHECK(rx.size() == 3);
+    CHECK(rx.at(0).index == 0x6040);  // controlword
+    CHECK(rx.at(1).index == 0x607A);  // target position
+    CHECK(rx.at(2).index == 0x6081);  // profile velocity
+    for (const auto& e : rx) {
+        CHECK(e.index != 0x6060);  // mode-of-operation is NOT mapped for fixed PP
+    }
+    // Derived TxPDO 0x1A00: fault + status + mode-display + pos + vel + torque.
+    const auto& tx = c.txpdo.entries.at(0x1A00);
+    CHECK(tx.size() == 6);
+    CHECK(tx.at(0).index == 0x603F);
+    CHECK(tx.at(2).index == 0x6061);  // mode-display -- the #45/#57 mode-echo source
+    // SM assign-index derived from direction (0x1600->0x1C12, 0x1A00->0x1C13).
+    CHECK(c.rxpdo.assign_index(ethercat::PdoDirection::Rx) == 0x1C12);
+    CHECK(c.txpdo.assign_index(ethercat::PdoDirection::Tx) == 0x1C13);
+
+    c.require_realtime = false;  // CI has no RT scheduling; the shipped config keeps true.
+    c.validate();                // throws ConfigError on any invalid field
+}
+
 TEST_MAIN()

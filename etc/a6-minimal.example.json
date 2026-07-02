@@ -1,0 +1,45 @@
+{
+  "_README": [
+    "MINIMAL real-A6 config for the viam:ethercat:servo motor model (#64). The",
+    "companion to a6-hardware.example.json -- that one spells out the full PDO map",
+    "as an ADVANCED override; THIS one omits it and lets the driver DERIVE the",
+    "standard CiA402 map from control_mode (#61). This is all a conformant CiA402",
+    "drive needs: the required identity/motor facts + the A6's non-default hardware",
+    "bits. NO rxpdo/txpdo (derived) and NO move-complete tolerances (defaulted).",
+    "",
+    "DERIVED per control_mode (standard CiA402 objects, index:subindex decimal):",
+    "  PP  RxPDO 0x1600: 0x6040 controlword + 0x607A target-pos + 0x6081 profile-vel",
+    "  PV  RxPDO 0x1600: 0x6040 controlword + 0x60FF target-vel",
+    "  switchable       : the superset {0x6040,0x6060,0x607A,0x6081,0x60FF} -> runtime",
+    "                     GoTo->PP / SetRPM->PV mode-switch (0x6060 mapped).",
+    "  TxPDO 0x1A00 (all modes): 0x603F fault + 0x6041 status + 0x6061 mode-display +",
+    "                     0x6064 actual-pos + 0x606C vel-actual + 0x6077 torque.",
+    "  SM assign 0x1600->0x1C12, 0x1A00->0x1C13 (derived from direction).",
+    "Move-complete defaults: position_tolerance_counts = counts_per_rev/720 (0.5 deg),",
+    "  velocity gate off (noise-robust position-delta). Override either only if needed.",
+    "",
+    "!!! CONFIRM counts_per_rev + the DC/sync bits against THIS drive's ESI + the",
+    "motor nameplate before ENERGIZING. require_realtime defaults true (needs",
+    "CAP_SYS_NICE/RLIMIT_RTPRIO -- see docs/deployment-capabilities.md)."
+  ],
+  "name": "servo",
+  "api": "rdk:component:motor",
+  "model": "viam:ethercat:servo",
+  "attributes": {
+    "_comment_mode": "control_mode PP (GoTo/GoFor) | PV (SetRPM) | switchable (both, runtime PP<->PV). For \"switchable\" the derived map adds 0x6060 so the driver auto-selects PP for GoTo and PV for SetRPM.",
+    "interface": "enp86s0",
+    "control_mode": "PP",
+
+    "_comment_motor": "Required motor facts. counts_per_rev = encoder counts per MOTOR rev at the drive's 1:1 electronic gear (A6 = 131072 = 2^17). motor_rated_current_amps = nameplate rated current (amps -> torque per-mille).",
+    "max_rpm": 3000.0,
+    "counts_per_rev": 131072.0,
+    "motor_rated_current_amps": 2.5,
+
+    "_comment_a6_hw": "A6-EC non-default hardware bits (CONFIG DATA, never library constants). The A6 supports ONLY DC sync (free-run -> AL 0x0027), on a 250 us SYNC0 granularity; its fault-reset is a vendor SDO write 1 to 0x2031:01 (24625:1), NOT controlword bit7.",
+    "use_distributed_clocks": true,
+    "sync_cycle_granularity_ns": 250000,
+    "vendor_fault_reset": { "index": 8241, "subindex": 1, "value": 1, "value_bytes": 2 },
+
+    "_comment_optional": "Everything else is OPTIONAL: rxpdo/txpdo (derived above), position_tolerance_counts (default counts_per_rev/720), velocity_threshold (default: position-delta), gear_ratio (1.0), peak_current_amps, loop_rate_hz (1000), quick_stop_decel (0x6085) for a controlled ramp-stop, fault_code_labels gloss. Add only what a bench measurement or the app requires."
+  }
+}
