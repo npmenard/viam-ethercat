@@ -47,6 +47,9 @@ Cia402Mode to_cia402_mode(ControlMode mode) noexcept {
 
 ServoConfig validated(ServoConfig config) {
     config.validate();
+    // #61: control_mode INTENT -> derive the standard CiA402 PDO map when the user didn't supply one
+    // (an explicit rxpdo/txpdo is an advanced override, left verbatim). Idempotent.
+    config.apply_derived_pdo_maps();
     // #59: reached/is_moving is noise-robust position-delta (see publish_state); position_tolerance_counts
     // is the "close enough + stable" band. DEFAULT it to counts_per_rev/720 (0.5 deg) when unset (<=0) --
     // self-documenting + scales with encoder resolution. (Was 0, which forced an EXACT-match reached
@@ -288,21 +291,17 @@ void ServoController::resolve_fields() {
     f_ctrlword_ = master_->rx_field(s, kCtrlword, 0);
     f_statusword_ = master_->tx_field(s, kStatusword, 0);
     f_actual_ = master_->tx_field(s, kActualPos, 0);
-    if (config_.mode == ControlMode::ProfilePosition) {
-        f_target_ = master_->rx_field(s, kTargetPos, 0);
-        // Profile velocity (0x6081) is OPTIONAL in the map. If the drive maps it
-        // (the A6 does), the RT loop must write the commanded speed there every
-        // cycle -- else the move runs at the drive's default speed (rpm ignored).
-        f_profile_velocity_ = rxpdo_has(kProfileVel) ? master_->rx_field(s, kProfileVel, 0) : FieldLocation{};
-    } else {
-        f_velocity_ = master_->rx_field(s, kTargetVel, 0);
-        // #47-P3b M6: a PV motion-hold can lock POSITION (not just zero velocity) ONLY if the map is
-        // switch-capable -- 0x6060 (runtime mode-of-operation) AND 0x607A (PP target) both present, so
-        // the policy can switch PV->PP and seed the hold target. Absent either, Halt stays the interim
-        // bit8 zero-VELOCITY hold (drifts under load; safe on the sim / no-load bench). The policy also
-        // guards every switch write on mapped(), so this gate only picks hold STRATEGY, never safety.
-        pv_hold_capable_ = rxpdo_has(kModeOfOp) && rxpdo_has(kTargetPos);
-    }
+    // #61: resolve whichever command objects the (derived or overridden) map carries -- PP
+    // {0x607A,0x6081}, PV {0x60FF}, switchable ALL. Map-driven (rxpdo_has) so all three control_modes
+    // work; an absent object caches !mapped() (the policy guards every write on mapped()).
+    f_target_ = rxpdo_has(kTargetPos) ? master_->rx_field(s, kTargetPos, 0) : FieldLocation{};
+    f_profile_velocity_ = rxpdo_has(kProfileVel) ? master_->rx_field(s, kProfileVel, 0) : FieldLocation{};
+    f_velocity_ = rxpdo_has(kTargetVel) ? master_->rx_field(s, kTargetVel, 0) : FieldLocation{};
+    // #47-P3b M6 / #61: a PV motion-hold locks POSITION (not just zero velocity) ONLY for a PV or
+    // switchable config (NOT a fixed PP config -- a PP halt already holds in PP, no switch) AND when the
+    // map is switch-capable (0x6060 runtime-mode + 0x607A PP-target both present). Absent -> the interim
+    // bit8 zero-VELOCITY hold. The RUNTIME halt handler further gates on the current intent being PV.
+    pv_hold_capable_ = config_.mode != ControlMode::ProfilePosition && rxpdo_has(kModeOfOp) && rxpdo_has(kTargetPos);
     // OPTIONAL TxPDO feedback (spec #16) -- both modes. !mapped() => not in the map, so the
     // RT loop falls back (velocity estimate) / omits the tier (fault code).
     f_fault_code_ = txpdo_has(kFaultCode) ? master_->tx_field(s, kFaultCode, 0) : FieldLocation{};
@@ -414,6 +413,16 @@ bool ServoController::position_stable(std::int32_t actual) noexcept {
     return (hi - lo) <= config_.position_tolerance_counts;
 }
 
+Cia402Mode ServoController::commanded_cia402_mode() const noexcept {
+    // #61: a switchable config commands the current intent (go_to->PP, set_rpm->PV); a fixed PP/PV
+    // config always commands that mode. The policy runs the §6 switch when 0x6060 is mapped and the
+    // commanded mode differs from the drive's confirmed 0x6061 (switchable maps 0x6060 -> switch live).
+    if (config_.mode == ControlMode::Switchable) {
+        return switch_intent_ == ControlMode::ProfileVelocity ? Cia402Mode::ProfileVelocity : Cia402Mode::ProfilePosition;
+    }
+    return to_cia402_mode(config_.mode);
+}
+
 std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, const CommandBatch& batch, std::int32_t actual) noexcept {
     const Cia402State dev = status.decode();
     const bool bus_fault = ctx.fault();
@@ -432,7 +441,9 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // fires only AFTER the mode-switch stop-first ramp has brought the motor to REST -> the latched
         // target IS the rest position (spec M6 "seed 0x607A=ACTUAL counts"), so no back-jump/lunge. Not
         // switch-capable -> pv_hold_as_pp_ stays false -> interim bit8 zero-velocity hold.
-        if (pv_hold_capable_) {
+        // #61: only when the drive is currently in PV (fixed-PV always; switchable only after set_rpm) --
+        // a PP-intent halt already holds in PP, no switch. commanded_is_pp() reads the live switch_intent_.
+        if (pv_hold_capable_ && !commanded_is_pp()) {
             pv_hold_as_pp_ = true;
             ++pv_hold_token_;
         }
@@ -444,7 +455,9 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
     //  cancel of an already-completed move does NOT overwrite its success: first-terminal-wins.)
 
     // Adopt a new PP target (generation rides in the command, post-coalescing).
-    if (config_.mode == ControlMode::ProfilePosition && batch.set_target.has_value()) {
+    // #61: a PP target arrives for a PP config OR a switchable config (go_to/go_for) -> intent PP.
+    if (config_.mode != ControlMode::ProfileVelocity && batch.set_target.has_value()) {
+        switch_intent_ = ControlMode::ProfilePosition;  // switchable: route to PP (no-op for a fixed PP config)
         const SetTarget& t = *batch.set_target;
         if (t.generation != state_.active_generation.load(std::memory_order_relaxed)) {
             target_counts_ = t.relative ? static_cast<std::int32_t>(actual + t.counts) : t.counts;
@@ -457,7 +470,9 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             // change on the next step() -- no wrapper-side handshake state to prime (#47-P3b).
         }
     }
-    if (config_.mode == ControlMode::ProfileVelocity && batch.set_velocity.has_value()) {
+    // #61: a velocity setpoint arrives for a PV config OR a switchable config (set_rpm) -> intent PV.
+    if (config_.mode != ControlMode::ProfilePosition && batch.set_velocity.has_value()) {
+        switch_intent_ = ControlMode::ProfileVelocity;  // switchable: route to PV (no-op for a fixed PV config)
         pv_velocity_ = batch.set_velocity->velocity;
     }
 
@@ -480,7 +495,7 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // itself -- else on a PDO-mapped-0x6060 map the drive follows the PDO (=0) and enables in mode 0.
         // Inert when 0x6060 is SDO-set only (production): f_mode_wr_ !mapped().
         if (f_mode_wr_.mapped()) {
-            ctx.store<cia402::ModeOfOperation::type>(f_mode_wr_, static_cast<std::int8_t>(to_cia402_mode(config_.mode)));
+            ctx.store<cia402::ModeOfOperation::type>(f_mode_wr_, static_cast<std::int8_t>(commanded_cia402_mode()));  // #61: switchable -> current intent
         }
         // #47-P3c/#57 MODE-ECHO GATE (#45 fail-closed, in the module's OWN ladder): once the drive is
         // SwitchedOn the commanded mode should be adopted (SDO-set at configure, or PDO-seeded above), so
@@ -490,7 +505,7 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // module never reaches (it delegates to the policy only post-OE).
         if (mode_gate_ == ModeGate::Pending && f_mode_disp_.mapped() &&
             (dev == Cia402State::SwitchedOn || dev == Cia402State::OperationEnabled)) {
-            const auto want = static_cast<std::int8_t>(to_cia402_mode(config_.mode));
+            const auto want = static_cast<std::int8_t>(commanded_cia402_mode());  // #61: gate on the commanded (intent) mode
             const auto echo = ctx.load<cia402::ModeDisplay::type>(f_mode_disp_);
             if (echo == want) {
                 mode_gate_ = ModeGate::Passed;
@@ -542,7 +557,7 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             pcmd.halt = false;
             pcmd.token = pv_hold_token_;
         } else {
-            pcmd.mode = (config_.mode == ControlMode::ProfilePosition) ? Cia402Mode::ProfilePosition : Cia402Mode::ProfileVelocity;
+            pcmd.mode = commanded_cia402_mode();  // #61: switchable -> current intent (policy runs the §6 switch when it differs from 0x6061)
             pcmd.target_counts = target_counts_;
             pcmd.profile_velocity = profile_vel_;
             pcmd.target_velocity = pv_velocity_;
@@ -564,6 +579,13 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         if (policy_.state().mode_switch_failed && pv_hold_as_pp_) {
             pv_hold_as_pp_ = false;
             pv_velocity_ = 0;  // spec §A R1 "PV-AT-0": command zero velocity for the reverted hold (don't resume the pre-halt rpm)
+        } else if (policy_.state().mode_switch_failed && config_.mode == ControlMode::Switchable) {
+            // #61: a switchable operator switch (go_to/set_rpm intent) couldn't confirm the new 0x6061 --
+            // revert the intent to the drive's CONFIRMED mode so we stop re-requesting (no retry storm);
+            // stay energized at rest, no throw (the motion API call already returned). SAFE disposition.
+            switch_intent_ = (policy_.state().current_mode == static_cast<std::int8_t>(Cia402Mode::ProfileVelocity))
+                                 ? ControlMode::ProfileVelocity
+                                 : ControlMode::ProfilePosition;
         }
         return cw;
     }
@@ -651,7 +673,7 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
     // is_moving: PP = an active positioned move not yet at target; PV = the drive is not at rest.
     // target_counts_ is never assigned in PV, so the PP position predicate must NOT drive PV moving.
     const bool moving =
-        (config_.mode == ControlMode::ProfilePosition) ? (powered && move_active && !at_target) : (powered && !stopped);
+        commanded_is_pp() ? (powered && move_active && !at_target) : (powered && !stopped);  // #61: switchable uses the live intent
     state_.moving.store(moving, std::memory_order_relaxed);
 
     // PP generation protocol: completion + no-progress watchdog (PP-only via move_active).
@@ -767,7 +789,7 @@ void ServoController::step(CycleContext& ctx) noexcept {
         // one is opt-in. The policy's step() takes its ctx.stopping() branch and writes the cw.
         if (config_.quick_stop_decel > 0) {
             PolicyCommand scmd;
-            scmd.mode = (config_.mode == ControlMode::ProfilePosition) ? Cia402Mode::ProfilePosition : Cia402Mode::ProfileVelocity;
+            scmd.mode = commanded_cia402_mode();  // #61
             scmd.enable = false;  // stopping is not a motion intent; the policy's stopping branch owns the cw
             scmd.token = state_.active_generation.load(std::memory_order_relaxed);
             (void)policy_.step(ctx, scmd);  // writes cw (kQuickStopCw / disable backstop) into ctx
@@ -838,8 +860,8 @@ void ServoController::set_rpm(double rpm) {
     if (degraded_.load(std::memory_order_acquire)) {  // §8 Degraded-but-alive: motion APIs throw, never act
         throw BusError("set_rpm unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
     }
-    if (config_.mode != ControlMode::ProfileVelocity) {
-        throw ConfigError("set_rpm requires Profile Velocity (PV) mode; this servo is configured PP -- use go_to/go_for");
+    if (config_.mode == ControlMode::ProfilePosition) {  // #61: PV and switchable accept set_rpm; only a fixed PP config rejects
+        throw ConfigError("set_rpm requires Profile Velocity (PV) or switchable mode; this servo is configured PP -- use go_to/go_for");
     }
     // R3 exclusion matrix (§3): a PV setpoint yields to a LIVE blocking move (a go_for timed run) --
     // reject "operation ongoing" (set_rpm(0) too; halt() is the stop verb). PV setpoints are
@@ -947,8 +969,8 @@ void ServoController::go_to(double rpm, double position) {
         if (degraded_.load(std::memory_order_acquire)) {  // §8
             throw BusError("go_to unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
         }
-        if (config_.mode != ControlMode::ProfilePosition) {
-            throw ConfigError("go_to requires Profile Position (PP) mode; this servo is configured PV -- use set_rpm");
+        if (config_.mode == ControlMode::ProfileVelocity) {  // #61: PP and switchable accept go_to; only a fixed PV config rejects
+            throw ConfigError("go_to requires Profile Position (PP) or switchable mode; this servo is configured PV -- use set_rpm");
         }
         // ABSOLUTE target in the ZEROED frame: add zero_offset_counts to map the
         // user's zeroed position to the raw encoder frame, so go_to(X) lands where
@@ -969,7 +991,7 @@ void ServoController::go_to(double rpm, double position) {
 }
 
 void ServoController::go_for(double rpm, double revs) {
-    if (config_.mode == ControlMode::ProfilePosition) {
+    if (config_.mode != ControlMode::ProfileVelocity) {  // #61: PP + switchable -> relative PP move; PV -> timed run (below)
         std::uint32_t g = 0;
         std::chrono::milliseconds move_timeout{0};
         {

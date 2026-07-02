@@ -1099,4 +1099,108 @@ TEST("ServoController(PP): R3 first-terminal-wins -- cancel AFTER completion is 
     CHECK(std::abs(ctrl.position_revs() - 2.0) < 0.01);
 }
 
+// --- #61: control_mode INTENT derives the map; switchable auto-routes GoTo->PP / SetRPM->PV ------------
+namespace {
+// A switchable module config with NO explicit rxpdo/txpdo -> the ctor (validated()) derives the superset.
+ServoConfig make_config_switchable() {
+    ServoConfig c = make_config(ControlMode::ProfilePosition);  // borrow the scalar fields
+    c.mode = ControlMode::Switchable;
+    c.rxpdo = ethercat::PdoMap{};  // clear -> apply_derived_pdo_maps() materializes the switchable superset
+    c.txpdo = ethercat::PdoMap{};
+    c.quick_stop_decel = 100'000;  // enable the policy's PV quick-stop configure
+    c.velocity_threshold = 50;     // deterministic velocity gate (bypass position-delta for the jog check)
+    return c;
+}
+// Sim model matching the DERIVED switchable byte layout: RxPDO {6040@0,6060@2,607A@3,6081@7,60FF@11}=15B,
+// TxPDO {603F@0,6041@2,6061@4,6064@5,606C@9,6077@13}=15B.
+SimSlaveModel make_model_switchable() {
+    SimSlaveModel m;
+    m.output_bytes = 15;
+    m.ctrlword_off = 0;
+    m.mode_of_op_off = 2;
+    m.target_off = 3;
+    m.profile_velocity_off = 7;
+    m.velocity_off = 11;
+    m.input_bytes = 15;
+    m.fault_code_off = 0;
+    m.statusword_off = 2;
+    m.mode_display_off = 4;
+    m.actual_off = 5;
+    m.velocity_actual_off = 9;
+    m.target_reached_always_set = true;  // A6 bit10 quirk (harmless; module never reads bit10)
+    return m;
+}
+bool rx_has(const std::vector<PdoEntry>& v, std::uint16_t index) {
+    for (const auto& e : v) {
+        if (e.index == index) {
+            return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
+TEST("#61: control_mode=switchable with NO explicit map derives the 0x6060 superset RxPDO + full TxPDO") {
+    ServoConfig c = make_config_switchable();
+    c.apply_derived_pdo_maps();  // (also runs inside the ServoController ctor via validated())
+    CHECK(c.rxpdo.entries.count(0x1600) == 1);
+    const auto& rx = c.rxpdo.entries.at(0x1600);
+    CHECK_EQ(rx.size(), std::size_t{5});
+    CHECK(rx_has(rx, 0x6040) && rx_has(rx, 0x6060) && rx_has(rx, 0x607A) && rx_has(rx, 0x6081) && rx_has(rx, 0x60FF));
+    CHECK(c.txpdo.entries.count(0x1A00) == 1);
+    const auto& tx = c.txpdo.entries.at(0x1A00);
+    CHECK(rx_has(tx, 0x6061));  // 0x6061 mapped -> mode-echo gate + switch-confirm work
+    // PP-only derivation has no 0x6060 (SDO-set mode, no runtime switch):
+    ServoConfig pp = make_config(ControlMode::ProfilePosition);
+    pp.rxpdo = ethercat::PdoMap{};
+    pp.mode = ControlMode::ProfilePosition;
+    pp.apply_derived_pdo_maps();
+    CHECK(!rx_has(pp.rxpdo.entries.at(0x1600), 0x6060));
+}
+
+TEST("#61: switchable -- go_to runs PP, then set_rpm switches the drive to PV (0x6061 confirms)") {
+    SimBackend* sim = nullptr;
+    ServoController::BackendFactory factory = [&sim] {
+        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_switchable()});
+        sim = be.get();
+        return std::unique_ptr<EcatBackend>(std::move(be));
+    };
+    ServoController ctrl{make_config_switchable(), factory};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));  // enables in PP (intent default)
+    ctrl.go_to(1000.0, 0.5);  // PP move (accepted for switchable) completes
+    CHECK(std::abs(ctrl.position_revs() - 0.5) < 0.02);
+    ctrl.set_rpm(120.0);  // accepted for switchable -> §6 switch PP->PV, then jog
+    CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(800)));  // PV jog started (switch confirmed)
+    ctrl.stop();          // JOIN -> race-free sim read
+    CHECK(sim->effective_mode(1) == ethercat::Cia402Mode::ProfileVelocity);  // the drive DID switch to PV
+}
+
+TEST("#61: switchable -- an unconfirmable switch reverts SAFE (energized, no throw, no retry storm)") {
+    SimSlaveModel m = make_model_switchable();
+    m.mode_echo_forced = true;
+    m.mode_echo_value = 1;  // 0x6061 stuck at PP(1) -> a PP->PV switch can never confirm
+    SimBackend* sim = nullptr;
+    ServoController::BackendFactory factory = [m, &sim] {
+        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m});
+        sim = be.get();
+        return std::unique_ptr<EcatBackend>(std::move(be));
+    };
+    ServoController ctrl{make_config_switchable(), factory};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.set_rpm(120.0);  // request PV; 0x6061 never echoes PV -> mode_switch_failed -> revert intent to PP
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));  // past T_switch; revert settled
+    CHECK(ctrl.is_powered());          // SAFE: stayed ENERGIZED through the failed switch (no de-energize, no throw)
+    CHECK(!ctrl.is_moving());           // reverted to PP at rest (not jogging in an unconfirmed PV)
+    (void)sim;
+}
+
+TEST("#61: a fixed PP config still REJECTS set_rpm (switchable is opt-in)") {
+    ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, nullptr)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    CHECK_THROWS_MSG(ctrl.set_rpm(60.0), ConfigError, "PP");  // cross-mode call rejected on a fixed PP config
+}
+
 TEST_MAIN()

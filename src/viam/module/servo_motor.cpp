@@ -239,13 +239,15 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     c.handshake_timeout_cycles = static_cast<std::uint32_t>(opt_num(attrs, "handshake_timeout_cycles", 100.0));
     c.move_timeout_ms = static_cast<std::uint32_t>(opt_num(attrs, "move_timeout_ms", 0.0));
 
-    const ProtoValue* const rx = find_attr(attrs, "rxpdo");
-    const ProtoValue* const tx = find_attr(attrs, "txpdo");
-    if (rx == nullptr || tx == nullptr) {
-        throw ConfigError("both 'rxpdo' and 'txpdo' PDO maps are required (the drive's object map is config data)");
+    // #61: rxpdo/txpdo are OPTIONAL advanced overrides. Absent -> the driver DERIVES the standard CiA402
+    // map from control_mode (PP/PV/switchable) in ServoConfig::apply_derived_pdo_maps() (via validated()).
+    // Present -> parsed + used verbatim. (Was: both required.)
+    if (const ProtoValue* const rx = find_attr(attrs, "rxpdo"); rx != nullptr) {
+        c.rxpdo = parse_pdo_map(*rx, "rxpdo");
     }
-    c.rxpdo = parse_pdo_map(*rx, "rxpdo");
-    c.txpdo = parse_pdo_map(*tx, "txpdo");
+    if (const ProtoValue* const tx = find_attr(attrs, "txpdo"); tx != nullptr) {
+        c.txpdo = parse_pdo_map(*tx, "txpdo");
+    }
     c.fault_code_labels = parse_fault_code_labels(attrs);  // optional 0x603F gloss
 
     c.validate();  // throws ConfigError (clear text) on any invalid field

@@ -326,6 +326,10 @@ class ServoController : public SlaveControl {
     // Push `actual` into the ring and return whether the position is STABLE over the full window (needs a
     // full window first). velocity_threshold>0 bypasses this (a velocity gate); 0 => this method (#59).
     bool position_stable(std::int32_t actual) noexcept;
+    // #61: the Cia402 mode to command THIS cycle -- the fixed config mode (PP/PV) or, for a switchable
+    // config, the current switch_intent_. RT-only (reads switch_intent_).
+    Cia402Mode commanded_cia402_mode() const noexcept;
+    bool commanded_is_pp() const noexcept { return commanded_cia402_mode() == Cia402Mode::ProfilePosition; }
     bool halted_ = false;           // STICKY Stop: Halt stays asserted until a new motion command
     // #47-P3b M6 (PV->PP hold-switch): a PV motion-hold that holds zero VELOCITY (bit8) drifts under
     // load -- the drive has no position loop in PV. When the map is switch-capable (0x6060 + 0x607A both
@@ -335,6 +339,10 @@ class ServoController : public SlaveControl {
     // 1) kicks the policy's PP handshake for the hold WITHOUT touching active_generation (the halt already
     // failed the in-flight move -- the hold is not a completable move). On mode_switch_failed the hold
     // reverts to the interim PV-at-0 bit8 hold (accept small drift, never de-energize -- spec §A R1).
+    // #61 switchable: the current motion INTENT (RT-only). Meaningful only when config_.mode==Switchable;
+    // the command batch sets it (go_to/go_for -> PP, set_rpm -> PV). PP/PV configs ignore it. Default PP
+    // so a switchable drive enables in PP. commanded_cia402_mode() folds it with the fixed config modes.
+    ControlMode switch_intent_ = ControlMode::ProfilePosition;
     bool pv_hold_capable_ = false;  // set at resolve: PV mode AND 0x6060 AND 0x607A both mapped
     bool pv_hold_as_pp_ = false;    // STICKY: currently holding a halted PV motor via PP-at-counts
     std::uint32_t pv_hold_token_ = 0x80000000u;  // policy token that kicks the PP hold handshake (never a real gen)

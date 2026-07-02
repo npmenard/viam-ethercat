@@ -18,14 +18,17 @@
 
 namespace ethercat::servo {
 
-// Viam motor control mode. PP = Profile Position (GoTo/GoFor); PV = Profile
-// Velocity (SetRPM).
+// Viam motor control mode (INTENT; the driver derives the CiA402 PDO map, #61).
+// PP = Profile Position (GoTo/GoFor); PV = Profile Velocity (SetRPM); Switchable =
+// BOTH -- the superset map incl. 0x6060 so GoTo auto-selects PP and SetRPM auto-
+// selects PV via the runtime §6 mode-switch.
 enum class ControlMode : std::uint8_t {
     ProfilePosition,
     ProfileVelocity,
+    Switchable,
 };
 
-// Parse "PP"/"PV" (case-insensitive); throws ConfigError on anything else.
+// Parse "PP"/"PV"/"switchable" (case-insensitive); throws ConfigError on anything else.
 ControlMode parse_control_mode(std::string_view text);
 const char* to_string(ControlMode mode) noexcept;
 
@@ -127,6 +130,14 @@ struct ServoConfig {
     // Throws ethercat::ConfigError (clear text) on any invalid field. Pure --
     // no I/O.
     void validate() const;
+
+    // #61: fill an EMPTY rxpdo/txpdo from the standard CiA402 map derived from `mode` (PP/PV/switchable).
+    // A user-supplied map (non-empty) is left verbatim (advanced override). Standard objects only (#41):
+    //   PP  RxPDO 0x1600: 0x6040,0x607A,0x6081     PV RxPDO: 0x6040,0x60FF
+    //   switchable RxPDO: 0x6040,0x6060,0x607A,0x6081,0x60FF  (superset; runtime §6 switch enabled)
+    //   TxPDO 0x1A00 (all): 0x603F,0x6041,0x6061,0x6064,0x606C,0x6077
+    // Assign 0x1600->0x1C12 / 0x1A00->0x1C13 (derived from direction). Idempotent.
+    void apply_derived_pdo_maps();
 };
 
 }  // namespace ethercat::servo
