@@ -441,14 +441,26 @@ void SimBackend::step_device(Slave& s) noexcept {
         sw |= 0x1000U;  // bit12 set-point acknowledge
     }
 
+    // #59 encoder READ noise (gated: report_noise>0): jitter the REPORTED actual by a ±report_noise
+    // square wave -- physics s.actual stays clean. Reported velocity = the jittered delta (nonzero at
+    // rest). Off by default -> reported_actual == s.actual, reported_vel == s.velocity (all tests as-is).
+    std::int32_t reported_actual = s.actual;
+    std::int32_t reported_vel = s.velocity;
+    if (s.model.report_noise > 0) {
+        s.noise_phase = !s.noise_phase;
+        reported_actual = s.actual + (s.noise_phase ? s.model.report_noise : -s.model.report_noise);
+        reported_vel = reported_actual - s.reported_prev;
+        s.reported_prev = reported_actual;
+    }
+
     const auto in = std::span<std::byte>(s.input_image);
     store_le<std::uint16_t>(in.subspan(s.model.statusword_off, 2), static_cast<std::uint16_t>(sw));
-    store_le<std::int32_t>(in.subspan(s.model.actual_off, 4), s.actual);
+    store_le<std::int32_t>(in.subspan(s.model.actual_off, 4), reported_actual);
     // #16 TxPDO feedback de-mask (only when the field is mapped): velocity-actual
     // (0x606C) every cycle from the wire-driven motion; drive error code (0x603F) =
     // the configured code WHILE in Fault, else 0 (so the flag gates the payload).
     if (s.model.velocity_actual_off >= 0) {
-        store_le<std::int32_t>(in.subspan(static_cast<std::size_t>(s.model.velocity_actual_off), 4), s.velocity);
+        store_le<std::int32_t>(in.subspan(static_cast<std::size_t>(s.model.velocity_actual_off), 4), reported_vel);
     }
     if (s.model.fault_code_off >= 0) {
         // A forced stale code (test hook) overrides the gating -> 0x603F is nonzero

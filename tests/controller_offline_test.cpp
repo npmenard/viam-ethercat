@@ -143,6 +143,34 @@ TEST("ServoController(PP): go_to propagates + converges; position reads back") {
     CHECK(std::abs(ctrl.position_revs() - 2.0) < 0.01);  // within tolerance, in revs
 }
 
+TEST("#59: reached/is_moving is noise-robust (position-delta) — omitting tolerance+velocity_threshold completes UNDER encoder noise") {
+    // THE latent bug: position_tolerance_counts=0 AND velocity_threshold=0 fed the OLD predicate
+    // (|actual-target|==0 && |vel|==0) -> under encoder noise a move NEVER completes + is_moving sticks
+    // true. Fix: velocity_threshold=0 -> position-delta stability; position_tolerance_counts=0 -> DEFAULT
+    // counts_per_rev/720 (=182 @ 131072). NON-VACUOUS: report_noise=60 makes 0x606C swing +/-120 at rest
+    // (the old |vel|<=0 gate would hang -> go_to throws MoveStalled/timeout), while the position RANGE
+    // (120) stays < 182 so the position-delta predicate correctly reports STOPPED.
+    SimSlaveModel m = make_model(ControlMode::ProfilePosition, /*feedback=*/true);
+    m.report_noise = 60;  // +/-60 counts encoder jitter -> 0x606C +/-120 nonzero at rest; range 120 < cpr/720 (182)
+    SimBackend* sim = nullptr;
+    ServoController::BackendFactory factory = [m, &sim] {
+        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m});
+        sim = be.get();
+        return std::unique_ptr<EcatBackend>(std::move(be));
+    };
+    ServoConfig cfg = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
+    cfg.position_tolerance_counts = 0;  // OMIT -> validated() defaults to counts_per_rev/720 (0.5 deg)
+    cfg.velocity_threshold = 0;         // OMIT -> position-delta method (kills the broken exact-|vel|<=0 gate)
+    cfg.move_timeout_ms = 3000;         // bound: a regressed (velocity-exact) predicate would throw within 3s
+    ServoController ctrl{cfg, factory};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    ctrl.go_to(1000.0, 1.0);  // COMPLETES via position-delta despite the velocity noise (old predicate: hangs -> throws)
+    CHECK(std::abs(ctrl.position_revs() - 1.0) < 0.01);
+    CHECK(!ctrl.is_moving());  // at rest under noise -> position stable -> NOT moving (was stuck-true pre-#59)
+    (void)sim;
+}
+
 TEST("ServoController: mode guards reject the wrong API with clear errors") {
     {
         ServoController pp{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, nullptr)};

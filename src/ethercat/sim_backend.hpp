@@ -57,6 +57,11 @@ struct SimSlaveModel {
     // --- #47-P3b M56S: a SECOND device's runtime mode-switch quirks (the generic mode-switch's T_switch
     //     knob adapts the SAME policy to these -- no per-device policy code). ---
     std::uint32_t mode_switch_latency = 0;       // cycles the drive TAKES to apply a new 0x6060 (0x6061 lags this many cycles); models M56S "transition takes time" (undefined-feedback window). 0 = instant (the A6).
+    // #59: encoder READ noise -- the REPORTED 0x6064/0x606C jitter by a ±report_noise square wave (the
+    // physics s.actual stays clean). At rest this makes 0x606C nonzero (defeats an exact-|vel|<=0 reached
+    // predicate) while the position RANGE stays 2*report_noise (a position-delta predicate tolerates it).
+    // 0 = clean (default; all existing tests unaffected).
+    std::int32_t report_noise = 0;
     Cia402Mode unsupported_mode = Cia402Mode::None;  // a mode the drive REJECTS (never applies -> 0x6061 never echoes it); models M56S "errors on an unsupported mode". None = accept all.
     // De-mask of the #16 TxPDO FEEDBACK fields (offsets into the INPUT image; <0 = not
     // mapped, so the controller's read path falls back -- exercises the optional guard).
@@ -196,6 +201,8 @@ class SimBackend final : public EcatBackend {
         std::int32_t target = 0;
         std::int32_t target_written = 0;  // #47-P3b: the last 0x607A the master WROTE this cycle (seed/mirror wire value, latched-or-not) -- DA no-lunge probe
         std::int32_t actual = 0;
+        bool noise_phase = false;         // #59: encoder-noise square-wave phase (toggles per cycle when model.report_noise>0)
+        std::int32_t reported_prev = 0;   // #59: previous REPORTED (jittered) actual -> the jittered 0x606C delta
         bool setpoint_ack = false;  // PP bit12 latch
         // ATOMIC: written by a non-RT test hook (inject_fault/set_fault_code/
         // set_stale_fault_code) while the RT loop reads them in step_device -- the only

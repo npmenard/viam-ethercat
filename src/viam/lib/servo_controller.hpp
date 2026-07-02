@@ -39,6 +39,7 @@
 #include <string>
 #include <thread>
 #include <variant>
+#include <vector>
 
 #include "ethercat/backend.hpp"
 #include "ethercat/cia402.hpp"
@@ -317,6 +318,14 @@ class ServoController : public SlaveControl {
     std::uint32_t stall_cycles_ = 0;
     std::int32_t prev_actual_ = 0;  // previous-cycle actual (instantaneous velocity estimate)
     bool first_cycle_ = true;       // skip the velocity estimate on the first cycle
+    // #59 noise-robust "stopped": a ring of the last N actual positions; STABLE when the window's range
+    // (max-min) <= position_tolerance_counts. Sized in resolve_fields (~20ms @ the loop rate). RT-only.
+    std::vector<std::int32_t> pos_hist_;
+    std::size_t pos_hist_idx_ = 0;
+    std::uint32_t pos_hist_filled_ = 0;  // entries written so far (window not "full" until == pos_hist_.size())
+    // Push `actual` into the ring and return whether the position is STABLE over the full window (needs a
+    // full window first). velocity_threshold>0 bypasses this (a velocity gate); 0 => this method (#59).
+    bool position_stable(std::int32_t actual) noexcept;
     bool halted_ = false;           // STICKY Stop: Halt stays asserted until a new motion command
     // #47-P3b M6 (PV->PP hold-switch): a PV motion-hold that holds zero VELOCITY (bit8) drifts under
     // load -- the drive has no position loop in PV. When the map is switch-capable (0x6060 + 0x607A both

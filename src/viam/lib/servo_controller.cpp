@@ -47,6 +47,17 @@ Cia402Mode to_cia402_mode(ControlMode mode) noexcept {
 
 ServoConfig validated(ServoConfig config) {
     config.validate();
+    // #59: reached/is_moving is noise-robust position-delta (see publish_state); position_tolerance_counts
+    // is the "close enough + stable" band. DEFAULT it to counts_per_rev/720 (0.5 deg) when unset (<=0) --
+    // self-documenting + scales with encoder resolution. (Was 0, which forced an EXACT-match reached
+    // predicate -> a move never completed under encoder noise. Latent bug, #59.) velocity_threshold stays
+    // an OPTIONAL override: >0 => a velocity gate; 0 => the position-delta method (the default).
+    if (config.position_tolerance_counts <= 0) {
+        config.position_tolerance_counts = static_cast<std::int32_t>(config.counts_per_rev / 720.0 + 0.5);
+        if (config.position_tolerance_counts < 1) {
+            config.position_tolerance_counts = 1;  // floor for a tiny-count encoder
+        }
+    }
     return config;
 }
 
@@ -108,8 +119,16 @@ DeviceProfile ServoController::make_module_profile(const ServoConfig& c) noexcep
     // this field is for the policy's future in-loop reset -- R2/sub-step-4.)
     p.fault_reset = c.vendor_fault_reset.has_value() ? DeviceProfile::FaultReset::VendorSdo : DeviceProfile::FaultReset::Cia402Bit7;
     p.vendor_fault_reset = c.vendor_fault_reset;
-    p.position_tolerance = c.position_tolerance_counts;
-    p.zero_vel_threshold = c.velocity_threshold;
+    p.position_tolerance = c.position_tolerance_counts;  // effective value (validated() defaulted 0 -> counts_per_rev/720)
+    // #59 (2nd consumer): the policy's zero_vel_threshold gates the quick-stop-AT-REST de-energize
+    // (:209/:335) -- a BACKSTOP; the PRIMARY is 0x605A=2 auto-SwitchOnDisabled (P3c-proven). Keep it a
+    // velocity gate (position-delta lives in the wrapper, not the pure-counts generic policy -- #41). Only
+    // override the profile's sane 500 default when the config set an explicit velocity_threshold (>0);
+    // do NOT propagate the 0 "unset" sentinel (that would zero the gate -> break the backstop for a
+    // non-auto-disable device). Flagged to team-lead + DA.
+    if (c.velocity_threshold > 0) {
+        p.zero_vel_threshold = c.velocity_threshold;
+    }
     p.quick_stop_decel = c.quick_stop_decel;  // 0 => configure() skips the quick-stop SDO setup
     // --- MODULE behavior flags (vs the bench A6 defaults): full 4-phase new-setpoint handshake
     //     with the module's ack timeout; Stop = CiA402 bit8 Halt; no PV position mirror. ---
@@ -294,6 +313,13 @@ void ServoController::resolve_fields() {
     f_mode_wr_ = rxpdo_has(kModeOfOp) ? master_->rx_field(s, kModeOfOp, 0) : FieldLocation{};
     f_mode_disp_ = txpdo_has(kModeDisplay) ? master_->tx_field(s, kModeDisplay, 0) : FieldLocation{};
 
+    // #59: size the position-stability window to ~20 ms at the loop rate (>=3 cycles), reset it. Pre-
+    // allocated here (non-RT, pre-spawn) so the RT loop never allocates. Re-sized on each start/reconfigure.
+    const std::uint32_t win = std::max<std::uint32_t>(3, static_cast<std::uint32_t>(config_.target_loop_rate_hz) / 50);
+    pos_hist_.assign(win, 0);
+    pos_hist_idx_ = 0;
+    pos_hist_filled_ = 0;
+
     // #47-P3b R1 opt-out OBSERVABILITY (DA): a module WITHOUT a configured quick_stop_decel stops
     // via UNCONTROLLED disable-voltage coast -- a known, predictable coast, safe BECAUSE we won't
     // Quick-Stop against an unverified/unsized decel. But on a load-holding / vertical axis a coast
@@ -364,6 +390,28 @@ void ServoController::abort_active_move(RtError reason) noexcept {
         state_.failed_generation.store(g, std::memory_order_release);  // abort tier: wakes the go_to waiter
         completion_cv_.notify_all();                                   // RT never LOCKS completion_mutex_
     }
+}
+
+bool ServoController::position_stable(std::int32_t actual) noexcept {
+    // #59: push `actual` into the ring; STABLE once the window is full AND its range (max-min) is within
+    // position_tolerance_counts -- encoder jitter at rest stays within tol => stable; real motion widens
+    // the range => not stable. Not-yet-full => not stable (still settling). O(N), N ~ 20ms of cycles.
+    if (pos_hist_.empty()) {
+        return false;  // never sized (pre-start) -- treat as moving, fail-safe
+    }
+    pos_hist_[pos_hist_idx_] = actual;
+    pos_hist_idx_ = (pos_hist_idx_ + 1) % pos_hist_.size();
+    if (pos_hist_filled_ < pos_hist_.size()) {
+        ++pos_hist_filled_;
+        return false;
+    }
+    std::int32_t lo = pos_hist_[0];
+    std::int32_t hi = pos_hist_[0];
+    for (const std::int32_t p : pos_hist_) {
+        lo = std::min(lo, p);
+        hi = std::max(hi, p);
+    }
+    return (hi - lo) <= config_.position_tolerance_counts;
 }
 
 std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, const CommandBatch& batch, std::int32_t actual) noexcept {
@@ -589,16 +637,21 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
     const bool move_active = g != 0 && state_.completed_generation.load(std::memory_order_relaxed) != g &&
                              state_.failed_generation.load(std::memory_order_relaxed) != g;
 
-    // Move-complete predicate: |target - actual| <= tol && |vel| <= vthresh (NEVER
-    // bit10). Only meaningful in PP (move_active implies a go_to generation).
-    const bool at_target =
-        std::abs(actual - target_counts_) <= config_.position_tolerance_counts && std::abs(velocity) <= config_.velocity_threshold;
+    // #59 noise-robust "stopped" (NEVER bit10): position STABLE over the last N cycles (its range <=
+    // position_tolerance_counts) -- immune to encoder jitter at rest. velocity_threshold>0 is an OPTIONAL
+    // override (a classic velocity gate); 0 (the default) uses the position-delta method. position_stable
+    // MUST be called once per cycle (it advances the ring), so evaluate it unconditionally.
+    const bool pos_stable = position_stable(actual);
+    const bool stopped = (config_.velocity_threshold > 0) ? (std::abs(velocity) <= config_.velocity_threshold) : pos_stable;
 
-    // is_moving: PP = an active positioned move not yet at target; PV = the drive
-    // is actually turning (|velocity| above the threshold). target_counts_ is
-    // never assigned in PV, so the PP position predicate must NOT drive PV moving.
-    const bool moving = (config_.mode == ControlMode::ProfilePosition) ? (powered && move_active && !at_target)
-                                                                       : (powered && std::abs(velocity) > config_.velocity_threshold);
+    // Move-complete predicate: |target - actual| <= tol AND the axis has come to rest (stopped).
+    // Only meaningful in PP (move_active implies a go_to generation).
+    const bool at_target = std::abs(actual - target_counts_) <= config_.position_tolerance_counts && stopped;
+
+    // is_moving: PP = an active positioned move not yet at target; PV = the drive is not at rest.
+    // target_counts_ is never assigned in PV, so the PP position predicate must NOT drive PV moving.
+    const bool moving =
+        (config_.mode == ControlMode::ProfilePosition) ? (powered && move_active && !at_target) : (powered && !stopped);
     state_.moving.store(moving, std::memory_order_relaxed);
 
     // PP generation protocol: completion + no-progress watchdog (PP-only via move_active).
