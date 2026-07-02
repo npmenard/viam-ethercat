@@ -176,6 +176,56 @@ std::vector<std::pair<std::uint16_t, std::string>> parse_fault_code_labels(const
     return out;
 }
 
+// A CoE index/subindex given as a JSON number OR a hex string ("0x2040") -- vendor object
+// indices read far better in hex. Accepts either; throws ConfigError on anything else.
+std::uint32_t parse_index_value(const ProtoValue& v, const std::string& ctx) {
+    if (const double* const d = v.get<double>()) {
+        return static_cast<std::uint32_t>(*d);
+    }
+    if (const std::string* const s = v.get<std::string>()) {
+        try {
+            return static_cast<std::uint32_t>(std::stoul(*s, nullptr, 0));  // base 0 -> auto-detect 0x
+        } catch (const std::exception&) {
+            throw ConfigError(ctx + ": '" + *s + "' is not a valid number (use a decimal or a hex string like \"0x2040\")");
+        }
+    }
+    throw ConfigError(ctx + ": must be a number or a hex string like \"0x2040\"");
+}
+
+// #68 parse one do_command SDO monitor spec {index, subindex?, type, scale}. `index` is a
+// number or hex string; `type` is u8/i8/u16/i16/u32/i32; `scale` is a NUMBER (fixed divisor,
+// value = raw/scale) or the string "rated_permille" (value = raw/1000 * motor_rated_current_amps).
+SdoMonitor parse_sdo_monitor(const ProtoStruct& obj, const char* which) {
+    const std::string ctx = std::string("sdo_monitors.") + which;
+    SdoMonitor m;
+    const auto ii = obj.find("index");
+    if (ii == obj.end()) {
+        throw ConfigError(ctx + ": missing 'index'");
+    }
+    m.index = static_cast<std::uint16_t>(parse_index_value(ii->second, ctx + " index"));
+    if (const auto si = obj.find("subindex"); si != obj.end()) {
+        m.subindex = static_cast<std::uint8_t>(parse_index_value(si->second, ctx + " subindex"));
+    }
+    const auto ti = obj.find("type");
+    if (ti == obj.end() || ti->second.get<std::string>() == nullptr) {
+        throw ConfigError(ctx + ": 'type' must be a string (u8/i8/u16/i16/u32/i32)");
+    }
+    m.type = parse_sdo_value_type(*ti->second.get<std::string>());
+    const auto sci = obj.find("scale");
+    if (sci == obj.end()) {
+        throw ConfigError(ctx + ": missing 'scale' (a number divisor, or \"rated_permille\")");
+    }
+    if (const double* const d = sci->second.get<double>()) {
+        m.scale_kind = SdoScaleKind::Divisor;
+        m.divisor = *d;
+    } else if (const std::string* const s = sci->second.get<std::string>(); s != nullptr && *s == "rated_permille") {
+        m.scale_kind = SdoScaleKind::RatedCurrentPermille;
+    } else {
+        throw ConfigError(ctx + ": 'scale' must be a number (fixed divisor) or the string \"rated_permille\"");
+    }
+    return m;
+}
+
 ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     ServoConfig c;
     c.ifname = req_str(attrs, "interface");
@@ -253,6 +303,30 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
         c.txpdo = parse_pdo_map(*tx, "txpdo");
     }
     c.fault_code_labels = parse_fault_code_labels(attrs);  // optional 0x603F gloss
+
+    // #68 optional "sdo_monitors" block: override the do_command converted-SDO read targets
+    // (absent -> the standard CiA402 defaults in ServoConfig). The A6 needs it because it does
+    // NOT implement 0x6079/0x6078 -- it exposes bus voltage / phase current via vendor 0x2040.
+    if (const ProtoValue* const sm = find_attr(attrs, "sdo_monitors"); sm != nullptr) {
+        const ProtoStruct* const obj = sm->get<ProtoStruct>();
+        if (obj == nullptr) {
+            throw ConfigError("sdo_monitors must be an object {\"voltage\": {...}, \"current\": {...}}");
+        }
+        if (const auto vi = obj->find("voltage"); vi != obj->end()) {
+            const ProtoStruct* const vo = vi->second.get<ProtoStruct>();
+            if (vo == nullptr) {
+                throw ConfigError("sdo_monitors.voltage must be an object {index, subindex?, type, scale}");
+            }
+            c.voltage_monitor = parse_sdo_monitor(*vo, "voltage");
+        }
+        if (const auto ci = obj->find("current"); ci != obj->end()) {
+            const ProtoStruct* const co = ci->second.get<ProtoStruct>();
+            if (co == nullptr) {
+                throw ConfigError("sdo_monitors.current must be an object {index, subindex?, type, scale}");
+            }
+            c.current_monitor = parse_sdo_monitor(*co, "current");
+        }
+    }
 
     c.validate();  // throws ConfigError (clear text) on any invalid field
     return c;
@@ -332,13 +406,20 @@ bool command_flag(const ProtoStruct& command, const char* key) {
 }
 
 // --- #22/#68 do_command SDO reads (CONVERTED VALUES ONLY) ---------------------
-// STANDARD CiA402 objects (not A6-vendor: these indices are fixed DS402 assignments), read
-// via the controller's steady-state marshaled SDO path (single-port-owner safe). Unit
-// conversion lives HERE (the module = Viam-unit layer), not in the generic controller.
-constexpr std::uint16_t kDcLinkVoltage = 0x6079;        // U32, unit mV (CiA402); DC-link circuit voltage
-constexpr std::uint16_t kCurrentActual = 0x6078;        // I16, per-mille of motor rated current
-constexpr std::uint16_t kSupportedDriveModes = 0x6502;  // U32 bitmask of supported modes
+// Read via the controller's steady-state marshaled SDO path (single-port-owner safe).
+// voltage/current object identity + scaling are CONFIG DATA (SdoMonitor, standard-CiA402
+// defaults or a vendor override); the read+convert is convert_sdo_monitor. drive_modes is the
+// standard 0x6502 bitmask (fixed -- it works on the A6 and needs no scaling).
+constexpr std::uint16_t kSupportedDriveModes = 0x6502;  // U32 bitmask of supported modes (standard, fixed)
 constexpr std::chrono::milliseconds kSdoTimeout{200};
+
+// Read a config-driven SDO monitor via the controller and convert to its reported double.
+// Throws ethercat::Error on SDO abort/timeout (caller captures into a *_error key).
+double read_monitor(ServoController& ctrl, const SdoMonitor& m) {
+    std::array<std::byte, 8> buf{};  // >= any monitor width (<=4 B)
+    const std::size_t n = ctrl.sdo_read(m.index, m.subindex, std::span<std::byte>(buf.data(), m.byte_width()), kSdoTimeout);
+    return convert_sdo_monitor(m, std::span<const std::byte>(buf.data(), n), ctrl.rated_current_amps());
+}
 
 // Decode the 0x6502 supported-drive-modes bitmask into CiA402 mode-name strings.
 std::vector<ProtoValue> decode_drive_modes(std::uint32_t bits) {
@@ -495,21 +576,14 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
     // servicer); pre-operational -> a clean ConfigError captured into the *_error key.
     if (command_flag(command, "get_motor_voltage")) {
         try {
-            std::array<std::byte, 4> buf{};
-            controller_->sdo_read(kDcLinkVoltage, 0, buf, kSdoTimeout);
-            const double volts = static_cast<double>(ethercat::load_le<std::uint32_t>(std::span<const std::byte>(buf.data(), 4))) / 1000.0;
-            result.emplace("voltage_volts", ProtoValue(volts));  // 0x6079 unit = mV (CiA402)
+            result.emplace("voltage_volts", ProtoValue(read_monitor(*controller_, controller_->voltage_monitor())));
         } catch (const ethercat::Error& e) {
             result.emplace("voltage_volts_error", ProtoValue(std::string("get_motor_voltage failed: ") + e.what()));
         }
     }
     if (command_flag(command, "get_motor_current_actual_value")) {
         try {
-            std::array<std::byte, 2> buf{};
-            controller_->sdo_read(kCurrentActual, 0, buf, kSdoTimeout);
-            const std::int16_t permille = ethercat::load_le<std::int16_t>(std::span<const std::byte>(buf.data(), 2));
-            const double amps = (static_cast<double>(permille) / 1000.0) * controller_->rated_current_amps();  // 0x6078 per-mille of rated
-            result.emplace("current_amps", ProtoValue(amps));
+            result.emplace("current_amps", ProtoValue(read_monitor(*controller_, controller_->current_monitor())));
         } catch (const ethercat::Error& e) {
             result.emplace("current_amps_error", ProtoValue(std::string("get_motor_current_actual_value failed: ") + e.what()));
         }

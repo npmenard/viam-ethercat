@@ -1408,7 +1408,8 @@ TEST("#68: config-driven monitors read+convert end-to-end for BOTH default-stand
     // (sim OD serves 0x6079/0x6078) and a vendor override (sim OD serves 0x2040:07/:0D).
     const auto read_convert = [](ServoController& ctrl, const SdoMonitor& m) {
         std::array<std::byte, 8> buf{};
-        const std::size_t n = ctrl.sdo_read(m.index, m.subindex, std::span<std::byte>(buf.data(), m.byte_width()), std::chrono::milliseconds(200));
+        const std::size_t n =
+            ctrl.sdo_read(m.index, m.subindex, std::span<std::byte>(buf.data(), m.byte_width()), std::chrono::milliseconds(200));
         CHECK_EQ(n, m.byte_width());
         return convert_sdo_monitor(m, std::span<const std::byte>(buf.data(), n), ctrl.rated_current_amps());
     };
@@ -1416,8 +1417,8 @@ TEST("#68: config-driven monitors read+convert end-to-end for BOTH default-stand
     // (1) DEFAULTS: standard CiA402 objects. Sim serves 0x6079=310000mV, 0x6078=400 permille.
     {
         SimSlaveModel model = make_model(ControlMode::ProfilePosition, /*feedback=*/true);
-        model.dc_link_voltage_mv = 310'000;      // -> 310.0 V (÷1000)
-        model.current_actual_permille = 400;     // -> 400 * 2.5 / 1000 = 1.0 A
+        model.dc_link_voltage_mv = 310'000;   // -> 310.0 V (÷1000)
+        model.current_actual_permille = 400;  // -> 400 * 2.5 / 1000 = 1.0 A
         ServoController::BackendFactory f = [model] {
             return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{model}));
         };
@@ -1433,8 +1434,8 @@ TEST("#68: config-driven monitors read+convert end-to-end for BOTH default-stand
     // A6 config does. Sim serves 0x2040:07=3154 (315.4V), 0x2040:0D=-55 (-5.5A).
     {
         SimSlaveModel model = make_model(ControlMode::ProfilePosition, /*feedback=*/true);
-        model.vendor_bus_voltage_dV = 3154;      // -> 315.4 V (÷10)
-        model.vendor_phase_current_dA = -55;     // -> -5.5 A  (÷10, signed)
+        model.vendor_bus_voltage_dV = 3154;   // -> 315.4 V (÷10)
+        model.vendor_phase_current_dA = -55;  // -> -5.5 A  (÷10, signed)
         ServoController::BackendFactory f = [model] {
             return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{model}));
         };

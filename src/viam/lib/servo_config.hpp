@@ -83,14 +83,14 @@ struct ServoConfig {
     // DEFAULTS = the standard CiA402 objects, so a generic drive works with zero config. A
     // vendor drive overrides them (the A6 lacks 0x6079/0x6078; it uses 0x2040:07 ÷10 V and
     // 0x2040:0D ÷10 A). get_motor_drive_modes (0x6502) is standard + fixed, NOT in this block.
-    SdoMonitor voltage_monitor{0x6079, 0x00, SdoValueType::U32, SdoScaleKind::Divisor, 1000.0};           // DC-link mV -> V
+    SdoMonitor voltage_monitor{0x6079, 0x00, SdoValueType::U32, SdoScaleKind::Divisor, 1000.0};            // DC-link mV -> V
     SdoMonitor current_monitor{0x6078, 0x00, SdoValueType::I16, SdoScaleKind::RatedCurrentPermille, 1.0};  // per-mille * rated -> A
 
     // --- move-complete predicate (noise-robust position-delta, #59) ---
     // reached/is_moving = |actual-target| <= position_tolerance_counts AND the position is STABLE (its
     // range over the last N cycles <= position_tolerance_counts). Both fields OPTIONAL:
     std::int32_t position_tolerance_counts = 0;  // >= 0; 0 => DEFAULT counts_per_rev/720 (0.5 deg), set in validated()
-    std::int32_t velocity_threshold = 0;         // >= 0; 0 => use the position-delta stability method; >0 => honor a velocity gate (override)
+    std::int32_t velocity_threshold = 0;  // >= 0; 0 => use the position-delta stability method; >0 => honor a velocity gate (override)
 
     // --- RT ---
     std::uint32_t target_loop_rate_hz = 1000;  // 1..1000

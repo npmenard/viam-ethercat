@@ -143,7 +143,8 @@ double convert_sdo_monitor(const SdoMonitor& m, std::span<const std::byte> raw, 
 void ServoConfig::apply_derived_pdo_maps() {
     // #61: standard CiA402 objects only (#41) -- these ARE the standard, so they live in the library.
     constexpr std::uint16_t kCtrl = 0x6040, kMode = 0x6060, kTargetPos = 0x607A, kProfileVel = 0x6081, kTargetVel = 0x60FF;
-    constexpr std::uint16_t kFault = 0x603F, kStatus = 0x6041, kModeDisp = 0x6061, kActualPos = 0x6064, kVelAct = 0x606C, kTorqueAct = 0x6077;
+    constexpr std::uint16_t kFault = 0x603F, kStatus = 0x6041, kModeDisp = 0x6061, kActualPos = 0x6064, kVelAct = 0x606C,
+                            kTorqueAct = 0x6077;
     const auto E = [](std::uint16_t index, std::uint8_t bits) { return ethercat::PdoEntry{index, 0, bits}; };
 
     if (rxpdo.pdo_indices.empty()) {  // absent -> derive; present -> advanced override, untouched
