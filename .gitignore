@@ -21,3 +21,4 @@ review-notes.org
 reference-src/
 build-hw/
 .venv*/
+__pycache__/
