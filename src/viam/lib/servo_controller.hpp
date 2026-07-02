@@ -69,6 +69,7 @@ struct ControllerState {
     std::atomic<bool> wkc_faulted{false};                // BUS tier = master_->fault(); pairs with fault_wkc
     std::atomic<bool> drive_faulted{false};              // DRIVE tier = status.fault() (bit3); pairs with drive_fault_code
     std::atomic<std::uint16_t> drive_fault_code{0};      // 0x603F live-read every faulted cycle; relaxed before drive_faulted release
+    std::atomic<std::uint16_t> bringup_al_code{0};       // #71: ESC AL status code at a bring-up give-up (e.g. 0x0027 free-run); 0 = none
     std::atomic<std::uint64_t> loop_cycle{0};            // heartbeat counter
     std::atomic<std::uint64_t> last_cycle_time_ns{0};    // CLOCK_MONOTONIC ns at last iteration (watchdog; 0 = never published)
     std::atomic<std::int32_t> zero_offset_counts{0};     // SetZero software offset

@@ -207,6 +207,9 @@ void ServoConfig::validate() const {
     if (command_queue_capacity == 0) {
         throw ConfigError("servo config: 'command_queue_capacity' must be > 0");
     }
+    if (op_await_timeout_ms == 0) {
+        throw ConfigError("servo config: 'op_await_timeout_ms' must be > 0 (bring-up give-up patience)");
+    }
     // #68 sdo_monitors: a 0 index is never a real object; a Divisor scale must be nonzero.
     const auto check_monitor = [](const SdoMonitor& m, const char* which) {
         if (m.index == 0) {

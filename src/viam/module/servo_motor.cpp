@@ -244,6 +244,9 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     c.target_loop_rate_hz = static_cast<std::uint32_t>(opt_num(attrs, "loop_rate_hz", 1000.0));
     c.require_realtime = opt_attr<bool>(attrs, "require_realtime").value_or(true);
     c.rt_priority = static_cast<int>(opt_num(attrs, "rt_priority", 80.0));
+    // #71: bring-up OP-await patience (ms) before giving up Degraded with the AL cause. Default
+    // generous (30 s) for the A6's slow SAFE-OP->OP; lower it for a faster fail on a misconfig.
+    c.op_await_timeout_ms = static_cast<std::uint32_t>(opt_num(attrs, "op_await_timeout_ms", 30000.0));
     c.use_distributed_clocks = opt_attr<bool>(attrs, "use_distributed_clocks").value_or(false);
     // #44: optional drive datum -- the SYNC0 cycle granularity the drive accepts (A6: 250000 ns).
     // When set, the Master validates loop rate vs granularity at config time (clear text)

@@ -101,6 +101,7 @@ MasterConfig build_master_config(const ServoConfig& c) {
     mc.slaves = {slave};
     mc.max_consecutive_wkc_errors = static_cast<std::uint32_t>(c.max_consecutive_wkc_errors);
     mc.use_distributed_clocks = c.use_distributed_clocks;
+    mc.op_await_timeout_ms = c.op_await_timeout_ms;  // #71: bring-up give-up patience (Degraded + AL diag on timeout)
     // Post-OP DC settle grace (cycles) while the SYNC0 phase finishes locking: suppress
     // the WKC-fault latch so a residual transient doesn't trip a spurious BusError. The
     // bring-up SETTLE bound uses MasterConfig's own default (dc_op_gate_cycles);
@@ -185,6 +186,8 @@ void ServoController::reset_run_state() {
     stopping_.store(false, std::memory_order_release);
     rt_error_.store(RtError::None, std::memory_order_relaxed);
     state_.faulted.store(false, std::memory_order_relaxed);
+    state_.drive_faulted.store(false, std::memory_order_relaxed);  // #71: clear a prior bring-up drive tier on restart
+    state_.bringup_al_code.store(0, std::memory_order_relaxed);    // #71: clear a prior AL-refusal code on restart
     state_.loop_cycle.store(0, std::memory_order_relaxed);
     state_.last_cycle_time_ns.store(0, std::memory_order_relaxed);
     state_.active_generation.store(0, std::memory_order_relaxed);
@@ -853,15 +856,36 @@ void ServoController::step(CycleContext& ctx) noexcept {
 
 void ServoController::on_stop(StopReason reason) noexcept {
     if (reason == StopReason::BringupAborted) {
-        // SYNC0 did not take (Er74.1 in the gate). Surface root cause (drive tier) + symptom
-        // (not operational) -- the old run_rt_loop bring-up-abort branch, now here. No
-        // auto-retry (repeated Er74 OP-entry wedges the A6); recovery = explicit reconfigure.
-        state_.drive_fault_code.store(last_sync_code_ != 0 ? last_sync_code_ : config_.sync_fault_code.value_or(0),
-                                      std::memory_order_relaxed);
-        state_.drive_faulted.store(true, std::memory_order_release);
+        // Bring-up gave up. WHY has two independent sources, and #71 taught us to surface BOTH, not
+        // just assume the sync fault: (1) the DC-sync gate -- 0x603F == the configured no-sync code
+        // (Er74.1) held, the SYNC0-didn't-take case; (2) the ESC AL status code -- the drive REFUSED
+        // an AL transition, e.g. AL 0x0027 "Freerun not supported" when a DC-only drive is requested
+        // into OP without SYNC0 (use_distributed_clocks=false). Before #71 this branch ALWAYS blamed
+        // the sync code -> a free-run failure was mis-reported as Er74.1 (or, if 0x603F read 0,
+        // surfaced NOTHING but "drive not operational"), and there was no stderr line at all.
+        //
+        // #71: read the AL status code (cached, no port I/O -- this runs on the Runner's RT thread,
+        // the sole master toucher) and publish it; only attribute the DRIVE (0x603F) tier when the
+        // sync code was actually the configured no-sync fault.
+        const std::uint16_t al = master_ != nullptr ? master_->al_status_code(config_.slave_id) : 0;
+        const std::string al_msg = master_ != nullptr ? master_->al_status_message(config_.slave_id) : std::string{};
+        state_.bringup_al_code.store(al, std::memory_order_relaxed);
+        const bool sync_fault = config_.sync_fault_code.has_value() && last_sync_code_ != 0 && last_sync_code_ == *config_.sync_fault_code;
+        if (sync_fault) {
+            state_.drive_fault_code.store(last_sync_code_, std::memory_order_relaxed);
+            state_.drive_faulted.store(true, std::memory_order_release);
+        }
         rt_error_.store(RtError::NotOperational, std::memory_order_release);
         state_.faulted.store(true, std::memory_order_release);
         degraded_.store(true, std::memory_order_release);  // §8: bring-up failed -> Degraded (APIs throw via last_error())
+        // One-shot operator log line (the old bring-up-abort path emitted NOTHING to stderr, #71).
+        // Cold teardown path -- fprintf here is fine (not the hot loop).
+        (void)std::fprintf(stderr,
+                           "[servo] bring-up FAILED: drive not operational%s%s\n",
+                           al != 0 ? (" -- drive refused OP: AL " + hex(al) + " (" + al_msg + ")").c_str() : "",
+                           (al == 0x0027 && !config_.use_distributed_clocks)
+                               ? " -- freerun not supported; this drive requires use_distributed_clocks=true"
+                               : "");
     } else if (reason == StopReason::RtSetupFailed) {
         // §8: realtime scheduling unavailable && require_realtime -> Degraded-but-alive (the
         // old start() InitError throw is REPLACED by this, the task's explicit §8 addition).
@@ -1188,6 +1212,17 @@ std::string ServoController::last_error() const {
         } else {
             append("drive fault (code pending)");
         }
+    }
+    // #71 BRING-UP AL REFUSAL: the drive refused an AL state transition at bring-up (e.g. AL 0x0027
+    // "Freerun not supported" when a DC-only drive is requested into OP without SYNC0). Distinct from
+    // the 0x603F drive fault above -- it names the actual cause that a bare "drive not operational"
+    // (or a mis-attributed Er74.1) used to hide (#71).
+    if (const std::uint16_t al = state_.bringup_al_code.load(std::memory_order_relaxed); al != 0) {
+        std::string msg = "drive refused OP: AL " + hex(al);
+        if (al == 0x0027 && !config_.use_distributed_clocks) {
+            msg += " (freerun not supported -- set use_distributed_clocks=true for this DC-only drive)";
+        }
+        append(msg);
     }
     // BUS (symptom + recovery).
     if (state_.wkc_faulted.load(std::memory_order_acquire)) {
