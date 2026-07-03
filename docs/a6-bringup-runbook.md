@@ -1,6 +1,6 @@
 # A6-EC Bench Bring-up Runbook (Phase 7)
 
-Step-by-step procedure to bring the `viam:ethercat:servo` motor module up on a **real A6-EC drive** on a bench. This is the hardware-independent prep + the on-bench sequence; do the prep now, run the bench steps when the drive + NIC are in front of you.
+Step-by-step procedure to bring the EtherCAT servo motor module up on a **real A6-EC drive** on a bench. Use the **`viam:ethercat:a6-servo`** model for the A6 (#15 item 2): it is an `A6ServoDriver` subclass of the generic `viam:ethercat:servo` driver that carries the three A6 residuals **in code** — the vendor fault-reset (`0x2031:01 = 1`), the no-SYNC0 code (`0x8700` / Er74.1), and its `0x603F` gloss — so those are **no longer config attributes**. A generic non-A6 CiA402 drive uses `viam:ethercat:servo` instead. This is the hardware-independent prep + the on-bench sequence; do the prep now, run the bench steps when the drive + NIC are in front of you.
 
 **Read alongside:**
 - [`docs/a6-hardware-wiring.md`](./a6-hardware-wiring.md) — power/motor/comms wiring + the ⚠️ mains-voltage safety section. **Do the wiring (and its safety steps) before anything here.**
