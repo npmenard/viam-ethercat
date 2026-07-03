@@ -97,7 +97,7 @@ struct Options {
     // --- #47-P3b sub-step 5 (P3c) runtime mode-switch exercise ---
     bool then_jog_vel = false;  // --move-pos POS --then-jog-vel VEL: after the PP move REACHES, SWITCH to PV (§6) and jog at VEL until
                                 // Ctrl-C (drives the canonical mode-switch on the wire)
-    // #22 steady-state SDO probe: while Running, issue Master::sdo_read_deferred (marshaled
+    // #22 steady-state SDO probe: while Running, issue Master::sdo_read (direct non-RT, #15;
     // through the RT loop) for 0x6079/0x6078/0x6502 every ~500ms and print raw + converted.
     // Exercises the exact steady-state SDO path on real hardware WHILE PD flows -- the HW
     // evidence for #22 (WKC/Er74/LRW-gap intact around each mid-run mailbox read).

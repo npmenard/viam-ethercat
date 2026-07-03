@@ -489,149 +489,17 @@ Tpdo Master::make_tpdo(std::uint16_t slave) {
 }
 
 void Master::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
-    // Port-ownership guard (#39): a blocking mailbox transfer concurrent with a running
-    // RT loop starves cyclic LRW (the ec_sample 0x001B lesson). rt_active_ is the
-    // consumer-DECLARED RT phase; while set, refuse loudly instead of corrupting timing.
-    if (rt_active_.load(std::memory_order_acquire)) {
-        throw ConfigError("Master::sdo_write: refused during a declared RT phase (slave " + std::to_string(slave) + " object " +
-                          std::to_string(index) + ":" + std::to_string(sub) +
-                          ") -- SDO is pre-RT-spawn/post-RT-join only; steady-state access is the #22 queue");
-    }
+    // #15: the CoE mailbox transfer runs on the CALLER's thread and blocks until it completes. It is
+    // SAFE while the RT PDO loop is running: SOEM v2's port is thread-safe (per-index frame buffers +
+    // PRIO_INHERIT getindex/tx/rx mutexes in nicdrv), and the mailbox SyncManager is distinct from the
+    // PDO SM, so a ONE-SHOT SDO neither corrupts nor -- being one-shot, not a tight poll -- starves the
+    // cyclic LRW. No RT-phase gate, no marshaling through the RT thread (that whole path is gone).
     backend_->sdo_write(slave, index, sub, data);
 }
 
 std::size_t Master::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
-    if (rt_active_.load(std::memory_order_acquire)) {
-        throw ConfigError("Master::sdo_read: refused during a declared RT phase (slave " + std::to_string(slave) + " object " +
-                          std::to_string(index) + ":" + std::to_string(sub) +
-                          ") -- SDO is pre-RT-spawn/post-RT-join only; steady-state access is the #22 queue");
-    }
+    // #15: caller-thread, blocking, RT-concurrent-safe (see sdo_write). Returns bytes read into `out`.
     return backend_->sdo_read(slave, index, sub, out);
-}
-
-// --- #22 steady-state SDO: marshaled through the RT thread -------------------------
-
-void Master::set_rt_active(bool active) noexcept {
-    rt_active_.store(active, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lk(sdo_mtx_);
-        sdo_service_open_ = active;
-        if (!active) {
-            // The RT servicer is gone (called after the join). Any in-flight request can no
-            // longer be serviced: drop it to Idle and clear pending, so a blocked waiter wakes
-            // (its predicate also checks !sdo_service_open_) and throws cleanly rather than
-            // hanging across stop()/reconfigure().
-            sdo_phase_ = SdoPhase::Idle;
-            sdo_pending_.store(false, std::memory_order_release);
-        }
-    }
-    sdo_cv_.notify_all();
-}
-
-std::size_t Master::sdo_read_deferred(
-    std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out, std::chrono::milliseconds timeout) {
-    const std::string what = "slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" + std::to_string(sub);
-    std::unique_lock<std::mutex> lk(sdo_mtx_);
-    if (!sdo_service_open_) {
-        throw ConfigError("Master::sdo_read_deferred: no RT servicer running (" + what +
-                          ") -- a steady-state SDO read requires the RT loop; call while operational");
-    }
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    // Serialize concurrent submitters: wait for the single slot to be free.
-    if (!sdo_cv_.wait_until(lk, deadline, [&] { return sdo_phase_ == SdoPhase::Idle || !sdo_service_open_; })) {
-        throw SdoError("Master::sdo_read_deferred: timed out waiting for the SDO slot (" + what + ")");
-    }
-    if (!sdo_service_open_) {
-        throw ConfigError("Master::sdo_read_deferred: RT servicer stopped before the request was posted (" + what + ")");
-    }
-    // Post the request.
-    sdo_job_ = SdoJob{};
-    sdo_job_.slave = slave;
-    sdo_job_.index = index;
-    sdo_job_.sub = sub;
-    sdo_job_.want = out.size();
-    sdo_phase_ = SdoPhase::Requested;
-    sdo_pending_.store(true, std::memory_order_release);  // publish the job fields to the RT reader (acquire in service_sdo)
-    // Wait for the RT thread to complete it. service_sdo() holds sdo_mtx_ ACROSS its blocking
-    // transfer, so once we re-acquire here the phase is a settled Requested/Done -- never a
-    // mid-transfer state, so a timeout can safely reclaim a still-Requested slot.
-    (void)sdo_cv_.wait_until(lk, deadline, [&] { return sdo_phase_ == SdoPhase::Done || !sdo_service_open_; });
-    if (sdo_phase_ != SdoPhase::Done) {
-        const bool closed = !sdo_service_open_;
-        if (sdo_phase_ == SdoPhase::Requested) {
-            // The RT thread never claimed it (else phase would be Done -- it transitions
-            // Requested->Done atomically under this same lock). Reclaim the slot.
-            sdo_phase_ = SdoPhase::Idle;
-            sdo_pending_.store(false, std::memory_order_release);
-            sdo_cv_.notify_all();
-        }
-        lk.unlock();
-        if (closed) {
-            throw ConfigError("Master::sdo_read_deferred: RT servicer stopped before the SDO completed (" + what + ")");
-        }
-        throw SdoError("Master::sdo_read_deferred: SDO read timed out after " + std::to_string(timeout.count()) + " ms (" + what + ")");
-    }
-    // Done: consume the result and free the slot for the next submitter.
-    const bool ok = sdo_job_.ok;
-    const std::string err = sdo_job_.error;
-    const std::size_t got = sdo_job_.got;
-    std::array<std::byte, kMaxSdoReadBytes> buf = sdo_job_.buf;
-    sdo_phase_ = SdoPhase::Idle;
-    sdo_pending_.store(false, std::memory_order_release);
-    lk.unlock();
-    sdo_cv_.notify_all();  // wake any submitter waiting on the slot
-    if (!ok) {
-        throw SdoError(err);
-    }
-    const std::size_t n = std::min(got, out.size());
-    std::memcpy(out.data(), buf.data(), n);
-    return n;
-}
-
-void Master::service_sdo() noexcept {
-    // RT idle fast path: a single acquire-load; pairs with the submitter's release store of
-    // sdo_pending_ so the job fields are visible if we do proceed. No lock/alloc when Idle.
-    if (!sdo_pending_.load(std::memory_order_acquire)) {
-        return;
-    }
-    // #72 priority-inversion guard: the RT thread must NEVER BLOCK on sdo_mtx_. std::mutex has no
-    // priority inheritance, so a plain lock here would stall the RT loop for as long as a non-RT
-    // submitter -- preempted by host load while it briefly holds the lock (post-request, pre-wait) --
-    // stays off-CPU. That stall gaps PD and can drop SYNC0 (the ~26ms class of stall). A NON-BLOCKING
-    // try-lock keeps PD flowing regardless: if we don't get it this cycle the submitter is mid-handoff
-    // and releases it in its wait_until; we service next cycle (idempotent; its own timeout bounds it).
-    // Strictly better than a PI mutex here -- PI would only BOUND the block; this avoids it entirely.
-    std::unique_lock<std::mutex> lk(sdo_mtx_, std::try_to_lock);
-    if (!lk.owns_lock()) {
-        return;  // contended (submitter mid-handoff) -- retry next cycle; PD never gapped
-    }
-    if (sdo_phase_ != SdoPhase::Requested) {
-        // A timed-out/closed waiter reclaimed the slot between our atomic load and the lock.
-        sdo_pending_.store(false, std::memory_order_release);
-        return;
-    }
-    // Execute exactly ONE transaction, UNDER the lock: holding it across the blocking mailbox
-    // round-trip is what makes the waiter's Requested->Done view atomic (no mid-transfer
-    // reclaim). This cycle deliberately overruns by the round-trip (~1-2 ms); the Runner's
-    // pacer catch-up + the drive's SM watchdog absorb the single-cycle PD gap (#22 HW-verified).
-    SdoJob& j = sdo_job_;
-    try {
-        const std::size_t want = std::min<std::size_t>(j.want, j.buf.size());
-        j.got = backend_->sdo_read(j.slave, j.index, j.sub, std::span<std::byte>(j.buf.data(), want));
-        j.ok = true;
-    } catch (const std::exception& e) {
-        j.got = 0;
-        j.ok = false;
-        j.error = e.what();  // alloc permitted HERE: this is the bounded jitter window, not the idle hot path
-    } catch (...) {
-        j.got = 0;
-        j.ok = false;
-        j.error = "unknown error servicing steady-state SDO read";
-    }
-    sdo_phase_ = SdoPhase::Done;
-    sdo_pending_.store(false, std::memory_order_release);
-    lk.unlock();
-    sdo_cv_.notify_all();
 }
 
 std::string Master::last_error() const {

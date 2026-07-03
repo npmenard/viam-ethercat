@@ -275,7 +275,7 @@ CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc,
                 {
                     std::array<std::byte, 4> vbuf{};
                     try {
-                        const std::size_t n = master.sdo_read_deferred(slave, kDcLinkVoltage, 0, vbuf, std::chrono::milliseconds(200));
+                        const std::size_t n = master.sdo_read(slave, kDcLinkVoltage, 0, vbuf);
                         line += "0x6079 DC-link=" + std::to_string((n >= 4 ? load_le<std::uint32_t>(vbuf) : 0) / 1000.0) + "V";
                     } catch (const Error& e) {
                         line += std::string("0x6079 ERR{") + e.what() + "}";
@@ -284,7 +284,7 @@ CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc,
                 {
                     std::array<std::byte, 2> cbuf{};
                     try {
-                        const std::size_t n = master.sdo_read_deferred(slave, kCurrentActual, 0, cbuf, std::chrono::milliseconds(200));
+                        const std::size_t n = master.sdo_read(slave, kCurrentActual, 0, cbuf);
                         line += " | 0x6078 current=" + std::to_string(n >= 2 ? load_le<std::int16_t>(cbuf) : 0) + "permille";
                     } catch (const Error& e) {
                         line += std::string(" | 0x6078 ERR{") + e.what() + "}";
@@ -293,7 +293,7 @@ CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc,
                 {
                     std::array<std::byte, 4> mbuf{};
                     try {
-                        const std::size_t n = master.sdo_read_deferred(slave, kSupportedModes, 0, mbuf, std::chrono::milliseconds(200));
+                        const std::size_t n = master.sdo_read(slave, kSupportedModes, 0, mbuf);
                         const std::uint32_t modes = n >= 4 ? load_le<std::uint32_t>(mbuf) : 0;
                         char hex[16];
                         (void)std::snprintf(hex, sizeof(hex), "0x%X", modes);

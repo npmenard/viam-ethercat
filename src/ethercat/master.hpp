@@ -14,14 +14,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <string>
 
@@ -320,59 +318,19 @@ class Master {
         }
     }
 
-    // --- narrow public SDO primitive (#39: vendor POLICY is consumer-side) -------------
-    // #23 removed the public SDO surface to stop ad-hoc CoE poking; #39 partially reverses
-    // that BY USER DIRECTION: vendor fault-reset (and vendor policy generally) belongs to
-    // CONSUMERS, which requires a consumer-reachable primitive. The boundary moved from
-    // "no public SDO" to "public SDO with an explicit PORT-OWNERSHIP contract":
+    // --- public SDO primitive (#39 vendor policy is consumer-side; #15 concurrent-safe) ------
+    // A CoE object read/write via the backend's blocking mailbox transfer, run on the CALLER's
+    // thread. #39 exposed this (vendor fault-reset etc. belong to consumers); #15 made it safe to
+    // call CONCURRENTLY with a running RT PDO loop and retired the old RT-serviced marshaling queue.
     //
-    // CONTRACT: callable ONLY while the caller is the SINGLE port owner -- pre-RT-spawn
-    // (after init()/configure(), before any cyclic thread) or post-RT-join. NEVER
-    // concurrently with a running RT loop: SOEM's port is not thread-safe, and a blocking
-    // mailbox transfer interleaved with cyclic LRW starves process data (the ec_sample
-    // 0x001B SM-watchdog lesson). Steady-state (RT running) SDO access is NOT this
-    // primitive -- that is #22's RT-serviced request queue.
-    //
-    // STRUCTURAL GUARD: Master cannot self-detect RT activity (consumers own their loop
-    // threads and call process()), so the enforceable form is the consumer-DECLARED RT
-    // phase: bracket set_rt_active(true/false) EXACTLY around the RT thread spawn/join
-    // (ServoController does). While declared active, sdo_read/sdo_write THROW ConfigError
-    // (a release-mode throw, not a debug assert -- the module ships release). For external
-    // library users the flag is part of the documented contract; the doc-contract stays
-    // primary. Single-threaded tools (a6_validate) never set it.
-    //
-    // It ALSO opens/closes the #22 steady-state SDO SERVICER WINDOW (below): set_rt_active(true)
-    // means "the RT loop will service marshaled SDO requests"; set_rt_active(false) (after the
-    // join) FAILS any in-flight request + wakes every waiter cleanly (no hang across stop()).
-    void set_rt_active(bool active) noexcept;
-    // Write/read one CoE object via the backend (blocking mailbox transfer). Throws
-    // ConfigError while a consumer-declared RT phase is active (the guard above); the
-    // backend's own error tiers (SdoError on a CoE abort, ConfigError on a bad slave id)
-    // pass through unchanged. sdo_read returns the number of bytes read into `out`.
+    // CONCURRENCY (#15): SOEM v2's port IS thread-safe -- per-index frame buffers + PRIO_INHERIT
+    // getindex/tx/rx mutexes (nicdrv) -- and the mailbox SyncManager is distinct from the PDO SM, so
+    // a one-shot SDO from a non-RT thread neither corrupts nor (being one-shot, not a tight poll)
+    // starves the cyclic LRW. This reverses the pre-#15 contract ("single port owner only"; SOEM v1
+    // was not thread-safe). The backend's error tiers (SdoError on a CoE abort, ConfigError on a bad
+    // slave id) pass through; sdo_read returns the number of bytes read into `out`.
     void sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data);
     std::size_t sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out);
-
-    // --- #22 STEADY-STATE SDO: RT-serviced request queue -----------------------------
-    // The complement to the guarded pre-/post-RT primitive above: read a CoE object WHILE
-    // the RT loop is running, WITHOUT a second thread ever driving SOEM's (non-thread-safe)
-    // port. A non-RT caller MARSHALS the request to the RT thread, which executes exactly
-    // ONE blocking mailbox transfer per cycle at a designated point (Runner steady loop ->
-    // service_sdo()) and posts the result back. The single-port-owner invariant holds by
-    // construction; the cost is a bounded, occasional PD gap on the servicing cycle (the
-    // mailbox round-trip, ~1-2 ms), absorbed by the pacer's phase-preserving catch-up and
-    // tolerated by the drive's SM watchdog (>=50 ms) -- HW-verified (#22).
-    //
-    // Single request in flight (a submit mutex serializes concurrent callers). Blocks up to
-    // `timeout` for the RT thread to service it; returns the byte count read into `out`.
-    // Throws ConfigError if no RT servicer is running (call this only while operational;
-    // pre-/post-RT use the guarded sdo_read above), SdoError on a CoE abort or on timeout.
-    std::size_t sdo_read_deferred(
-        std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out, std::chrono::milliseconds timeout);
-    // RT hot path: service AT MOST ONE pending SDO request, else return immediately. Called
-    // ONCE per steady cycle by the Runner (the single port owner). noexcept: a CoE abort is
-    // captured into the request's result, never thrown across the RT boundary. The idle path
-    // is a single acquire-load of an atomic -- no lock, no alloc when nothing is pending.
-    void service_sdo() noexcept;
 
    private:
     // INTERNAL per-object mapping record (#30 §5): byte offset + mapped width in bits.
@@ -449,35 +407,9 @@ class Master {
     std::atomic<bool> operational_{false};
     std::atomic<std::uint64_t> total_cycles_{0};  // #40 WkcStats: process() cycles since configure()
     std::atomic<std::uint64_t> bad_cycles_{0};    // #40 WkcStats: short/abnormal-WKC cycles
-    // Consumer-declared RT phase (#39): while true, the public sdo_read/sdo_write throw
-    // (port-ownership guard). Set/cleared by the consumer around its RT thread spawn/join.
-    std::atomic<bool> rt_active_{false};
-
-    // --- #22 steady-state SDO request slot (single in-flight) ------------------------
-    // The marshaling handoff between a non-RT caller (sdo_read_deferred) and the RT thread
-    // (service_sdo). sdo_pending_ is the RT hot-path fast check (acquire-load; skip the lock
-    // entirely when Idle). Everything else is under sdo_mtx_ -- taken only off the idle path
-    // (a submit, a completion, or the bounded jitter window of the actual transfer), so the
-    // 1 kHz idle cycle never locks/allocs.
-    static constexpr std::size_t kMaxSdoReadBytes = 64;  // these objects are <=4 B; 64 is ample headroom
-    enum class SdoPhase : std::uint8_t { Idle, Requested, Done };
-    struct SdoJob {
-        std::uint16_t slave = 0;
-        std::uint16_t index = 0;
-        std::uint8_t sub = 0;
-        std::size_t want = 0;  // bytes requested (out.size())
-        std::size_t got = 0;   // bytes actually read
-        bool ok = false;       // false => `error` holds the reason
-        std::string error;     // set by the RT servicer on abort (jitter-window alloc, never the idle path)
-        std::array<std::byte, kMaxSdoReadBytes>
-            buf{};  // RT reads INTO here; the waiter copies OUT (caller buffer lifetime is irrelevant to RT)
-    };
-    std::mutex sdo_mtx_;
-    std::condition_variable sdo_cv_;
-    std::atomic<bool> sdo_pending_{false};  // RT fast path: is there a Requested job to service?
-    bool sdo_service_open_ = false;         // guarded by sdo_mtx_: an RT loop is running to service (mirrors rt_active_)
-    SdoPhase sdo_phase_ = SdoPhase::Idle;   // guarded by sdo_mtx_
-    SdoJob sdo_job_;                        // guarded by sdo_mtx_ (RT holds the lock across its transfer)
+    // #15: the RT-phase gate (rt_active_) and the #22 RT-serviced SDO request slot are GONE --
+    // sdo_read/sdo_write now run the mailbox transfer directly on the caller's thread, concurrency-safe
+    // against the RT PDO loop via SOEM v2's thread-safe port (see the public sdo_read/sdo_write doc).
 };
 
 // ---------------------------------------------------------------------------

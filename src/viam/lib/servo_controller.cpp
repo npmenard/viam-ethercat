@@ -1167,16 +1167,23 @@ std::int32_t ServoController::velocity_counts() const noexcept {
 }
 
 std::size_t ServoController::sdo_read(std::uint16_t index, std::uint8_t sub, std::span<std::byte> out, std::chrono::milliseconds timeout) {
-    // Shared lock: serializes against reconfigure()'s exclusive master_.reset(), so master_
-    // can't be reset mid-call. The marshaled read blocks up to `timeout` HOLDING the shared
-    // lock -- bounded, so reconfigure() waits at most that long (unlike go_to, which releases
-    // before its multi-second park). master_-guarded, NOT part of the master_-free accessor
-    // contract; #22 steady-state SDO is a deliberate, bounded exception.
+    // #15: the CoE read now runs DIRECTLY on this (non-RT) caller thread, concurrent with the RT PDO
+    // loop (SOEM v2 port is thread-safe). The shared lock still serializes against reconfigure()'s
+    // exclusive master_.reset() so master_ can't be reset mid-transfer; the read blocks HOLDING the
+    // shared lock, bounded by the backend's mailbox timeout, so reconfigure() waits at most that long.
+    // (`timeout` is retained on the signature for the caller but no longer drives a marshaling wait --
+    // the transfer's own SOEM timeout bounds it.)
+    (void)timeout;
     const std::shared_lock<std::shared_mutex> lk(api_mutex_);
-    if (master_ == nullptr) {
-        throw ConfigError("ServoController::sdo_read: not started (object " + std::to_string(index) + ":" + std::to_string(sub) + ")");
+    // #15: gate on the RUNNING state (rt_runner_), not just master_ != null. stop() resets rt_runner_
+    // but keeps master_, and after stop() the bus is closed -- a direct SDO must fail cleanly (never
+    // return stale data or hit a closed port), so refuse unless a Runner is live. rt_runner_ is written
+    // only under the EXCLUSIVE api_mutex_ (start/stop/reconfigure), so this shared-lock read is safe.
+    if (master_ == nullptr || rt_runner_ == nullptr) {
+        throw ConfigError("ServoController::sdo_read: not running -- call while operational (object " + std::to_string(index) +
+                          ":" + std::to_string(sub) + ")");
     }
-    return master_->sdo_read_deferred(config_.slave_id, index, sub, out, timeout);
+    return master_->sdo_read(config_.slave_id, index, sub, out);
 }
 
 double ServoController::rated_current_amps() const noexcept {

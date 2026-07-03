@@ -140,9 +140,6 @@ void Runner::start() {
     realtime::lock_current();
     started_.store(true, std::memory_order_release);
     rt_core_->phase_.store(RunnerPhase::BringingUp, std::memory_order_relaxed);
-    // #39 bracket: declared active EXACTLY across the RT thread's lifetime; cleared
-    // after the join in stop() (the one audited site post-#47).
-    master_.set_rt_active(true);
     // The thread captures the RtCore* (NOT `this`) -- so it never reaches a Runner
     // member, and a leaked RtCore (#52 wedge) carries everything the thread needs.
     rt_core_->thread_ = std::jthread([core = rt_core_.get()](const std::stop_token& st) { core->rt_body(st); });
@@ -202,8 +199,7 @@ void Runner::stop() noexcept {
     if (core.thread_.joinable()) {
         core.thread_.join();
     }
-    master_.set_rt_active(false);  // joined -- single port owner again
-    master_.close();               // the proven INIT teardown (idempotent at the backend)
+    master_.close();  // the proven INIT teardown (idempotent at the backend)
 }
 
 void Runner::run() {
@@ -361,12 +357,8 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
                     a.control->on_stop(r);
                 }
             }
-            // #22 steady-state SDO: the Runner is the single port owner, so it is the ONLY
-            // place a marshaled SDO transfer may run. Service AT MOST ONE pending request per
-            // steady cycle, right after process()/publish. No-op (one acquire atomic load)
-            // when none is pending. NOT during the stopping window -- the controlled-stop ramp
-            // has its own tight de-energize deadline that a mailbox round-trip must not eat.
-            master_.service_sdo();
+            // #15: no SDO servicing here anymore -- do_command SDOs run directly on the caller's
+            // (non-RT) thread now (SOEM v2 port is thread-safe), so the RT loop never touches the mailbox.
         }
         for (Attached& a : controls_) {
             dispatch(a, cycle, dct, stopping, [&](CycleContext& ctx) { a.control->step(ctx); });

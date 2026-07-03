@@ -1060,22 +1060,20 @@ TEST("#39: the RT-phase bracket clears after stop() -- a restart's pre-spawn res
     ctrl.stop();
 }
 
-// (#39, DA-required) The bracket's SET-TRUE half, end-to-end: while the controller's RT
-// phase is running, the Master's public SDO surface REFUSES (ConfigError) -- the failure
-// mode of a missing set(true) fails-OPEN (silently back to doc-contract-only), so it
-// must be pinned by test, not review. After stop() (joined), SDO proceeds again.
-// master_for_sdo() is the single-port-owner seam: used here pre/post the RT phase and
-// AROUND lifecycle calls only (never concurrently with them).
-TEST("#39: SDO refused while the controller's RT phase is declared; allowed after stop") {
+// #15: the pre-#15 RT-phase port-ownership gate is GONE. The Master's public SDO now runs the mailbox
+// transfer directly on the caller's thread, concurrency-safe against a running RT PDO loop (SOEM v2's
+// port is thread-safe). So a consumer-side SDO via master_for_sdo() succeeds BOTH while the RT phase is
+// running AND after stop() -- no ConfigError refusal.
+TEST("#15: consumer SDO works during the RT phase and after stop (no port-ownership gate)") {
     SimBackend* sim = nullptr;
     ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
     CHECK(ctrl.master_for_sdo() == nullptr);  // pre-first-start: no Master yet
     ctrl.start();
     CHECK(ctrl.master_for_sdo() != nullptr);
     const std::array<std::byte, 2> one{std::byte{0x01}, std::byte{0x00}};
-    CHECK_THROWS(ctrl.master_for_sdo()->sdo_write(1, 0x2031, 0x01, one), ethercat::ConfigError);  // RT declared
-    ctrl.stop();  // joined -> the bracket cleared -> single port owner again
-    ctrl.master_for_sdo()->sdo_write(1, 0x2031, 0x01, one);
+    ctrl.master_for_sdo()->sdo_write(1, 0x2031, 0x01, one);  // #15: succeeds DURING the RT phase (was ConfigError)
+    ctrl.stop();                                             // joined
+    ctrl.master_for_sdo()->sdo_write(1, 0x2031, 0x01, one);  // and after stop
     CHECK(sim != nullptr);
     CHECK_EQ(sim->recorded_sdo(1, 0x2031, 0x01).size(), std::size_t{2});
 }
@@ -1479,23 +1477,23 @@ TEST("#68: config-driven monitors read+convert end-to-end for BOTH default-stand
     }
 }
 
-TEST("#22: an SDO read after stop() fails cleanly (no servicer) and does not hang") {
+TEST("#22/#15: an SDO read after stop() fails cleanly (not running) and does not hang") {
     ServoController ctrl{
         make_config(ControlMode::ProfilePosition, /*feedback=*/true),
         [] { return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_sdo()})); }};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
-    ctrl.stop();  // joins the RT thread + closes the servicer window (set_rt_active(false))
+    ctrl.stop();  // joins the RT thread + drops the Runner (bus closed)
 
-    // The window is closed: the read must throw PROMPTLY (ConfigError), never block on the
-    // absent servicer. Bound the whole call to prove no hang.
+    // #15: after stop() the controller is not running (rt_runner_ reset), so sdo_read refuses PROMPTLY
+    // (ConfigError) rather than reading a stale value off a closed bus. Bound the call to prove no hang.
     std::array<std::byte, 4> buf{};
     const auto t0 = std::chrono::steady_clock::now();
     CHECK_THROWS(ctrl.sdo_read(0x6079, 0, buf, std::chrono::milliseconds(500)), ethercat::Error);
     CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(200));  // immediate, not a 500ms timeout
 }
 
-TEST("#22: a reader racing stop() unblocks cleanly (waiter woken by the servicer close)") {
+TEST("#22/#15: a reader looping SDO reads across stop() exits cleanly (not-running throw, no hang)") {
     ServoController ctrl{
         make_config(ControlMode::ProfilePosition, /*feedback=*/true),
         [] { return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{make_model_sdo()})); }};
