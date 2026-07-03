@@ -59,7 +59,6 @@ std::vector<SimSlaveModel> make_models() {
     m.actual_off = 2;
     m.mode = Cia402Mode::ProfilePosition;
     m.counts_per_step = 1000;
-    m.target_reached_always_set = true;  // A6-shaped model: the bit10 quirk is model DATA (#43)
     return {m};
 }
 
@@ -113,7 +112,7 @@ bool drive_to_op(Master& m) {
 
 }  // namespace
 
-TEST("Master+SimBackend: full RT loop reaches OperationEnabled, WKC + bit10 hold") {
+TEST("Master+SimBackend: full RT loop reaches OperationEnabled, WKC holds") {
     Master master{make_config(), std::make_unique<SimBackend>(make_models())};
     master.init();
     master.configure();
@@ -132,9 +131,6 @@ TEST("Master+SimBackend: full RT loop reaches OperationEnabled, WKC + bit10 hold
     for (int cycle = 0; cycle < 50; ++cycle) {
         const PdoSnapshot snap = master.read_inputs(1);
         const Status st = status_of(snap);
-        if (snap.is_live()) {
-            CHECK(st.target_reached());  // A6 bit10 held =1 on every real published frame
-        }
         write_ctrl(master, Cia402Fsm{}.step(st, Cia402State::OperationEnabled));
         master.process();
         CHECK_EQ(master.working_counter(), master.expected_wkc());  // healthy WKC every cycle
@@ -535,6 +531,5 @@ TEST("#32.4: dc_sync0_shift_ns threads through configure() to the backend arm ca
     m.configure();  // arms SYNC0 in PRE-OP (DC on) -> backend records the CyclShift it received
     CHECK_EQ(raw->configured_dc_sync0_shift_ns(), std::int32_t{12345});
 }
-
 
 TEST_MAIN()

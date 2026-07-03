@@ -128,12 +128,12 @@ SimSlaveModel sim_model_from_config(const ServoConfig& sc_in) {
         for (const PdoEntry& e : sc.rxpdo.entries.at(pidx)) {
             if (e.index == 0x6040) {
                 m.ctrlword_off = off;
+            } else if (e.index == 0x6060) {
+                m.mode_of_op_off = static_cast<std::int32_t>(off);
             } else if (e.index == 0x607A) {
                 m.target_off = off;
             } else if (e.index == 0x60FF) {
                 m.velocity_off = static_cast<std::int32_t>(off);
-            } else if (e.index == 0x6081) {
-                m.profile_velocity_off = static_cast<std::int32_t>(off);
             }
             off += e.bit_length / 8U;
         }
@@ -145,8 +145,12 @@ SimSlaveModel sim_model_from_config(const ServoConfig& sc_in) {
         for (const PdoEntry& e : sc.txpdo.entries.at(pidx)) {
             if (e.index == 0x6041) {
                 m.statusword_off = off;
+            } else if (e.index == 0x6061) {
+                m.mode_display_off = static_cast<std::int32_t>(off);
             } else if (e.index == 0x6064) {
                 m.actual_off = off;
+            } else if (e.index == 0x606C) {
+                m.velocity_actual_off = static_cast<std::int32_t>(off);
             }
             off += e.bit_length / 8U;
         }

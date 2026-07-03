@@ -41,8 +41,6 @@ std::uint32_t sdo_key(std::uint16_t index, std::uint8_t sub) noexcept {
 }  // namespace
 
 SimBackend::SimBackend(std::vector<SimSlaveModel> slaves) {
-    // emplace in place: Slave holds atomics (cross-thread test-hook fields) so it is
-    // non-movable; std::deque back-insertion constructs directly without moving.
     for (auto& model : slaves) {
         slaves_.emplace_back();
         slaves_.back().model = std::move(model);
@@ -86,19 +84,8 @@ void SimBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_
                           std::to_string(slaves_.size()) + ")");
     }
     Slave& s = slaves_[slave - 1];
-    // Test injection (#32 note 14): simulate a drive CoE abort on this object. SdoError is the
-    // GENERIC SDO tier; apply_pdo_map re-tags it PdoMappingError for the mapping objects.
-    if (const auto it = s.sdo_write_aborts.find(sdo_key(index, sub)); it != s.sdo_write_aborts.end()) {
-        throw SdoError("SimBackend: slave " + std::to_string(slave) + " aborted SDO write to object " + std::to_string(index) + ":" +
-                       std::to_string(sub) + " (CoE abort code " + std::to_string(it->second) + ")");
-    }
     s.dictionary[sdo_key(index, sub)] = std::vector<std::byte>(data.begin(), data.end());
     s.sdo_write_order.push_back(sdo_key(index, sub));
-    // De-mask: the runtime mode of operation comes from the 0x6060 SDO (U8), NOT
-    // model.mode -- so a master that forgets to set it leaves the device in mode 0.
-    if (index == 0x6060 && sub == 0 && !data.empty()) {
-        s.effective_mode = static_cast<Cia402Mode>(static_cast<std::int8_t>(data[0]));
-    }
 }
 
 std::size_t SimBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
@@ -107,64 +94,34 @@ std::size_t SimBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::
                           std::to_string(slaves_.size()) + ")");
     }
     const Slave& s = slaves_[slave - 1];
-    // #53: 0x605A (quick-stop option, i16) is a device object the control READS to assert the
-    // PV stop regime -- serve it from the model (default 2). 0x6085 (quick-stop decel) normally
-    // reads back the written value (dictionary, below), but the model can FORCE a clamp/absent
-    // echo (0 -> the control refuses; a clamped value -> the control uses the echoed value).
+    // Conformant quick-stop configure gate: 0x605A (quick-stop option) reads 2 so a
+    // PV/switchable configure() does not refuse; a written 0x6085 (decel) echoes back
+    // via the dictionary below (nonzero -> the readback gate passes).
     if (index == 0x605A && sub == 0 && out.size() >= 2) {
-        store_le<std::int16_t>(out.subspan(0, 2), s.model.quick_stop_option);
+        store_le<std::int16_t>(out.subspan(0, 2), 2);
         return 2;
     }
-    if (index == 0x6085 && sub == 0 && s.model.quick_stop_decel_echo_forced && out.size() >= 4) {
-        store_le<std::uint32_t>(out.subspan(0, 4), s.model.quick_stop_decel_echo);
-        return 4;
+    if (const auto it = s.dictionary.find(sdo_key(index, sub)); it != s.dictionary.end()) {
+        const std::size_t n = std::min(out.size(), it->second.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            out[i] = it->second[i];
+        }
+        return n;
     }
-    // #22 steady-state SDO read targets (the module's do_command reads these mid-run). Served
-    // from the model so the marshaled path is exercised offline; a real drive holds them in
-    // its OD. Standard CiA402 objects, not in the PDO map.
-    if (index == 0x6079 && sub == 0 && out.size() >= 4) {  // DC-link circuit voltage, U32, mV
-        store_le<std::uint32_t>(out.subspan(0, 4), s.model.dc_link_voltage_mv);
-        return 4;
-    }
-    if (index == 0x6078 && sub == 0 && out.size() >= 2) {  // current actual value, I16, per-mille of rated
-        store_le<std::int16_t>(out.subspan(0, 2), s.model.current_actual_permille);
-        return 2;
-    }
-    if (index == 0x6502 && sub == 0 && out.size() >= 4) {  // supported drive modes, U32 bitmask
-        store_le<std::uint32_t>(out.subspan(0, 4), s.model.supported_drive_modes);
-        return 4;
-    }
-    // A6 vendor monitoring object 0x2040 (test fixture; #15 no longer read by do_command).
-    if (index == 0x2040 && sub == 0x07 && out.size() >= 2) {  // bus voltage, U16, 0.1 V
-        store_le<std::uint16_t>(out.subspan(0, 2), s.model.vendor_bus_voltage_dV);
-        return 2;
-    }
-    if (index == 0x2040 && sub == 0x0D && out.size() >= 2) {  // RMS phase current, I16, 0.1 A
-        store_le<std::int16_t>(out.subspan(0, 2), s.model.vendor_phase_current_dA);
-        return 2;
-    }
-    const auto it = s.dictionary.find(sdo_key(index, sub));
-    if (it == s.dictionary.end()) {
-        return 0;
-    }
-    const std::size_t n = std::min(out.size(), it->second.size());
-    for (std::size_t i = 0; i < n; ++i) {
-        out[i] = it->second[i];
-    }
-    return n;
+    // Any other object reads as present-but-zero (a pipe, not a drive OD): zero-fill
+    // so a steady-state SDO reader interleaving with a live move still gets bytes back.
+    std::fill(out.begin(), out.end(), std::byte{0});
+    return out.size();
 }
 
 void SimBackend::map_process_data() {
     expected_wkc_ = 0;
     for (auto& s : slaves_) {
-        // Validate model offsets fit the image sizes at SETUP time. step_device()
-        // is noexcept and uses subspan(), so a bad offset there would throw and
-        // std::terminate -- fail loudly here instead.
+        // Validate the required offsets fit the image sizes at SETUP time (step_device
+        // is noexcept + uses subspan()), so a bad offset fails loudly here.
         const SimSlaveModel& m = s.model;
-        const bool fault_oob = m.fault_code_off >= 0 && static_cast<std::size_t>(m.fault_code_off) + 2 > m.input_bytes;
-        const bool vel_oob = m.velocity_actual_off >= 0 && static_cast<std::size_t>(m.velocity_actual_off) + 4 > m.input_bytes;
-        if (m.ctrlword_off + 2 > m.output_bytes || (m.target_off + 4 > m.output_bytes && m.mode == Cia402Mode::ProfilePosition) ||
-            m.statusword_off + 2 > m.input_bytes || m.actual_off + 4 > m.input_bytes || fault_oob || vel_oob) {
+        if (m.ctrlword_off + 2 > m.output_bytes || m.target_off + 4 > m.output_bytes || m.statusword_off + 2 > m.input_bytes ||
+            m.actual_off + 4 > m.input_bytes) {
             throw ConfigError("SimSlaveModel offsets exceed the image sizes (out=" + std::to_string(m.output_bytes) +
                               ", in=" + std::to_string(m.input_bytes) + ")");
         }
@@ -179,7 +136,7 @@ void SimBackend::map_process_data() {
 
 void SimBackend::request_state(std::uint16_t slave, EcatState target) {
     if (target == EcatState::Op) {
-        ++op_requests_;  // #47 test hook: the no-hammer metric (exactly one per start)
+        ++op_requests_;  // the no-hammer metric (exactly one per start)
     }
     if (slave == 0) {
         for (auto& s : slaves_) {
@@ -223,59 +180,11 @@ void SimBackend::step_device(Slave& s) noexcept {
     const std::uint16_t cw = load_le<std::uint16_t>(out.subspan(s.model.ctrlword_off, 2));
     const std::uint16_t prev = s.prev_ctrlword;
 
-    // #47-P3b sub-step 5: when 0x6060 is RxPDO-mapped, the RUNTIME mode-of-operation comes from the
-    // wire each cycle (the mode-switch drives it), not just the configure-time SDO. A byte of 0 (the
-    // field mapped but not yet written) leaves effective_mode unchanged -- the drive keeps its mode.
-    if (s.model.mode_of_op_off >= 0) {
-        const auto m = static_cast<std::int8_t>(out[static_cast<std::size_t>(s.model.mode_of_op_off)]);
-        const auto requested = static_cast<Cia402Mode>(m);
-        // #61 (DA): count 0x6060 OUTPUT-byte VALUE CHANGES. A single mode switch is exactly two
-        // transitions (StopFirst holds current, Settle writes wanted, then steady re-writes on
-        // confirm-or-revert); a wrapper that never reverts an unconfirmable switch re-arms every
-        // settle window and this climbs without bound -- the storm signal. First write establishes,
-        // not counts. RT-write / test-read (relaxed; the test polls twice for stability).
-        if (!s.mode_out_seen) {
-            s.mode_out_seen = true;
-            s.prev_mode_out = m;
-        } else if (m != s.prev_mode_out) {
-            s.mode_out_transitions.fetch_add(1, std::memory_order_relaxed);
-            s.prev_mode_out = m;
-        }
-        // #47-P3c FIDELITY -- GENERIC CiA402, NOT a device flag (DA device-agnostic check): when 0x6060 is
-        // RxPDO-MAPPED, a PDO value OVERRIDES the SDO-set default for ANY drive (PDO-overrides-SDO for a
-        // mapped object is standard CoE), so ModeDisplay(0x6061) FOLLOWS the PDO byte -- a wire 0 means
-        // mode 0 (NO mode), NOT "keep the SDO-set mode." (Only when 0x6060 is NOT mapped does the SDO
-        // default stand -- that path skips this whole block.) Before this, the sim echoed the SDO default
-        // on a wire 0, so a policy that failed to seed 0x6060 through the enable ladder still PASSED the
-        // mode-echo gate offline -- the P3c enable-ladder bug (its A6 instance) was invisible in sim. Now
-        // 0x6061 tracks the PDO for A6 AND M56S alike, and a mis-seed fails the gate.
-        if (m == 0) {
-            s.effective_mode = Cia402Mode::None;
-            s.mode_pending = Cia402Mode::None;
-        } else if (requested == s.model.unsupported_mode) {
-            // #47-P3b M56S: the drive REJECTS an unsupported mode -- effective_mode does NOT change,
-            // so 0x6061 never echoes it and the policy's confirm times out (mode_switch_failed).
-            s.mode_pending = Cia402Mode::None;
-        } else if (requested == s.effective_mode) {
-            s.mode_pending = Cia402Mode::None;  // already there -- nothing pending
-        } else if (s.effective_mode == Cia402Mode::None || s.model.mode_switch_latency == 0) {
-            // Establishment (None -> first mode) is ALWAYS instant; the latency models a RUNTIME mode
-            // CHANGE between two live modes. mode_switch_latency==0 = the A6 (instant).
-            s.effective_mode = requested;
-        } else if (s.mode_pending != requested) {
-            s.mode_pending = requested;  // #47-P3b M56S: start the slow-transition countdown
-            s.mode_pending_cycles = s.model.mode_switch_latency;
-        } else if (--s.mode_pending_cycles == 0) {
-            s.effective_mode = requested;  // latency elapsed -> the switch APPLIES; 0x6061 now echoes it
-            s.mode_pending = Cia402Mode::None;
-        }
-    }
-
-    // #47-P3b (DA no-lunge probe): snapshot the 0x607A the master wrote THIS cycle -- the seed (§6 step 2:
-    // PP-side target = actual) / the PV over-map mirror. A test asserts it tracks actual (never a stale
-    // target that would lunge). Guarded: only when 0x607A is really mapped (past the ctrlword, in-bounds).
-    if (s.model.target_off >= 2 && static_cast<std::size_t>(s.model.target_off) + 4 <= s.model.output_bytes) {
-        s.target_written = load_le<std::int32_t>(out.subspan(static_cast<std::size_t>(s.model.target_off), 4));
+    // Conformant instant mode echo: 0x6061 (mode-display) follows the 0x6060 the master
+    // wrote. Lets the driver's enable-time mode gate (0x6061 == commanded) energize.
+    if (s.model.mode_of_op_off >= 0 && s.model.mode_display_off >= 0) {
+        const auto in = std::span<std::byte>(s.input_image);
+        in[static_cast<std::size_t>(s.model.mode_display_off)] = out[static_cast<std::size_t>(s.model.mode_of_op_off)];
     }
 
     // CiA402 command decode (controlword masks).
@@ -284,26 +193,8 @@ void SimBackend::step_device(Slave& s) noexcept {
     const bool disable_voltage = (cw & 0x82U) == 0x00U;
     const bool enable_op = (cw & 0x8FU) == 0x0FU;
     const bool quick_stop = (cw & 0x86U) == 0x02U;
-    const bool fault_reset_rising = ((cw & 0x80U) != 0U) && ((prev & 0x80U) == 0U);
-    if (fault_reset_rising) {
-        s.fault_reset_edges.fetch_add(1, std::memory_order_relaxed);  // #18 no-spin observability
-    }
 
     using St = Cia402State;
-    // #18 type-(c): a momentary clear re-faults after its hold elapses (drive accepted
-    // the reset, resumed, re-detected the cause).
-    if (s.refault_countdown_ > 0) {
-        if (--s.refault_countdown_ == 0) {
-            s.faulted.store(true, std::memory_order_relaxed);
-        }
-    }
-    if (s.faulted.load(std::memory_order_relaxed) && s.device_state != St::Fault) {
-        s.device_state = St::Fault;
-        // #18: a fresh fault starts clean reflect/refault countdowns (RT-side, race-free).
-        s.clear_countdown_ = 0;
-        s.refault_countdown_ = 0;
-    }
-
     switch (s.device_state) {
         case St::NotReadyToSwitchOn:
             s.device_state = St::SwitchOnDisabled;  // auto power-on advance
@@ -332,8 +223,6 @@ void SimBackend::step_device(Slave& s) noexcept {
         case St::OperationEnabled:
             if (quick_stop) {
                 s.device_state = St::QuickStopActive;
-            } else if (enable_op) {
-                // stay in OperationEnabled
             } else if (switch_on) {
                 s.device_state = St::SwitchedOn;  // disable operation
             } else if (shutdown) {
@@ -343,71 +232,26 @@ void SimBackend::step_device(Slave& s) noexcept {
             }
             break;
         case St::QuickStopActive:
+            // No decel ramp modeled (bench-only): the quick-stop de-energizes at rest as
+            // soon as the control drops the voltage, or re-enables on enable_operation.
             if (disable_voltage) {
-                // #53 control-driven exit (the 0x605A in {5,6,7} backstop, OR the no-op cw=0x00
-                // the control sends after the =2 auto-disable): record the 0x606C velocity at the
-                // de-energize so the test can prove it ramped to ~0 FIRST (not a torque-cut).
-                s.velocity_at_qsa_exit = s.pv_velocity;
                 s.device_state = St::SwitchOnDisabled;
             } else if (enable_op) {
                 s.device_state = St::OperationEnabled;
             }
             break;
         case St::FaultReactionActive:
-            // The sim doesn't model the transient fault-reaction state
-            // (inject_fault jumps straight to Fault); kept for completeness. The
-            // master's Cia402Fsm::step handles it either way.
-            s.device_state = St::Fault;
-            break;
-        case St::Fault: {
-            // #18: model the drive's Fault->Switch-On-Disabled clear behaviour.
-            //  - persistent cause (type-b): the reset edge is ignored, stays Fault.
-            //  - reflect latency `d` (type-a): accept the edge, reflect the clear after d
-            //    exchanges (d=0 = instant, the unchanged default / common case).
-            //  - clear-then-refault (type-c): on clearing, arm a re-fault after `hold`.
-            if (s.fault_persistent.load(std::memory_order_relaxed)) {
-                break;  // cause still active -- no reset clears it
-            }
-            const auto do_clear = [&s] {
-                s.faulted.store(false, std::memory_order_relaxed);
-                s.device_state = St::SwitchOnDisabled;
-                const std::uint32_t hold = s.clear_then_refault_hold.load(std::memory_order_relaxed);
-                if (hold > 0) {
-                    s.refault_countdown_ = hold;  // type-(c): arm the momentary-clear re-fault
-                }
-            };
-            if (fault_reset_rising && s.clear_countdown_ == 0) {
-                const std::uint32_t d = s.fault_clear_delay.load(std::memory_order_relaxed);
-                if (d == 0) {
-                    do_clear();  // instant (unchanged default)
-                } else {
-                    s.clear_countdown_ = d;  // accept now, reflect the clear after d cycles
-                }
-            } else if (s.clear_countdown_ > 0) {
-                if (--s.clear_countdown_ == 0) {  // type-(a) reflect-delay elapsed
-                    do_clear();
-                }
-            }
-            break;
-        }
+        case St::Fault:
+            break;  // no fault modeling (bench-only)
     }
 
-    // Profile-Position set-point-acknowledge handshake (bit4 / bit12). Mode comes
-    // from the 0x6060 SDO (effective_mode), NOT model.mode -- mode 0 => no handshake.
-    if (s.effective_mode == Cia402Mode::ProfilePosition && s.device_state == St::OperationEnabled) {
+    // Profile-Position set-point-acknowledge handshake (bit4 -> bit12) + target latch.
+    if (s.model.mode == Cia402Mode::ProfilePosition && s.device_state == St::OperationEnabled) {
         const bool bit4 = (cw & 0x10U) != 0U;
         const bool prev_bit4 = (prev & 0x10U) != 0U;
-        // #70 fidelity (WIRE-PROVEN, task #9): the A6 ignores a new-setpoint (bit4) rising edge unless
-        // it has observed Halt (bit8) CLEAR in BOTH the previous cycle and this one -- a bit4 edge
-        // coincident with (or one cycle after) halt release is dropped, so a PP move issued right
-        // after Stop() never acks. Model that here: without it the sim would ack a post-halt move the
-        // real drive rejects (the #70 coverage gap -- same sim-fidelity class as #56). Target latch is
-        // gated too (an unacknowledged edge doesn't latch 0x607A on the drive either).
-        const bool halt_now = (cw & ControlWord::kHaltBit) != 0U;
-        const bool halt_prev = (prev & ControlWord::kHaltBit) != 0U;
-        if (bit4 && !prev_bit4 && !halt_now && !halt_prev) {
-            s.target = load_le<std::int32_t>(out.subspan(s.model.target_off, 4));
-            s.setpoint_ack = !s.suppress_ack.load(std::memory_order_relaxed);  // test hook: withhold bit12 -> handshake times out
+        if (bit4 && !prev_bit4) {
+            s.target = load_le<std::int32_t>(out.subspan(s.model.target_off, 4));  // latch the new set-point
+            s.setpoint_ack = true;
         } else if (!bit4 && prev_bit4) {
             s.setpoint_ack = false;
         }
@@ -415,23 +259,11 @@ void SimBackend::step_device(Slave& s) noexcept {
         s.setpoint_ack = false;
     }
 
-    // Motion: chase the target (PP) or integrate velocity (PV). Driven by the
-    // SDO-set effective_mode -- in mode 0 (0x6060 never written) the motor does NOT
-    // move, even when OperationEnabled, so a missing mode set fails offline.
-    const std::int32_t actual_before_motion = s.actual;
+    // Motion: chase the latched target (PP) or integrate the commanded velocity (PV).
+    const std::int32_t actual_before = s.actual;
     if (s.device_state == St::OperationEnabled) {
-        // Record the commanded profile velocity (0x6081) the master wrote -- test
-        // visibility for "did the RT loop actually send the move speed?".
-        if (s.model.profile_velocity_off >= 0) {
-            s.profile_velocity = load_le<std::int32_t>(out.subspan(static_cast<std::size_t>(s.model.profile_velocity_off), 4));
-        }
-        if (s.effective_mode == Cia402Mode::ProfilePosition) {
-            // De-mask: chase at the 0x6081 profile-velocity WIRE value the master
-            // wrote (counts/cycle here), NOT a config shortcut -- so if the RT loop
-            // forgets to write 0x6081 the value is 0 and the move makes NO progress
-            // (caught offline). Fall back to counts_per_step only when 0x6081 isn't
-            // mapped at all (profile_velocity_off < 0).
-            const std::int32_t step = (s.model.profile_velocity_off >= 0) ? s.profile_velocity : s.model.counts_per_step;
+        if (s.model.mode == Cia402Mode::ProfilePosition) {
+            const std::int32_t step = s.model.counts_per_step;
             if (s.actual < s.target) {
                 const std::int32_t next = static_cast<std::int32_t>(s.actual + step);
                 s.actual = (next > s.target) ? s.target : next;
@@ -439,90 +271,31 @@ void SimBackend::step_device(Slave& s) noexcept {
                 const std::int32_t next = static_cast<std::int32_t>(s.actual - step);
                 s.actual = (next < s.target) ? s.target : next;
             }
-        } else if (s.effective_mode == Cia402Mode::ProfileVelocity && s.model.velocity_off >= 0) {
-            // De-mask: record the commanded 0x60FF (test visibility), and (toy) take the
-            // velocity instantly (no accel ramp -- only the quick-stop DECEL ramp matters
-            // for the #53 safety assertion). actual integrates the velocity per cycle.
-            s.target_velocity = load_le<std::int32_t>(out.subspan(static_cast<std::size_t>(s.model.velocity_off), 4));
-            s.pv_velocity = s.target_velocity;
-            s.actual = static_cast<std::int32_t>(s.actual + s.pv_velocity);
+        } else if (s.model.velocity_off >= 0) {
+            const std::int32_t v = load_le<std::int32_t>(out.subspan(static_cast<std::size_t>(s.model.velocity_off), 4));
+            s.actual = static_cast<std::int32_t>(s.actual + v);
         }
-    } else if (s.device_state == St::QuickStopActive) {
-        // #53 Quick-Stop DECEL: ramp |pv_velocity| toward 0 by the model's per-cycle step
-        // (0 = instant), still INTEGRATING the (shrinking) velocity -> an ENERGIZED decel that
-        // emits a decreasing 0x606C, exactly the ramp-then-disable the PV stop must achieve.
-        s.entered_qsa = true;
-        const std::int32_t step = s.model.quick_stop_decel_step;
-        if (step <= 0 || std::abs(s.pv_velocity) <= step) {
-            s.pv_velocity = 0;
-        } else {
-            s.pv_velocity += (s.pv_velocity > 0) ? -step : step;
-        }
-        s.actual = static_cast<std::int32_t>(s.actual + s.pv_velocity);
-        // 0x605A == 2 (PRIMARY): once the drive reaches its own zero it AUTO-transitions
-        // QuickStopActive -> SwitchOnDisabled (the control's cw->0x00 is then a no-op).
-        // quick_stop_suppress_auto_disable models a drive that does NOT auto-disable -> the
-        // control's cw->0x00 BACKSTOP must do it (tested under a passing 0x605A=2).
-        if (s.pv_velocity == 0 && s.model.quick_stop_option == 2 && !s.model.quick_stop_suppress_auto_disable) {
-            s.velocity_at_qsa_exit = 0;  // driver-owned de-energize, at zero
-            s.device_state = St::SwitchOnDisabled;
-        }
-    } else {
-        s.pv_velocity = 0;  // not energized / not moving
     }
-    s.velocity = static_cast<std::int32_t>(s.actual - actual_before_motion);  // per-cycle delta -> 0x606C feedback
+    s.velocity = static_cast<std::int32_t>(s.actual - actual_before);  // per-cycle delta
 
     // Compose the statusword.
     unsigned sw = statusword_base(s.device_state);
     sw |= 0x0200U;  // bit9 remote
-    if (s.model.target_reached_always_set) {
-        sw |= 0x0400U;  // bit10 ALWAYS 1 -- the A6 quirk, modeled per-slave (#43); default = conformant (not forced)
-    }
     if (s.device_state != St::SwitchOnDisabled && s.device_state != St::NotReadyToSwitchOn) {
         sw |= 0x0010U;  // bit4 voltage enabled
     }
     if (s.setpoint_ack) {
         sw |= 0x1000U;  // bit12 set-point acknowledge
     }
-
-    // #59 encoder READ noise (gated: report_noise>0): jitter the REPORTED actual by a ±report_noise
-    // square wave -- physics s.actual stays clean. Reported velocity = the jittered delta (nonzero at
-    // rest). Off by default -> reported_actual == s.actual, reported_vel == s.velocity (all tests as-is).
-    std::int32_t reported_actual = s.actual;
-    std::int32_t reported_vel = s.velocity;
-    if (s.model.report_noise > 0) {
-        s.noise_phase = !s.noise_phase;
-        reported_actual = s.actual + (s.noise_phase ? s.model.report_noise : -s.model.report_noise);
-        reported_vel = reported_actual - s.reported_prev;
-        s.reported_prev = reported_actual;
+    if (s.device_state == St::OperationEnabled && s.model.mode == Cia402Mode::ProfilePosition && s.actual == s.target) {
+        sw |= 0x0400U;  // bit10 target reached (conformant: set only at target)
     }
 
     const auto in = std::span<std::byte>(s.input_image);
     store_le<std::uint16_t>(in.subspan(s.model.statusword_off, 2), static_cast<std::uint16_t>(sw));
-    store_le<std::int32_t>(in.subspan(s.model.actual_off, 4), reported_actual);
-    // #16 TxPDO feedback de-mask (only when the field is mapped): velocity-actual
-    // (0x606C) every cycle from the wire-driven motion; drive error code (0x603F) =
-    // the configured code WHILE in Fault, else 0 (so the flag gates the payload).
+    store_le<std::int32_t>(in.subspan(s.model.actual_off, 4), s.actual);
     if (s.model.velocity_actual_off >= 0) {
-        store_le<std::int32_t>(in.subspan(static_cast<std::size_t>(s.model.velocity_actual_off), 4), reported_vel);
-    }
-    if (s.model.fault_code_off >= 0) {
-        // A forced stale code (test hook) overrides the gating -> 0x603F is nonzero
-        // even with bit3 clear; otherwise the code is the configured value WHILE in
-        // Fault, else 0 (the flag gates the payload on the wire).
-        const std::uint16_t stale = s.stale_fault_code.load(std::memory_order_relaxed);
-        std::uint16_t code = stale;  // forced stale code overrides the gating
-        if (stale == 0 && s.device_state == St::Fault) {
-            code = s.fault_code.load(std::memory_order_relaxed);  // gated: code only while faulted
-        }
-        store_le<std::uint16_t>(in.subspan(static_cast<std::size_t>(s.model.fault_code_off), 2), code);
-    }
-    // #53 mode-display echo (0x6061, i8): normally the SDO-set effective_mode (the A6 reflects
-    // the accepted 0x6060); the model can FORCE a wrong value to model the A6 SILENTLY ignoring
-    // an unsupported mode-set (#45) -- the controller's DA-B echo gate must refuse to enable.
-    if (s.model.mode_display_off >= 0) {
-        const std::int8_t md = s.model.mode_echo_forced ? s.model.mode_echo_value : static_cast<std::int8_t>(s.effective_mode);
-        in[static_cast<std::size_t>(s.model.mode_display_off)] = static_cast<std::byte>(md);
+        store_le<std::int32_t>(in.subspan(static_cast<std::size_t>(s.model.velocity_actual_off), 4), s.velocity);
     }
 
     s.prev_ctrlword = cw;
@@ -558,61 +331,12 @@ void SimBackend::close() noexcept {
     }
 }
 
-void SimBackend::inject_fault(std::uint16_t slave) noexcept {
-    if (slave >= 1 && slave <= slaves_.size()) {
-        slaves_[slave - 1].faulted.store(true, std::memory_order_relaxed);
-    }
-}
-
-void SimBackend::set_fault_code(std::uint16_t slave, std::uint16_t code) noexcept {
-    if (slave >= 1 && slave <= slaves_.size()) {
-        slaves_[slave - 1].fault_code.store(code, std::memory_order_relaxed);
-    }
-}
-
-void SimBackend::set_stale_fault_code(std::uint16_t slave, std::uint16_t code) noexcept {
-    if (slave >= 1 && slave <= slaves_.size()) {
-        slaves_[slave - 1].stale_fault_code.store(code, std::memory_order_relaxed);
-    }
-}
-
-void SimBackend::set_fault_clear_delay(std::uint16_t slave, std::uint32_t cycles) noexcept {
-    if (slave >= 1 && slave <= slaves_.size()) {
-        slaves_[slave - 1].fault_clear_delay.store(cycles, std::memory_order_relaxed);
-    }
-}
-
-void SimBackend::set_fault_persistent(std::uint16_t slave, bool on) noexcept {
-    if (slave >= 1 && slave <= slaves_.size()) {
-        slaves_[slave - 1].fault_persistent.store(on, std::memory_order_relaxed);
-    }
-}
-
-void SimBackend::set_fault_clear_then_refault(std::uint16_t slave, std::uint32_t hold_cycles) noexcept {
-    if (slave >= 1 && slave <= slaves_.size()) {
-        slaves_[slave - 1].clear_then_refault_hold.store(hold_cycles, std::memory_order_relaxed);
-    }
-}
-
-std::uint32_t SimBackend::fault_reset_edge_count(std::uint16_t slave) const noexcept {
-    if (slave >= 1 && slave <= slaves_.size()) {
-        return slaves_[slave - 1].fault_reset_edges.load(std::memory_order_relaxed);
-    }
-    return 0;
-}
-
 void SimBackend::force_short_wkc_once() noexcept {
     short_wkc_once_ = true;
 }
 
 void SimBackend::force_short_wkc(bool on) noexcept {
     short_wkc_sticky_.store(on, std::memory_order_relaxed);
-}
-
-void SimBackend::suppress_setpoint_ack(std::uint16_t slave, bool on) noexcept {
-    if (slave >= 1 && slave <= slaves_.size()) {
-        slaves_[slave - 1].suppress_ack.store(on, std::memory_order_relaxed);
-    }
 }
 
 void SimBackend::arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
@@ -628,81 +352,8 @@ std::int32_t SimBackend::configured_dc_sync0_shift_ns() const noexcept {
     return dc_sync0_shift_ns_;
 }
 
-void SimBackend::set_sdo_write_abort(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::uint32_t abort_code) {
-    if (slave < 1 || slave > slaves_.size()) {
-        throw ConfigError("SimBackend::set_sdo_write_abort: slave " + std::to_string(slave) + " out of range (configured " +
-                          std::to_string(slaves_.size()) + ")");
-    }
-    slaves_[slave - 1].sdo_write_aborts[sdo_key(index, sub)] = abort_code;
-}
-
 std::int64_t SimBackend::dc_time() const noexcept {
     return synthetic_dc_ns_;
-}
-
-std::int32_t SimBackend::received_profile_velocity(std::uint16_t slave) const noexcept {
-    if (slave >= 1 && slave <= slaves_.size()) {
-        return slaves_[slave - 1].profile_velocity;
-    }
-    return 0;
-}
-
-std::int32_t SimBackend::received_target_velocity(std::uint16_t slave) const noexcept {
-    if (slave >= 1 && slave <= slaves_.size()) {
-        return slaves_[slave - 1].target_velocity;
-    }
-    return 0;
-}
-
-std::uint16_t SimBackend::received_controlword(std::uint16_t slave) const noexcept {
-    // The LAST controlword the drive consumed (call AFTER stop/join -- race-free). #47-P3b 5d: lets a
-    // test observe the stop-sequence cw disposition (0x0B Quick-Stop while ramping -> 0x00 disable at rest).
-    if (slave >= 1 && slave <= slaves_.size()) {
-        return slaves_[slave - 1].prev_ctrlword;
-    }
-    return 0;
-}
-
-std::int32_t SimBackend::received_target_position(std::uint16_t slave) const noexcept {
-    // The last 0x607A the master wrote (call AFTER stop/join -- race-free). #47-P3b DA no-lunge: a test
-    // asserts the seeded/mirrored target tracks the drive's actual, never a stale value that would lunge.
-    if (slave >= 1 && slave <= slaves_.size()) {
-        return slaves_[slave - 1].target_written;
-    }
-    return 0;
-}
-
-std::uint32_t SimBackend::mode_of_op_write_transitions(std::uint16_t slave) const noexcept {
-    // #61 (DA): cumulative 0x6060 OUTPUT-byte value changes -- the unconfirmable-switch storm gate.
-    // Poll it twice with a wait between: STABLE => the wrapper reverted (single attempt, then frozen);
-    // CLIMBING => run_mode_switch_ re-arms forever (no revert). Atomic (RT-write/test-read).
-    if (slave >= 1 && slave <= slaves_.size()) {
-        return slaves_[slave - 1].mode_out_transitions.load(std::memory_order_relaxed);
-    }
-    return 0;
-}
-
-Cia402Mode SimBackend::effective_mode(std::uint16_t slave) const noexcept {
-    // The drive's CURRENT runtime mode-of-operation (from the 0x6060 the master wrote, or SDO-set).
-    // #47-P3b M6: lets a test confirm a PV motion-hold actually switched the drive to PP (position lock).
-    if (slave >= 1 && slave <= slaves_.size()) {
-        return slaves_[slave - 1].effective_mode;
-    }
-    return Cia402Mode::None;
-}
-
-std::int32_t SimBackend::velocity_at_qsa_exit(std::uint16_t slave) const noexcept {
-    if (slave >= 1 && slave <= slaves_.size()) {
-        return slaves_[slave - 1].velocity_at_qsa_exit;
-    }
-    return 0;
-}
-
-bool SimBackend::entered_qsa(std::uint16_t slave) const noexcept {
-    if (slave >= 1 && slave <= slaves_.size()) {
-        return slaves_[slave - 1].entered_qsa;
-    }
-    return false;
 }
 
 std::vector<std::byte> SimBackend::recorded_sdo(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const {

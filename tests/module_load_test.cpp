@@ -271,78 +271,9 @@ TEST("module-load: clean shutdown joins the RT thread promptly (no hang/leak)") 
     CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
 }
 
-// ---- Part B: #16 fault legibility reaches the gRPC consumer (do_command) ----
-// The config-driven ctor hides the SimBackend, so to drive a fault we use the TEST
-// ctor with a captured backend pointer -- but the assertion is still on the real
-// Motor API (do_command return), proving #16's compose-all last_error() reaches a
-// gRPC consumer end-to-end through the module boundary. (Per team-lead: no
-// production test-seam; fault-injection through the full config path would be a
-// future sim-only config knob, not #12.)
-
-namespace {
-
-ServoConfig fault_config() {
-    ServoConfig c;
-    c.ifname = "sim0";
-    c.slave_id = 1;
-    c.mode = ControlMode::ProfilePosition;
-    c.rxpdo.pdo_indices = {0x1600};
-    c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6081, 0, 32}};
-    c.txpdo.pdo_indices = {0x1A00};
-    c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16}};
-    c.max_motor_speed_rpm = 3000.0;
-    c.motor_rated_current_amps = 2.5;
-    c.gear_ratio = 1.0;
-    c.counts_per_rev = 131072.0;
-    c.position_tolerance_counts = 20;
-    c.velocity_threshold = 1'000'000'000;
-    c.target_loop_rate_hz = 1000;
-    c.require_realtime = false;
-    c.command_queue_capacity = 64;
-    c.handshake_timeout_cycles = 1000;
-    return c;
-}
-
-std::unique_ptr<ServoController> fault_controller(SimBackend** out) {
-    auto factory = [out] {
-        SimSlaveModel m;
-        m.output_bytes = 10;  // ctrl@0, target@2, profile-vel@6
-        m.input_bytes = 8;    // status@0, actual@2, 0x603F@6
-        m.ctrlword_off = 0;
-        m.target_off = 2;
-        m.profile_velocity_off = 6;
-        m.statusword_off = 0;
-        m.actual_off = 2;
-        m.fault_code_off = 6;
-        m.mode = ethercat::Cia402Mode::ProfilePosition;
-        m.counts_per_step = 50'000;
-        auto be = std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m});
-        if (out != nullptr) {
-            *out = be.get();
-        }
-        return std::unique_ptr<EcatBackend>(std::move(be));
-    };
-    // #15 item 2: the 0x8700 gloss now comes from the A6ServoDriver seam, so build the A6 subclass
-    // here (the generic base would surface the bare hex without the "Er74.1" label).
-    return std::make_unique<A6ServoDriver>(fault_config(), factory);
-}
-
-}  // namespace
-
-TEST("module-load: a drive fault is legible through do_command(status).last_error") {
-    SimBackend* sim = nullptr;
-    ServoMotor motor{"fault-motor", fault_controller(&sim)};
-    CHECK(wait_until([&] { return status_powered(motor); }, std::chrono::milliseconds(1000)));
-    CHECK(sim != nullptr);
-
-    sim->set_fault_code(1, 0x8700);  // Er74.1 (the missed-SYNC0 code)
-    sim->inject_fault(1);
-    CHECK(wait_until([&] { return !status_powered(motor); }, std::chrono::milliseconds(1000)));
-
-    // The #16 compose-all legibility reaches the gRPC return verbatim.
-    const std::string err = status_last_error(motor);
-    CHECK(err.find("drive fault 0x8700") != std::string::npos);
-    CHECK(err.find("Er74.1 / no SYNC0") != std::string::npos);
-}
+// Part B (#16 fault legibility through do_command) was RETIRED with the sim-fidelity
+// demotion (#17 item 12): it drove a fault via the dropped inject_fault/set_fault_code
+// hooks. Drive-fault legibility is now proven HW-first (bench + RDK campaign Test for
+// fault handling). See docs/offline-test-retirement.md.
 
 TEST_MAIN()

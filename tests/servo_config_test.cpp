@@ -11,10 +11,7 @@
 #include "viam/lib/servo_config.hpp"
 
 using ethercat::ConfigError;
-using ethercat::servo::ControlMode;
-using ethercat::servo::parse_control_mode;
 using ethercat::servo::ServoConfig;
-using ethercat::servo::to_string;
 
 namespace {
 
@@ -22,7 +19,6 @@ ServoConfig good_config() {
     ServoConfig c;
     c.ifname = "eth0";
     c.slave_id = 1;
-    c.mode = ControlMode::ProfilePosition;
     c.max_motor_speed_rpm = 3000.0;
     c.peak_current_limit_amps = 5.0;
     c.motor_rated_current_amps = 2.5;
@@ -37,14 +33,6 @@ ServoConfig good_config() {
 }
 
 }  // namespace
-
-TEST("parse_control_mode accepts PP/PV (case-insensitive), rejects others") {
-    CHECK_EQ(parse_control_mode("PP"), ControlMode::ProfilePosition);
-    CHECK_EQ(parse_control_mode("pv"), ControlMode::ProfileVelocity);
-    CHECK_THROWS_MSG(parse_control_mode("CSP"), ConfigError, "not valid");
-    CHECK(std::string("PP") == to_string(ControlMode::ProfilePosition));
-    CHECK(std::string("PV") == to_string(ControlMode::ProfileVelocity));
-}
 
 TEST("ServoConfig::validate accepts a good config") {
     good_config().validate();  // must not throw

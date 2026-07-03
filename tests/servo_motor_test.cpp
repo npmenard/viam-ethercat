@@ -22,10 +22,8 @@
 #include "viam/module/servo_motor.hpp"
 
 using ethercat::EcatBackend;
-using ethercat::PdoEntry;
 using ethercat::SimBackend;
 using ethercat::SimSlaveModel;
-using ethercat::servo::ControlMode;
 using ethercat::servo::ServoConfig;
 using ethercat::servo::ServoController;
 using ethercat::servo::ServoMotor;
@@ -34,15 +32,11 @@ using viam::sdk::ProtoValue;
 
 namespace {
 
+// #18: no mode + no PDO map in config -- the ServoController ctor sets the FIXED superset map.
 ServoConfig make_config() {
     ServoConfig c;
     c.ifname = "sim0";
     c.slave_id = 1;
-    c.mode = ControlMode::ProfilePosition;
-    c.rxpdo.pdo_indices = {0x1600};
-    c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x60FF, 0, 32}};
-    c.txpdo.pdo_indices = {0x1A00};
-    c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}};
     c.max_motor_speed_rpm = 3000.0;
     c.motor_rated_current_amps = 2.5;
     c.gear_ratio = 1.0;
@@ -58,14 +52,20 @@ ServoConfig make_config() {
 
 std::unique_ptr<ServoController> make_sim_controller() {
     auto factory = [] {
+        // The driver's fixed superset PDO layout, as a loopback model:
+        //   RxPDO: cw@0, mode@2, target@3, pvel@7, tvel@11 (15 B)
+        //   TxPDO: 0x603F@0, status@2, mdisp@4, actual@5, velact@9, torque@13 (15 B)
         SimSlaveModel m;
-        m.output_bytes = 10;  // ctrl@0, target@2, velocity@6
-        m.input_bytes = 6;    // status@0, actual@2
+        m.output_bytes = 15;
+        m.input_bytes = 15;
         m.ctrlword_off = 0;
-        m.target_off = 2;
-        m.velocity_off = 6;
-        m.statusword_off = 0;
-        m.actual_off = 2;
+        m.mode_of_op_off = 2;
+        m.target_off = 3;
+        m.velocity_off = 11;
+        m.statusword_off = 2;
+        m.mode_display_off = 4;
+        m.actual_off = 5;
+        m.velocity_actual_off = 9;
         m.mode = ethercat::Cia402Mode::ProfilePosition;
         m.counts_per_step = 50'000;
         return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m}));

@@ -18,10 +18,8 @@
 #include "viam/lib/servo_controller.hpp"
 
 using ethercat::EcatBackend;
-using ethercat::PdoEntry;
 using ethercat::SimBackend;
 using ethercat::SimSlaveModel;
-using ethercat::servo::ControlMode;
 using ethercat::servo::ServoConfig;
 using ethercat::servo::ServoController;
 
@@ -43,15 +41,13 @@ constexpr int kReconfigures = 20;
 constexpr auto kBurst = std::chrono::milliseconds(8);
 #endif
 
+// #18: the PDO map is a FIXED driver-defined superset (set unconditionally by the
+// ServoController ctor) -- the config carries no map. The sim model mirrors that superset
+// layout (see superset_model below), so the Master's remapped offsets line up.
 ServoConfig make_config() {
     ServoConfig c;
     c.ifname = "sim0";
     c.slave_id = 1;
-    c.mode = ControlMode::ProfilePosition;
-    c.rxpdo.pdo_indices = {0x1600};
-    c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x607A, 0, 32}};
-    c.txpdo.pdo_indices = {0x1A00};
-    c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}};
     c.max_motor_speed_rpm = 3000.0;
     c.motor_rated_current_amps = 2.5;
     c.gear_ratio = 1.0;
@@ -65,16 +61,26 @@ ServoConfig make_config() {
     return c;
 }
 
+// The driver's fixed superset PDO layout, as a loopback model:
+//   RxPDO: 0x6040 cw@0, 0x6060 mode@2, 0x607A target@3, 0x6081 pvel@7, 0x60FF tvel@11 (15 B)
+//   TxPDO: 0x603F@0, 0x6041 status@2, 0x6061 mdisp@4, 0x6064 actual@5, 0x606C@9, 0x6077@13 (15 B)
+SimSlaveModel superset_model(std::int32_t counts_per_step) {
+    SimSlaveModel m;
+    m.output_bytes = 15;
+    m.input_bytes = 15;
+    m.ctrlword_off = 0;
+    m.mode_of_op_off = 2;
+    m.target_off = 3;
+    m.velocity_off = 11;
+    m.statusword_off = 2;
+    m.mode_display_off = 4;
+    m.actual_off = 5;
+    m.counts_per_step = counts_per_step;
+    return m;
+}
+
 ServoController::BackendFactory sim_factory() {
-    return [] {
-        SimSlaveModel m;
-        m.output_bytes = 6;
-        m.input_bytes = 6;
-        m.target_off = 2;
-        m.actual_off = 2;
-        m.counts_per_step = 50'000;
-        return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{m}));
-    };
+    return [] { return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{superset_model(50'000)})); };
 }
 
 // Hammer the non-RT API; swallow the expected lifecycle exceptions (the move is
