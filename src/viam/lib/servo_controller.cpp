@@ -9,10 +9,10 @@
 #include <utility>
 
 #include "ethercat/errors.hpp"
-#include "ethercat/hex.hpp"
 #include "ethercat/pdo_buffer.hpp"
 #include "ethercat/realtime.hpp"
 #include "ethercat/soem_backend.hpp"
+#include "ethercat/util.hpp"
 #include "viam/lib/motion_profile.hpp"
 
 namespace ethercat::servo {
@@ -218,10 +218,8 @@ void ServoController::reset_run_state() {
     watchdog_ns_.store(std::max<std::uint64_t>(stall_ns, 20'000'000ULL), std::memory_order_release);
 }
 
-// Construct the one-shot Runner BORROWING master_, attach *this as the SlaveControl, and
-// start it. The Runner owns realtime setup + the DC bring-up pump + pacing + teardown (the
-// old run_rt_loop's job). #39: the Runner owns the set_rt_active bracket now. §8: a start-time
-// failure -> Degraded-but-alive (APIs throw, process stays up), never rethrown past here.
+// The Runner's stopping-window CAP (cycles): sized so a Quick-Stop ramp completes before
+// close()->INIT de-energizes (no torque-cut at speed). One source of truth with the VEL budget.
 std::uint32_t ServoController::teardown_window_cycles() const noexcept {
     // Opt-out (no controlled stop): disable-voltage coast is instant -> the old 2-cycle window.
     if (config_.quick_stop_decel == 0) {
@@ -1157,7 +1155,7 @@ double ServoController::rated_current_amps() const noexcept {
     return config_.motor_rated_current_amps;
 }
 
-std::string ServoController::fault_gloss(std::uint16_t /*code*/) const {
+std::string ServoController::fault_description(std::uint16_t /*code*/) const {
     // #15 item 2: the GENERIC base has no device gloss -> empty, so last_error() shows just the
     // bare hex (never wrong, just less descriptive). A device subclass (A6ServoDriver) overrides
     // this to name its codes (0x8700 -> "Er74.1 / no SYNC0"). Cold path.
@@ -1168,7 +1166,7 @@ std::string ServoController::last_error() const {
     // Cold-but-LOCK-FREE and master_-FREE (symmetric with is_powered/is_moving): read
     // the three published tier flags (acquire) + their payloads. COMPOSE every active
     // tier -- never pick one -- so a both-true Er74 reports root cause AND symptom.
-    // (fault_gloss reads config_, taking the shared lock -- fine, this is non-RT.)
+    // (fault_description reads config_, taking the shared lock -- fine, this is non-RT.)
     std::string out;
     const auto append = [&out](const std::string& s) {
         if (!out.empty()) {
@@ -1181,7 +1179,7 @@ std::string ServoController::last_error() const {
     if (state_.drive_faulted.load(std::memory_order_acquire)) {
         const std::uint16_t code = state_.drive_fault_code.load(std::memory_order_relaxed);
         if (code != 0) {
-            const std::string gloss = fault_gloss(code);
+            const std::string gloss = fault_description(code);
             append("drive fault " + hex(code) + (gloss.empty() ? "" : " (" + gloss + ")"));
         } else {
             append("drive fault (code pending)");

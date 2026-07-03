@@ -5,8 +5,8 @@
 #include <string>
 
 #include "ethercat/errors.hpp"
-#include "ethercat/hex.hpp"
 #include "ethercat/pdo_buffer.hpp"
+#include "ethercat/util.hpp"
 
 namespace ethercat {
 

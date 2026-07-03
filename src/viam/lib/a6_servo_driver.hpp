@@ -44,7 +44,7 @@ class A6ServoDriver final : public ServoController {
     std::optional<std::uint16_t> sync_fault_code() const noexcept override {
         return kNoSyncCode;  // Er74.1 "no SYNC0"
     }
-    std::string fault_gloss(std::uint16_t code) const override {
+    std::string fault_description(std::uint16_t code) const override {
         return code == kNoSyncCode ? std::string{"Er74.1 / no SYNC0"} : std::string{};
     }
 

@@ -200,7 +200,7 @@ class ServoController : public SlaveControl {
     }
     // 0x603F code -> human label for last_error() (cold path). Empty (base) => bare hex, so the
     // line is never wrong, just less descriptive. The A6 glosses its 0x8700 as "Er74.1 / no SYNC0".
-    virtual std::string fault_gloss(std::uint16_t code) const;
+    virtual std::string fault_description(std::uint16_t code) const;
 
    private:
     // --- lifecycle FSM (std::variant; each state's step() in the .cpp) ---

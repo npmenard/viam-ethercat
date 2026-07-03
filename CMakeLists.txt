@@ -170,7 +170,6 @@ add_library(ethercat)
 
 target_sources(ethercat
   PRIVATE
-    src/ethercat/version.cpp
     src/ethercat/cia402.cpp
     src/ethercat/pdo_cache.cpp
     src/ethercat/backend.cpp

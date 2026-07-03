@@ -9,7 +9,7 @@
 #include <soem/soem.h>
 
 #include "ethercat/errors.hpp"
-#include "ethercat/hex.hpp"
+#include "ethercat/util.hpp"
 
 namespace ethercat {
 
