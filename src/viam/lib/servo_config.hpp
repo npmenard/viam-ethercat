@@ -19,29 +19,28 @@
 
 namespace ethercat::servo {
 
-// Viam motor control mode (INTENT; the driver derives the CiA402 PDO map, #61).
-// PP = Profile Position (GoTo/GoFor); PV = Profile Velocity (SetRPM); Switchable =
-// BOTH -- the superset map incl. 0x6060 so GoTo auto-selects PP and SetRPM auto-
-// selects PV via the runtime §6 mode-switch.
+// The CiA402 command INTENT for a single motor API call (#18: always-switchable). PP = Profile
+// Position (GoTo/GoFor); PV = Profile Velocity (SetRPM). This is NOT a config choice -- the driver
+// is ALWAYS switch-capable and each API call ensures its own required mode at runtime (the driver
+// orchestrates the switch). Used internally as the per-command mode; never parsed from config.
 enum class ControlMode : std::uint8_t {
     ProfilePosition,
     ProfileVelocity,
-    Switchable,
 };
 
-// Parse "PP"/"PV"/"switchable" (case-insensitive); throws ConfigError on anything else.
-ControlMode parse_control_mode(std::string_view text);
 const char* to_string(ControlMode mode) noexcept;
 
 struct ServoConfig {
     // --- identity / bus ---
     std::string ifname;          // EtherCAT NIC
     std::uint16_t slave_id = 1;  // 1-based ring position
-    ethercat::PdoMap rxpdo;      // command map (0x1C12) -- A6 specifics are config data
-    ethercat::PdoMap txpdo;      // feedback map (0x1C13)
+    // #18: the RxPDO/TxPDO map is NO LONGER config -- it is a FIXED driver-defined superset
+    // (set_fixed_pdo_map()), never user-supplied. These fields hold that built map (fed to the
+    // Master's SDO remap path); they are populated by the driver, not parsed from the machine config.
+    ethercat::PdoMap rxpdo;  // command map (0x1C12): cw + 0x6060 + 0x607A + 0x6081 + 0x60FF
+    ethercat::PdoMap txpdo;  // feedback map (0x1C13): 0x603F,0x6041,0x6061,0x6064,0x606C,0x6077
 
-    // --- motor mode + limits ---
-    ControlMode mode = ControlMode::ProfilePosition;
+    // --- motor limits ---
     double max_motor_speed_rpm = 0.0;       // >= 0; the speed clamp
     double peak_current_limit_amps = 0.0;   // >= 0
     double motor_rated_current_amps = 0.0;  // > 0 (A6 datum: amps -> torque per-mille)
@@ -114,13 +113,12 @@ struct ServoConfig {
     // no I/O.
     void validate() const;
 
-    // #61: fill an EMPTY rxpdo/txpdo from the standard CiA402 map derived from `mode` (PP/PV/switchable).
-    // A user-supplied map (non-empty) is left verbatim (advanced override). Standard objects only (#41):
-    //   PP  RxPDO 0x1600: 0x6040,0x607A,0x6081     PV RxPDO: 0x6040,0x60FF
-    //   switchable RxPDO: 0x6040,0x6060,0x607A,0x6081,0x60FF  (superset; runtime §6 switch enabled)
-    //   TxPDO 0x1A00 (all): 0x603F,0x6041,0x6061,0x6064,0x606C,0x6077
+    // #18: set the FIXED driver-defined superset PDO map (unconditionally -- there is no per-mode
+    // choice and no user-supplied map). Standard CiA402 objects only (#41), always switch-capable:
+    //   RxPDO 0x1600: 0x6040 cw, 0x6060 mode, 0x607A target-pos, 0x6081 profile-vel, 0x60FF target-vel
+    //   TxPDO 0x1A00: 0x603F fault, 0x6041 status, 0x6061 mode-disp, 0x6064 actual-pos, 0x606C vel, 0x6077 torque
     // Assign 0x1600->0x1C12 / 0x1A00->0x1C13 (derived from direction). Idempotent.
-    void apply_derived_pdo_maps();
+    void set_fixed_pdo_map();
 };
 
 }  // namespace ethercat::servo

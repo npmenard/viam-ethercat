@@ -7,75 +7,29 @@
 
 namespace ethercat::servo {
 
-namespace {
-
-bool iequals(std::string_view a, std::string_view b) noexcept {
-    if (a.size() != b.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        const char ca = (a[i] >= 'a' && a[i] <= 'z') ? static_cast<char>(a[i] - 32) : a[i];
-        const char cb = (b[i] >= 'a' && b[i] <= 'z') ? static_cast<char>(b[i] - 32) : b[i];
-        if (ca != cb) {
-            return false;
-        }
-    }
-    return true;
-}
-
-}  // namespace
-
-ControlMode parse_control_mode(std::string_view text) {
-    if (iequals(text, "PP")) {
-        return ControlMode::ProfilePosition;
-    }
-    if (iequals(text, "PV")) {
-        return ControlMode::ProfileVelocity;
-    }
-    if (iequals(text, "switchable") || iequals(text, "SW")) {
-        return ControlMode::Switchable;
-    }
-    throw ConfigError("control_type '" + std::string(text) + "' is not valid (expected \"PP\", \"PV\", or \"switchable\")");
-}
-
 const char* to_string(ControlMode mode) noexcept {
     switch (mode) {
         case ControlMode::ProfilePosition:
             return "PP";
         case ControlMode::ProfileVelocity:
             return "PV";
-        case ControlMode::Switchable:
-            return "switchable";
     }
     return "?";
 }
 
-void ServoConfig::apply_derived_pdo_maps() {
-    // #61: standard CiA402 objects only (#41) -- these ARE the standard, so they live in the library.
+void ServoConfig::set_fixed_pdo_map() {
+    // #18: the ONE fixed driver-defined superset (standard CiA402 objects only, #41). Always
+    // switch-capable (0x6060 mapped) so any API call can ensure PP or PV at runtime. Unconditional
+    // -- there is no per-mode choice and no user override; overwrites whatever was there.
     constexpr std::uint16_t kCtrl = 0x6040, kMode = 0x6060, kTargetPos = 0x607A, kProfileVel = 0x6081, kTargetVel = 0x60FF;
     constexpr std::uint16_t kFault = 0x603F, kStatus = 0x6041, kModeDisp = 0x6061, kActualPos = 0x6064, kVelAct = 0x606C,
                             kTorqueAct = 0x6077;
     const auto E = [](std::uint16_t index, std::uint8_t bits) { return ethercat::PdoEntry{index, 0, bits}; };
 
-    if (rxpdo.pdo_indices.empty()) {  // absent -> derive; present -> advanced override, untouched
-        std::vector<ethercat::PdoEntry> rx{E(kCtrl, 16)};
-        if (mode == ControlMode::Switchable) {
-            rx.push_back(E(kMode, 8));  // 0x6060 -> runtime §6 mode-switch enabled
-        }
-        if (mode != ControlMode::ProfileVelocity) {  // PP + switchable carry the position-move objects
-            rx.push_back(E(kTargetPos, 32));
-            rx.push_back(E(kProfileVel, 32));
-        }
-        if (mode != ControlMode::ProfilePosition) {  // PV + switchable carry the velocity object
-            rx.push_back(E(kTargetVel, 32));
-        }
-        rxpdo.pdo_indices = {0x1600};
-        rxpdo.entries[0x1600] = std::move(rx);
-    }
-    if (txpdo.pdo_indices.empty()) {  // one superset TxPDO for all modes (feedback is mode-independent)
-        txpdo.pdo_indices = {0x1A00};
-        txpdo.entries[0x1A00] = {E(kFault, 16), E(kStatus, 16), E(kModeDisp, 8), E(kActualPos, 32), E(kVelAct, 32), E(kTorqueAct, 16)};
-    }
+    rxpdo.pdo_indices = {0x1600};
+    rxpdo.entries[0x1600] = {E(kCtrl, 16), E(kMode, 8), E(kTargetPos, 32), E(kProfileVel, 32), E(kTargetVel, 32)};
+    txpdo.pdo_indices = {0x1A00};
+    txpdo.entries[0x1A00] = {E(kFault, 16), E(kStatus, 16), E(kModeDisp, 8), E(kActualPos, 32), E(kVelAct, 32), E(kTorqueAct, 16)};
 }
 
 void ServoConfig::validate() const {

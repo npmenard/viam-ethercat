@@ -67,89 +67,13 @@ std::string req_str(const ProtoStruct& attrs, const std::string& key) {
     return *v;
 }
 
-// Read a numeric member out of a nested ProtoStruct (PDO map parsing).
-double struct_num(const ProtoStruct& obj, const std::string& key, const std::string& ctx) {
-    const auto it = obj.find(key);
-    if (it == obj.end()) {
-        throw ConfigError(ctx + ": missing '" + key + "'");
-    }
-    const double* const p = it->second.get<double>();
-    if (p == nullptr) {
-        throw ConfigError(ctx + ": '" + key + "' must be a number");
-    }
-    return *p;
-}
-
-double struct_num_or(const ProtoStruct& obj, const std::string& key, double dflt) {
-    const auto it = obj.find(key);
-    if (it == obj.end()) {
-        return dflt;
-    }
-    const double* const p = it->second.get<double>();
-    return p != nullptr ? *p : dflt;
-}
-
-// Parse one PDO map ({pdos:[{index, entries:[{index,subindex,bit_length}]}]}).
-// The A6 (or any drive) map is CONFIG DATA -- never hardcoded here. The SM assign-
-// index is DERIVED from direction at remap time (#TODO-8: Rx->0x1C12, Tx->0x1C13),
-// so the config no longer carries it. An optional "assign_index" key remains as an
-// override escape hatch for exotic non-standard SM layouts (default/absent = derive).
-PdoMap parse_pdo_map(const ProtoValue& val, const std::string& what) {
-    const ProtoStruct* const obj = val.get<ProtoStruct>();
-    if (obj == nullptr) {
-        throw ConfigError(what + " must be an object");
-    }
-    PdoMap map;
-    // Optional override only (0/absent = derive from direction). A stray 0 is ignored.
-    map.assign_index_override = static_cast<std::uint16_t>(struct_num_or(*obj, "assign_index", 0.0));
-
-    const auto pdos_it = obj->find("pdos");
-    if (pdos_it == obj->end()) {
-        throw ConfigError(what + ": missing 'pdos' list");
-    }
-    const ProtoList* const pdos = pdos_it->second.get<ProtoList>();
-    if (pdos == nullptr) {
-        throw ConfigError(what + ": 'pdos' must be a list");
-    }
-    for (const ProtoValue& pv : *pdos) {
-        const ProtoStruct* const pobj = pv.get<ProtoStruct>();
-        if (pobj == nullptr) {
-            throw ConfigError(what + ": each pdo must be an object");
-        }
-        const auto pidx = static_cast<std::uint16_t>(struct_num(*pobj, "index", what + " pdo"));
-        map.pdo_indices.push_back(pidx);
-
-        const auto entries_it = pobj->find("entries");
-        if (entries_it == pobj->end()) {
-            throw ConfigError(what + " pdo: missing 'entries' list");
-        }
-        const ProtoList* const entries = entries_it->second.get<ProtoList>();
-        if (entries == nullptr) {
-            throw ConfigError(what + " pdo: 'entries' must be a list");
-        }
-        std::vector<PdoEntry> parsed;
-        parsed.reserve(entries->size());
-        for (const ProtoValue& ev : *entries) {
-            const ProtoStruct* const eobj = ev.get<ProtoStruct>();
-            if (eobj == nullptr) {
-                throw ConfigError(what + " entry: must be an object");
-            }
-            PdoEntry e;
-            e.index = static_cast<std::uint16_t>(struct_num(*eobj, "index", what + " entry"));
-            e.subindex = static_cast<std::uint8_t>(struct_num_or(*eobj, "subindex", 0.0));
-            e.bit_length = static_cast<std::uint8_t>(struct_num(*eobj, "bit_length", what + " entry"));
-            parsed.push_back(e);
-        }
-        map.entries[pidx] = std::move(parsed);
-    }
-    return map;
-}
-
 ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     ServoConfig c;
     c.ifname = req_str(attrs, "interface");
     c.slave_id = static_cast<std::uint16_t>(opt_num(attrs, "slave", 1.0));
-    c.mode = parse_control_mode(req_str(attrs, "control_mode"));
+    // #18: no control_mode attribute -- the driver is ALWAYS switch-capable (each API call ensures
+    // its own mode at runtime). No rxpdo/txpdo attributes either -- the driver defines ONE fixed
+    // superset PDO map (ServoConfig::set_fixed_pdo_map(), applied in validated()).
 
     c.max_motor_speed_rpm = req_num(attrs, "max_rpm");
     c.counts_per_rev = req_num(attrs, "counts_per_rev");
@@ -177,16 +101,6 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     c.command_queue_capacity = static_cast<std::size_t>(opt_num(attrs, "command_queue_capacity", 64.0));
     c.handshake_timeout_cycles = static_cast<std::uint32_t>(opt_num(attrs, "handshake_timeout_cycles", 100.0));
 
-    // #61: rxpdo/txpdo are OPTIONAL advanced overrides. Absent -> the driver DERIVES the standard CiA402
-    // map from control_mode (PP/PV/switchable) in ServoConfig::apply_derived_pdo_maps() (via validated()).
-    // Present -> parsed + used verbatim. (Was: both required.)
-    if (const ProtoValue* const rx = find_attr(attrs, "rxpdo"); rx != nullptr) {
-        c.rxpdo = parse_pdo_map(*rx, "rxpdo");
-    }
-    if (const ProtoValue* const tx = find_attr(attrs, "txpdo"); tx != nullptr) {
-        c.txpdo = parse_pdo_map(*tx, "txpdo");
-    }
-
     c.validate();  // throws ConfigError (clear text) on any invalid field
     return c;
 }
@@ -200,9 +114,14 @@ bool wants_simulation(const ProtoStruct& attrs, const ServoConfig& sc) {
 
 // Derive an in-memory SimSlaveModel from the configured PDO offsets, so the module
 // can load + run in a Viam robot config with no hardware (DoD: loads in sim).
-SimSlaveModel sim_model_from_config(const ServoConfig& sc) {
+SimSlaveModel sim_model_from_config(const ServoConfig& sc_in) {
+    // #18: the sim reads the driver's FIXED superset map (config carries no map). Materialize it on a
+    // copy so the SimSlaveModel offsets match what the Master will remap. (Slice 6 reworks the sim to a
+    // loopback stub; for now it models a Profile-Position drive -- the sim smoke path does go_to.)
+    ServoConfig sc = sc_in;
+    sc.set_fixed_pdo_map();
     SimSlaveModel m;
-    m.mode = sc.mode == ControlMode::ProfileVelocity ? Cia402Mode::ProfileVelocity : Cia402Mode::ProfilePosition;
+    m.mode = Cia402Mode::ProfilePosition;
 
     std::size_t off = 0;
     for (const std::uint16_t pidx : sc.rxpdo.pdo_indices) {

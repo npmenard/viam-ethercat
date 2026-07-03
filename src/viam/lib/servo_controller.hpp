@@ -384,11 +384,11 @@ class ServoController : public SlaveControl {
     // 1) kicks the policy's PP handshake for the hold WITHOUT touching active_generation (the halt already
     // failed the in-flight move -- the hold is not a completable move). On mode_switch_failed the hold
     // reverts to the interim PV-at-0 bit8 hold (accept small drift, never de-energize -- spec §A R1).
-    // #61 switchable: the current motion INTENT (RT-only). Meaningful only when config_.mode==Switchable;
-    // the command batch sets it (go_to/go_for -> PP, set_rpm -> PV). PP/PV configs ignore it. Default PP
-    // so a switchable drive enables in PP. commanded_cia402_mode() folds it with the fixed config modes.
+    // #18: the current motion INTENT (RT-only), always meaningful (the drive is always switch-capable).
+    // The command batch sets it (go_to/go_for -> PP, set_rpm -> PV). Default PP so the drive enables in
+    // PP. commanded_cia402_mode() maps it to the Cia402Mode the policy commands this cycle.
     ControlMode switch_intent_ = ControlMode::ProfilePosition;
-    bool pv_hold_capable_ = false;               // set at resolve: PV mode AND 0x6060 AND 0x607A both mapped
+    bool pv_hold_capable_ = false;               // set at resolve: 0x6060 AND 0x607A both mapped (always, fixed superset)
     bool pv_hold_as_pp_ = false;                 // STICKY: currently holding a halted PV motor via PP-at-counts
     std::uint32_t pv_hold_token_ = 0x80000000u;  // policy token that kicks the PP hold handshake (never a real gen)
     bool stop_at_rest_ = false;  // RT-only (#47-P3b R1): drive reached SwitchOnDisabled during the stopping window -> teardown early-out
