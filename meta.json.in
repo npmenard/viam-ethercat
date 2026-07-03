@@ -9,6 +9,11 @@
       "api": "rdk:component:motor",
       "model": "viam:ethercat:servo",
       "markdown_link": "README.md#configuration-and-usage"
+    },
+    {
+      "api": "rdk:component:motor",
+      "model": "viam:ethercat:a6-servo",
+      "markdown_link": "README.md#configuration-and-usage"
     }
   ],
   "entrypoint": "@CMAKE_INSTALL_BINDIR@/ethercat-servo"

@@ -41,9 +41,13 @@ ServoConfig parse_servo_config(const ProtoStruct& attributes);
 
 class ServoMotor final : public Motor, public Reconfigurable {
    public:
-    // Model identity: viam:ethercat:servo (generic -- A6 is config data, not a model).
+    // Two models in the viam:ethercat family (#15 item 2): the GENERIC standard-CiA402 driver
+    // (viam:ethercat:servo) and the A6 specialization (viam:ethercat:a6-servo), whose factory
+    // constructs an A6ServoDriver. Both are rdk:component:motor and share this ServoMotor glue +
+    // config parser; they differ only in which ServoController subclass they build.
     static const ModelFamily& model_family();
-    static Model model();
+    static Model model();     // viam:ethercat:servo (generic base)
+    static Model a6_model();  // viam:ethercat:a6-servo (A6ServoDriver subclass -- a test vehicle)
     static std::vector<std::shared_ptr<ModelRegistration>> create_model_registrations();
 
     // Static validator for ModelRegistration: parse+validate the config, throwing

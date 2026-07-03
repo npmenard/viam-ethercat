@@ -54,20 +54,15 @@ def _base_attributes() -> dict:
         "loop_rate_hz": 1000,
         "use_distributed_clocks": True,
         "sync_cycle_granularity_ns": 250000,
-        "sync_fault_code": 34560,
-        "vendor_fault_reset": {"index": 8241, "subindex": 1, "value": 1, "value_bytes": 2},
         "handshake_timeout_cycles": 1000,
         "stall_threshold_cycles": 2000,
         "command_queue_capacity": 64,
         "max_consecutive_wkc_errors": 5,
-        # Test 6 DoCommands: the A6 does NOT implement CiA402 0x6079/0x6078 (CoE abort
-        # 0x06020000); its bus voltage / RMS phase current live in vendor 0x2040:07/:0D,
-        # 0.1-unit scaled (live-confirmed via slaveinfo). Absent block = standard objects.
-        "sdo_monitors": {
-            "voltage": {"index": "0x2040", "subindex": "0x07", "type": "u16", "scale": 10},
-            "current": {"index": "0x2040", "subindex": "0x0D", "type": "i16", "scale": 10},
-        },
-        "fault_code_labels": [{"code": 34560, "label": "Er74.1 / no SYNC0"}],
+        # #15 item 2: sync_fault_code, vendor_fault_reset, and fault_code_labels are NO LONGER config
+        # attributes -- the a6-servo model (an A6ServoDriver subclass) carries them in code. #15 item 1:
+        # sdo_monitors is gone too; Test 6's DoCommands (get_motor_voltage/current) read the STANDARD
+        # CiA402 objects (0x6079/0x6078), which the A6 aborts -> value 0 + a "<key>_diag" note (a 0V
+        # reading is valid; the A6 is a test vehicle), so Test 6 passes on 0-values.
     }
 
 
@@ -78,7 +73,7 @@ def _machine(attributes: dict) -> dict:
             {
                 "name": "servo",
                 "api": "rdk:component:motor",
-                "model": "viam:ethercat:servo",
+                "model": "viam:ethercat:a6-servo",
                 "attributes": attributes,
             }
         ],

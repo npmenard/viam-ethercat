@@ -20,6 +20,7 @@
 #include "ethercat/errors.hpp"
 #include "ethercat/pdo_mapping.hpp"
 #include "ethercat/sim_backend.hpp"
+#include "viam/lib/a6_servo_driver.hpp"
 #include "viam/lib/servo_config.hpp"
 
 namespace ethercat::servo {
@@ -144,54 +145,6 @@ PdoMap parse_pdo_map(const ProtoValue& val, const std::string& what) {
     return map;
 }
 
-// OPTIONAL 0x603F gloss (spec #16): "fault_code_labels": [{ "code": <U16>, "label":
-// "<text>" }, ...]. Drive error code -> human label for last_error(). Absent -> empty
-// (last_error shows bare hex). CONFIG DATA -- the A6-specific codes live in the JSON.
-std::vector<std::pair<std::uint16_t, std::string>> parse_fault_code_labels(const ProtoStruct& attrs) {
-    std::vector<std::pair<std::uint16_t, std::string>> out;
-    const ProtoValue* const v = find_attr(attrs, "fault_code_labels");
-    if (v == nullptr) {
-        return out;  // optional
-    }
-    const ProtoList* const list = v->get<ProtoList>();
-    if (list == nullptr) {
-        throw ConfigError("fault_code_labels must be a list of {code, label}");
-    }
-    for (const ProtoValue& ev : *list) {
-        const ProtoStruct* const eobj = ev.get<ProtoStruct>();
-        if (eobj == nullptr) {
-            throw ConfigError("fault_code_labels: each entry must be an object");
-        }
-        const auto code = static_cast<std::uint16_t>(struct_num(*eobj, "code", "fault_code_labels entry"));
-        const auto lit = eobj->find("label");
-        if (lit == eobj->end()) {
-            throw ConfigError("fault_code_labels entry: missing 'label'");
-        }
-        const std::string* const label = lit->second.get<std::string>();
-        if (label == nullptr) {
-            throw ConfigError("fault_code_labels entry: 'label' must be a string");
-        }
-        out.emplace_back(code, *label);
-    }
-    return out;
-}
-
-// A CoE index/subindex given as a JSON number OR a hex string ("0x2040") -- vendor object
-// indices read far better in hex. Accepts either; throws ConfigError on anything else.
-std::uint32_t parse_index_value(const ProtoValue& v, const std::string& ctx) {
-    if (const double* const d = v.get<double>()) {
-        return static_cast<std::uint32_t>(*d);
-    }
-    if (const std::string* const s = v.get<std::string>()) {
-        try {
-            return static_cast<std::uint32_t>(std::stoul(*s, nullptr, 0));  // base 0 -> auto-detect 0x
-        } catch (const std::exception&) {
-            throw ConfigError(ctx + ": '" + *s + "' is not a valid number (use a decimal or a hex string like \"0x2040\")");
-        }
-    }
-    throw ConfigError(ctx + ": must be a number or a hex string like \"0x2040\"");
-}
-
 ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     ServoConfig c;
     c.ifname = req_str(attrs, "interface");
@@ -215,43 +168,9 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     // When set, the Master validates loop rate vs granularity at config time (clear text)
     // instead of the drive rejecting the cycle cryptically at OP entry.
     c.sync_cycle_granularity_ns = static_cast<std::uint32_t>(opt_num(attrs, "sync_cycle_granularity_ns", 0.0));
-    // #TODO-4: optional drive "no-sync" 0x603F code (A6: 34560 = 0x8700, Er74.1). CONFIG
-    // DATA -- the bring-up sync gate reads it from here, never a hardcoded constant in the
-    // generic core. Absent ⇒ nullopt ⇒ no sync-fault detection (generic drive).
-    if (const auto sfc = opt_attr<double>(attrs, "sync_fault_code")) {
-        c.sync_fault_code = static_cast<std::uint16_t>(*sfc);
-    }
-
-    // #39: optional CONSUMER-side vendor fault-reset, executed once pre-RT-spawn (A6:
-    // {"index": 8241 /*0x2031*/, "subindex": 1, "value": 1, "value_bytes": 2}). The vendor
-    // datum lives HERE in config, never library code. value is little-endian encoded into
-    // value_bytes (default 2 -- a U16 object).
-    if (const ProtoValue* const vfr = find_attr(attrs, "vendor_fault_reset"); vfr != nullptr) {
-        const ProtoStruct* const obj = vfr->get<ProtoStruct>();
-        if (obj == nullptr) {
-            throw ConfigError("vendor_fault_reset must be an object {index, subindex, value[, value_bytes]}");
-        }
-        ethercat::SdoWrite w;
-        w.index = static_cast<std::uint16_t>(struct_num(*obj, "index", "vendor_fault_reset"));
-        w.subindex = static_cast<std::uint8_t>(struct_num_or(*obj, "subindex", 0.0));
-        const auto value = static_cast<std::uint64_t>(struct_num(*obj, "value", "vendor_fault_reset"));
-        const auto nbytes = static_cast<std::size_t>(struct_num_or(*obj, "value_bytes", 2.0));
-        if (nbytes == 0 || nbytes > 8) {
-            throw ConfigError("vendor_fault_reset: 'value_bytes' must be 1..8");
-        }
-        w.data.resize(nbytes);
-        for (std::size_t i = 0; i < nbytes; ++i) {
-            w.data[i] = static_cast<std::byte>((value >> (8U * i)) & 0xFFU);  // little-endian
-        }
-        c.vendor_fault_reset = std::move(w);
-    }
-    // #39 migration guard: the pre-#39 "fault_reset" config attribute must NOT be silently
-    // ignored -- a deployed config silently losing its reset is a silent behavior change.
-    if (find_attr(attrs, "fault_reset") != nullptr) {
-        throw ConfigError(
-            "config attribute 'fault_reset' is obsolete (#39): the vendor fault-reset moved to "
-            "'vendor_fault_reset' {index, subindex, value[, value_bytes]} -- update the config");
-    }
+    // #15 item 2: the A6 "no-sync" 0x603F code, the vendor fault-reset SDO, and the 0x603F gloss are
+    // NO LONGER config attributes -- they moved to the A6ServoDriver subclass (the viam:ethercat:a6-servo
+    // model). A generic config carries none of them; the generic base drives standard CiA402 only.
 
     c.max_consecutive_wkc_errors = static_cast<int>(opt_num(attrs, "max_consecutive_wkc_errors", 5.0));
     c.stall_threshold_cycles = static_cast<std::uint64_t>(opt_num(attrs, "stall_threshold_cycles", 10.0));
@@ -267,7 +186,6 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     if (const ProtoValue* const tx = find_attr(attrs, "txpdo"); tx != nullptr) {
         c.txpdo = parse_pdo_map(*tx, "txpdo");
     }
-    c.fault_code_labels = parse_fault_code_labels(attrs);  // optional 0x603F gloss
 
     c.validate();  // throws ConfigError (clear text) on any invalid field
     return c;
@@ -328,13 +246,18 @@ ServoController::BackendFactory sim_factory_from_config(const ServoConfig& sc) {
     return [model] { return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{model})); };
 }
 
+// Build the controller for a model. `Controller` is the generic ServoController (viam:ethercat:servo)
+// or the A6ServoDriver subclass (viam:ethercat:a6-servo); both share the SAME config parser + ctors
+// (A6 inherits them) and differ only in the three device seams. Returns a base-typed unique_ptr so
+// ServoMotor stays subclass-agnostic (reconfigure() rebuilds the master in place, preserving the type).
+template <class Controller>
 std::unique_ptr<ServoController> build_controller(const ResourceConfig& cfg) {
     const ProtoStruct& attrs = cfg.attributes();
     ServoConfig sc = config_from_attrs(attrs);
     if (wants_simulation(attrs, sc)) {
-        return std::make_unique<ServoController>(std::move(sc), sim_factory_from_config(sc));
+        return std::make_unique<Controller>(std::move(sc), sim_factory_from_config(sc));
     }
-    return std::make_unique<ServoController>(std::move(sc));  // SoemBackend (real hardware)
+    return std::make_unique<Controller>(std::move(sc));  // SoemBackend (real hardware)
 }
 
 bool command_flag(const ProtoStruct& command, const char* key) {
@@ -410,12 +333,29 @@ Model ServoMotor::model() {
     return {model_family(), "servo"};
 }
 
+Model ServoMotor::a6_model() {
+    return {model_family(), "a6-servo"};
+}
+
 std::vector<std::shared_ptr<ModelRegistration>> ServoMotor::create_model_registrations() {
-    return {std::make_shared<ModelRegistration>(
-        API::get<Motor>(),
-        model(),
-        [](const auto& deps, const auto& cfg) { return std::make_shared<ServoMotor>(deps, cfg); },
-        [](const auto& cfg) { return ServoMotor::validate(cfg); })};
+    // Both models are rdk:component:motor with the SAME validator (one config parser). They differ
+    // ONLY in the controller subclass the factory builds: the generic base vs the A6ServoDriver seams.
+    return {
+        std::make_shared<ModelRegistration>(
+            API::get<Motor>(),
+            model(),  // viam:ethercat:servo -- generic standard-CiA402 driver
+            [](const auto& /*deps*/, const auto& cfg) {
+                return std::make_shared<ServoMotor>(cfg.name(), build_controller<ServoController>(cfg));
+            },
+            [](const auto& cfg) { return ServoMotor::validate(cfg); }),
+        std::make_shared<ModelRegistration>(
+            API::get<Motor>(),
+            a6_model(),  // viam:ethercat:a6-servo -- A6ServoDriver subclass (test vehicle)
+            [](const auto& /*deps*/, const auto& cfg) {
+                return std::make_shared<ServoMotor>(cfg.name(), build_controller<A6ServoDriver>(cfg));
+            },
+            [](const auto& cfg) { return ServoMotor::validate(cfg); }),
+    };
 }
 
 std::vector<std::string> ServoMotor::validate(const ResourceConfig& cfg) {
@@ -423,7 +363,8 @@ std::vector<std::string> ServoMotor::validate(const ResourceConfig& cfg) {
     return {};                                   // a motor has no dependencies
 }
 
-ServoMotor::ServoMotor(const Dependencies& /*deps*/, const ResourceConfig& cfg) : Motor(cfg.name()), controller_(build_controller(cfg)) {
+ServoMotor::ServoMotor(const Dependencies& /*deps*/, const ResourceConfig& cfg)
+    : Motor(cfg.name()), controller_(build_controller<ServoController>(cfg)) {
     controller_->start();
 }
 

@@ -1,8 +1,9 @@
 {
   "_comment": [
-    "Example Viam component config for the viam:ethercat:servo motor model.",
-    "The drive's object dictionary (PDO map, counts/rev, gear) is CONFIG DATA --",
-    "this file is the A6-EC profile; the module code stays generic. Index/subindex",
+    "Example Viam component config for the viam:ethercat:a6-servo motor model.",
+    "The drive's object dictionary (PDO map, counts/rev, gear) is CONFIG DATA; the",
+    "A6 vendor residuals (fault-reset, no-SYNC0 code, gloss) live in the a6-servo",
+    "subclass, not config (#15 item 2). Index/subindex",
     "are decimal (JSON has no hex): 0x6040=24640 (controlword), 0x607A=24698",
     "(target position), 0x60FF=24831 (target velocity), 0x6041=24641 (statusword),",
     "0x6064=24676 (actual position); RxPDO 0x1600=5632 on SM 0x1C12=7186, TxPDO",
@@ -17,7 +18,7 @@
   ],
   "name": "servo",
   "api": "rdk:component:motor",
-  "model": "viam:ethercat:servo",
+  "model": "viam:ethercat:a6-servo",
   "attributes": {
     "interface": "eth0",
     "simulate": true,

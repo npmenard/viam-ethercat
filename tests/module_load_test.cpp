@@ -35,6 +35,7 @@
 #include "ethercat/errors.hpp"
 #include "ethercat/sim_backend.hpp"
 #include "test_harness.hpp"
+#include "viam/lib/a6_servo_driver.hpp"
 #include "viam/lib/servo_config.hpp"
 #include "viam/lib/servo_controller.hpp"
 #include "viam/module/servo_motor.hpp"
@@ -44,6 +45,7 @@ using ethercat::EcatBackend;
 using ethercat::PdoEntry;
 using ethercat::SimBackend;
 using ethercat::SimSlaveModel;
+using ethercat::servo::A6ServoDriver;
 using ethercat::servo::ControlMode;
 using ethercat::servo::ServoConfig;
 using ethercat::servo::ServoController;
@@ -123,22 +125,26 @@ std::string status_last_error(ServoMotor& motor) {
 
 // ---- Part A: the config-driven module-load path (what servo_motor_test skips) ----
 
-TEST("module-load: the model registers and the registered construct/validate functors WORK") {
+TEST("module-load: BOTH models register and their construct/validate functors WORK") {
     const auto regs = ServoMotor::create_model_registrations();
-    CHECK(!regs.empty());
+    CHECK_EQ(regs.size(), std::size_t{2});  // #15 item 2: generic servo + a6-servo
     CHECK(ServoMotor::model().to_string() == "viam:ethercat:servo");
+    CHECK(ServoMotor::a6_model().to_string() == "viam:ethercat:a6-servo");
 
     // Identity isn't enough -- the point of #12 is that the SDK can actually FIND and
     // CONSTRUCT through this registration. Invoke the registered functors (what the
-    // SDK's resource manager calls when a viam-server loads the module).
-    const auto& reg = regs.front();
-    const ResourceConfig cfg = make_resource_config(load_sim_attrs(), "registered");
-    CHECK(reg->validate(cfg).empty());  // registered validator -> no deps
+    // SDK's resource manager calls when a viam-server loads the module) for EACH model:
+    // both route through the same ServoMotor glue + parser, differing only in the
+    // controller subclass the factory builds (generic ServoController vs A6ServoDriver).
+    for (const auto& reg : regs) {
+        const ResourceConfig cfg = make_resource_config(load_sim_attrs(), "registered");
+        CHECK(reg->validate(cfg).empty());  // registered validator -> no deps
 
-    const std::shared_ptr<viam::sdk::Resource> res = reg->construct_resource(Dependencies{}, cfg);
-    const std::shared_ptr<Motor> motor = std::dynamic_pointer_cast<Motor>(res);
-    CHECK(motor != nullptr);                   // constructed a Motor through the registration
-    (void)motor->get_position(ProtoStruct{});  // and it responds to the Motor API
+        const std::shared_ptr<viam::sdk::Resource> res = reg->construct_resource(Dependencies{}, cfg);
+        const std::shared_ptr<Motor> motor = std::dynamic_pointer_cast<Motor>(res);
+        CHECK(motor != nullptr);                   // constructed a Motor through the registration
+        (void)motor->get_position(ProtoStruct{});  // and it responds to the Motor API
+    }
 }
 
 TEST("module-load: validate() accepts the sim config and rejects malformed ones with clear text") {
@@ -284,7 +290,6 @@ ServoConfig fault_config() {
     c.rxpdo.entries[0x1600] = {PdoEntry{0x6040, 0, 16}, PdoEntry{0x607A, 0, 32}, PdoEntry{0x6081, 0, 32}};
     c.txpdo.pdo_indices = {0x1A00};
     c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16}};
-    c.fault_code_labels = {{0x8700, "Er74.1 / no SYNC0"}};
     c.max_motor_speed_rpm = 3000.0;
     c.motor_rated_current_amps = 2.5;
     c.gear_ratio = 1.0;
@@ -317,7 +322,9 @@ std::unique_ptr<ServoController> fault_controller(SimBackend** out) {
         }
         return std::unique_ptr<EcatBackend>(std::move(be));
     };
-    return std::make_unique<ServoController>(fault_config(), factory);
+    // #15 item 2: the 0x8700 gloss now comes from the A6ServoDriver seam, so build the A6 subclass
+    // here (the generic base would surface the bare hex without the "Er74.1" label).
+    return std::make_unique<A6ServoDriver>(fault_config(), factory);
 }
 
 }  // namespace

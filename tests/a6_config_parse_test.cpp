@@ -59,25 +59,9 @@ TEST("a6-hardware.example.json: PP config parses through the real parser + valid
     CHECK(c.require_realtime);
     CHECK(c.rxpdo.entries.at(0x1600).size() == 3);  // controlword + target position + profile velocity
     CHECK(c.txpdo.entries.at(0x1A00).size() == 6);  // fault, status, mode-display, pos, vel, torque
-    // #39: the consumer-side vendor fault-reset rides in the example (A6 0x2031:01 = 1, U16 LE).
-    CHECK(c.vendor_fault_reset.has_value());
-    CHECK(c.vendor_fault_reset->index == 0x2031);
-    CHECK(c.vendor_fault_reset->subindex == 0x01);
-    CHECK(c.vendor_fault_reset->data.size() == 2);
-    CHECK(c.vendor_fault_reset->data[0] == std::byte{0x01});
-    CHECK(c.vendor_fault_reset->data[1] == std::byte{0x00});
-    // #TODO-4: the A6 no-sync code rides in the example as CONFIG DATA (34560 = 0x8700,
-    // Er74.1), feeding the bring-up sync gate -- no longer a hardcoded constant in core.
-    CHECK(c.sync_fault_code.has_value());
-    CHECK(c.sync_fault_code.value() == std::uint16_t{0x8700});
-}
-
-TEST("#39: the obsolete 'fault_reset' config key is REJECTED, never silently ignored") {
-    // A deployed config silently losing its reset would be a silent behavior change --
-    // the parser must fail loudly with the migration path in the message.
-    ProtoStruct attrs = load_attributes(A6_HW_CONFIG_PATH);
-    attrs["fault_reset"] = viam::sdk::ProtoValue(true);  // the pre-#39 key, any shape
-    CHECK_THROWS(parse_servo_config(attrs), ethercat::ConfigError);
+    // #15 item 2: the A6 no-sync code, vendor fault-reset, and 0x603F gloss are NO LONGER config
+    // attributes -- they moved to the A6ServoDriver subclass (the viam:ethercat:a6-servo model).
+    // The example carries none of them; the parser produces a generic ServoConfig.
 }
 
 TEST("a6-hardware.example.json: PV variant parses + validates") {
@@ -99,9 +83,6 @@ TEST("a6-servo.example.json: sim config parses + validates") {
     const ServoConfig c = parse_servo_config(attrs);
     CHECK(c.mode == ControlMode::ProfilePosition);
     CHECK(c.counts_per_rev == 131072.0);
-    // #TODO-4: the sim example declares no sync_fault_code -> nullopt -> the bring-up
-    // gate's drive-sync-faulted signal is always false (a generic, non-DC-quirk drive).
-    CHECK(!c.sync_fault_code.has_value());
 }
 
 TEST("a6-minimal.example.json: no rxpdo/txpdo -> parses, derives the PP map (#61/#64), validates") {
@@ -116,8 +97,6 @@ TEST("a6-minimal.example.json: no rxpdo/txpdo -> parses, derives the PP map (#61
     // The A6 hardware bits ride in the minimal config (never library constants).
     CHECK(c.use_distributed_clocks);
     CHECK(c.sync_cycle_granularity_ns == 250000);
-    CHECK(c.vendor_fault_reset.has_value());
-    CHECK(c.vendor_fault_reset->index == 0x2031);  // 8241
     // As shipped: the maps are EMPTY (derived, not spelled out).
     CHECK(c.rxpdo.entries.empty());
     CHECK(c.txpdo.entries.empty());

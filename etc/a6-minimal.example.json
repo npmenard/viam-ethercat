@@ -1,6 +1,6 @@
 {
   "_README": [
-    "MINIMAL real-A6 config for the viam:ethercat:servo motor model (#64). The",
+    "MINIMAL real-A6 config for the viam:ethercat:a6-servo motor model (#64). The",
     "companion to a6-hardware.example.json -- that one spells out the full PDO map",
     "as an ADVANCED override; THIS one omits it and lets the driver DERIVE the",
     "standard CiA402 map from control_mode (#61). This is all a conformant CiA402",
@@ -24,7 +24,7 @@
   ],
   "name": "servo",
   "api": "rdk:component:motor",
-  "model": "viam:ethercat:servo",
+  "model": "viam:ethercat:a6-servo",
   "attributes": {
     "_comment_mode": "control_mode PP (GoTo/GoFor) | PV (SetRPM) | switchable (both, runtime PP<->PV). For \"switchable\" the derived map adds 0x6060 so the driver auto-selects PP for GoTo and PV for SetRPM.",
     "interface": "enp86s0",
@@ -35,11 +35,10 @@
     "counts_per_rev": 131072.0,
     "motor_rated_current_amps": 2.5,
 
-    "_comment_a6_hw": "A6-EC non-default hardware bits (CONFIG DATA, never library constants). The A6 supports ONLY DC sync (free-run -> AL 0x0027), on a 250 us SYNC0 granularity; its fault-reset is a vendor SDO write 1 to 0x2031:01 (24625:1), NOT controlword bit7.",
+    "_comment_a6_hw": "A6-EC non-default hardware bits. The A6 supports ONLY DC sync (free-run -> AL 0x0027), on a 250 us SYNC0 granularity -- config data, set here. Its fault-reset (vendor SDO 0x2031:01=1), no-SYNC0 code (0x8700/Er74.1), and 0x603F gloss now live IN CODE in the viam:ethercat:a6-servo model (an A6ServoDriver subclass), NOT as config attributes (#15 item 2).",
     "use_distributed_clocks": true,
     "sync_cycle_granularity_ns": 250000,
-    "vendor_fault_reset": { "index": 8241, "subindex": 1, "value": 1, "value_bytes": 2 },
 
-    "_comment_optional": "Everything else is OPTIONAL: rxpdo/txpdo (derived above), position_tolerance_counts (default counts_per_rev/720), velocity_threshold (default: position-delta), gear_ratio (1.0), peak_current_amps, loop_rate_hz (1000), quick_stop_decel (0x6085) for a controlled ramp-stop, fault_code_labels gloss. Add only what a bench measurement or the app requires."
+    "_comment_optional": "Everything else is OPTIONAL: rxpdo/txpdo (derived above), position_tolerance_counts (default counts_per_rev/720), velocity_threshold (default: position-delta), gear_ratio (1.0), peak_current_amps, loop_rate_hz (1000), quick_stop_decel (0x6085) for a controlled ramp-stop. Add only what a bench measurement or the app requires."
   }
 }

@@ -38,8 +38,9 @@
   ],
   "name": "servo",
   "api": "rdk:component:motor",
-  "model": "viam:ethercat:servo",
+  "model": "viam:ethercat:a6-servo",
   "attributes": {
+    "_comment_model": "#15 item 2: the A6 uses the viam:ethercat:a6-servo model -- an A6ServoDriver subclass that supplies the three A6 residuals in CODE (vendor fault-reset 0x2031:01=1, the no-SYNC0 code 0x8700/Er74.1, and its 0x603F gloss). Those are NO LONGER config attributes. A generic non-A6 CiA402 drive uses viam:ethercat:servo instead.",
     "_comment_bus": "interface = the host NIC bound to the EtherCAT segment (CONFIRM: `ip link`). slave = 1-based ring position of the A6.",
     "interface": "REPLACE_WITH_NIC",
     "slave": 1,
@@ -58,18 +59,9 @@
     "loop_rate_hz": 1000,
     "use_distributed_clocks": true,
     "sync_cycle_granularity_ns": 250000,
-    "sync_fault_code": 34560,
-    "_comment_vendor_reset": "#39 CONSUMER-side vendor fault-reset, run once pre-RT-spawn: the A6 clears a latent fault via vendor object 0x2031:01 = 1 (a U16; NOT CiA402 controlword bit7). index 8241 = 0x2031 in decimal. Remove this block for a drive with no vendor reset (the generic bit7 path still runs). NOTE: the old per-slave 'fault_reset' attribute is OBSOLETE and rejected.",
-    "vendor_fault_reset": {
-      "index": 8241,
-      "subindex": 1,
-      "value": 1,
-      "value_bytes": 2
-    },
     "_comment_tuning": "reached/is_moving is POSITION-STABILITY based (#59): stopped/reached = actual position (0x6064) not changing beyond position_tolerance_counts over N cycles -- NOT a velocity threshold, so there is NO velocity-noise-floor tuning to do (the A6's 0x606C carries a +/-2000-4000 c/s noise floor; see a6-quirks Q13). position_tolerance_counts is OPTIONAL, default = counts_per_rev/720 (~0.5 deg); the 200 below is an explicit example (~0.55 deg at 131072 c/rev). velocity_threshold is now an OPTIONAL OVERRIDE (most configs omit it); shown here for illustration only.",
     "position_tolerance_counts": 200,
     "velocity_threshold": 50000,
-    "move_timeout_ms": 10000,
     "handshake_timeout_cycles": 1000,
     "stall_threshold_cycles": 2000,
     "command_queue_capacity": 64,
@@ -138,13 +130,6 @@
         }
       ]
     },
-    "_comment_fault_labels": "OPTIONAL gloss for the 0x603F (24639) drive error code, surfaced by last_error(). CONFIG DATA -- A6 codes live here, never hardcoded. code is the U16 value of 0x603F; 34560 = 0x8700 = DS402 sync error (Er74.1 / no SYNC0). Extend per the A6 manual as the bench surfaces other codes; an unlisted code shows as bare hex.",
-    "fault_code_labels": [
-      {
-        "code": 34560,
-        "label": "Er74.1 / no SYNC0"
-      }
-    ],
     "_pv_variant": {
       "_comment": "PROFILE VELOCITY drive: apply these two changes to the attributes above. control_mode=PV -> modes-of-operation 0x6060 = 3. The RxPDO swaps target position 0x607A (24698) for target velocity 0x60FF (24831); the TxPDO is unchanged (statusword + position actual). set_rpm drives a signed velocity; go_to is rejected in PV.",
       "control_mode": "PV",
