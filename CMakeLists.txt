@@ -351,16 +351,37 @@ if (ETHERCAT_BUILD_MODULE)
   # the host. Runs under BOTH `cmake --install` (DESTDIR) AND `cpack` (staging prefix) via
   # $ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}. Symlinks are skipped (patchelf the real files only).
   # patchelf is a build-image dep (see Dockerfile).
+  #
+  # #16 STRIP the bundled libs in the SAME pass. The viam-cpp-sdk is built RelWithDebInfo, so its two
+  # libs (libviamsdk ~110MB, libviamapi ~110MB) ship UNSTRIPPED -- ~181MB of debug info that is dead
+  # weight in a DEPLOY bundle (they dominate the ~254MB lib/). `strip --strip-unneeded` keeps the
+  # dynamic symbol table (the .so stays loadable) and drops .symtab/.debug -> the bundle falls to
+  # ~73MB. This is a PACKAGING step, NOT a build-type change: RelWithDebInfo stays for LOCAL debugging
+  # (the un-installed build tree keeps full symbols); only the packaged/bundled copies are stripped.
+  # strip is best-effort (a failure leaves a larger-but-working lib, never breaks the package);
+  # patchelf stays a hard requirement. Order: strip THEN patchelf (rpath edit is the last write).
   install(CODE [==[
     find_program(_ethercat_patchelf patchelf)
     if(NOT _ethercat_patchelf)
       message(FATAL_ERROR "#69: patchelf is required to stamp $ORIGIN into the bundled deps -- install it in the build image")
+    endif()
+    find_program(_ethercat_strip strip)
+    if(NOT _ethercat_strip)
+      message(WARNING "#16: strip not found -- bundling UNSTRIPPED libs (~181MB of SDK debug info retained). Install binutils to shrink the bundle.")
     endif()
     set(_ethercat_root "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}")
     file(GLOB_RECURSE _ethercat_bundled LIST_DIRECTORIES false "${_ethercat_root}/*.so*")
     set(_ethercat_n 0)
     foreach(_so IN LISTS _ethercat_bundled)
       if(NOT IS_SYMLINK "${_so}")
+        if(_ethercat_strip)
+          execute_process(
+            COMMAND "${_ethercat_strip}" --strip-unneeded "${_so}"
+            RESULT_VARIABLE _ethercat_strip_rc)
+          if(NOT _ethercat_strip_rc EQUAL 0)
+            message(WARNING "#16: strip --strip-unneeded failed on ${_so} (continuing; lib is unstripped but valid)")
+          endif()
+        endif()
         execute_process(
           COMMAND "${_ethercat_patchelf}" --set-rpath "$ORIGIN" "${_so}"
           RESULT_VARIABLE _ethercat_rc)
@@ -370,7 +391,7 @@ if (ETHERCAT_BUILD_MODULE)
         math(EXPR _ethercat_n "${_ethercat_n}+1")
       endif()
     endforeach()
-    message(STATUS "#69: stamped $ORIGIN RUNPATH into ${_ethercat_n} bundled lib file(s) under ${_ethercat_root}")
+    message(STATUS "#69/#16: stamped $ORIGIN RUNPATH into (and stripped) ${_ethercat_n} bundled lib file(s) under ${_ethercat_root}")
   ]==])
 
   # Module smoke test: drives a ServoMotor over a SimBackend-backed controller.
