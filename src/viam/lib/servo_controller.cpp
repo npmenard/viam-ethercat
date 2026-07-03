@@ -27,6 +27,11 @@ constexpr std::uint16_t kTargetVel = 0x60FF;
 constexpr std::uint16_t kProfileVel = 0x6081;   // PP move speed (carries the GoTo/GoFor rpm); optional in the map
 constexpr std::uint16_t kModeOfOp = 0x6060;     // runtime mode-of-operation (RxPDO); present => PV->PP hold-switch (M6)
 constexpr std::uint16_t kModeDisplay = 0x6061;  // mode display (TxPDO); present => enable-time mode-echo gate (#45/#57)
+// #15: fixed generous backstop on the BLOCKING go_to/go_for wait (was the config move_timeout_ms).
+// A hard total-time cap breaks legitimately-long moves, so this is deliberately generous -- the RT
+// no-progress watchdog (4x stall threshold) is the real stuck-move safety; this only bounds a move
+// that hangs AND somehow evades the watchdog. 10 min covers any realistic move.
+constexpr std::chrono::milliseconds kMoveWaiterTimeout{600'000};
 constexpr std::uint16_t kFaultCode = 0x603F;    // drive error code (TxPDO, optional feedback)
 // #TODO-4: the A6's "no-SYNC0" code (0x8700 / Er74.1) is NO LONGER a constant here --
 // it's CONFIG DATA (ServoConfig::sync_fault_code), so this generic core carries no
@@ -101,7 +106,7 @@ MasterConfig build_master_config(const ServoConfig& c) {
     mc.slaves = {slave};
     mc.max_consecutive_wkc_errors = static_cast<std::uint32_t>(c.max_consecutive_wkc_errors);
     mc.use_distributed_clocks = c.use_distributed_clocks;
-    mc.op_await_timeout_ms = c.op_await_timeout_ms;  // #71: bring-up give-up patience (Degraded + AL diag on timeout)
+    // #15: op_await_timeout_ms is no longer a config knob -- MasterConfig's fixed 30s default (bring-up give-up patience) applies.
     // Post-OP DC settle grace (cycles) while the SYNC0 phase finishes locking: suppress
     // the WKC-fault latch so a residual transient doesn't trip a spurious BusError. The
     // bring-up SETTLE bound uses MasterConfig's own default (dc_op_gate_cycles);
@@ -701,18 +706,17 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
         state_.completed_generation.store(g, std::memory_order_release);  // publish BEFORE notify
         completion_cv_.notify_all();                                      // no completion_mutex_ held
     } else if (move_active) {
-        // No-progress watchdog: if the actual isn't advancing toward target for
-        // too long, fail the move (wakes its waiter to throw, instead of a silent
-        // wait). Window = move_timeout_ms (or 4x the stall threshold).
+        // No-progress watchdog: if the actual isn't advancing toward target for too long, fail the
+        // move (wakes its waiter to throw, instead of a silent wait). #15: this is the REAL stuck-move
+        // safety and is DURATION-INDEPENDENT -- a progressing move resets the counter and never trips
+        // it, however long the move. Fixed window = 4x the stall threshold (move_timeout_ms is gone).
         if (std::abs(actual - last_progress_actual_) <= config_.position_tolerance_counts) {
             ++stall_cycles_;
         } else {
             stall_cycles_ = 0;
             last_progress_actual_ = actual;
         }
-        const std::uint64_t rate = config_.target_loop_rate_hz;
-        const std::uint32_t limit = config_.move_timeout_ms != 0 ? static_cast<std::uint32_t>(config_.move_timeout_ms * rate / 1000ULL)
-                                                                 : static_cast<std::uint32_t>(config_.stall_threshold_cycles * 4);
+        const std::uint32_t limit = static_cast<std::uint32_t>(config_.stall_threshold_cycles * 4);
         if (stall_cycles_ > limit) {
             abort_active_move(RtError::MoveStalled);  // latch + wake the waiter (same invariant as the handshake timeout)
         }
@@ -1039,7 +1043,7 @@ void ServoController::go_to(double rpm, double position) {
         if (!try_claim_motion_slot(g)) {  // R3 single-in-flight: a live blocking move already owns the slot
             throw BusError("go_to: a motion operation is already in progress");
         }
-        move_timeout = config_.move_timeout_ms != 0 ? std::chrono::milliseconds(config_.move_timeout_ms) : std::chrono::milliseconds(30000);
+        move_timeout = kMoveWaiterTimeout;  // #15: fixed backstop (no-progress watchdog is the real safety)
         (void)commands_.push(Command{SetTarget{counts, static_cast<std::uint32_t>(std::abs(prof)), false, g}});
     }  // release the shared lock BEFORE parking (so reconfigure isn't blocked for the whole move)
 
@@ -1065,8 +1069,7 @@ void ServoController::go_for(double rpm, double revs) {
             if (!try_claim_motion_slot(g)) {  // R3 single-in-flight
                 throw BusError("go_for: a motion operation is already in progress");
             }
-            move_timeout =
-                config_.move_timeout_ms != 0 ? std::chrono::milliseconds(config_.move_timeout_ms) : std::chrono::milliseconds(30000);
+            move_timeout = kMoveWaiterTimeout;  // #15: fixed backstop (see go_to)
             (void)commands_.push(Command{SetTarget{delta, static_cast<std::uint32_t>(std::abs(prof)), true, g}});
         }
         await_move(g, move_timeout);

@@ -6,8 +6,8 @@ bench-proven /home/viam/a6-robot.trixie.json, with the campaign deltas:
   - NO rxpdo/txpdo blocks (exercises the #61 derived superset map);
   - NO position_tolerance_counts / velocity_threshold (exercises the #59
     0.5-degree default + position-stability reach);
-  - move_timeout_ms raised to 120 s (Test6 drives a 2000-rev move that would
-    trip a 10 s watchdog before its mid-move DoCommand checks finish).
+  - #15: move_timeout_ms REMOVED -- the blocking-API wait now has a fixed 10min backstop and the
+    RT no-progress watchdog is the real stuck-move safety, so Test6's long 2000-rev move just works.
 
 Scenario variants for the "What to test" list:
   valid            - the known-good switchable config
@@ -56,7 +56,6 @@ def _base_attributes() -> dict:
         "sync_cycle_granularity_ns": 250000,
         "sync_fault_code": 34560,
         "vendor_fault_reset": {"index": 8241, "subindex": 1, "value": 1, "value_bytes": 2},
-        "move_timeout_ms": 120000,
         "handshake_timeout_cycles": 1000,
         "stall_threshold_cycles": 2000,
         "command_queue_capacity": 64,

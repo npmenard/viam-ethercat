@@ -165,7 +165,7 @@ TEST("#59: reached/is_moving is noise-robust (position-delta) — omitting toler
     ServoConfig cfg = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
     cfg.position_tolerance_counts = 0;  // OMIT -> validated() defaults to counts_per_rev/720 (0.5 deg)
     cfg.velocity_threshold = 0;         // OMIT -> position-delta method (kills the broken exact-|vel|<=0 gate)
-    cfg.move_timeout_ms = 3000;         // bound: a regressed (velocity-exact) predicate would throw within 3s
+    // #15: move_timeout_ms knob removed -- the RT no-progress watchdog (4x stall) bounds a stuck/regressed move.
     ServoController ctrl{cfg, factory};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
@@ -207,7 +207,7 @@ TEST("#67: a frozen drive FAR from target must NOT report reached (the |actual-t
         return std::unique_ptr<EcatBackend>(std::move(be));
     };
     ServoConfig cfg = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
-    cfg.move_timeout_ms = 1500;  // bound the clean-code throw (stall/timeout) ~1.5s; mutant returns in ~tens of cycles
+    // #15: move_timeout_ms knob removed -- the RT no-progress watchdog (4x stall) bounds a stuck/regressed move.
     ServoController ctrl{cfg, factory};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));

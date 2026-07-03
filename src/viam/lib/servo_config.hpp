@@ -96,11 +96,7 @@ struct ServoConfig {
     std::uint32_t target_loop_rate_hz = 1000;  // 1..1000
     bool require_realtime = true;              // hard-fail if RT scheduling unavailable
     int rt_priority = 80;                      // SCHED_FIFO priority, 1..99
-    // Bring-up OP-await patience (#71): how long the RT loop waits for the drive to reach a held
-    // OP before GIVING UP (Degraded + last_error naming the AL cause). Generous by default because
-    // the A6's SAFE-OP->OP takes seconds; lower it for a faster fail signal on a misconfigured drive
-    // (e.g. free-run against a DC-only drive -> AL 0x0027). Threads to MasterConfig::op_await_timeout_ms.
-    std::uint32_t op_await_timeout_ms = 30'000;  // > 0
+    // #15: op_await_timeout_ms removed as a config knob -- MasterConfig's fixed 30s default applies.
     // Enable Distributed-Clock SYNC0. REQUIRED by drives that support only DC sync
     // (the A6-EC faults out of OP -- Er74.1 "no sync signal", WKC->0 -- without it).
     // The SYNC0 cycle = 1e9 / target_loop_rate_hz; that period MUST be a value the
@@ -161,7 +157,7 @@ struct ServoConfig {
     // don't delay genuine recovery. (Risky direction is too-SMALL fault_reset_window_cycles
     // -- below the drive's clear-reflect latency it false-fails; keep it >= that latency.)
     std::uint32_t fault_reset_clear_confirm_cycles = 3;
-    std::uint32_t move_timeout_ms = 0;  // 0 = no-progress watchdog only
+    // #15: move_timeout_ms removed -- the RT no-progress watchdog (4x stall) + a fixed 10min blocking-API backstop.
 
     // --- diagnostics ---
     // OPTIONAL gloss for the 0x603F drive error code -> human label, surfaced by
