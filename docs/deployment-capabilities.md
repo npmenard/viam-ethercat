@@ -204,6 +204,66 @@ Notes:
   `require_realtime=false` only for dev/CI on non-RT machines.
   Check: `uname -v` should contain `PREEMPT_RT` (or `PREEMPT RT`).
 
+### RT determinism under host load (#72)
+
+A `PREEMPT_RT` kernel + `SCHED_FIFO` scheduling does **not**, by itself, guarantee
+the RT loop is never stalled. The EtherCAT master's cyclic thread must transmit
+process data every cycle (1 ms at 1 kHz); if the OS keeps it off-CPU for even
+~20–30 ms, process data gaps, the drive loses its DC SYNC0 lock, and it faults
+(`AL … no-sync` / Er74.1) and drops out. We observed exactly one such event on the
+bench — a single ~26 ms outbound gap, otherwise-pristine timing — that correlated
+with a heavy parallel compile (`-jN` clang/ctest) running on the **same** host.
+
+Its exact mechanism was **not** identified: directed reproduction on this host
+(two build storms up to load ~32, including in-window SDO polling and privileged
+FIFO test-thread contention) did **not** reproduce it, so the candidates below are
+mitigations, not a confirmed root cause. Harden the deployment against all of them
+and rely on the tripwire (below) to name the next natural occurrence.
+
+Candidate host stall vectors and how to remove them:
+
+- **RT bandwidth throttling.** Default kernels cap all `SCHED_FIFO`/`RR` tasks on a
+  runqueue at `sched_rt_runtime_us` / `sched_rt_period_us` (typically `950000/1000000`
+  = 95 % per second); once that budget is spent the *whole* RT class is throttled for
+  the remainder of the period — up to **50 ms**, which is longer than the drive's
+  sync watchdog. Check and disable for a dedicated EtherCAT host:
+  ```bash
+  cat /proc/sys/kernel/sched_rt_runtime_us   # 950000 = throttling ON
+  sudo sysctl -w kernel.sched_rt_runtime_us=-1   # -1 = OFF (persist in /etc/sysctl.d/)
+  ```
+  (Only advisable on a host where the EtherCAT RT thread is the trusted RT workload —
+  disabling the throttle removes the kernel's safety net against a runaway RT task.)
+- **No CPU isolation / affinity.** By default the RT thread floats across all CPUs and
+  competes with every other task for cache, TLB, and scheduling. Dedicate a core:
+  boot with `isolcpus=<N> nohz_full=<N> rcu_nocbs=<N>` and pin the RT thread (and the
+  EtherCAT NIC IRQ, below) to CPU `N`. (The module does not yet set affinity itself;
+  until it does, pin the whole `viam-server` cgroup with `AllowedCPUs=`/`taskset`, or
+  add an affinity config knob.)
+- **NIC IRQ priority below ours.** On `PREEMPT_RT` the EtherCAT NIC's IRQ is a threaded
+  IRQ; if its `SCHED_FIFO` priority is **below** the module's RT thread (default `80`),
+  a busy-wait for a frame the IRQ must deliver can invert. Raise it to ≥ the RT thread:
+  ```bash
+  # find the enp*/eth* NIC's irq/*-<nic> threads and their rtprio
+  ps -eo pid,comm,cls,rtprio | grep -E "irq/.*<nic>"
+  sudo chrt -f -p 85 <irq-thread-pid>   # >= module rt_priority (80)
+  ```
+- **Firmware SMIs (System Management Interrupts).** BIOS/firmware can steal the CPU
+  host-wide for a few to tens of milliseconds — invisible to the OS scheduler and a
+  known cause of one-off RT latency spikes, plausibly correlated with power/thermal
+  management under sustained compile load. If the tripwire fires, check the SMI count:
+  ```bash
+  sudo turbostat --quiet --show SMI sleep 1   # nonzero SMI during a stall = firmware theft
+  ```
+  Mitigate in firmware (disable unnecessary SMI sources / aggressive power management),
+  not in software.
+
+**The permanent tripwire.** The Runner now measures per-cycle overrun and logs, once,
+`[ethercat] RT cycle overrun <X>ms (<N> cycles) at cycle <M>` when the RT thread wakes
+≥ 5 ms late. **This line means the host stalled the RT thread** — not an EtherCAT/drive
+fault. On seeing it, correlate with host load and the SMI counter above; it identifies
+the class of problem in one line (the original event had no such line). A `mlockall`
+failure (unlocked RT memory → page-fault jitter) likewise now logs a warning at startup.
+
 ---
 
 ## C++ runtime ABI floor on the robot (libstdc++ + glibc)
