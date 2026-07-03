@@ -19,37 +19,6 @@
 
 namespace ethercat::servo {
 
-// #68: a do_command converted-SDO read target. Describes ONE CoE object read while operating
-// (via the #22 marshaled steady-state SDO) plus how to convert its raw integer to a reported
-// double. CONFIG DATA, never a hardcoded vendor constant: the DEFAULTS are the standard CiA402
-// objects (a generic drive works with zero config), and a vendor drive overrides index/
-// subindex/type/scale from the hardware JSON "sdo_monitors" block. (The A6 does NOT implement
-// the standard 0x6079/0x6078 and exposes bus voltage / phase current only via vendor object
-// 0x2040 -- so its config points these at 0x2040:07 / 0x2040:0D, keeping this core vendor-free.)
-enum class SdoValueType : std::uint8_t { U8, I8, U16, I16, U32, I32 };
-// Parse "u8"/"i8"/"u16"/"i16"/"u32"/"i32" (case-insensitive); throws ConfigError otherwise.
-SdoValueType parse_sdo_value_type(std::string_view text);
-const char* to_string(SdoValueType t) noexcept;
-
-// How the raw integer becomes the reported double. Either a fixed DIVISOR (value = raw/divisor
-// -- 1000 for CiA402 mV->V, 10 for the A6's 0.1 V / 0.1 A) or the CiA402 RATED-CURRENT per-mille
-// (value = (raw/1000) * motor_rated_current_amps).
-enum class SdoScaleKind : std::uint8_t { Divisor, RatedCurrentPermille };
-
-struct SdoMonitor {
-    std::uint16_t index = 0;
-    std::uint8_t subindex = 0;
-    SdoValueType type = SdoValueType::U32;
-    SdoScaleKind scale_kind = SdoScaleKind::Divisor;
-    double divisor = 1.0;  // used ONLY when scale_kind == Divisor (value = raw / divisor)
-    // Bytes to read = sizeof the value type (1/2/4).
-    std::size_t byte_width() const noexcept;
-};
-
-// Decode `raw` (little-endian, at least m.byte_width() bytes) as m.type, then apply m's scale.
-// rated_current_amps is used ONLY by RatedCurrentPermille. Throws ConfigError if raw is short.
-double convert_sdo_monitor(const SdoMonitor& m, std::span<const std::byte> raw, double rated_current_amps);
-
 // Viam motor control mode (INTENT; the driver derives the CiA402 PDO map, #61).
 // PP = Profile Position (GoTo/GoFor); PV = Profile Velocity (SetRPM); Switchable =
 // BOTH -- the superset map incl. 0x6060 so GoTo auto-selects PP and SetRPM auto-
@@ -79,13 +48,8 @@ struct ServoConfig {
     double gear_ratio = 1.0;                // motor revs per output rev; != 0
     double counts_per_rev = 0.0;            // encoder counts per motor rev; > 0 (A6 = 131072)
 
-    // --- #68 do_command converted-SDO read targets (optional "sdo_monitors" JSON block) ---
-    // DEFAULTS = the standard CiA402 objects, so a generic drive works with zero config. A
-    // vendor drive overrides them (the A6 lacks 0x6079/0x6078; it uses 0x2040:07 ÷10 V and
-    // 0x2040:0D ÷10 A). get_motor_drive_modes (0x6502) is standard + fixed, NOT in this block.
-    SdoMonitor voltage_monitor{0x6079, 0x00, SdoValueType::U32, SdoScaleKind::Divisor, 1000.0};            // DC-link mV -> V
-    SdoMonitor current_monitor{0x6078, 0x00, SdoValueType::I16, SdoScaleKind::RatedCurrentPermille, 1.0};  // per-mille * rated -> A
-
+    // #15: do_command SDO reads target the fixed STANDARD CiA402 objects (0x6079/0x6078/0x6502) in
+    // the module handler -- no config, no override (see servo_motor.cpp read_std_sdo).
     // --- move-complete predicate (noise-robust position-delta, #59) ---
     // reached/is_moving = |actual-target| <= position_tolerance_counts AND the position is STABLE (its
     // range over the last N cycles <= position_tolerance_counts). Both fields OPTIONAL:

@@ -192,40 +192,6 @@ std::uint32_t parse_index_value(const ProtoValue& v, const std::string& ctx) {
     throw ConfigError(ctx + ": must be a number or a hex string like \"0x2040\"");
 }
 
-// #68 parse one do_command SDO monitor spec {index, subindex?, type, scale}. `index` is a
-// number or hex string; `type` is u8/i8/u16/i16/u32/i32; `scale` is a NUMBER (fixed divisor,
-// value = raw/scale) or the string "rated_permille" (value = raw/1000 * motor_rated_current_amps).
-SdoMonitor parse_sdo_monitor(const ProtoStruct& obj, const char* which) {
-    const std::string ctx = std::string("sdo_monitors.") + which;
-    SdoMonitor m;
-    const auto ii = obj.find("index");
-    if (ii == obj.end()) {
-        throw ConfigError(ctx + ": missing 'index'");
-    }
-    m.index = static_cast<std::uint16_t>(parse_index_value(ii->second, ctx + " index"));
-    if (const auto si = obj.find("subindex"); si != obj.end()) {
-        m.subindex = static_cast<std::uint8_t>(parse_index_value(si->second, ctx + " subindex"));
-    }
-    const auto ti = obj.find("type");
-    if (ti == obj.end() || ti->second.get<std::string>() == nullptr) {
-        throw ConfigError(ctx + ": 'type' must be a string (u8/i8/u16/i16/u32/i32)");
-    }
-    m.type = parse_sdo_value_type(*ti->second.get<std::string>());
-    const auto sci = obj.find("scale");
-    if (sci == obj.end()) {
-        throw ConfigError(ctx + ": missing 'scale' (a number divisor, or \"rated_permille\")");
-    }
-    if (const double* const d = sci->second.get<double>()) {
-        m.scale_kind = SdoScaleKind::Divisor;
-        m.divisor = *d;
-    } else if (const std::string* const s = sci->second.get<std::string>(); s != nullptr && *s == "rated_permille") {
-        m.scale_kind = SdoScaleKind::RatedCurrentPermille;
-    } else {
-        throw ConfigError(ctx + ": 'scale' must be a number (fixed divisor) or the string \"rated_permille\"");
-    }
-    return m;
-}
-
 ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     ServoConfig c;
     c.ifname = req_str(attrs, "interface");
@@ -302,30 +268,6 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
         c.txpdo = parse_pdo_map(*tx, "txpdo");
     }
     c.fault_code_labels = parse_fault_code_labels(attrs);  // optional 0x603F gloss
-
-    // #68 optional "sdo_monitors" block: override the do_command converted-SDO read targets
-    // (absent -> the standard CiA402 defaults in ServoConfig). The A6 needs it because it does
-    // NOT implement 0x6079/0x6078 -- it exposes bus voltage / phase current via vendor 0x2040.
-    if (const ProtoValue* const sm = find_attr(attrs, "sdo_monitors"); sm != nullptr) {
-        const ProtoStruct* const obj = sm->get<ProtoStruct>();
-        if (obj == nullptr) {
-            throw ConfigError("sdo_monitors must be an object {\"voltage\": {...}, \"current\": {...}}");
-        }
-        if (const auto vi = obj->find("voltage"); vi != obj->end()) {
-            const ProtoStruct* const vo = vi->second.get<ProtoStruct>();
-            if (vo == nullptr) {
-                throw ConfigError("sdo_monitors.voltage must be an object {index, subindex?, type, scale}");
-            }
-            c.voltage_monitor = parse_sdo_monitor(*vo, "voltage");
-        }
-        if (const auto ci = obj->find("current"); ci != obj->end()) {
-            const ProtoStruct* const co = ci->second.get<ProtoStruct>();
-            if (co == nullptr) {
-                throw ConfigError("sdo_monitors.current must be an object {index, subindex?, type, scale}");
-            }
-            c.current_monitor = parse_sdo_monitor(*co, "current");
-        }
-    }
 
     c.validate();  // throws ConfigError (clear text) on any invalid field
     return c;

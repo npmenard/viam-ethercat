@@ -23,8 +23,6 @@
 
 using ethercat::servo::ControlMode;
 using ethercat::servo::parse_servo_config;
-using ethercat::servo::SdoScaleKind;
-using ethercat::servo::SdoValueType;
 using ethercat::servo::ServoConfig;
 using viam::sdk::ProtoStruct;
 using viam::sdk::ProtoValue;
@@ -72,57 +70,6 @@ TEST("a6-hardware.example.json: PP config parses through the real parser + valid
     // Er74.1), feeding the bring-up sync gate -- no longer a hardcoded constant in core.
     CHECK(c.sync_fault_code.has_value());
     CHECK(c.sync_fault_code.value() == std::uint16_t{0x8700});
-    // #68: the A6 vendor-object monitor overrides parse (hex-string index/subindex + divisor):
-    // bus voltage 0x2040:07 (U16, ÷10) and RMS phase current 0x2040:0D (I16, ÷10).
-    CHECK(c.voltage_monitor.index == 0x2040);
-    CHECK(c.voltage_monitor.subindex == 0x07);
-    CHECK(c.voltage_monitor.type == SdoValueType::U16);
-    CHECK(c.voltage_monitor.scale_kind == SdoScaleKind::Divisor);
-    CHECK(c.voltage_monitor.divisor == 10.0);
-    CHECK(c.current_monitor.index == 0x2040);
-    CHECK(c.current_monitor.subindex == 0x0D);
-    CHECK(c.current_monitor.type == SdoValueType::I16);
-    CHECK(c.current_monitor.divisor == 10.0);
-}
-
-TEST("#68: sdo_monitors absent -> standard CiA402 defaults (0x6079 mV, 0x6078 per-mille)") {
-    ProtoStruct attrs = load_attributes(A6_HW_CONFIG_PATH);
-    attrs.erase("sdo_monitors");  // a generic drive omits the block
-    const ServoConfig c = parse_servo_config(attrs);
-    CHECK(c.voltage_monitor.index == 0x6079);
-    CHECK(c.voltage_monitor.scale_kind == SdoScaleKind::Divisor);
-    CHECK(c.voltage_monitor.divisor == 1000.0);
-    CHECK(c.current_monitor.index == 0x6078);
-    CHECK(c.current_monitor.scale_kind == SdoScaleKind::RatedCurrentPermille);
-}
-
-TEST("#68: sdo_monitors accepts rated_permille scale + rejects a bad value type") {
-    // rated_permille parses (the standard-current shape, given explicitly).
-    {
-        ProtoStruct attrs = load_attributes(A6_HW_CONFIG_PATH);
-        ProtoStruct cur;
-        cur["index"] = ProtoValue(std::string("0x6078"));
-        cur["type"] = ProtoValue(std::string("i16"));
-        cur["scale"] = ProtoValue(std::string("rated_permille"));
-        ProtoStruct sm;
-        sm["current"] = ProtoValue(std::move(cur));
-        attrs["sdo_monitors"] = ProtoValue(std::move(sm));
-        const ServoConfig c = parse_servo_config(attrs);
-        CHECK(c.current_monitor.index == 0x6078);
-        CHECK(c.current_monitor.scale_kind == SdoScaleKind::RatedCurrentPermille);
-    }
-    // A bad value type is a loud ConfigError, not a silent default.
-    {
-        ProtoStruct attrs = load_attributes(A6_HW_CONFIG_PATH);
-        ProtoStruct v;
-        v["index"] = ProtoValue(std::string("0x2040"));
-        v["type"] = ProtoValue(std::string("u24"));  // not a valid width
-        v["scale"] = ProtoValue(10.0);
-        ProtoStruct sm;
-        sm["voltage"] = ProtoValue(std::move(v));
-        attrs["sdo_monitors"] = ProtoValue(std::move(sm));
-        CHECK_THROWS_MSG(parse_servo_config(attrs), ethercat::ConfigError, "not valid");
-    }
 }
 
 TEST("#39: the obsolete 'fault_reset' config key is REJECTED, never silently ignored") {

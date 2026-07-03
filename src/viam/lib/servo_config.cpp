@@ -50,96 +50,6 @@ const char* to_string(ControlMode mode) noexcept {
     return "?";
 }
 
-SdoValueType parse_sdo_value_type(std::string_view text) {
-    if (iequals(text, "u8")) {
-        return SdoValueType::U8;
-    }
-    if (iequals(text, "i8")) {
-        return SdoValueType::I8;
-    }
-    if (iequals(text, "u16")) {
-        return SdoValueType::U16;
-    }
-    if (iequals(text, "i16")) {
-        return SdoValueType::I16;
-    }
-    if (iequals(text, "u32")) {
-        return SdoValueType::U32;
-    }
-    if (iequals(text, "i32")) {
-        return SdoValueType::I32;
-    }
-    throw ConfigError("sdo_monitors: value type '" + std::string(text) + "' is not valid (expected u8/i8/u16/i16/u32/i32)");
-}
-
-const char* to_string(SdoValueType t) noexcept {
-    switch (t) {
-        case SdoValueType::U8:
-            return "u8";
-        case SdoValueType::I8:
-            return "i8";
-        case SdoValueType::U16:
-            return "u16";
-        case SdoValueType::I16:
-            return "i16";
-        case SdoValueType::U32:
-            return "u32";
-        case SdoValueType::I32:
-            return "i32";
-    }
-    return "?";
-}
-
-std::size_t SdoMonitor::byte_width() const noexcept {
-    switch (type) {
-        case SdoValueType::U8:
-        case SdoValueType::I8:
-            return 1;
-        case SdoValueType::U16:
-        case SdoValueType::I16:
-            return 2;
-        case SdoValueType::U32:
-        case SdoValueType::I32:
-            return 4;
-    }
-    return 0;
-}
-
-double convert_sdo_monitor(const SdoMonitor& m, std::span<const std::byte> raw, double rated_current_amps) {
-    const std::size_t width = m.byte_width();
-    if (raw.size() < width) {
-        throw ConfigError("convert_sdo_monitor: object 0x" + std::to_string(m.index) + " read " + std::to_string(raw.size()) +
-                          " byte(s), need " + std::to_string(width) + " for type " + to_string(m.type));
-    }
-    // Decode the raw little-endian integer as the declared type into a double (exact for all
-    // these widths). Uses the shared load_le -- no hand-rolled packing.
-    double value = 0.0;
-    switch (m.type) {
-        case SdoValueType::U8:
-            value = ethercat::load_le<std::uint8_t>(raw.first(1));
-            break;
-        case SdoValueType::I8:
-            value = ethercat::load_le<std::int8_t>(raw.first(1));
-            break;
-        case SdoValueType::U16:
-            value = ethercat::load_le<std::uint16_t>(raw.first(2));
-            break;
-        case SdoValueType::I16:
-            value = ethercat::load_le<std::int16_t>(raw.first(2));
-            break;
-        case SdoValueType::U32:
-            value = ethercat::load_le<std::uint32_t>(raw.first(4));
-            break;
-        case SdoValueType::I32:
-            value = ethercat::load_le<std::int32_t>(raw.first(4));
-            break;
-    }
-    if (m.scale_kind == SdoScaleKind::RatedCurrentPermille) {
-        return (value / 1000.0) * rated_current_amps;
-    }
-    return value / m.divisor;  // divisor validated nonzero in ServoConfig::validate()
-}
-
 void ServoConfig::apply_derived_pdo_maps() {
     // #61: standard CiA402 objects only (#41) -- these ARE the standard, so they live in the library.
     constexpr std::uint16_t kCtrl = 0x6040, kMode = 0x6060, kTargetPos = 0x607A, kProfileVel = 0x6081, kTargetVel = 0x60FF;
@@ -207,17 +117,6 @@ void ServoConfig::validate() const {
     if (command_queue_capacity == 0) {
         throw ConfigError("servo config: 'command_queue_capacity' must be > 0");
     }
-    // #68 sdo_monitors: a 0 index is never a real object; a Divisor scale must be nonzero.
-    const auto check_monitor = [](const SdoMonitor& m, const char* which) {
-        if (m.index == 0) {
-            throw ConfigError(std::string("servo config: sdo_monitors.") + which + " 'index' must be nonzero");
-        }
-        if (m.scale_kind == SdoScaleKind::Divisor && m.divisor == 0.0) {
-            throw ConfigError(std::string("servo config: sdo_monitors.") + which + " 'scale' divisor must not be 0");
-        }
-    };
-    check_monitor(voltage_monitor, "voltage");
-    check_monitor(current_monitor, "current");
 }
 
 }  // namespace ethercat::servo

@@ -134,7 +134,7 @@ std::size_t SimBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::
         store_le<std::uint32_t>(out.subspan(0, 4), s.model.supported_drive_modes);
         return 4;
     }
-    // #68 A6 vendor monitoring object 0x2040 (the sdo_monitors-override targets).
+    // A6 vendor monitoring object 0x2040 (test fixture; #15 no longer read by do_command).
     if (index == 0x2040 && sub == 0x07 && out.size() >= 2) {  // bus voltage, U16, 0.1 V
         store_le<std::uint16_t>(out.subspan(0, 2), s.model.vendor_bus_voltage_dV);
         return 2;
