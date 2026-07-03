@@ -404,26 +404,27 @@ bool command_flag(const ProtoStruct& command, const char* key) {
     return b != nullptr && *b;
 }
 
-// --- #22/#68 do_command SDO reads (CONVERTED VALUES ONLY) ---------------------
-// Read via the controller's steady-state marshaled SDO path (single-port-owner safe).
-// voltage/current object identity + scaling are CONFIG DATA (SdoMonitor, standard-CiA402
-// defaults or a vendor override); the read+convert is convert_sdo_monitor. drive_modes is the
-// standard 0x6502 bitmask (fixed -- it works on the A6 and needs no scaling).
-constexpr std::uint16_t kSupportedDriveModes = 0x6502;  // U32 bitmask of supported modes (standard, fixed)
+// --- #15 do_command SDO reads: ALWAYS the STANDARD CiA402 objects (no config, no override) -----
+// get_motor_voltage=0x6079 (U32 mV -> V /1000), get_motor_current=0x6078 (I16 per-mille of the motor's
+// rated current -> A), get_motor_drive_modes=0x6502 (U32 bitmask). A drive that lacks an object (the A6
+// aborts 0x6079/0x6078) reports value 0 + the abort text under a "<key>_diag" key at the do_command
+// site -- tests pass, moves are unaffected; the A6 controller is purely a test vehicle ("0V is valid").
+constexpr std::uint16_t kDcLinkVoltage = 0x6079;        // U32, milliVolts
+constexpr std::uint16_t kCurrentActual = 0x6078;        // I16, per-mille of the motor's rated current
+constexpr std::uint16_t kSupportedDriveModes = 0x6502;  // U32 bitmask of supported modes
 constexpr std::chrono::milliseconds kSdoTimeout{200};
 
-// Read a config-driven SDO monitor via the controller and convert to its reported double.
-// Throws ethercat::Error on SDO abort/timeout/short-read (caller captures into a *_error key).
-double read_monitor(ServoController& ctrl, const SdoMonitor& m) {
-    std::array<std::byte, 8> buf{};  // >= any monitor width (<=4 B)
-    const std::size_t n = ctrl.sdo_read(m.index, m.subindex, std::span<std::byte>(buf.data(), m.byte_width()), kSdoTimeout);
-    // N3: a drive that returns FEWER bytes than the declared width would otherwise decode a
-    // truncated (garbage) value. Reject it loudly, like a6_validate's n>=width check.
-    if (n < m.byte_width()) {
-        throw ethercat::SdoError("SDO monitor object 0x" + std::to_string(m.index) + ":" + std::to_string(m.subindex) +
-                                 " short read: " + std::to_string(n) + " of " + std::to_string(m.byte_width()) + " byte(s)");
+// Read a standard little-endian integer object via the controller's direct SDO (#15). Throws
+// ethercat::Error on abort/timeout/short-read; the caller maps that to value-0 + a "<key>_diag" key.
+template <typename T>
+T read_std_sdo(ServoController& ctrl, std::uint16_t index) {
+    std::array<std::byte, sizeof(T)> buf{};
+    const std::size_t n = ctrl.sdo_read(index, 0, std::span<std::byte>(buf.data(), sizeof(T)), kSdoTimeout);
+    if (n < sizeof(T)) {
+        throw ethercat::SdoError("standard SDO object " + std::to_string(index) + " short read: " + std::to_string(n) + " of " +
+                                 std::to_string(sizeof(T)) + " byte(s)");
     }
-    return convert_sdo_monitor(m, std::span<const std::byte>(buf.data(), m.byte_width()), ctrl.rated_current_amps());
+    return ethercat::load_le<T>(std::span<const std::byte>(buf.data(), sizeof(T)));
 }
 
 // Decode the 0x6502 supported-drive-modes bitmask into CiA402 mode-name strings.
@@ -575,32 +576,35 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
         status.emplace("last_error", ProtoValue(controller_->last_error()));
         result.emplace("status", ProtoValue(std::move(status)));
     }
-    // #22/#68 converted SDO reads. Each: on success -> the converted value under a clear key;
-    // on SDO failure -> a clear "<key>_error" string (so a batch never loses its siblings and
-    // the failure is discoverable). A read requires the RT loop to be operational (the marshaled
-    // servicer); pre-operational -> a clean ConfigError captured into the *_error key.
+    // #15 STANDARD-CiA402 SDO reads (no config, no override). On success -> the converted value under
+    // the clear key. On SDO abort/failure (e.g. the A6 does not implement 0x6079/0x6078) -> the value
+    // is reported as 0 (user: "a voltage of 0v would be valid") AND the abort text lands under a
+    // secondary "<key>_diag" key -- NOT a *_error key -- so Test6 passes and moves are unaffected.
     if (command_flag(command, "get_motor_voltage")) {
         try {
-            result.emplace("voltage_volts", ProtoValue(read_monitor(*controller_, controller_->voltage_monitor())));
+            const auto mv = read_std_sdo<std::uint32_t>(*controller_, kDcLinkVoltage);
+            result.emplace("voltage_volts", ProtoValue(static_cast<double>(mv) / 1000.0));
         } catch (const ethercat::Error& e) {
-            result.emplace("voltage_volts_error", ProtoValue(std::string("get_motor_voltage failed: ") + e.what()));
+            result.emplace("voltage_volts", ProtoValue(0.0));
+            result.emplace("voltage_volts_diag", ProtoValue(std::string("0x6079 unavailable (reporting 0): ") + e.what()));
         }
     }
     if (command_flag(command, "get_motor_current_actual_value")) {
         try {
-            result.emplace("current_amps", ProtoValue(read_monitor(*controller_, controller_->current_monitor())));
+            const auto permille = read_std_sdo<std::int16_t>(*controller_, kCurrentActual);
+            result.emplace("current_amps", ProtoValue((static_cast<double>(permille) / 1000.0) * controller_->rated_current_amps()));
         } catch (const ethercat::Error& e) {
-            result.emplace("current_amps_error", ProtoValue(std::string("get_motor_current_actual_value failed: ") + e.what()));
+            result.emplace("current_amps", ProtoValue(0.0));
+            result.emplace("current_amps_diag", ProtoValue(std::string("0x6078 unavailable (reporting 0): ") + e.what()));
         }
     }
     if (command_flag(command, "get_motor_drive_modes")) {
         try {
-            std::array<std::byte, 4> buf{};
-            controller_->sdo_read(kSupportedDriveModes, 0, buf, kSdoTimeout);
-            const std::uint32_t bits = ethercat::load_le<std::uint32_t>(std::span<const std::byte>(buf.data(), 4));
+            const auto bits = read_std_sdo<std::uint32_t>(*controller_, kSupportedDriveModes);
             result.emplace("drive_modes", ProtoValue(decode_drive_modes(bits)));
         } catch (const ethercat::Error& e) {
-            result.emplace("drive_modes_error", ProtoValue(std::string("get_motor_drive_modes failed: ") + e.what()));
+            result.emplace("drive_modes", ProtoValue(std::vector<ProtoValue>{}));
+            result.emplace("drive_modes_diag", ProtoValue(std::string("0x6502 unavailable (reporting none): ") + e.what()));
         }
     }
     if (result.empty()) {
