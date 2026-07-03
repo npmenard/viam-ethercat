@@ -56,13 +56,7 @@ struct DeviceProfile {
     std::uint32_t zero_vel_debounce = 5;    // consecutive sub-thresh cycles before disable/reached latch
     std::uint32_t quick_stop_decel =
         0;  // 0x6085 write (counts/s^2); 0 = unset -> a quick-stop consumer MUST set it (fail-closed at configure)
-    std::int16_t quick_stop_option = 2;             // 0x605A required (decel-then-auto-SwitchOnDisabled)
-    std::uint32_t mode_switch_settle_cycles = 200;  // T_switch (§6 step 4; the transition undefined-feedback window)
-    // §6 step 1 stop-first bound: cycles to let the motor ramp to |vel| <= zero_vel_threshold in the
-    // CURRENT mode before a mode-switch. If it never stops in this window (a load resisting stop) the
-    // switch FAILS "motor didn't stop" (don't switch mid-motion, don't hang the queue). DISTINCT from
-    // controlled_stop_window (the LIFECYCLE de-energize budget) -- this is a motion-hold ramp bound.
-    std::uint32_t mode_switch_ramp_stop_cycles = 1000;
+    std::int16_t quick_stop_option = 2;  // 0x605A required (decel-then-auto-SwitchOnDisabled)
 
     // --- PP new-setpoint handshake shape (P3b sub-step 2/3, profile-gated superset) ---
     // 0 => the SIMPLE 2-phase handshake (raise bit4 until the drive acks, then clear + a
@@ -111,11 +105,6 @@ struct PolicyState {
     bool handshake_idle = true;  // the new-setpoint handshake is quiescent (WRAPPER gates completion on this + its own at-target)
     bool handshake_timed_out =
         false;  // PER-CYCLE: the ack (or ack-clear) timed out THIS cycle -> WRAPPER maps to abort_active_move (FOLD 3)
-    // --- §6 runtime mode-switch (sub-step 5) ---
-    bool switching = false;  // a mode-switch sequence is in progress (stop-first / write / settle)
-    bool mode_switch_failed =
-        false;  // PER-CYCLE: the switch could NOT confirm (motor-didn't-stop | 0x6061 never echoed within T_switch | drive error) ->
-                // WRAPPER throws "mode-switch failed"; policy holds SAFE (energized, at rest, no lunge)
 };
 
 // The generic policy. Owns its resolved FieldLocations + the RT-only sequencing state.
@@ -195,7 +184,6 @@ class Cia402Policy {
         state_.fault_code = fc_loc_.mapped() ? ctx.load<cia402::FaultCode::type>(fc_loc_) : std::uint16_t{0};
         state_.current_mode = mode_loc_.mapped() ? ctx.load<cia402::ModeDisplay::type>(mode_loc_) : std::int8_t{0};
         state_.handshake_timed_out = false;  // PER-CYCLE signal: re-armed each step, set only on the timeout cycle
-        state_.mode_switch_failed = false;   // PER-CYCLE signal: set only on the cycle a mode-switch gives up
 
         // #70: count consecutive cycles the WIRE controlword had Halt (bit8) clear, off last_cw_ (the
         // cw we WROTE last cycle -- exactly what the drive observed). The PP handshake gates its bit4
@@ -253,10 +241,12 @@ class Cia402Policy {
         // RxPDO mode-of-operation over the SDO default once it is cycling, so if 0x6060 is only written
         // post-OperationEnabled (drive_operational_) it stays 0 through the ladder, the drive never
         // adopts the commanded mode, and the gate sees 0x6061 != commanded -> SILENT request_stop (the
-        // move never happens; observed on the wire, cw stuck at 0x07). Seed it here every cycle EXCEPT
-        // while a mode-switch owns 0x6060 (run_mode_switch_ writes the transitional mode; the switch is
-        // post-OE anyway). Post-OE-steady this matches drive_operational_'s write (redundant, harmless).
-        if (mode_wr_loc_.mapped() && ms_phase_ == ModeSwitch::None) {
+        // move never happens; observed on the wire, cw stuck at 0x07). Seed it here every cycle. The
+        // policy is a DUMB per-mode executor (#18): it always writes 0x6060 = cmd.mode -- the WRAPPER
+        // owns the runtime mode-switch orchestration and picks cmd.mode (the transitional mode during a
+        // stop-first/settle, the target mode once confirmed). Post-OE-steady this matches
+        // drive_operational_'s write (redundant, harmless).
+        if (mode_wr_loc_.mapped()) {
             ctx.store<cia402::ModeOfOperation::type>(mode_wr_loc_, static_cast<std::int8_t>(cmd.mode));
         }
 
@@ -302,8 +292,6 @@ class Cia402Policy {
         state_ = PolicyState{};
         handshake_ = Handshake::Idle;
         handshake_cycles_remaining_ = 0;
-        ms_phase_ = ModeSwitch::None;
-        ms_cycles_ = 0;
         last_cw_ = 0;
         announced_op_ = false;
         mode_checked_ = false;
@@ -319,19 +307,11 @@ class Cia402Policy {
     // Halt (R1 HOLD). Pure counts; the reached predicate is actual-vs-target + vel~0 (NEVER bit10).
     std::uint16_t drive_operational_(
         CycleContext& ctx, const PolicyCommand& cmd, Status status, std::int32_t pos, std::int32_t vel) noexcept {
-        // §6 RUNTIME MODE-SWITCH: if the drive's CONFIRMED mode (0x6061) != the commanded mode, OR a
-        // switch is mid-sequence, run the switch (HOLD energized, no motion) INSTEAD of the motion
-        // body. Only when 0x6060 is RxPDO-mapped -- else runtime switching isn't possible and the mode
-        // is fixed (byte-identical: A6Control doesn't map 0x6060, so this never triggers).
-        if (mode_wr_loc_.mapped()) {
-            const std::int8_t want = static_cast<std::int8_t>(cmd.mode);
-            if (ms_phase_ != ModeSwitch::None || (state_.current_mode != 0 && state_.current_mode != want)) {
-                return run_mode_switch_(ctx, cmd, pos, vel, want);
-            }
-        }
         std::uint16_t base = ControlWord::enable_operation();  // 0x0F
-        // sub-step 5: when 0x6060 is RxPDO-mapped, keep it = the commanded mode on the wire each
-        // steady cycle (no switch in progress -- the mode is confirmed and stable).
+        // DUMB per-mode executor (#18): when 0x6060 is RxPDO-mapped, write it = cmd.mode every steady
+        // cycle. The WRAPPER owns the runtime mode-switch orchestration (bring-to-rest -> command the
+        // transitional mode via cmd.mode -> await the 0x6061 echo -> revert-safe on fail); the policy
+        // never decides to switch -- it just commands whatever mode the wrapper hands it this cycle.
         if (mode_wr_loc_.mapped()) {
             ctx.store<cia402::ModeOfOperation::type>(mode_wr_loc_, static_cast<std::int8_t>(cmd.mode));
         }
@@ -450,80 +430,6 @@ class Cia402Policy {
         return base;
     }
 
-    // §6 canonical mode-switch sequence. HOLDS energized (cw 0x0F) throughout -- "no motion" during a
-    // switch is NOT de-energize (R1). On give-up sets state_.mode_switch_failed (per-cycle); the drive
-    // stays SAFE (at rest, energized, no lunge) and the WRAPPER throws "mode-switch failed". (A drive
-    // FAULT during the window is NOT handled here -- step()'s faulted branch takes it: a fault is an
-    // involuntary de-energize + the two-tier fault path, not a stay-safe hold.)
-    std::uint16_t run_mode_switch_(
-        CycleContext& ctx, const PolicyCommand& cmd, std::int32_t pos, std::int32_t vel, std::int8_t want) noexcept {
-        (void)cmd;
-        const std::uint16_t cw = ControlWord::enable_operation();  // 0x0F -- hold energized (§6 steps 1+4)
-        const std::int8_t pp = static_cast<std::int8_t>(Cia402Mode::ProfilePosition);
-        if (ms_phase_ == ModeSwitch::None) {  // ENTER: begin the stop-first ramp
-            ms_phase_ = ModeSwitch::StopFirst;
-            ms_cycles_ = 0;
-            zerovel_cycles_ = 0;
-        }
-        state_.switching = true;
-
-        if (ms_phase_ == ModeSwitch::StopFirst) {
-            // Step 1 -- PRECONDITION: ramp to rest in the CURRENT mode (command NO motion), bounded.
-            if (state_.current_mode == pp) {
-                if (target_loc_.mapped()) {
-                    ctx.store<cia402::TargetPosition::type>(target_loc_, pos);  // hold current position
-                }
-            } else if (tv_loc_.mapped()) {
-                ctx.store<cia402::TargetVelocity::type>(tv_loc_, 0);  // ramp velocity -> 0
-            }
-            if (mode_wr_loc_.mapped()) {
-                ctx.store<cia402::ModeOfOperation::type>(mode_wr_loc_, state_.current_mode);  // NOT switched yet
-            }
-            if (std::abs(vel) <= profile_.zero_vel_threshold) {
-                ++zerovel_cycles_;
-            } else {
-                zerovel_cycles_ = 0;
-            }
-            if (zerovel_cycles_ >= profile_.zero_vel_debounce) {
-                seed_and_write_mode_(ctx, pos, want);  // steps 2+3: seed safe + WRITE 0x6060
-                ms_phase_ = ModeSwitch::Settle;
-                ms_cycles_ = 0;
-            } else if (++ms_cycles_ >= profile_.mode_switch_ramp_stop_cycles) {
-                state_.mode_switch_failed = true;  // motor didn't stop -> never switch mid-motion
-                ms_phase_ = ModeSwitch::None;
-                state_.switching = false;
-            }
-            ctx.store<cia402::ControlWord::type>(cw_loc_, cw);
-            return cw;
-        }
-        // Steps 4+5 -- SETTLE: hold the new mode + safe seed, NO motion; confirm 0x6061==want or fail.
-        seed_and_write_mode_(ctx, pos, want);
-        if (state_.current_mode == want) {  // CONFIRMED -> next cycle runs the new mode's motion body
-            ms_phase_ = ModeSwitch::None;
-            state_.switching = false;
-        } else if (++ms_cycles_ >= profile_.mode_switch_settle_cycles) {
-            state_.mode_switch_failed = true;  // 0x6061 never echoed the new mode (silent-mismatch, #45 shape)
-            ms_phase_ = ModeSwitch::None;
-            state_.switching = false;
-        }
-        ctx.store<cia402::ControlWord::type>(cw_loc_, cw);
-        return cw;
-    }
-
-    // Seed the NEW mode's RxPDO command to a SAFE no-lunge value + write 0x6060 = new mode.
-    void seed_and_write_mode_(CycleContext& ctx, std::int32_t pos, std::int8_t want) noexcept {
-        if (want == static_cast<std::int8_t>(Cia402Mode::ProfilePosition)) {
-            if (target_loc_.mapped()) {
-                ctx.store<cia402::TargetPosition::type>(target_loc_, pos);  // 0x607A = THIS-cycle actual (no lunge)
-            }
-        } else if (tv_loc_.mapped()) {
-            ctx.store<cia402::TargetVelocity::type>(tv_loc_, 0);  // 0x60FF = 0
-        }
-        if (mode_wr_loc_.mapped()) {
-            ctx.store<cia402::ModeOfOperation::type>(mode_wr_loc_, want);
-        }
-    }
-
     // Latch state_.reached once |pos-target| <= tol AND |vel| sub-threshold for the debounce.
     void update_reached_(std::int32_t pos, std::int32_t vel, std::int32_t tgt) noexcept {
         const bool pos_ok = std::abs(pos - tgt) <= profile_.position_tolerance;
@@ -560,9 +466,6 @@ class Cia402Policy {
 
     // 4-phase PP new-setpoint handshake sub-FSM (used only when handshake_timeout_cycles > 0).
     enum class Handshake : std::uint8_t { Idle, WriteTarget, AwaitAck, ClearBit4, AwaitAckClear };
-    // §6 runtime mode-switch sub-FSM (sub-step 5): StopFirst (ramp to rest in the current mode) ->
-    // Settle (0x6060 written, hold energized, wait for the 0x6061 confirm or T_switch/error fail).
-    enum class ModeSwitch : std::uint8_t { None, StopFirst, Settle };
 
     DeviceProfile profile_;
     Cia402Fsm fsm_;
@@ -574,8 +477,6 @@ class Cia402Policy {
     // written Halt. Gates the bit4 raise in BOTH handshake variants so a coincident halt-release +
     // bit4 edge never reaches the wire.
     std::uint32_t halt_clear_cycles_ = kSetpointHaltSettleCycles;
-    ModeSwitch ms_phase_ = ModeSwitch::None;  // §6 runtime mode-switch sub-state
-    std::uint32_t ms_cycles_ = 0;             // stop-first / settle window counter
 
     FieldLocation cw_loc_, target_loc_, pv_loc_, tv_loc_, mode_wr_loc_;
     FieldLocation sw_loc_, pos_loc_, vel_loc_, fc_loc_, mode_loc_;

@@ -41,6 +41,12 @@ constexpr std::uint64_t kNsPerSec = 1'000'000'000ULL;
 // #47-P3b R1 controlled-stop watchdog headroom: the teardown window / VEL budget reserve this much
 // time below the full window so the ramp finishes strictly BEFORE close() (A6 sync watchdog ~50ms).
 constexpr double kStopWindowMarginS = 0.05;
+// #18 driver-owned mode-switch bounds (cycles; internal constants, no config knob -- the switch is a
+// bounded HOLD, never a de-energize deadline). kModeSwitchStopCycles: max to ramp the CURRENT mode to
+// rest before switching (a load resisting stop gives up rather than switch mid-motion). kModeSwitch-
+// SettleCycles: max to await the 0x6061 echo of the new mode before giving up (silent-mismatch, #45).
+constexpr std::uint32_t kModeSwitchStopCycles = 1000;
+constexpr std::uint32_t kModeSwitchSettleCycles = 200;
 
 // #40 item 7: ONE clock helper -- alias the shared realtime::monotonic_ns (the local
 // duplicate is gone; watchdog + last_cycle_time are the users).
@@ -209,6 +215,9 @@ void ServoController::reset_run_state() {
     first_cycle_ = true;
     halted_ = false;
     stop_at_rest_ = false;
+    switch_phase_ = SwitchPhase::None;  // #18: no mode-switch in flight on a fresh run
+    switch_cycles_ = 0;
+    at_rest_ = false;
     latched_ctrl_error_ = RtError::None;
     last_progress_actual_ = 0;
     stall_cycles_ = 0;
@@ -427,8 +436,67 @@ bool ServoController::position_stable(std::int32_t actual) noexcept {
 
 Cia402Mode ServoController::commanded_cia402_mode() const noexcept {
     // #18: always switch-capable -- command the current intent (go_to/go_for -> PP, set_rpm -> PV).
-    // The policy runs the §6 switch when the commanded mode differs from the drive's confirmed 0x6061.
+    // The wrapper (run_mode_switch) runs the switch when this differs from the drive's confirmed 0x6061.
     return to_cia402_mode(switch_intent_);
+}
+
+// #18 DRIVER-OWNED runtime mode-switch (moved out of Cia402Policy). HOLDS energized (cw 0x0F) throughout
+// -- "no motion" during a switch is NOT a de-energize. STOPPING: ramp the CURRENT mode to rest (driver
+// rest detection, at_rest_) then advance. SETTLING: command the target mode via the dumb policy (which
+// writes 0x6060 = cmd.mode) + a safe seed, and confirm the 0x6061 echo. The hold token is constant
+// through the switch so the policy's handshake settles to Idle (a clean cw=0x0F hold, no re-armed bit4).
+// A drive FAULT during the window is NOT handled here -- step_lifecycle's Fault branch takes it.
+std::uint16_t ServoController::run_mode_switch(CycleContext& ctx, std::int32_t actual, Cia402Mode want) noexcept {
+    const std::int8_t want_i8 = static_cast<std::int8_t>(want);
+    const std::int8_t confirmed = ctx.load<cia402::ModeDisplay::type>(f_mode_disp_);  // 0x6061 echo THIS cycle
+    PolicyCommand pcmd;
+    pcmd.enable = true;
+    pcmd.halt = false;
+    pcmd.profile_velocity = profile_vel_;
+    pcmd.target_counts = actual;      // PP hold at the current position (no lunge)
+    pcmd.target_velocity = 0;         // PV ramp to 0
+    pcmd.token = switch_hold_token_;  // constant through the switch -> policy holds (handshake -> Idle, no re-arm)
+
+    if (switch_phase_ == SwitchPhase::Stopping) {
+        // Command the CURRENT confirmed mode so the drive stays in its present control loop while it ramps
+        // to rest (don't write the new 0x6060 until the motor has stopped -- avoid an in-motion switch).
+        pcmd.mode = (confirmed == static_cast<std::int8_t>(Cia402Mode::ProfileVelocity)) ? Cia402Mode::ProfileVelocity
+                                                                                         : Cia402Mode::ProfilePosition;
+        const std::uint16_t cw = policy_.step(ctx, pcmd);
+        if (at_rest_) {  // driver rest detection (last publish_state's verdict)
+            switch_phase_ = SwitchPhase::Settling;
+            switch_cycles_ = 0;
+        } else if (++switch_cycles_ >= kModeSwitchStopCycles) {
+            mode_switch_give_up(confirmed);  // motor didn't stop -> never switch mid-motion
+        }
+        return cw;
+    }
+    // Settling: command the TARGET mode + safe seed (the dumb policy writes 0x6060 = want); confirm the echo.
+    pcmd.mode = want;
+    const std::uint16_t cw = policy_.step(ctx, pcmd);
+    if (confirmed == want_i8) {  // CONFIRMED -> next cycle runs the target mode's motion body
+        switch_phase_ = SwitchPhase::None;
+    } else if (++switch_cycles_ >= kModeSwitchSettleCycles) {
+        mode_switch_give_up(confirmed);  // 0x6061 never echoed the new mode (silent-mismatch, #45 shape)
+    }
+    return cw;
+}
+
+// SAFE give-up disposition for a mode-switch that couldn't confirm. NEVER throws (the motion API call
+// already returned; a switch failure is a stay-safe hold, not an operator error). An M6 PV->PP hold
+// reverts to the interim PV-at-0 bit8 hold (accept small drift, stay energized -- spec §A R1). An
+// operator switch reverts the intent to the drive's CONFIRMED mode so we stop re-requesting (no retry
+// storm) and hold energized at rest.
+void ServoController::mode_switch_give_up(std::int8_t confirmed) noexcept {
+    switch_phase_ = SwitchPhase::None;
+    switch_cycles_ = 0;
+    if (pv_hold_as_pp_) {
+        pv_hold_as_pp_ = false;
+        pv_velocity_ = 0;
+    } else {
+        switch_intent_ = (confirmed == static_cast<std::int8_t>(Cia402Mode::ProfileVelocity)) ? ControlMode::ProfileVelocity
+                                                                                              : ControlMode::ProfilePosition;
+    }
 }
 
 std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, const CommandBatch& batch, std::int32_t actual) noexcept {
@@ -553,30 +621,49 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         if (batch.quick_stop) {
             return ControlWord::quick_stop();
         }
-        // #47-P3b: DELEGATE the Operational healthy-path (enable-hold + PP new-setpoint handshake +
-        // 0x6081 move-speed / PV 0x60FF stream + Halt) to the shared generic policy. The wrapper
-        // KEEPS completion-generations, the two-tier fault, #18 fault-reset, and the stall watchdog
-        // (rev-6 boundary). The opaque token = the active move generation (the policy resets its
+        // #18 DRIVER-OWNED runtime mode-switch. The intent's Cia402 mode is PP for a positioned move (or
+        // a PV->PP motion-hold), PV for set_rpm. If the drive's CONFIRMED 0x6061 differs -- or a switch
+        // is already mid-sequence -- the WRAPPER orchestrates the switch (HOLD energized, bring to rest,
+        // command the new mode via the dumb policy, await the echo) INSTEAD of the motion body. Only when
+        // 0x6060 (write) + 0x6061 (echo) are both mapped (always, the fixed superset); else the mode is
+        // fixed and this never triggers.
+        const Cia402Mode want = pv_hold_as_pp_ ? Cia402Mode::ProfilePosition : commanded_cia402_mode();
+        if (f_mode_wr_.mapped() && f_mode_disp_.mapped()) {
+            const std::int8_t want_i8 = static_cast<std::int8_t>(want);
+            const std::int8_t confirmed = ctx.load<cia402::ModeDisplay::type>(f_mode_disp_);  // 0x6061 echo THIS cycle
+            if (switch_phase_ == SwitchPhase::None && confirmed != 0 && confirmed != want_i8) {
+                switch_phase_ = SwitchPhase::Stopping;
+                switch_cycles_ = 0;
+                ++switch_hold_token_;  // arm the hold: the policy re-arms its handshake off the token change, then settles to Idle
+            }
+            if (switch_phase_ != SwitchPhase::None) {
+                return run_mode_switch(ctx, actual, want);
+            }
+        }
+
+        // No switch in flight -- DELEGATE the Operational healthy-path (enable-hold + PP new-setpoint
+        // handshake + 0x6081 move-speed / PV 0x60FF stream + Halt) to the shared generic policy. The
+        // wrapper KEEPS completion-generations, the two-tier fault, #18 fault-reset, and the stall
+        // watchdog (rev-6 boundary). The opaque token = the active move generation (the policy resets its
         // reached-latch + restarts the handshake when it changes -- FOLD 3). The policy writes the
         // controlword + command objects into ctx and returns the cw; publish_state below reads its
         // handshake-idle for the completion gate.
         PolicyCommand pcmd;
         if (pv_hold_as_pp_) {
-            // M6: PV motion-hold as PP-at-current-counts. Command PP with target = the position latched
-            // at the halt; the generic mode-switch ramps PV->0, switches 0x6060=PP, then the PP handshake
-            // (kicked by pv_hold_token_) latches the hold target so the drive's position loop LOCKS the
-            // shaft (no drift). halt=false so the handshake actually runs (a bit8 halt would freeze the
+            // M6: PV motion-hold as PP-at-current-counts. The switch above brought PV->PP (position loop
+            // active); command PP with target = the position latched at the halt so the drive's position
+            // loop LOCKS the shaft (no drift). The PP handshake (kicked by pv_hold_token_) latches it once
+            // at rest -> no lunge. halt=false so the handshake actually runs (a bit8 halt would freeze the
             // profile generator and never latch the setpoint). Not a completable move -> pv_hold_token_,
             // not active_generation, so completion tracking is untouched (the halt already failed it).
             pcmd.mode = Cia402Mode::ProfilePosition;
-            pcmd.target_counts = actual;  // LIVE actual: the handshake latches it at REST (post ramp) -> no lunge
+            pcmd.target_counts = actual;  // LIVE actual: the handshake latches it at REST -> no lunge
             pcmd.profile_velocity = profile_vel_;
             pcmd.enable = true;
             pcmd.halt = false;
             pcmd.token = pv_hold_token_;
         } else {
-            pcmd.mode =
-                commanded_cia402_mode();  // #61: switchable -> current intent (policy runs the §6 switch when it differs from 0x6061)
+            pcmd.mode = commanded_cia402_mode();  // #18: the current intent (the switch above ensured 0x6061 matches)
             pcmd.target_counts = target_counts_;
             pcmd.profile_velocity = profile_vel_;
             pcmd.target_velocity = pv_velocity_;
@@ -590,21 +677,6 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // the old step_handshake abort_active_move(HandshakeTimeout).
         if (policy_.state().handshake_timed_out && !pv_hold_as_pp_) {
             abort_active_move(RtError::HandshakeTimeout);
-        }
-        // M6 failure disposition (spec §A R1): if the PV->PP hold-switch can't confirm (motor won't
-        // stop / 0x6061 never echoes PP), DON'T throw -- this is an internal hold, not an operator
-        // command. Revert to the interim PV-at-0 bit8 hold (accept small drift, stay energized). Next
-        // cycle commands PV+halt; current_mode is still PV (switch failed pre-echo) so no re-switch.
-        if (policy_.state().mode_switch_failed && pv_hold_as_pp_) {
-            pv_hold_as_pp_ = false;
-            pv_velocity_ = 0;  // spec §A R1 "PV-AT-0": command zero velocity for the reverted hold (don't resume the pre-halt rpm)
-        } else if (policy_.state().mode_switch_failed) {
-            // #18: an operator switch (go_to/set_rpm intent) couldn't confirm the new 0x6061 -- revert
-            // the intent to the drive's CONFIRMED mode so we stop re-requesting (no retry storm); stay
-            // energized at rest, no throw (the motion API call already returned). SAFE disposition.
-            switch_intent_ = (policy_.state().current_mode == static_cast<std::int8_t>(Cia402Mode::ProfileVelocity))
-                                 ? ControlMode::ProfileVelocity
-                                 : ControlMode::ProfilePosition;
         }
         return cw;
     }
@@ -684,6 +756,7 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
     // MUST be called once per cycle (it advances the ring), so evaluate it unconditionally.
     const bool pos_stable = position_stable(actual);
     const bool stopped = (config_.velocity_threshold > 0) ? (std::abs(velocity) <= config_.velocity_threshold) : pos_stable;
+    at_rest_ = stopped;  // #18: the driver's rest verdict, read (1-cycle stale) by run_mode_switch's stop-first gate
 
     // Move-complete predicate: |target - actual| <= tol AND the axis has come to rest (stopped).
     // Only meaningful in PP (move_active implies a go_to generation).
@@ -699,7 +772,9 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
     if (powered && move_active && at_target && policy_.state().handshake_idle) {
         state_.completed_generation.store(g, std::memory_order_release);  // publish BEFORE notify
         completion_cv_.notify_all();                                      // no completion_mutex_ held
-    } else if (move_active) {
+    } else if (move_active && switch_phase_ == SwitchPhase::None) {
+        // #18: skip the no-progress watchdog WHILE a driver mode-switch is orchestrating (the motor is
+        // deliberately held at rest during a PV->PP go_to switch, which would else read as "no progress").
         // No-progress watchdog: if the actual isn't advancing toward target for too long, fail the
         // move (wakes its waiter to throw, instead of a silent wait). #15: this is the REAL stuck-move
         // safety and is DURATION-INDEPENDENT -- a progressing move resets the counter and never trips

@@ -378,12 +378,12 @@ class ServoController : public SlaveControl {
     bool halted_ = false;  // STICKY Stop: Halt stays asserted until a new motion command
     // #47-P3b M6 (PV->PP hold-switch): a PV motion-hold that holds zero VELOCITY (bit8) drifts under
     // load -- the drive has no position loop in PV. When the map is switch-capable (0x6060 + 0x607A both
-    // RxPDO-mapped), a Halt of a PV move instead switches the drive to PP-at-current-counts (the generic
-    // mode-switch, then a PP setpoint = the position latched AT the halt) so the drive's position loop
-    // LOCKS the shaft. pv_hold_token_ (high-bit base, never collides with real move gens which start at
-    // 1) kicks the policy's PP handshake for the hold WITHOUT touching active_generation (the halt already
-    // failed the in-flight move -- the hold is not a completable move). On mode_switch_failed the hold
-    // reverts to the interim PV-at-0 bit8 hold (accept small drift, never de-energize -- spec §A R1).
+    // RxPDO-mapped), a Halt of a PV move instead switches the drive to PP-at-current-counts (the DRIVER
+    // mode-switch below, then a PP setpoint = the position latched AT the halt) so the drive's position
+    // loop LOCKS the shaft. pv_hold_token_ (high-bit base, never collides with real move gens which start
+    // at 1) kicks the policy's PP handshake for the hold WITHOUT touching active_generation (the halt
+    // already failed the in-flight move -- the hold is not a completable move). On a switch give-up the
+    // hold reverts to the interim PV-at-0 bit8 hold (accept small drift, never de-energize -- spec §A R1).
     // #18: the current motion INTENT (RT-only), always meaningful (the drive is always switch-capable).
     // The command batch sets it (go_to/go_for -> PP, set_rpm -> PV). Default PP so the drive enables in
     // PP. commanded_cia402_mode() maps it to the Cia402Mode the policy commands this cycle.
@@ -391,6 +391,15 @@ class ServoController : public SlaveControl {
     bool pv_hold_capable_ = false;               // set at resolve: 0x6060 AND 0x607A both mapped (always, fixed superset)
     bool pv_hold_as_pp_ = false;                 // STICKY: currently holding a halted PV motor via PP-at-counts
     std::uint32_t pv_hold_token_ = 0x80000000u;  // policy token that kicks the PP hold handshake (never a real gen)
+    // #18 DRIVER-OWNED runtime mode-switch (moved out of Cia402Policy): when the drive's CONFIRMED 0x6061
+    // mode differs from the intent's Cia402 mode, the wrapper HOLDS energized, brings the motor to REST
+    // (Stopping), commands the target mode via the dumb policy + awaits the 0x6061 echo (Settling), then
+    // runs the target mode's motion body. Fail-safe give-up (never a throw). RT-only.
+    enum class SwitchPhase : std::uint8_t { None, Stopping, Settling };
+    SwitchPhase switch_phase_ = SwitchPhase::None;
+    std::uint32_t switch_cycles_ = 0;                // stop-first / settle window counter
+    std::uint32_t switch_hold_token_ = 0x40000000u;  // policy hold token during a switch (distinct from real gens + pv_hold_token_)
+    bool at_rest_ = false;       // last publish_state's "stopped" verdict; run_mode_switch's stop-first gate reads it (1-cycle stale)
     bool stop_at_rest_ = false;  // RT-only (#47-P3b R1): drive reached SwitchOnDisabled during the stopping window -> teardown early-out
     // Controller-error tier: one-shot latches (HandshakeTimeout/MoveStalled) set by
     // the FSM, cleared ONLY by an explicit fault_reset. The bus WkcFault tier is
@@ -402,6 +411,10 @@ class ServoController : public SlaveControl {
     // FSM helpers (RT-only). Defined in the .cpp. ctx replaces the old direct master_
     // output writes / master_->fault() reads (the Runner is the sole Master toucher).
     std::uint16_t step_lifecycle(CycleContext& ctx, Status status, const CommandBatch& batch, std::int32_t actual) noexcept;
+    // #18 DRIVER-OWNED runtime mode-switch step (Stopping/Settling); returns the cw the policy wrote.
+    std::uint16_t run_mode_switch(CycleContext& ctx, std::int32_t actual, Cia402Mode want) noexcept;
+    // SAFE give-up for a switch that couldn't confirm (motor won't stop / echo never arrives). No throw.
+    void mode_switch_give_up(std::int8_t confirmed) noexcept;
     std::uint16_t fault_reset_with_rearm(Status status) noexcept;
     // Reads THIS cycle's owned input snapshot via ctx (0x603F, statusword, etc. all from
     // the same latched image the Runner copied in -- structurally consistent, as before).

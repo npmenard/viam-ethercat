@@ -94,9 +94,6 @@ struct Options {
     std::int32_t pp_vel_cps = 0;  // --move-pos optional VEL (profile velocity, counts/s); 0 => default from move_rpm
     std::int32_t pv_vel_cps = 0;  // --move-vel VEL (counts/s)
     std::int32_t pos_tol = 300;   // --pos-tol (DA-C: proven HW default 300; tighten only with a bench deadband measurement)
-    // --- #47-P3b sub-step 5 (P3c) runtime mode-switch exercise ---
-    bool then_jog_vel = false;  // --move-pos POS --then-jog-vel VEL: after the PP move REACHES, SWITCH to PV (§6) and jog at VEL until
-                                // Ctrl-C (drives the canonical mode-switch on the wire)
     // #22 steady-state SDO probe: while Running, issue Master::sdo_read (direct non-RT, #15 --
     // the caller drives the mailbox exchange) for 0x6079/0x6078/0x6502 every ~500ms and print raw + converted.
     // Exercises the exact steady-state SDO path on real hardware WHILE PD flows -- the HW
@@ -474,16 +471,6 @@ class A6Control final : public SlaveControl {
     std::uint32_t qs_decel_echoed() const noexcept {
         return uses_policy_() ? policy_.qs_decel_echoed() : qs_decel_echoed_;
     }
-    // #47-P3b P3c mode-switch observers (read AFTER the Runner is stopped/joined).
-    bool switched_to_vel() const noexcept {
-        return switched_to_vel_;
-    }
-    bool mode_switch_failed() const noexcept {
-        return mode_switch_failed_seen_;
-    }
-    std::int8_t confirmed_mode() const noexcept {
-        return policy_.state().current_mode;  // 0x6061 echo the policy last read
-    }
 
    private:
     // #47-P3b: drive the generic policy for --move-pos (PP absolute) / --move-vel (PV). The
@@ -492,30 +479,20 @@ class A6Control final : public SlaveControl {
     // policy owns ALL the CiA402 sequencing (enable ladder, mode-echo, bit4 handshake, quick-stop,
     // reached). This tool keeps its own CSP-sine / PP-relative / plain-hold paths (bench-only).
     void step_policy_(CycleContext& ctx) noexcept {
-        // P3c mode-switch exercise (--then-jog-vel): once the PP move REACHES, latch the switch to PV
-        // -> the policy runs the §6 mode-switch (stop-first -> write 0x6060=PV -> confirm) then jogs.
-        // If the switch already FAILED (safe disposition), do NOT re-request it -- revert to the
-        // confirmed (PP) mode and hold at rest, never a retry storm.
-        if (opt_.then_jog_vel && opt_.move_pos && policy_.state().reached && !mode_switch_failed_seen_) {
-            switched_to_vel_ = true;
-        }
-        const bool vel_now = opt_.move_vel || switched_to_vel_;
+        // #18: the policy is now a dumb per-mode executor -- the bench drives ONE fixed mode per run
+        // (--move-pos PP or --move-vel PV). Runtime mode-switch orchestration is the VIAM DRIVER's job
+        // (ServoController), exercised HW-first by the RDK campaign, not this tool.
         PolicyCommand cmd;
-        cmd.mode = vel_now ? Cia402Mode::ProfileVelocity : Cia402Mode::ProfilePosition;
+        cmd.mode = opt_.move_vel ? Cia402Mode::ProfileVelocity : Cia402Mode::ProfilePosition;
         cmd.enable = opt_.enable;
         cmd.target_counts = opt_.pos_target;
         cmd.profile_velocity = pp_profile_vel_;
         cmd.target_velocity = opt_.pv_vel_cps;
         cmd.token = 1;  // one bench move per invocation
         const std::uint16_t cw = policy_.step(ctx, cmd);
-        if (policy_.state().mode_switch_failed) {
-            mode_switch_failed_seen_ = true;  // latch the per-cycle signal for post-run inspection
-            switched_to_vel_ = false;         // SAFE disposition: give up the switch, revert to the confirmed mode (no retry storm)
-        }
 
-        // move-to finishes on reached; --then-jog-vel switches to PV instead of stopping (jogs until
-        // Ctrl-C); plain continuous PV runs until Ctrl-C -> request_stop.
-        if (opt_.move_pos && !opt_.then_jog_vel && policy_.state().reached && ctx.cycle() % 500 == 0) {
+        // move-to finishes on reached; continuous PV runs until Ctrl-C -> request_stop.
+        if (opt_.move_pos && policy_.state().reached && ctx.cycle() % 500 == 0) {
             ctx.request_stop();
         }
         // Bench telemetry: the same feedback the policy read this cycle.
@@ -569,28 +546,6 @@ class A6Control final : public SlaveControl {
         return p;
     }
 
-    // The M56S DeviceProfile -- THE genericity payoff (#47-P3b, spec §6). A second, DIFFERENT servo
-    // (M56S/MDX+ manual §4.2.3: stop-before-switch + tolerate-undefined-transition + errors-on-
-    // unsupported-mode) drives the SAME generic Cia402Policy by DATA ALONE. Only two knobs differ from
-    // the A6: (1) a LONGER mode_switch_settle window -- the M56S transition "takes time" (its 0x6061 lags
-    // the 0x6060 write), so T_switch must cover it; (2) a LONGER ramp-stop bound to match. Everything else
-    // is standard CiA402. NO M56S codes leak into the policy -- the drive-specific residual is this struct.
-   public:
-    static DeviceProfile make_m56s_profile(const Options& opt) noexcept {
-        DeviceProfile p;
-        p.fault_reset = DeviceProfile::FaultReset::Cia402Bit7;
-        p.position_tolerance = opt.pos_tol;
-        p.zero_vel_threshold = kZeroVelThresh;
-        p.zero_vel_debounce = kZeroVelDebounce;
-        p.quick_stop_decel = kQuickStopDecelDefault;
-        p.quick_stop_option = kQuickStopOptionRequired;
-        p.mode_switch_settle_cycles =
-            60;  // T_switch: covers the M56S slow transition (the A6 default 200 also would; 60 is the tuned-to-device value)
-        p.mode_switch_ramp_stop_cycles = 2000;  // the M56S ramps slower -> a longer stop-first bound
-        return p;
-    }
-
-   private:
     const Options& opt_;
     Telemetry& tel_;
     Cia402Policy policy_;
@@ -623,13 +578,11 @@ class A6Control final : public SlaveControl {
     std::uint32_t stopping_steps_ = 0;
     StopReason stop_reason_ = StopReason::None;
     // #53 mode-echo gate + PP-abs handshake-edge + zero-vel debounce
-    bool mode_checked_ = false;             // 0x6061 echo confirmed -> enable allowed
-    bool mode_refused_ = false;             // echo mismatch -> refused to enable (one-shot)
-    bool switched_to_vel_ = false;          // #47-P3b P3c: the PP move reached -> latched the switch to PV (--then-jog-vel)
-    bool mode_switch_failed_seen_ = false;  // sticky: the policy reported a mode-switch failure at least once
-    bool bit4_high_ = false;                // tracks the bit4 level for edge counting
-    int bit4_edges_ = 0;                    // count of bit4 0->1 rising edges (#53 PP, DA-I: must be 1)
-    std::uint32_t zerovel_cycles_ = 0;      // consecutive |vel|<thresh cycles (PV stop backstop + PP reached)
+    bool mode_checked_ = false;         // 0x6061 echo confirmed -> enable allowed
+    bool mode_refused_ = false;         // echo mismatch -> refused to enable (one-shot)
+    bool bit4_high_ = false;            // tracks the bit4 level for edge counting
+    int bit4_edges_ = 0;                // count of bit4 0->1 rising edges (#53 PP, DA-I: must be 1)
+    std::uint32_t zerovel_cycles_ = 0;  // consecutive |vel|<thresh cycles (PV stop backstop + PP reached)
 };
 
 }  // namespace ethercat::tools
