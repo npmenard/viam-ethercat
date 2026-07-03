@@ -1,0 +1,14 @@
+# BUG #73 repro — distilled log excerpt (trivial Go module, local viam-server, no cloud)
+## initial construct (healthy orphan-to-be):
+2026-07-02T23:07:42.257Z	INFO	repro73mod.rdk:component:generic/thingy	module/main.go:53	REPRO73_CONSTRUCT_DONE: instance 0x3fc0d0abc420 is now LIVE for "thingy"
+## bad=true pushed -> node errored, NO close, NO RemoveResource:
+2026-07-02T23:08:04.612Z	INFO	rdk	impl/local_robot.go:1930	Reconfiguring robot
+2026-07-02T23:08:04.613Z	ERROR	rdk.modmanager	modmanager/manager.go:763	Modular config validation error found in resource: thingy	{"error":"rpc error: code = Unknown desc = error validating resource: repro73: config is INVALID (bad=true) for \"thingy\""}
+2026-07-02T23:08:04.613Z	INFO	rdk.resource_manager	impl/resource_manager.go:803	Now rebuilding resource	{"resource":"rdk:component:generic/thingy","model":"repro73:demo:thing"}
+## bad=false pushed -> recovery -> AddResource collides, forever:
+2026-07-02T23:08:30.994Z	ERROR	rdk.resource_manager.rdk:component:generic/thingy	resource/graph_node.go:333	resource build error: rpc error: code = Unknown desc = resource rdk:component:generic/thingy already exists	{"resource":"rdk:component:generic/thingy","model":"repro73:demo:thing"}
+2026-07-02T23:08:32.136Z	ERROR	rdk.resource_manager	impl/resource_manager.go:1168	resource build error: rpc error: code = Unknown desc = resource rdk:component:generic/thingy already exists
+2026-07-02T23:08:32.137Z	ERROR	rdk.resource_manager.rdk:component:generic/thingy	resource/graph_node.go:333	resource build error: rpc error: code = Unknown desc = resource rdk:component:generic/thingy already exists	{"resource":"rdk:component:generic/thingy","model":"repro73:demo:thing"}
+## orphan closed ONLY at shutdown (SIGTERM), never during brick:
+2026-07-02T23:09:28.327Z	INFO	repro73mod.rdk:component:generic/thingy	module/main.go:69	REPRO73_CLOSE: Close() CALLED on instance 0x3fc0d0abc420 ("thingy")
+2026-07-02T23:09:28.328Z	INFO	repro73mod	module/module.go:315	Shutting down gracefully.

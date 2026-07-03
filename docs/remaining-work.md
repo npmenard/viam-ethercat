@@ -83,3 +83,19 @@ _Single-mode PP/PV ships on the 1a path; `switchable` must not ship on offline-g
 - **Run-don't-trust** — DA's execution gates caught three issues a code read missed this cycle
   (retry-storm coverage, offline-ungatable backstop, false-reached guard). Energized HW is the
   final arbiter for any drive-behavior claim (the P3c mode-seed bug passed sim green).
+
+---
+
+## Archived backlog (2026-07-03 — user: "we will do it later")
+- **#69b — build-time bundle-completeness check**: fail the package step loudly if any bundled
+  .so has a NEEDED entry resolvable neither in-bundle nor in the glibc exclude set (the #69
+  RPATH fix makes the bundle self-RESOLVING, not self-COMPLETE; guards a future
+  RUNTIME_DEPENDENCY_SET dropout). Approach notes were in task #10.
+- **#65/#58 umbrella — pin the module build environment**: pin the Dockerfile base digest +
+  apt versions (the unpinned noble universe is how #69 was triggered); refresh/publish the
+  ghcr image so builds stop depending on the stateful bench container. Largely mitigated
+  already by the #69 RPATH fix + scripts/bootstrap-build-host.sh (local builds).
+- **#73 — RDK orphaned-instance regression**: investigation COMPLETE and proven — see
+  docs/rdk-issue-73.md (root cause, introducing commit 2525d53c/PR #3386, 2-minute Go repro
+  in docs/rdk-issue-73/, drafted issue text, module-side safety-net sketch, operational
+  workaround). Remaining: file/fix upstream + optional safety net.
