@@ -594,7 +594,17 @@ void Master::service_sdo() noexcept {
     if (!sdo_pending_.load(std::memory_order_acquire)) {
         return;
     }
-    std::unique_lock<std::mutex> lk(sdo_mtx_);
+    // #72 priority-inversion guard: the RT thread must NEVER BLOCK on sdo_mtx_. std::mutex has no
+    // priority inheritance, so a plain lock here would stall the RT loop for as long as a non-RT
+    // submitter -- preempted by host load while it briefly holds the lock (post-request, pre-wait) --
+    // stays off-CPU. That stall gaps PD and can drop SYNC0 (the ~26ms class of stall). A NON-BLOCKING
+    // try-lock keeps PD flowing regardless: if we don't get it this cycle the submitter is mid-handoff
+    // and releases it in its wait_until; we service next cycle (idempotent; its own timeout bounds it).
+    // Strictly better than a PI mutex here -- PI would only BOUND the block; this avoids it entirely.
+    std::unique_lock<std::mutex> lk(sdo_mtx_, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        return;  // contended (submitter mid-handoff) -- retry next cycle; PD never gapped
+    }
     if (sdo_phase_ != SdoPhase::Requested) {
         // A timed-out/closed waiter reclaimed the slot between our atomic load and the lock.
         sdo_pending_.store(false, std::memory_order_release);
