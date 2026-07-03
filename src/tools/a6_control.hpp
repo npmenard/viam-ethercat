@@ -106,9 +106,9 @@ struct Options {
     // lifecycles on the same NIC (no power cycle) -- the module's reconfigure. Early cycles hold
     // early_hold_seconds (prove the re-bring-up works); the LAST holds hold_seconds (the long soak that
     // surfaces the ~150s DC drift). 0 = single run (default, unchanged).
-    int cycle_count = 0;           // --cycle N
-    int hold_seconds = 600;        // --hold-seconds S : final-cycle soak (>=10min default)
-    int early_hold_seconds = 20;   // --early-hold S   : per-early-cycle hold
+    int cycle_count = 0;          // --cycle N
+    int hold_seconds = 600;       // --hold-seconds S : final-cycle soak (>=10min default)
+    int early_hold_seconds = 20;  // --early-hold S   : per-early-cycle hold
 };
 
 // Count the mutually-exclusive move modes set (>1 => CLI conflict). Pure + testable.

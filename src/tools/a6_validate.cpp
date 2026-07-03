@@ -31,9 +31,9 @@
 // Defaults are non-energizing and motionless. Runtime needs CAP_NET_RAW (raw
 // socket). NOT a production path; the real driver is the Viam module.
 
+#include <algorithm>
 #include <array>
 #include <atomic>
-#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -138,8 +138,7 @@ struct CycleOutcome {
     bool reached_op = false;
 };
 
-CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc,
-                           std::chrono::seconds hold, int cyc, int ncycles) {
+CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc, std::chrono::seconds hold, int cyc, int ncycles) {
     CycleOutcome oc;
     const std::uint16_t slave = 1;
 
@@ -257,10 +256,10 @@ CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc,
                     last_health = now2;
                     const Status status{tel.sw.load(std::memory_order_relaxed)};
                     const std::uint64_t bad_now = tel.bad_wkc.load(std::memory_order_relaxed);
-                    std::cout << "[cycle " << cyc << "/" << ncycles << "] +" << held.count() << "s OP-HOLD: "
-                              << to_string(status.decode()) << " sw=0x" << std::hex << status.raw << std::dec
-                              << " 0x603F=0x" << std::hex << tel.fc.load(std::memory_order_relaxed) << std::dec
-                              << " badWKC=" << bad_now << " (+" << (bad_now - bad_at_op) << " since OP)"
+                    std::cout << "[cycle " << cyc << "/" << ncycles << "] +" << held.count() << "s OP-HOLD: " << to_string(status.decode())
+                              << " sw=0x" << std::hex << status.raw << std::dec << " 0x603F=0x" << std::hex
+                              << tel.fc.load(std::memory_order_relaxed) << std::dec << " badWKC=" << bad_now << " (+"
+                              << (bad_now - bad_at_op) << " since OP)"
                               << " dcPhase=" << tel.dc_phase_ns.load(std::memory_order_relaxed) << "ns\n";
                 }
                 if (held >= hold) {
@@ -346,8 +345,8 @@ CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc,
     oc.bad_cycles = stats.bad_cycles;
     oc.total_cycles = stats.total_cycles;
     std::cout << "\n=== cycle " << cyc << "/" << ncycles << " done. stop=" << to_string(reason)
-              << (control.safety_abort() ? " (CSP SAFETY ABORT)" : "")
-              << " | bad-WKC cycles: " << stats.bad_cycles << " / " << stats.total_cycles << " ===\n";
+              << (control.safety_abort() ? " (CSP SAFETY ABORT)" : "") << " | bad-WKC cycles: " << stats.bad_cycles << " / "
+              << stats.total_cycles << " ===\n";
     if (reason == StopReason::BringupAborted) {
         std::cout << "[#71] bring-up gave up. AL status = 0x" << std::hex << oc.al_code << std::dec << " (" << al_msg << ")"
                   << (oc.al_code == 0x0027 ? " -- FREERUN NOT SUPPORTED: this drive requires DC (drop --no-dc)" : "") << '\n';
@@ -496,15 +495,13 @@ int main(int argc, char** argv) {
     for (int cyc = 1; cyc <= ncycles; ++cyc) {
         if (opt.cycle_count > 0) {
             std::cout << "\n========== CYCLE " << cyc << "/" << ncycles
-                      << (cyc == 1 ? " (fresh bring-up)"
-                                   : " (in-place re-bring-up, NO power cycle -- #72 reconfigure repro)")
+                      << (cyc == 1 ? " (fresh bring-up)" : " (in-place re-bring-up, NO power cycle -- #72 reconfigure repro)")
                       << " ==========\n";
         }
         // #72: --cycle holds each cycle a fixed wall time -- short on early cycles, the long soak on the
         // last -- then tears down and re-brings-up. Single-run (no --cycle) => hold 0 = run until
         // SIGINT/abort (unchanged behavior).
-        const std::chrono::seconds hold = opt.cycle_count == 0 ? std::chrono::seconds{0}
-                                          : (cyc == ncycles ? final_hold : early_hold);
+        const std::chrono::seconds hold = opt.cycle_count == 0 ? std::chrono::seconds{0} : (cyc == ncycles ? final_hold : early_hold);
         last = run_one_cycle(opt, mode, no_dc, hold, cyc, ncycles);
         if (last.reason == StopReason::BringupAborted || last.reason == StopReason::RtSetupFailed) {
             worst_rc = 1;
@@ -516,8 +513,7 @@ int main(int argc, char** argv) {
         }
         if (opt.cycle_count > 0 && cyc >= 2 && !last.reached_op) {
             worst_rc = 1;
-            std::cout << "[#72] *** re-bring-up on cycle " << cyc << "/" << ncycles
-                      << " never reached OP (stop=" << to_string(last.reason)
+            std::cout << "[#72] *** re-bring-up on cycle " << cyc << "/" << ncycles << " never reached OP (stop=" << to_string(last.reason)
                       << ") -- residual DC/config poisoning from the prior teardown. ***\n";
         }
         if (g_stop.load()) {
@@ -533,8 +529,7 @@ int main(int argc, char** argv) {
         }
     }
     if (opt.cycle_count > 0) {
-        std::cout << "\n========== --cycle SUMMARY: " << ncycles << " cycles, final stop="
-                  << to_string(last.reason) << " ==========\n";
+        std::cout << "\n========== --cycle SUMMARY: " << ncycles << " cycles, final stop=" << to_string(last.reason) << " ==========\n";
     }
     return worst_rc;
 }

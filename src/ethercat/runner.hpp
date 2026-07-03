@@ -350,7 +350,7 @@ class RtCore {
     RtCore(RtCore&&) = delete;
     RtCore& operator=(RtCore&&) = delete;
 
-    void request_stop() noexcept;             // latch Requested + set the flag (RT or owner)
+    void request_stop() noexcept;              // latch Requested + set the flag (RT or owner)
     void latch_reason(StopReason r) noexcept;  // first cause wins (CAS from None)
     void rt_body(const std::stop_token& st) noexcept;
 
@@ -436,8 +436,7 @@ class Runner {
     // never this poll. (StopReason::Wedged is never OBSERVED here -- a wedge fail-stops the
     // process inside stop(), #52, so there is no surviving Runner to report it.)
     RunnerStatus status() const noexcept {
-        return RunnerStatus{rt_core_->phase_.load(std::memory_order_relaxed),
-                            rt_core_->reason_.load(std::memory_order_relaxed)};
+        return RunnerStatus{rt_core_->phase_.load(std::memory_order_relaxed), rt_core_->reason_.load(std::memory_order_relaxed)};
     }
 
    private:

@@ -272,7 +272,7 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
     bool operational = false;
     while (!stop_flag_.load(std::memory_order_acquire)) {
         bool any_sync_fault = false;
-        bool all_present = true;  // #71/#25: every control's drive feedback must look alive to confirm OP
+        bool all_present = true;                                    // #71/#25: every control's drive feedback must look alive to confirm OP
         const std::int64_t bring_dct = dc ? master_.dc_time() : 0;  // ctx contract: 0 when DC off
         for (Attached& a : controls_) {
             dispatch(a, 0, bring_dct, false, [&](CycleContext& ctx) {
@@ -369,12 +369,12 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
         }
         if (static_cast<std::uint64_t>(skipped) * period_ns >= kRtOverrunReportNs && !rt_overrun_logged) {
             rt_overrun_logged = true;  // one-shot -- a fault/teardown typically follows within cycles
-            (void)std::fprintf(
-                stderr,
-                "[ethercat] RT cycle overrun %.1fms (%u cycles) at cycle %llu -- the SCHED_FIFO RT thread was "
-                "starved (host contention / page fault / priority inversion); PD gapped, SYNC0 may drop (Er74.1).\n",
-                static_cast<double>(static_cast<std::uint64_t>(skipped) * period_ns) / 1e6, skipped,
-                static_cast<unsigned long long>(cycle));
+            (void)std::fprintf(stderr,
+                               "[ethercat] RT cycle overrun %.1fms (%u cycles) at cycle %llu -- the SCHED_FIFO RT thread was "
+                               "starved (host contention / page fault / priority inversion); PD gapped, SYNC0 may drop (Er74.1).\n",
+                               static_cast<double>(static_cast<std::uint64_t>(skipped) * period_ns) / 1e6,
+                               skipped,
+                               static_cast<unsigned long long>(cycle));
             (void)std::fflush(stderr);
         }
         ++cycle;

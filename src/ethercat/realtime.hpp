@@ -159,8 +159,7 @@ class DcPacer {
     // priority inversion, page fault) and PD gapped that long; the caller surfaces it (#72).
     std::uint32_t pace(std::int64_t dc_time_ns) noexcept {
         std::uint32_t skipped = 0;
-        (void)advance_to_deadline(
-            dc_time_ns, []() noexcept { return monotonic_ns(); }, &skipped);
+        (void)advance_to_deadline(dc_time_ns, []() noexcept { return monotonic_ns(); }, &skipped);
         timespec ts{};
         ts.tv_sec = static_cast<std::time_t>(next_ / kNsPerSec);
         ts.tv_nsec = static_cast<long>(next_ % kNsPerSec);
