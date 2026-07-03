@@ -71,25 +71,12 @@ struct ServoConfig {
     // loop rate against it AT CONFIG TIME with clear text + nearest valid rates, instead
     // of the drive rejecting the cycle cryptically at OP entry (A6 Er74.0). 0 = none.
     std::uint32_t sync_cycle_granularity_ns = 0;
-    // OPTIONAL drive "no-sync" fault code (#TODO-4: CONFIG DATA, never a hardcoded
-    // constant in the generic servo core). The 0x603F value a DC drive reports while
-    // SYNC0 has not yet established -- the A6's is 0x8700 (Er74.1 "no SYNC0"). The
-    // bring-up gate feeds (mapped 0x603F == this) to Master::bringup_step as the
-    // drive-sync-faulted signal, keeping Master AND the generic servo core free of any
-    // vendor code. nullopt ⇒ no sync-fault detection (the gate signal is always false --
-    // a generic drive with no such code). Lives in the hardware JSON ("sync_fault_code"),
-    // like sync_cycle_granularity_ns (#44) and vendor_fault_reset (#39).
-    std::optional<std::uint16_t> sync_fault_code;
-    // OPTIONAL vendor fault-reset SDO (#39: CONSUMER-side policy -- the library's
-    // configure() carries zero vendor knowledge now). Executed ONCE by ServoController
-    // at start()/reconfigure() AFTER Master::configure(), BEFORE the RT thread spawns
-    // (single port owner -> a plain blocking Master::sdo_write; best-effort, logged).
-    // The A6's reset is a vendor SDO write 1 to 0x2031:01, NOT CiA402 controlword bit7
-    // (CLAUDE.md) -- that datum lives in the hardware JSON ("vendor_fault_reset"), never
-    // in code. Present ⇒ clear a latent fault at bring-up; absent ⇒ no vendor reset (a
-    // generic CiA402 drive uses the bit7 path the controller already drives).
-    // Steady-state operator reset (RT running) is #22's queue, not this.
-    std::optional<ethercat::SdoWrite> vendor_fault_reset;
+    // #15 item 2: the drive "no-sync" 0x603F code, the vendor fault-reset SDO, and the
+    // 0x603F->label gloss are NO LONGER config data. They are DEVICE knowledge, now carried
+    // by a ServoController subclass (A6ServoDriver) via its overridable seams -- the sanctioned
+    // extension mechanism (reverses the old "drive specifics live only as config" rule). The
+    // generic base drives STANDARD CiA402 only. PDO map / limits / kinematics stay per-machine
+    // config below.
 
     // --- health / boundary ---
     int max_consecutive_wkc_errors = 5;            // WKC latch threshold (passed to Master)
@@ -122,14 +109,6 @@ struct ServoConfig {
     // -- below the drive's clear-reflect latency it false-fails; keep it >= that latency.)
     std::uint32_t fault_reset_clear_confirm_cycles = 3;
     // #15: move_timeout_ms removed -- the RT no-progress watchdog (4x stall) + a fixed 10min blocking-API backstop.
-
-    // --- diagnostics ---
-    // OPTIONAL gloss for the 0x603F drive error code -> human label, surfaced by
-    // last_error() (e.g. 0x8700 -> "Er74.1 / no SYNC0"). CONFIG DATA, never a
-    // hardcoded A6 table: populated from the hardware JSON. A code not in this list
-    // glosses to bare hex, so the line is never wrong, just less descriptive. Small
-    // (a handful of codes); looked up on the cold last_error() path only.
-    std::vector<std::pair<std::uint16_t, std::string>> fault_code_labels;
 
     // Throws ethercat::ConfigError (clear text) on any invalid field. Pure --
     // no I/O.

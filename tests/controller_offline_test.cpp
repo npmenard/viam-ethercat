@@ -16,6 +16,7 @@
 #include "ethercat/errors.hpp"
 #include "ethercat/sim_backend.hpp"
 #include "test_harness.hpp"
+#include "viam/lib/a6_servo_driver.hpp"
 #include "viam/lib/motion_profile.hpp"
 #include "viam/lib/servo_config.hpp"
 #include "viam/lib/servo_controller.hpp"
@@ -26,6 +27,7 @@ using ethercat::EcatBackend;
 using ethercat::PdoEntry;
 using ethercat::SimBackend;
 using ethercat::SimSlaveModel;
+using ethercat::servo::A6ServoDriver;
 using ethercat::servo::ControlMode;
 using ethercat::servo::ServoConfig;
 using ethercat::servo::ServoController;
@@ -55,7 +57,6 @@ ServoConfig make_config(ControlMode mode, bool feedback = false) {
     // TxPDO so the controller resolves + reads them. status@0, actual@2, 603F@6, 606C@8.
     if (feedback) {
         c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}, PdoEntry{0x603F, 0, 16}, PdoEntry{0x606C, 0, 32}};
-        c.fault_code_labels = {{0x8700, "Er74.1 / no SYNC0"}};
     } else {
         c.txpdo.entries[0x1A00] = {PdoEntry{0x6041, 0, 16}, PdoEntry{0x6064, 0, 32}};
     }
@@ -672,10 +673,13 @@ TEST("ServoController: fault inject -> not powered; fault_reset recovers") {
 
 // ---- #16: TxPDO feedback (fault legibility + velocity) ----
 
-TEST("ServoController(#16): a drive fault is legible -- last_error shows 0x603F + config gloss") {
+TEST("A6ServoDriver(#16): a drive fault is legible -- last_error shows 0x603F + the A6 subclass gloss") {
+    // #15 item 2: the 0x8700 gloss moved from config (fault_code_labels) to the A6ServoDriver seam
+    // (fault_gloss override). This is the gloss NON-VACUITY: the A6 subclass names the code, the
+    // generic base does NOT (asserted in the companion test below).
     SimBackend* sim = nullptr;
-    ServoController ctrl{make_config(ControlMode::ProfilePosition, /*feedback=*/true),
-                         sim_factory(ControlMode::ProfilePosition, &sim, /*feedback=*/true)};
+    A6ServoDriver ctrl{make_config(ControlMode::ProfilePosition, /*feedback=*/true),
+                       sim_factory(ControlMode::ProfilePosition, &sim, /*feedback=*/true)};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
     CHECK(sim != nullptr);
@@ -686,7 +690,27 @@ TEST("ServoController(#16): a drive fault is legible -- last_error shows 0x603F 
 
     const std::string e = ctrl.last_error();
     CHECK(e.find("drive fault 0x8700") != std::string::npos);  // the raw code
-    CHECK(e.find("Er74.1 / no SYNC0") != std::string::npos);   // the config-data gloss
+    CHECK(e.find("Er74.1 / no SYNC0") != std::string::npos);   // the A6 subclass gloss
+}
+
+// #15 item 2 gloss NON-VACUITY (base side): the GENERIC base has no device gloss, so the same
+// 0x8700 fault surfaces the bare hex WITHOUT the "Er74.1" label -- proving the label comes from
+// the A6 subclass seam, not the generic core.
+TEST("ServoController(#15): the generic base does NOT gloss a device code (bare hex only)") {
+    SimBackend* sim = nullptr;
+    ServoController ctrl{make_config(ControlMode::ProfilePosition, /*feedback=*/true),
+                         sim_factory(ControlMode::ProfilePosition, &sim, /*feedback=*/true)};
+    ctrl.start();
+    CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+    CHECK(sim != nullptr);
+
+    sim->set_fault_code(1, 0x8700);
+    sim->inject_fault(1);
+    CHECK(wait_until([&] { return !ctrl.is_powered(); }, std::chrono::milliseconds(500)));
+
+    const std::string e = ctrl.last_error();
+    CHECK(e.find("drive fault 0x8700") != std::string::npos);  // the raw code, still legible
+    CHECK(e.find("Er74.1") == std::string::npos);              // but NO gloss from the generic base
 }
 
 TEST("ServoController(#16): compose-both -- a drive fault AND a WKC fault BOTH surface (Er74)") {
@@ -862,7 +886,6 @@ TEST("ServoController(#18): recovers below the window, gives up above it") {
 TEST("ServoController(#18): persistent-cause give-up -- last_error composes drive + CTRL tiers") {
     SimBackend* sim = nullptr;
     ServoConfig cfg = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
-    cfg.fault_code_labels = {{0x6320, "Er74.0 / cycle error"}};  // gloss for the compose
     ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim, /*feedback=*/true)};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
@@ -887,7 +910,6 @@ TEST("ServoController(#18): persistent-cause give-up -- last_error composes driv
 TEST("ServoController(#18): clear-then-refault flicker -> give-up (not false recovery)") {
     SimBackend* sim = nullptr;
     ServoConfig cfg = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
-    cfg.fault_code_labels = {{0x6320, "Er74.0 / cycle error"}};
     ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim, /*feedback=*/true)};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
@@ -928,7 +950,6 @@ TEST("ServoController(#18): clear-then-refault flicker -> give-up (not false rec
 TEST("ServoController(#18): clear that HOLDS past K recovers, a later refault is a new fault") {
     SimBackend* sim = nullptr;
     ServoConfig cfg = make_config(ControlMode::ProfilePosition, /*feedback=*/true);
-    cfg.fault_code_labels = {{0x6320, "Er74.0 / cycle error"}};
     ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim, /*feedback=*/true)};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
@@ -1011,17 +1032,16 @@ TEST("ServoController(#18): instant clear (default) -- one reset recovers, uncha
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(1000)));
 }
 
-// (#39) The CONSUMER-side vendor fault-reset: executed once pre-RT-spawn when configured
-// (the sim's SDO record shows the 0x2031 write), skipped entirely when absent. And the
-// RT-phase bracket clears on stop(): a STOP -> START cycle re-runs the pre-spawn reset
-// successfully -- if stop() left rt_active set, the restart's sdo_write would throw and
-// start() would fail (the behavioral proof of the bracket's clear-after-join half).
-TEST("#39: config-driven vendor fault-reset runs pre-spawn; absent = zero vendor traffic") {
-    {  // present -> the 0x2031 write lands before the RT thread exists
-        ServoConfig cfg = make_config(ControlMode::ProfilePosition);
-        cfg.vendor_fault_reset = ethercat::SdoWrite{0x2031, 0x01, {std::byte{0x01}, std::byte{0x00}}};
+// (#39 / #15 item 2) The device vendor fault-reset seam: executed once pre-RT-spawn by the
+// A6ServoDriver subclass (the sim's SDO record shows the 0x2031 write), and NOT emitted by the
+// generic base (no vendor knowledge). This is the vendor-reset seam NON-VACUITY: subclass writes
+// 0x2031, base writes nothing. (The A6 datum moved from config to the subclass in #15 item 2.)
+// NOTE: what is offline-proven here is that the seam EMITS the write; that the write actually
+// CLEARS the A6's fault is HW-verify (drive behavior, not modeled in sim).
+TEST("#15 item 2: the A6ServoDriver seam runs the vendor reset pre-spawn; the generic base emits none") {
+    {  // A6 subclass -> the 0x2031 write lands before the RT thread exists
         SimBackend* sim = nullptr;
-        ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim)};
+        A6ServoDriver ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
         ctrl.start();
         CHECK(sim != nullptr);
         const std::vector<std::byte> rec = sim->recorded_sdo(1, 0x2031, 0x01);
@@ -1029,7 +1049,7 @@ TEST("#39: config-driven vendor fault-reset runs pre-spawn; absent = zero vendor
         CHECK(!rec.empty() && rec[0] == std::byte{0x01});
         ctrl.stop();
     }
-    {  // absent -> no vendor object traffic at all
+    {  // generic base -> no vendor object traffic at all
         SimBackend* sim = nullptr;
         ServoController ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
         ctrl.start();
@@ -1040,17 +1060,15 @@ TEST("#39: config-driven vendor fault-reset runs pre-spawn; absent = zero vendor
 }
 
 TEST("#39: the RT-phase bracket clears after stop() -- a restart's pre-spawn reset succeeds") {
-    ServoConfig cfg = make_config(ControlMode::ProfilePosition);
-    cfg.vendor_fault_reset = ethercat::SdoWrite{0x2031, 0x01, {std::byte{0x01}, std::byte{0x00}}};
     SimBackend* sim = nullptr;
-    ServoController ctrl{cfg, sim_factory(ControlMode::ProfilePosition, &sim)};
+    A6ServoDriver ctrl{make_config(ControlMode::ProfilePosition), sim_factory(ControlMode::ProfilePosition, &sim)};
     ctrl.start();  // spawn: rt_active declared
     ctrl.stop();   // join: rt_active MUST clear (else the next pre-spawn SDO throws)
     // reconfigure (same config) = the restart path: its pre-spawn vendor reset must not
     // throw. A stale-true rt_active on a persisting Master is the hazard this catches --
     // the restart builds a fresh Master, and stop()'s explicit clear covers the
     // stop-then-external-SDO pattern; both paths land here green.
-    ctrl.reconfigure(cfg);
+    ctrl.reconfigure(make_config(ControlMode::ProfilePosition));
     CHECK(sim != nullptr);
     CHECK_EQ(sim->recorded_sdo(1, 0x2031, 0x01).size(), std::size_t{2});  // the restart's reset landed
     ctrl.stop();

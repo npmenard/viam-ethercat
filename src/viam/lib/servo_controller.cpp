@@ -32,7 +32,7 @@ constexpr std::uint16_t kModeDisplay = 0x6061;  // mode display (TxPDO); present
 // no-progress watchdog (4x stall threshold) is the real stuck-move safety; this only bounds a move
 // that hangs AND somehow evades the watchdog. 10 min covers any realistic move.
 constexpr std::chrono::milliseconds kMoveWaiterTimeout{600'000};
-constexpr std::uint16_t kFaultCode = 0x603F;    // drive error code (TxPDO, optional feedback)
+constexpr std::uint16_t kFaultCode = 0x603F;  // drive error code (TxPDO, optional feedback)
 // #TODO-4: the A6's "no-SYNC0" code (0x8700 / Er74.1) is NO LONGER a constant here --
 // it's CONFIG DATA (ServoConfig::sync_fault_code), so this generic core carries no
 // vendor value. The bring-up gate reads it from config (nullopt ⇒ no detection).
@@ -69,27 +69,6 @@ ServoConfig validated(ServoConfig config) {
     return config;
 }
 
-// #39: CONSUMER-side vendor fault-reset, run while this thread is still the SINGLE
-// port owner (after Master::configure(), before the RT thread spawns). The vendor
-// datum (A6: 0x2031:01 = 1) comes from the hardware JSON, never code. Best-effort:
-// a failed clear is logged, not fatal -- the bring-up gate still guards OP entry.
-void run_vendor_fault_reset(Master& m, const ServoConfig& c) {
-    if (!c.vendor_fault_reset.has_value()) {
-        return;
-    }
-    const SdoWrite& fr = *c.vendor_fault_reset;
-    try {
-        m.sdo_write(c.slave_id, fr.index, fr.subindex, fr.data);
-    } catch (const Error& e) {
-        (void)std::fprintf(stderr,
-                           "[servo] vendor fault-reset SDO (slave %u 0x%04X:%02X) failed (continuing): %s\n",
-                           static_cast<unsigned>(c.slave_id),
-                           static_cast<unsigned>(fr.index),
-                           static_cast<unsigned>(fr.subindex),
-                           e.what());
-    }
-}
-
 MasterConfig build_master_config(const ServoConfig& c) {
     SlaveConfig slave;
     slave.slave_id = c.slave_id;
@@ -121,13 +100,33 @@ MasterConfig build_master_config(const ServoConfig& c) {
 ServoController::ServoController(ServoConfig config)
     : ServoController(std::move(config), [] { return std::unique_ptr<EcatBackend>(std::make_unique<SoemBackend>()); }) {}
 
-DeviceProfile ServoController::make_module_profile(const ServoConfig& c) noexcept {
+// #15 item 2: the device fault-reset seam (vendor_fault_reset_sdo()) run once pre-RT-spawn, while
+// this thread is still the SINGLE port owner (after Master::configure(), before the RT thread spawns).
+// The vendor datum (A6: 0x2031:01 = 1) is carried by the subclass, never config. Best-effort: a
+// failed clear is logged, not fatal -- the bring-up gate still guards OP entry.
+void ServoController::run_vendor_fault_reset() {
+    const std::optional<SdoWrite> reset = vendor_fault_reset_sdo();
+    if (!reset.has_value()) {
+        return;
+    }
+    try {
+        master_->sdo_write(config_.slave_id, reset->index, reset->subindex, reset->data);
+    } catch (const Error& e) {
+        (void)std::fprintf(stderr,
+                           "[servo] vendor fault-reset SDO (slave %u 0x%04X:%02X) failed (continuing): %s\n",
+                           static_cast<unsigned>(config_.slave_id),
+                           static_cast<unsigned>(reset->index),
+                           static_cast<unsigned>(reset->subindex),
+                           e.what());
+    }
+}
+
+DeviceProfile ServoController::build_device_profile(const ServoConfig& c) noexcept {
     DeviceProfile p;
-    // Fault-reset mechanism: a vendor SDO (e.g. A6 0x2031:01) when the config carries one, else the
-    // standard CiA402 controlword bit7. (The module runs its own #18 fault machine in the wrapper;
-    // this field is for the policy's future in-loop reset -- R2/sub-step-4.)
-    p.fault_reset = c.vendor_fault_reset.has_value() ? DeviceProfile::FaultReset::VendorSdo : DeviceProfile::FaultReset::Cia402Bit7;
-    p.vendor_fault_reset = c.vendor_fault_reset;
+    // NOTE (#15 item 2): the DeviceProfile fault-reset fields (fault_reset / vendor_fault_reset) are
+    // DORMANT -- the policy's in-loop reset always uses standard CiA402 bit7 today, and the ACTIVE
+    // vendor reset is the pre-RT-spawn run_vendor_fault_reset() seam. Left at their generic defaults;
+    // when the policy's R2/sub-step-4 in-loop vendor reset lands it will read the subclass seam too.
     p.position_tolerance = c.position_tolerance_counts;  // effective value (validated() defaulted 0 -> counts_per_rev/720)
     // #59 (2nd consumer): the policy's zero_vel_threshold gates the quick-stop-AT-REST de-energize
     // (:209/:335) -- a BACKSTOP; the PRIMARY is 0x605A=2 auto-SwitchOnDisabled (P3c-proven). Keep it a
@@ -155,7 +154,7 @@ DeviceProfile ServoController::make_module_profile(const ServoConfig& c) noexcep
 ServoController::ServoController(ServoConfig config, BackendFactory backend_factory)
     : config_(validated(std::move(config))),
       backend_factory_(std::move(backend_factory)),
-      policy_(make_module_profile(config_)),
+      policy_(build_device_profile(config_)),
       commands_(config_.command_queue_capacity) {
     if (!backend_factory_) {
         throw ConfigError("ServoController: null backend factory");
@@ -182,7 +181,7 @@ void ServoController::start() {
     master_->init();
     master_->configure();  // -> SAFE-OP (may throw InitError; propagated as today -- the SDK retries)
     resolve_fields();
-    run_vendor_fault_reset(*master_, config_);  // #39: consumer-side, single port owner (pre-Runner-start)
+    run_vendor_fault_reset();  // #15 item 2: device seam, single port owner (pre-Runner-start)
     spawn_runner();
 }
 
@@ -286,7 +285,7 @@ void ServoController::reconfigure(ServoConfig config) {
     master_->init();
     master_->configure();
     resolve_fields();
-    run_vendor_fault_reset(*master_, config_);  // #39: consumer-side, single port owner (pre-Runner-start)
+    run_vendor_fault_reset();  // #15 item 2: device seam, single port owner (pre-Runner-start)
     spawn_runner();
 }
 
@@ -796,7 +795,8 @@ bool ServoController::sync_faulted(const CycleContext& ctx) const noexcept {
     // bring-up-abort diagnostic (sync_faulted + on_stop both run on the RT thread).
     const std::uint16_t code = f_fault_code_.mapped() ? ctx.load<std::uint16_t>(f_fault_code_) : 0;
     last_sync_code_ = code;
-    return config_.sync_fault_code.has_value() && code == *config_.sync_fault_code;
+    const std::optional<std::uint16_t> no_sync = sync_fault_code();  // #15 item 2: device seam (base nullopt)
+    return no_sync.has_value() && code == *no_sync;
 }
 
 void ServoController::step(CycleContext& ctx) noexcept {
@@ -889,7 +889,8 @@ void ServoController::on_stop(StopReason reason) noexcept {
         }
         const std::string al_msg = master_ != nullptr ? master_->describe_al_code(al) : std::string{};
         state_.bringup_al_code.store(al, std::memory_order_relaxed);
-        const bool sync_fault = config_.sync_fault_code.has_value() && last_sync_code_ != 0 && last_sync_code_ == *config_.sync_fault_code;
+        const std::optional<std::uint16_t> no_sync = sync_fault_code();  // #15 item 2: device seam (base nullopt)
+        const bool sync_fault = no_sync.has_value() && last_sync_code_ != 0 && last_sync_code_ == *no_sync;
         if (sync_fault) {
             state_.drive_fault_code.store(last_sync_code_, std::memory_order_relaxed);
             state_.drive_faulted.store(true, std::memory_order_release);
@@ -1183,8 +1184,8 @@ std::size_t ServoController::sdo_read(std::uint16_t index, std::uint8_t sub, std
     // return stale data or hit a closed port), so refuse unless a Runner is live. rt_runner_ is written
     // only under the EXCLUSIVE api_mutex_ (start/stop/reconfigure), so this shared-lock read is safe.
     if (master_ == nullptr || rt_runner_ == nullptr) {
-        throw ConfigError("ServoController::sdo_read: not running -- call while operational (object " + std::to_string(index) +
-                          ":" + std::to_string(sub) + ")");
+        throw ConfigError("ServoController::sdo_read: not running -- call while operational (object " + std::to_string(index) + ":" +
+                          std::to_string(sub) + ")");
     }
     return master_->sdo_read(config_.slave_id, index, sub, out);
 }
@@ -1194,14 +1195,10 @@ double ServoController::rated_current_amps() const noexcept {
     return config_.motor_rated_current_amps;
 }
 
-std::string ServoController::fault_gloss(std::uint16_t code) const {
-    // Config-data lookup (NOT a hardcoded A6 table): 0x603F code -> human label.
-    // Unknown code -> empty, so last_error() shows just the bare hex. Cold path.
-    for (const auto& [c, label] : config_.fault_code_labels) {
-        if (c == code) {
-            return label;
-        }
-    }
+std::string ServoController::fault_gloss(std::uint16_t /*code*/) const {
+    // #15 item 2: the GENERIC base has no device gloss -> empty, so last_error() shows just the
+    // bare hex (never wrong, just less descriptive). A device subclass (A6ServoDriver) overrides
+    // this to name its codes (0x8700 -> "Er74.1 / no SYNC0"). Cold path.
     return {};
 }
 

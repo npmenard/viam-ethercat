@@ -179,6 +179,29 @@ class ServoController : public SlaveControl {
     // under the shared lock (reconfigure() rewrites config_ under the exclusive lock).
     double rated_current_amps() const noexcept;
 
+   protected:
+    // --- DEVICE SEAMS (#15 item 2). The base IS the generic CiA402 servo driver; a device
+    // subclass (A6ServoDriver) overrides EXACTLY these to add its vendor specifics -- knowledge
+    // that USED to be hardware-JSON config (sync_fault_code / vendor_fault_reset / fault_code_labels).
+    // All three are consulted only OUTSIDE the constructor (start()/reconfigure()/RT loop), so a
+    // subclass override dispatches normally (no virtual-during-construction trap). ---
+    //
+    // Vendor fault-reset SDO, run ONCE pre-RT-spawn (single port owner). nullopt (base) => no
+    // vendor reset: the standard CiA402 controlword bit7 in-loop path is the only reset. The A6's
+    // reset is a vendor SDO write 1 to 0x2031:01, NOT bit7 (CLAUDE.md lesson 4).
+    virtual std::optional<ethercat::SdoWrite> vendor_fault_reset_sdo() const {
+        return std::nullopt;
+    }
+    // The drive's "SYNC0 not yet established" 0x603F code, fed to the DC bring-up gate + on_stop
+    // diagnostic. nullopt (base) => no sync-fault detection (the gate signal is always false -- a
+    // generic drive with no such quirk). The A6's is 0x8700 (Er74.1 "no SYNC0").
+    virtual std::optional<std::uint16_t> sync_fault_code() const noexcept {
+        return std::nullopt;
+    }
+    // 0x603F code -> human label for last_error() (cold path). Empty (base) => bare hex, so the
+    // line is never wrong, just less descriptive. The A6 glosses its 0x8700 as "Er74.1 / no SYNC0".
+    virtual std::string fault_gloss(std::uint16_t code) const;
+
    private:
     // --- lifecycle FSM (std::variant; each state's step() in the .cpp) ---
     struct Init {};
@@ -238,9 +261,12 @@ class ServoController : public SlaveControl {
     void resolve_fields();                               // cache controlword/status/target/actual/velocity FieldLocations
     bool rxpdo_has(std::uint16_t index) const noexcept;  // is `index` mapped in the RxPDO? (optional-field probe)
     bool txpdo_has(std::uint16_t index) const noexcept;  // is `index` mapped in the TxPDO? (optional feedback probe)
-    std::string fault_gloss(std::uint16_t code) const;   // 0x603F code -> config label (empty if unknown); cold path
-    bool rt_alive() const noexcept;                      // !watchdog_expired() && !state_.faulted  (master_-FREE)
-    bool watchdog_expired() const noexcept;              // (now - last_cycle_time_ns) > watchdog_ns
+    // #15 item 2: run the device fault-reset seam (vendor_fault_reset_sdo()) once pre-RT-spawn, while
+    // this thread is still the SINGLE port owner (after Master::configure(), before the RT thread
+    // spawns). Best-effort: a failed clear is logged, not fatal. nullopt seam => no-op (generic drive).
+    void run_vendor_fault_reset();
+    bool rt_alive() const noexcept;          // !watchdog_expired() && !state_.faulted  (master_-FREE)
+    bool watchdog_expired() const noexcept;  // (now - last_cycle_time_ns) > watchdog_ns
 
     ServoConfig config_;
     BackendFactory backend_factory_;
@@ -280,7 +306,7 @@ class ServoController : public SlaveControl {
     // HERE; the wrapper keeps the two-tier fault + #18 fault-reset machine + completion-generations
     // + stall watchdog (rev-6 signed boundary). Parameterized by a DeviceProfile mapped from
     // ServoConfig (module flags: bit8 Halt, no PV pos-mirror, 4-phase handshake + ack timeout).
-    static DeviceProfile make_module_profile(const ServoConfig& c) noexcept;
+    static DeviceProfile build_device_profile(const ServoConfig& c) noexcept;
     Cia402Policy policy_;
     // 0x6085 readback from policy_.configure (0 = quick-stop not configured). WRITTEN once by the
     // RT thread in on_configured (pre-steady), READ by the non-RT velocity guard -> atomic.
