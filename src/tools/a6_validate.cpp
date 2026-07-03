@@ -267,7 +267,7 @@ CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc,
                     runner.request_stop();  // #72: hold elapsed -> teardown -> next cycle re-brings-up
                 }
             }
-            // #22 mid-run marshaled SDO reads (only while Running; the RT loop services them).
+            // #22 mid-run direct non-RT SDO reads (only while Running; #15 -- the caller drives the mailbox exchange).
             if (opt.sdo_probe && runner.status().phase == RunnerPhase::Running &&
                 std::chrono::steady_clock::now() - last_sdo >= std::chrono::milliseconds(500)) {
                 last_sdo = std::chrono::steady_clock::now();
@@ -392,7 +392,7 @@ int main(int argc, char** argv) {
         } else if (a == "--move-sine") {
             opt.move_sine = true;  // requires an EXPLICIT --enable (checked below) -- no implicit energize
         } else if (a == "--sdo-probe") {
-            opt.sdo_probe = true;  // #22: read 0x6079/0x6078/0x6502 via the marshaled steady-state SDO while Running
+            opt.sdo_probe = true;  // #22: read 0x6079/0x6078/0x6502 via the direct non-RT steady-state SDO while Running (#15)
         } else if (a == "--csp-probe") {
             opt.csp_probe = true;  // CSP mode, NO enable -- read+print feedback only (diagnostic)
         } else if (a == "--sine-amplitude" && i + 1 < args.size()) {
@@ -435,7 +435,7 @@ int main(int argc, char** argv) {
                       << "  --csp-probe: NON-energizing diagnostic -- bring up in CSP mode (0x6060=8), hold at\n"
                       << "               ReadyToSwitchOn (NO enable), print feedback.\n"
                       << "  --sdo-probe: #22 steady-state SDO -- while Running, read 0x6079 (DC-link V), 0x6078 (current),\n"
-                      << "               0x6502 (supported modes) every ~500ms via the RT-serviced marshaled path; print\n"
+                      << "               0x6502 (supported modes) every ~500ms via the direct non-RT SDO path (#15); print\n"
                       << "               raw + converted. Safe with a plain hold (no --enable); exercises mid-run mailbox reads.\n"
                       << "  --reset-fault: clear a latent drive fault at bring-up via the A6 vendor SDO 0x2031:01=1.\n"
                       << "  --cycle N [--early-hold S] [--hold-seconds S]: #72 in-place-reconfigure repro -- run N\n"
