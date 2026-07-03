@@ -1,51 +1,34 @@
 {
   "_README": [
-    "REAL-HARDWARE A6-EC servo config for the viam:ethercat:servo motor model --",
-    "the companion to etc/a6-servo.example.json (which is sim-only). This is the",
-    "artifact Phase 7 (real bring-up) starts from: plug in, set `interface`, run.",
+    "REAL-HARDWARE A6-EC servo config for the viam:ethercat:a6-servo motor model --",
+    "the companion to etc/a6-servo.example.json (sim-only) and etc/a6-minimal.example.json",
+    "(the leanest form). This is the artifact real bring-up starts from: plug in,",
+    "set `interface`, run.",
     "",
     "!!! CONFIRM BEFORE ENERGIZING !!!",
-    "Every PDO index/subindex/bit-length, the modes-of-operation code, and the",
-    "encoder/gear/current values below MUST be verified against THIS drive's ESI",
-    "file and the motor nameplate before applying power. The CiA402 object indices",
-    "(0x6040/0x6041/0x607A/0x6064/0x60FF) are standard and are what the controller",
-    "resolves per mode; the PDO *assignment* (which objects sit in 0x1600/0x1A00 and",
-    "whether the drive permits runtime remap via CoE) is drive-specific. A wrong map",
-    "or a wrong counts_per_rev will command the motor incorrectly. require_realtime",
-    "is true here -- the host needs CAP_SYS_NICE / RLIMIT_RTPRIO or start() throws.",
+    "The encoder/gear/current values below MUST be verified against THIS drive's ESI",
+    "file and the motor nameplate before applying power. A wrong counts_per_rev will",
+    "command the motor incorrectly. require_realtime is true here -- the host needs",
+    "CAP_SYS_NICE / RLIMIT_RTPRIO or start() throws.",
     "",
-    "Authoritative map verified against the A6 manual section 10 (object dictionary",
-    "+ PDO config). Object indices in DECIMAL (JSON has no hex):",
-    "  0x6040=24640 controlword (16b)        0x6041=24641 statusword (16b)",
-    "  0x607A=24698 target position (32b)    0x6064=24676 position actual (32b)",
-    "  0x6081=24705 profile velocity (32b)   0x606C=24684 velocity actual (32b)",
-    "  0x60FF=24831 target velocity (32b)    0x603F=24639 fault code (16b)",
-    "  0x6060=24672 modes-of-operation (8b, SDO-set, PP=1/PV=3, NOT in the map)",
-    "  0x6061=24673 mode display (8b)        0x6077=24695 torque actual (16b)",
-    "  RxPDO 0x1600=5632 on SM2 assign 0x1C12=7186",
-    "  TxPDO 0x1A00=6656 on SM3 assign 0x1C13=7187",
-    "PP RxPDO (3 entries/10B): controlword + target position + profile velocity",
-    "(0x6081 carries the GoTo/GoFor rpm -- the RT loop writes it every cycle).",
-    "PV RxPDO (2 entries/6B): controlword + target velocity (signed = direction).",
-    "TxPDO (6 entries/15B, both modes): fault code, statusword, mode display,",
-    "position actual, velocity actual, torque actual.",
-    "",
-    "This file shows the PROFILE POSITION (PP) component. For a PROFILE VELOCITY (PV)",
-    "drive, see the `_pv_variant` block at the bottom: set control_mode=PV and swap",
-    "the RxPDO entry from target-position 0x607A to target-velocity 0x60FF (the",
-    "controller resolves 0x607A only in PP and 0x60FF only in PV, and throws if the",
-    "required object is not mapped)."
+    "#18: there is NO control_mode and NO rxpdo/txpdo. The driver is ALWAYS",
+    "switch-capable (each motor API call ensures its own mode at runtime: GoTo/GoFor",
+    "-> PP, SetRPM -> PV) and defines ONE fixed CiA402 superset PDO map itself, using",
+    "the standard object indices:",
+    "  0x6040 controlword    0x6060 mode-of-op   0x607A target-pos",
+    "  0x6081 profile-vel    0x60FF target-vel   (RxPDO 0x1600 -> SM2 assign 0x1C12)",
+    "  0x603F fault  0x6041 status  0x6061 mode-display  0x6064 actual-pos",
+    "  0x606C vel-actual  0x6077 torque          (TxPDO 0x1A00 -> SM3 assign 0x1C13)",
+    "CONFIRM (per the A6 ESI) that the drive permits CoE PDO remap on these indices."
   ],
   "name": "servo",
   "api": "rdk:component:motor",
   "model": "viam:ethercat:a6-servo",
   "attributes": {
-    "_comment_model": "#15 item 2: the A6 uses the viam:ethercat:a6-servo model -- an A6ServoDriver subclass that supplies the three A6 residuals in CODE (vendor fault-reset 0x2031:01=1, the no-SYNC0 code 0x8700/Er74.1, and its 0x603F gloss). Those are NO LONGER config attributes. A generic non-A6 CiA402 drive uses viam:ethercat:servo instead.",
+    "_comment_model": "#15 item 2: the A6 uses the viam:ethercat:a6-servo model -- an A6ServoDriver subclass that supplies the three A6 residuals in CODE (vendor fault-reset 0x2031:01=1, the no-SYNC0 code 0x8700/Er74.1, and its 0x603F gloss). Those are NOT config attributes. A generic non-A6 CiA402 drive uses viam:ethercat:servo instead.",
     "_comment_bus": "interface = the host NIC bound to the EtherCAT segment (CONFIRM: `ip link`). slave = 1-based ring position of the A6.",
     "interface": "REPLACE_WITH_NIC",
     "slave": 1,
-    "_comment_mode": "control_mode is an INTENT: PP | PV | switchable (#61). The driver DERIVES the standard CiA402 PDO map from it -- PP -> 0x6060=1 map {controlword,target-pos,profile-vel}; PV -> 0x6060=3 map {controlword,target-vel}; switchable -> the SUPERSET map {controlword,0x6060,target-pos,target-vel,profile-vel} so GoTo auto-selects PP and SetRPM auto-selects PV at runtime. You normally do NOT specify rxpdo/txpdo (see _comment_pdo). switchable REQUIRES a drive that supports runtime mode re-selection + energized HW validation before production.",
-    "control_mode": "PP",
     "_comment_motor": "CONFIRM against the MOTOR nameplate (these are motor-, not drive-, specific): rated speed, rated current, peak current.",
     "max_rpm": 3000.0,
     "motor_rated_current_amps": 2.5,
@@ -65,93 +48,6 @@
     "handshake_timeout_cycles": 1000,
     "stall_threshold_cycles": 2000,
     "command_queue_capacity": 64,
-    "max_consecutive_wkc_errors": 5,
-    "_comment_pdo": "OPTIONAL ADVANCED OVERRIDE (#61). You normally OMIT rxpdo/txpdo entirely -- the driver derives the standard CiA402 map from control_mode (see _comment_mode). Specify these blocks ONLY for a non-standard drive whose mappable objects/indices differ from the CiA402 defaults. The blocks below are exactly the map the driver would derive for PP, kept as a worked example + to CONFIRM the A6 permits CoE PDO remap on these indices (per its ESI). PP RxPDO (command): controlword + target position + profile velocity (RT loop writes the rpm into 0x6081 each cycle). TxPDO (feedback): fault code + statusword + mode display + position actual + velocity actual + torque actual. NOTE (Q14/#56): if 0x6060 is in the RxPDO (switchable), it MUST be seeded from cycle 0 -- the per-cycle PDO value overrides the SDO-set mode.",
-    "rxpdo": {
-      "pdos": [
-        {
-          "index": 5632,
-          "entries": [
-            {
-              "index": 24640,
-              "subindex": 0,
-              "bit_length": 16
-            },
-            {
-              "index": 24698,
-              "subindex": 0,
-              "bit_length": 32
-            },
-            {
-              "index": 24705,
-              "subindex": 0,
-              "bit_length": 32
-            }
-          ]
-        }
-      ]
-    },
-    "txpdo": {
-      "pdos": [
-        {
-          "index": 6656,
-          "entries": [
-            {
-              "index": 24639,
-              "subindex": 0,
-              "bit_length": 16
-            },
-            {
-              "index": 24641,
-              "subindex": 0,
-              "bit_length": 16
-            },
-            {
-              "index": 24673,
-              "subindex": 0,
-              "bit_length": 8
-            },
-            {
-              "index": 24676,
-              "subindex": 0,
-              "bit_length": 32
-            },
-            {
-              "index": 24684,
-              "subindex": 0,
-              "bit_length": 32
-            },
-            {
-              "index": 24695,
-              "subindex": 0,
-              "bit_length": 16
-            }
-          ]
-        }
-      ]
-    },
-    "_pv_variant": {
-      "_comment": "PROFILE VELOCITY drive: apply these two changes to the attributes above. control_mode=PV -> modes-of-operation 0x6060 = 3. The RxPDO swaps target position 0x607A (24698) for target velocity 0x60FF (24831); the TxPDO is unchanged (statusword + position actual). set_rpm drives a signed velocity; go_to is rejected in PV.",
-      "control_mode": "PV",
-      "rxpdo": {
-        "pdos": [
-          {
-            "index": 5632,
-            "entries": [
-              {
-                "index": 24640,
-                "subindex": 0,
-                "bit_length": 16
-              },
-              {
-                "index": 24831,
-                "subindex": 0,
-                "bit_length": 32
-              }
-            ]
-          }
-        ]
-      }
-    }
+    "max_consecutive_wkc_errors": 5
   }
 }

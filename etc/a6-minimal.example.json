@@ -1,20 +1,18 @@
 {
   "_README": [
-    "MINIMAL real-A6 config for the viam:ethercat:a6-servo motor model (#64). The",
-    "companion to a6-hardware.example.json -- that one spells out the full PDO map",
-    "as an ADVANCED override; THIS one omits it and lets the driver DERIVE the",
-    "standard CiA402 map from control_mode (#61). This is all a conformant CiA402",
-    "drive needs: the required identity/motor facts + the A6's non-default hardware",
-    "bits. NO rxpdo/txpdo (derived) and NO move-complete tolerances (defaulted).",
+    "MINIMAL real-A6 config for the viam:ethercat:a6-servo motor model. All a",
+    "conformant CiA402 drive needs: the required identity/motor facts + the A6's",
+    "non-default hardware bits.",
     "",
-    "DERIVED per control_mode (standard CiA402 objects, index:subindex decimal):",
-    "  PP  RxPDO 0x1600: 0x6040 controlword + 0x607A target-pos + 0x6081 profile-vel",
-    "  PV  RxPDO 0x1600: 0x6040 controlword + 0x60FF target-vel",
-    "  switchable       : the superset {0x6040,0x6060,0x607A,0x6081,0x60FF} -> runtime",
-    "                     GoTo->PP / SetRPM->PV mode-switch (0x6060 mapped).",
-    "  TxPDO 0x1A00 (all modes): 0x603F fault + 0x6041 status + 0x6061 mode-display +",
-    "                     0x6064 actual-pos + 0x606C vel-actual + 0x6077 torque.",
-    "  SM assign 0x1600->0x1C12, 0x1A00->0x1C13 (derived from direction).",
+    "#18: there is NO control_mode and NO rxpdo/txpdo. The driver is ALWAYS",
+    "switch-capable and defines ONE fixed CiA402 superset PDO map itself:",
+    "  RxPDO 0x1600: 0x6040 controlword + 0x6060 mode + 0x607A target-pos +",
+    "                0x6081 profile-vel + 0x60FF target-vel",
+    "  TxPDO 0x1A00: 0x603F fault + 0x6041 status + 0x6061 mode-display +",
+    "                0x6064 actual-pos + 0x606C vel-actual + 0x6077 torque",
+    "  SM assign 0x1600->0x1C12, 0x1A00->0x1C13.",
+    "Each motor API call ensures its own mode at runtime: GoTo/GoFor -> PP,",
+    "SetRPM -> PV (the driver orchestrates the switch).",
     "Move-complete defaults: position_tolerance_counts = counts_per_rev/720 (0.5 deg),",
     "  velocity gate off (noise-robust position-delta). Override either only if needed.",
     "",
@@ -26,9 +24,7 @@
   "api": "rdk:component:motor",
   "model": "viam:ethercat:a6-servo",
   "attributes": {
-    "_comment_mode": "control_mode PP (GoTo/GoFor) | PV (SetRPM) | switchable (both, runtime PP<->PV). For \"switchable\" the derived map adds 0x6060 so the driver auto-selects PP for GoTo and PV for SetRPM.",
     "interface": "enp86s0",
-    "control_mode": "PP",
 
     "_comment_motor": "Required motor facts. counts_per_rev = encoder counts per MOTOR rev at the drive's 1:1 electronic gear (A6 = 131072 = 2^17). motor_rated_current_amps = nameplate rated current (amps -> torque per-mille).",
     "max_rpm": 3000.0,
@@ -39,6 +35,6 @@
     "use_distributed_clocks": true,
     "sync_cycle_granularity_ns": 250000,
 
-    "_comment_optional": "Everything else is OPTIONAL: rxpdo/txpdo (derived above), position_tolerance_counts (default counts_per_rev/720), velocity_threshold (default: position-delta), gear_ratio (1.0), peak_current_amps, loop_rate_hz (1000), quick_stop_decel (0x6085) for a controlled ramp-stop. Add only what a bench measurement or the app requires."
+    "_comment_optional": "Everything else is OPTIONAL: position_tolerance_counts (default counts_per_rev/720), velocity_threshold (default: position-delta), gear_ratio (1.0), peak_current_amps, loop_rate_hz (1000), quick_stop_decel (0x6085) for a controlled ramp-stop. Add only what a bench measurement or the app requires."
   }
 }

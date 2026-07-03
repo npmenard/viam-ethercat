@@ -2,16 +2,17 @@
 
 All configs target the REAL A6 on enp86s0. Attribute values come from the
 bench-proven /home/viam/a6-robot.trixie.json, with the campaign deltas:
-  - control_mode "switchable" (tests use SetRPM + GoFor + GoTo on one motor);
-  - NO rxpdo/txpdo blocks (exercises the #61 derived superset map);
+  - #18: NO control_mode and NO rxpdo/txpdo -- the driver is ALWAYS switch-capable
+    (tests use SetRPM + GoFor + GoTo on one motor) and defines the fixed CiA402
+    superset PDO map itself;
   - NO position_tolerance_counts / velocity_threshold (exercises the #59
     0.5-degree default + position-stability reach);
   - #15: move_timeout_ms REMOVED -- the blocking-API wait now has a fixed 10min backstop and the
     RT no-progress watchdog is the real stuck-move safety, so Test6's long 2000-rev move just works.
 
 Scenario variants for the "What to test" list:
-  valid            - the known-good switchable config
-  wrong            - fails config validation (bogus control_mode) -> error in logs
+  valid            - the known-good config
+  wrong            - fails config validation (missing required counts_per_rev) -> error in logs
   wrong_interface  - parses, but the NIC doesn't exist -> runtime init error in logs
   dc_validation    - loop_rate_hz 300 -> cycle 3.333 ms, NOT a multiple of the
                      declared 250 us SYNC0 granularity -> rejected at COMPONENT
@@ -43,7 +44,6 @@ def _base_attributes() -> dict:
     return {
         "interface": NIC,
         "slave": 1,
-        "control_mode": "switchable",
         "max_rpm": 3000.0,
         "motor_rated_current_amps": 2.5,
         "peak_current_amps": 7.5,
@@ -90,7 +90,7 @@ def valid() -> dict:
 
 def wrong() -> dict:
     a = _base_attributes()
-    a["control_mode"] = "torque"  # unsupported -> config parse/validation error in logs
+    del a["counts_per_rev"]  # #18: control_mode is gone, so a missing REQUIRED field is the parse/validation-error case
     return _machine(a)
 
 
