@@ -58,7 +58,6 @@ ServoConfig make_config() {
     c.gear_ratio = 1.0;
     c.counts_per_rev = kCountsPerRev;
     c.position_tolerance_counts = 20;
-    c.velocity_threshold = 1'000'000'000;  // lenient: move-complete is essentially |dpos| <= tol
     c.target_loop_rate_hz = 1000;
     c.require_realtime = false;  // CI has no CAP_SYS_NICE
     c.command_queue_capacity = 64;
@@ -218,18 +217,19 @@ TEST("ServoController: quick-stop OPT-OUT (no decel) -- configure skips the 0x60
 // --- velocity (PV) ----------------------------------------------------------
 
 TEST("ServoController(PV): a displaced, stopped motor reports is_moving == false") {
-    // PV is_moving must be velocity-based: a stopped-but-displaced motor is NOT moving.
-    ServoConfig cfg = make_config();
-    cfg.velocity_threshold = 1000;  // counts/s; PV is_moving = |velocity| > this
-    ServoController ctrl{cfg, sim_factory(Cia402Mode::ProfileVelocity, 50'000)};
+    // PV is_moving is position-STABILITY based (#19: the velocity_threshold override is gone): a motor
+    // that is displaced from zero but no longer advancing (its position ring is stable) is NOT moving.
+    ServoController ctrl{make_config(), sim_factory(Cia402Mode::ProfileVelocity, 50'000)};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
 
     ctrl.set_rpm(60.0);  // integrate a nonzero velocity -> the motor turns
-    CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(300)));
-    CHECK(std::abs(ctrl.position_revs()) > 0.01);  // displaced from zero
+    // Wait for REAL displacement (the position ring reads "moving" while it fills, before the shaft has
+    // actually turned, so gate on the position advancing rather than on is_moving first).
+    CHECK(wait_until([&] { return std::abs(ctrl.position_revs()) > 0.5; }, std::chrono::milliseconds(500)));
+    CHECK(ctrl.is_moving());  // advancing -> position not stable -> moving
 
-    ctrl.set_rpm(0.0);  // stop commanding velocity -> actual stops advancing
+    ctrl.set_rpm(0.0);  // stop commanding velocity -> actual stops advancing -> position stabilizes
     CHECK(wait_until([&] { return !ctrl.is_moving(); }, std::chrono::milliseconds(500)));
     CHECK(std::abs(ctrl.position_revs()) > 0.01);  // STILL displaced, but NOT moving
 }
@@ -390,15 +390,15 @@ TEST("#18: set_fixed_pdo_map materializes the 0x6060 superset RxPDO + full TxPDO
 }
 
 TEST("#64: a MINIMAL config (no tolerances) derives defaults + drives end-to-end") {
-    // Only the required fields; position_tolerance_counts/velocity_threshold 0 -> validated() defaults
-    // them, and the ctor sets the fixed superset map. Proves derive -> validate -> field-resolve -> move.
+    // Only the required fields; position_tolerance_counts 0 -> validated() defaults it, and the ctor
+    // sets the fixed superset map. Proves derive -> validate -> field-resolve -> move.
     ServoConfig c;
     c.ifname = "sim";
     c.max_motor_speed_rpm = 3000.0;
     c.counts_per_rev = kCountsPerRev;
     c.motor_rated_current_amps = 2.5;
     c.require_realtime = false;
-    // position_tolerance_counts / velocity_threshold left 0 -> validated() defaults them.
+    // position_tolerance_counts left 0 -> validated() defaults it.
     ServoController ctrl{c, pp_factory()};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));  // fixed map + gate -> OE

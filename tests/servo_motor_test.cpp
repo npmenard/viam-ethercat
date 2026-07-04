@@ -42,7 +42,6 @@ ServoConfig make_config() {
     c.gear_ratio = 1.0;
     c.counts_per_rev = 131072.0;
     c.position_tolerance_counts = 20;
-    c.velocity_threshold = 1'000'000'000;
     c.target_loop_rate_hz = 1000;
     c.require_realtime = false;  // CI has no CAP_SYS_NICE
     c.command_queue_capacity = 64;

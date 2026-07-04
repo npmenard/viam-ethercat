@@ -35,6 +35,6 @@
     "use_distributed_clocks": true,
     "sync_cycle_granularity_ns": 250000,
 
-    "_comment_optional": "Everything else is OPTIONAL: position_tolerance_counts (default counts_per_rev/720), velocity_threshold (default: position-delta), gear_ratio (1.0), peak_current_amps, loop_rate_hz (1000), quick_stop_decel (0x6085) for a controlled ramp-stop. Add only what a bench measurement or the app requires."
+    "_comment_optional": "Everything else is OPTIONAL: position_tolerance_counts (default counts_per_rev/720), gear_ratio (1.0), loop_rate_hz (1000), quick_stop_decel (0x6085) for a controlled ramp-stop. Add only what a bench measurement or the app requires."
   }
 }

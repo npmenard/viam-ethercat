@@ -42,8 +42,7 @@ struct ServoConfig {
 
     // --- motor limits ---
     double max_motor_speed_rpm = 0.0;       // >= 0; the speed clamp
-    double peak_current_limit_amps = 0.0;   // >= 0
-    double motor_rated_current_amps = 0.0;  // > 0 (A6 datum: amps -> torque per-mille)
+    double motor_rated_current_amps = 0.0;  // > 0 (A6 datum; do_command's per-mille current readback)
     double gear_ratio = 1.0;                // motor revs per output rev; != 0
     double counts_per_rev = 0.0;            // encoder counts per motor rev; > 0 (A6 = 131072)
 
@@ -51,9 +50,9 @@ struct ServoConfig {
     // the module handler -- no config, no override (see servo_motor.cpp read_std_sdo).
     // --- move-complete predicate (noise-robust position-delta, #59) ---
     // reached/is_moving = |actual-target| <= position_tolerance_counts AND the position is STABLE (its
-    // range over the last N cycles <= position_tolerance_counts). Both fields OPTIONAL:
+    // range over the last N cycles <= position_tolerance_counts). #19: the velocity_threshold override
+    // is gone -- is-moving/at-rest is ALWAYS the position-stability heuristic (PP and PV alike).
     std::int32_t position_tolerance_counts = 0;  // >= 0; 0 => DEFAULT counts_per_rev/720 (0.5 deg), set in validated()
-    std::int32_t velocity_threshold = 0;  // >= 0; 0 => use the position-delta stability method; >0 => honor a velocity gate (override)
 
     // --- RT ---
     std::uint32_t target_loop_rate_hz = 1000;  // 1..1000

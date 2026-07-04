@@ -53,7 +53,6 @@ ServoConfig make_config() {
     c.gear_ratio = 1.0;
     c.counts_per_rev = 131072.0;
     c.position_tolerance_counts = 20;
-    c.velocity_threshold = 1'000'000'000;
     c.target_loop_rate_hz = 500;  // gentler under TSan
     c.require_realtime = false;
     c.command_queue_capacity = 64;

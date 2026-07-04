@@ -79,10 +79,8 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     c.counts_per_rev = req_num(attrs, "counts_per_rev");
     c.motor_rated_current_amps = req_num(attrs, "motor_rated_current_amps");
     c.gear_ratio = opt_num(attrs, "gear_ratio", 1.0);
-    c.peak_current_limit_amps = opt_num(attrs, "peak_current_amps", 0.0);
 
     c.position_tolerance_counts = static_cast<std::int32_t>(opt_num(attrs, "position_tolerance_counts", 0.0));
-    c.velocity_threshold = static_cast<std::int32_t>(opt_num(attrs, "velocity_threshold", 0.0));
 
     c.target_loop_rate_hz = static_cast<std::uint32_t>(opt_num(attrs, "loop_rate_hz", 1000.0));
     c.require_realtime = opt_attr<bool>(attrs, "require_realtime").value_or(true);

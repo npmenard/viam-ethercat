@@ -20,12 +20,10 @@ ServoConfig good_config() {
     c.ifname = "eth0";
     c.slave_id = 1;
     c.max_motor_speed_rpm = 3000.0;
-    c.peak_current_limit_amps = 5.0;
     c.motor_rated_current_amps = 2.5;
     c.gear_ratio = 1.0;
     c.counts_per_rev = 131072.0;
     c.position_tolerance_counts = 10;
-    c.velocity_threshold = 5;
     c.target_loop_rate_hz = 1000;
     c.rt_priority = 80;
     c.command_queue_capacity = 64;

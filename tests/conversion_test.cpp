@@ -39,13 +39,4 @@ TEST("rpm<->device velocity (counts/s = rpm/60 * counts_per_rev * gear)") {
     CHECK_EQ(mp::device_velocity_to_rpm(262144, kA6CountsPerRev, 2.0), 60.0);
 }
 
-TEST("amps -> torque per-mille (A6: rated-current scaling, clamp 0..4000)") {
-    CHECK_EQ(mp::amps_to_torque_permille(2.5, 2.5), std::uint16_t{1000});   // rated -> 1000
-    CHECK_EQ(mp::amps_to_torque_permille(1.25, 2.5), std::uint16_t{500});   // half rated
-    CHECK_EQ(mp::amps_to_torque_permille(5.0, 2.5), std::uint16_t{2000});   // 2x rated
-    CHECK_EQ(mp::amps_to_torque_permille(20.0, 2.5), std::uint16_t{4000});  // clamps at 4000
-    CHECK_EQ(mp::amps_to_torque_permille(0.0, 2.5), std::uint16_t{0});
-    CHECK_EQ(mp::amps_to_torque_permille(5.0, 0.0), std::uint16_t{0});  // no rated current -> 0
-}
-
 TEST_MAIN()

@@ -775,12 +775,12 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
     at_rest_ = pos_stable;  // #18: the driver's rest verdict, read (1-cycle stale) by run_mode_switch's stop-first gate
     const bool pos_near_target = std::abs(actual - target_counts_) <= config_.position_tolerance_counts;
     const bool at_target = reached_target(pos_near_target, pos_stable, status);
-    const bool pv_stopped = (config_.velocity_threshold > 0) ? (std::abs(velocity) <= config_.velocity_threshold) : pos_stable;
 
-    // is_moving: PP = an active positioned move not yet at target; PV = the drive is not at rest.
+    // is_moving: PP = an active positioned move not yet at target; PV = the drive is not at rest. #19:
+    // at-rest is ALWAYS the position-stability heuristic now (the velocity_threshold override is gone).
     // target_counts_ is never assigned in PV, so the PP position predicate must NOT drive PV moving.
     const bool moving =
-        commanded_is_pp() ? (powered && move_active && !at_target) : (powered && !pv_stopped);  // #61: switchable uses the live intent
+        commanded_is_pp() ? (powered && move_active && !at_target) : (powered && !pos_stable);  // #61: switchable uses the live intent
     state_.moving.store(moving, std::memory_order_relaxed);
 
     // PP generation protocol: completion (PP-only via move_active). #17: the no-progress watchdog is

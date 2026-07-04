@@ -37,7 +37,6 @@
         "_comment_motor": "CONFIRM against the MOTOR nameplate (these are motor-, not drive-, specific): rated speed, rated current, peak current.",
         "max_rpm": 3000.0,
         "motor_rated_current_amps": 2.5,
-        "peak_current_amps": 7.5,
         "_comment_kinematics": "counts_per_rev = 2^17 = 131072 (A6 single-turn encoder resolution -- CONFIRM the encoder bits on the nameplate/ESI). gear_ratio = motor revs per output rev (CONFIRM the mechanical reduction; 1.0 = direct drive).",
         "counts_per_rev": 131072.0,
         "gear_ratio": 1.0,
@@ -47,11 +46,8 @@
         "loop_rate_hz": 1000,
         "use_distributed_clocks": true,
         "sync_cycle_granularity_ns": 250000,
-        "_comment_tuning": "Move-complete + watchdog tuning -- CONFIRM/tune on the bench. velocity_threshold is in device velocity units (counts/s).",
+        "_comment_tuning": "Move-complete tuning -- CONFIRM on the bench. position_tolerance_counts is the position-stability band (counts); reached/is_moving is position-stability based (#59), not velocity-gated.",
         "position_tolerance_counts": 200,
-        "velocity_threshold": 50000,
-        "handshake_timeout_cycles": 1000,
-        "stall_threshold_cycles": 2000,
         "command_queue_capacity": 64,
         "max_consecutive_wkc_errors": 5
       }

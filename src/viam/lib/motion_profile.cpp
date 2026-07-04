@@ -46,13 +46,4 @@ double clamp_rpm(double rpm, double max_rpm) noexcept {
     return std::clamp(rpm, -bound, bound);
 }
 
-std::uint16_t amps_to_torque_permille(double amps, double rated_current_amps) noexcept {
-    if (rated_current_amps <= 0.0) {
-        return 0;
-    }
-    const double permille = (amps / rated_current_amps) * 1000.0;
-    const double clamped = std::clamp(permille, 0.0, 4000.0);
-    return static_cast<std::uint16_t>(std::llround(clamped));
-}
-
 }  // namespace ethercat::servo

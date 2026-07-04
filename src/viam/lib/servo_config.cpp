@@ -42,9 +42,6 @@ void ServoConfig::validate() const {
     if (!(max_motor_speed_rpm >= 0.0)) {  // also rejects NaN
         throw ConfigError("servo config: 'max_motor_speed_rpm' must be >= 0");
     }
-    if (peak_current_limit_amps < 0.0) {
-        throw ConfigError("servo config: 'peak_current_limit_amps' must be >= 0");
-    }
     if (!(motor_rated_current_amps > 0.0)) {
         throw ConfigError(
             "servo config: 'motor_rated_current_amps' must be > 0 "
@@ -58,9 +55,6 @@ void ServoConfig::validate() const {
     }
     if (position_tolerance_counts < 0) {
         throw ConfigError("servo config: 'position_tolerance_counts' must be >= 0");
-    }
-    if (velocity_threshold < 0) {
-        throw ConfigError("servo config: 'velocity_threshold' must be >= 0");
     }
     if (target_loop_rate_hz == 0 || target_loop_rate_hz > 1000) {
         throw ConfigError("servo config: 'target_loop_rate_hz' " + std::to_string(target_loop_rate_hz) + " out of range (1..1000)");

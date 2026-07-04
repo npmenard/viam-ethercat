@@ -5,10 +5,10 @@ bench-proven /home/viam/a6-robot.trixie.json, with the campaign deltas:
   - #18: NO control_mode and NO rxpdo/txpdo -- the driver is ALWAYS switch-capable
     (tests use SetRPM + GoFor + GoTo on one motor) and defines the fixed CiA402
     superset PDO map itself;
-  - NO position_tolerance_counts / velocity_threshold (exercises the #59
-    0.5-degree default + position-stability reach);
-  - #15: move_timeout_ms REMOVED -- the blocking-API wait now has a fixed 10min backstop and the
-    RT no-progress watchdog is the real stuck-move safety, so Test6's long 2000-rev move just works.
+  - NO position_tolerance_counts (exercises the #59 0.5-degree default +
+    position-stability reach; #19: the velocity_threshold override is gone);
+  - #17: the blocking-API wait has NO timeout and there is no no-progress watchdog --
+    a move parks until it completes / the client stops it, so Test6's long 2000-rev move just works.
 
 Scenario variants for the "What to test" list:
   valid            - the known-good config
@@ -46,7 +46,6 @@ def _base_attributes() -> dict:
         "slave": 1,
         "max_rpm": 3000.0,
         "motor_rated_current_amps": 2.5,
-        "peak_current_amps": 7.5,
         "counts_per_rev": 131072.0,
         "gear_ratio": 1.0,
         "require_realtime": True,
@@ -54,8 +53,6 @@ def _base_attributes() -> dict:
         "loop_rate_hz": 1000,
         "use_distributed_clocks": True,
         "sync_cycle_granularity_ns": 250000,
-        "handshake_timeout_cycles": 1000,
-        "stall_threshold_cycles": 2000,
         "command_queue_capacity": 64,
         "max_consecutive_wkc_errors": 5,
         # #15 item 2: sync_fault_code, vendor_fault_reset, and fault_code_labels are NO LONGER config

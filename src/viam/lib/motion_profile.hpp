@@ -28,10 +28,4 @@ double device_velocity_to_rpm(std::int32_t dev, double counts_per_rev, double ge
 // a negative bound is treated as 0 (fully clamped).
 double clamp_rpm(double rpm, double max_rpm) noexcept;
 
-// A6 torque/current limit: per-mille of rated torque (0..4000), derived from a
-// current limit (amps) via the motor's rated current. permille =
-// amps/rated_current_amps * 1000, clamped to [0, 4000]. Returns 0 if
-// rated_current_amps <= 0 (no valid conversion).
-std::uint16_t amps_to_torque_permille(double amps, double rated_current_amps) noexcept;
-
 }  // namespace ethercat::servo

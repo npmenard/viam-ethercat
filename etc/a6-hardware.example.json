@@ -32,7 +32,6 @@
     "_comment_motor": "CONFIRM against the MOTOR nameplate (these are motor-, not drive-, specific): rated speed, rated current, peak current.",
     "max_rpm": 3000.0,
     "motor_rated_current_amps": 2.5,
-    "peak_current_amps": 7.5,
     "_comment_kinematics": "counts_per_rev = 2^17 = 131072 (A6 single-turn encoder resolution -- CONFIRM the encoder bits on the nameplate/ESI). gear_ratio = motor revs per output rev (CONFIRM the mechanical reduction; 1.0 = direct drive).",
     "counts_per_rev": 131072.0,
     "gear_ratio": 1.0,
@@ -42,11 +41,8 @@
     "loop_rate_hz": 1000,
     "use_distributed_clocks": true,
     "sync_cycle_granularity_ns": 250000,
-    "_comment_tuning": "reached/is_moving is POSITION-STABILITY based (#59): stopped/reached = actual position (0x6064) not changing beyond position_tolerance_counts over N cycles -- NOT a velocity threshold, so there is NO velocity-noise-floor tuning to do (the A6's 0x606C carries a +/-2000-4000 c/s noise floor; see a6-quirks Q13). position_tolerance_counts is OPTIONAL, default = counts_per_rev/720 (~0.5 deg); the 200 below is an explicit example (~0.55 deg at 131072 c/rev). velocity_threshold is now an OPTIONAL OVERRIDE (most configs omit it); shown here for illustration only.",
+    "_comment_tuning": "reached/is_moving is POSITION-STABILITY based (#59): stopped/reached = actual position (0x6064) not changing beyond position_tolerance_counts over N cycles -- NOT a velocity threshold, so there is NO velocity-noise-floor tuning to do (the A6's 0x606C carries a +/-2000-4000 c/s noise floor; see a6-quirks Q13). position_tolerance_counts is OPTIONAL, default = counts_per_rev/720 (~0.5 deg); the 200 below is an explicit example (~0.55 deg at 131072 c/rev).",
     "position_tolerance_counts": 200,
-    "velocity_threshold": 50000,
-    "handshake_timeout_cycles": 1000,
-    "stall_threshold_cycles": 2000,
     "command_queue_capacity": 64,
     "max_consecutive_wkc_errors": 5
   }
