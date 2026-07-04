@@ -343,13 +343,6 @@ std::uint16_t SoemBackend::al_status_code(std::uint16_t slave) const noexcept {
     return impl_->ctx.slavelist[slave].ALstatuscode;
 }
 
-std::string SoemBackend::al_status_message(std::uint16_t slave) const {
-    if (slave < 1 || slave > impl_->slave_count) {
-        return {};
-    }
-    return ec_ALstatuscode2string(impl_->ctx.slavelist[slave].ALstatuscode);
-}
-
 std::string SoemBackend::describe_al_code(std::uint16_t code) const {
     // #71/#25: SOEM's human string for an arbitrary (latched) AL code -- no slave read, no I/O.
     return ec_ALstatuscode2string(code);

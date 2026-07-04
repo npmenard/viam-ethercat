@@ -55,20 +55,4 @@ inline long dc_phase_correction(std::int64_t dc_time,
     return corr;
 }
 
-// Is the phase locked? |(dc_time - shift) mod cycle| within `band_ns` of 0 (the
-// warmup converges until this holds, then requests OP).
-inline bool dc_phase_locked(std::int64_t dc_time,
-                            std::int64_t cycle_ns,
-                            std::int64_t shift_ns = 0,
-                            std::int64_t band_ns = 50'000) noexcept {
-    if (dc_time == 0 || cycle_ns == 0) {
-        return false;
-    }
-    std::int64_t delta = (((dc_time - shift_ns) % cycle_ns) + cycle_ns) % cycle_ns;
-    if (delta > cycle_ns / 2) {
-        delta -= cycle_ns;
-    }
-    return (delta < 0 ? -delta : delta) <= band_ns;
-}
-
 }  // namespace ethercat

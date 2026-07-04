@@ -180,9 +180,6 @@ class Master {
     std::uint16_t al_status_code(std::uint16_t slave) const noexcept {
         return backend_->al_status_code(slave);
     }
-    std::string al_status_message(std::uint16_t slave) const {
-        return backend_->al_status_message(slave);
-    }
     // #71/#25: the last NON-ZERO ESC AL status code observed during AWAIT_OP, latched across the
     // whole bring-up. At a give-up the LIVE al_status_code(slave) can read 0 (reack_op ACKs the
     // SAFE_OP+ERROR on the very cycle we time out), so a consumer surfacing "why bring-up failed"

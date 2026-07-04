@@ -110,15 +110,11 @@ class EcatBackend {
     // #71: the ESC AL STATUS CODE for a slave (1-based) -- the standard EtherCAT "why the drive
     // refused an AL state transition" (e.g. 0x0027 "Freerun not supported", 0x0030 "Invalid DC
     // sync config", 0x001B "SM watchdog"). Cached from the last state check (no port I/O), so it
-    // is safe to read at a bring-up give-up. 0 = no error. al_status_message returns SOEM's
-    // human string for it. Default 0/empty (the sim overrides to model a refusal).
+    // is safe to read at a bring-up give-up. 0 = no error. Default 0 (the sim overrides to model a
+    // refusal); describe_al_code() below turns the code into text.
     virtual std::uint16_t al_status_code(std::uint16_t slave) const noexcept {
         (void)slave;
         return 0;
-    }
-    virtual std::string al_status_message(std::uint16_t slave) const {
-        (void)slave;
-        return {};
     }
     // #71/#25: human string for an ARBITRARY AL code (not a per-slave live read) -- lets a consumer
     // describe a latched code (Master::bringup_al_code()). Default: a bare hex rendering; SoemBackend
