@@ -78,13 +78,11 @@ extern "C" void on_sigint(int) {
 // bit4-handshake --move-pp) or CyclicSyncPosition (the streamed --move-sine). Both
 // reuse the SAME PDO map -- 0x607A serves the PP target AND the CSP streamed target --
 // so one builder covers both; only the post-enable control semantics differ.
-MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode, bool use_dc = true) {
+MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
     MasterConfig cfg;
     cfg.ifname = ifname;
-    cfg.target_loop_rate_hz = kLoopHz;  // 1 ms SYNC0 = 4 x 250 us (A6-legal)
-    // #71 bench check: --no-dc requests OP under FREE-RUN. The A6 supports ONLY DC sync, so it
-    // refuses with AL 0x0027 "Freerun not supported" -- exercises the AL-status give-up diagnostic.
-    cfg.use_distributed_clocks = use_dc;  // A6 supports ONLY DC sync (true); --no-dc forces the free-run refusal
+    cfg.target_loop_rate_hz = kLoopHz;    // 1 ms SYNC0 = 4 x 250 us (A6-legal)
+    cfg.use_distributed_clocks = true;    // the A6 supports ONLY DC sync
     cfg.dc_settle_cycles = 1000;          // ~1 s post-OP grace while the phase finishes locking
     cfg.max_consecutive_wkc_errors = 5;
     // The bring-up SETTLE bound uses MasterConfig's default (dc_op_gate_cycles). SYNC0 is
@@ -126,32 +124,20 @@ MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode, bool us
     return cfg;
 }
 
-// #72: run ONE full bring-up -> hold -> teardown lifecycle. --cycle repeats this back-to-back on the
-// SAME NIC, each iteration constructing a FRESH Master + Runner and destroying them (the in-place
-// reconfigure the module does when its config changes). A re-bring-up that leaves DC marginal shows up
-// as a mid-hold badWKC climb / OP loss (StopReason::BusFault) on cycle >= 2, or a re-bring-up that no
-// longer reaches OP. `hold`.count()==0 => run until SIGINT/abort (the single-run default, unchanged).
-struct CycleOutcome {
-    StopReason reason = StopReason::None;
-    std::uint64_t bad_cycles = 0;
-    std::uint64_t total_cycles = 0;
-    std::uint16_t al_code = 0;
-    bool reached_op = false;
-};
-
-CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc, std::chrono::seconds hold, int cyc, int ncycles) {
-    CycleOutcome oc;
+// Run ONE full bring-up -> hold -> teardown lifecycle: construct a fresh Master + Runner, bring
+// the A6 to OP, run the control policy until SIGINT/abort, then tear down. Returns the process
+// exit code (0 = clean stop, 1 = an init/configure/RT-start failure or a bring-up/bus abort).
+int run(const Options& opt, Cia402Mode mode) {
     const std::uint16_t slave = 1;
 
-    Master master(build_a6_config(opt.ifname, mode, /*use_dc=*/!no_dc), std::make_unique<SoemBackend>());
+    Master master(build_a6_config(opt.ifname, mode), std::make_unique<SoemBackend>());
 
-    // --- Stage A: open + enumerate (re-init on cycle >= 2 re-opens the NIC after the prior close()).
+    // --- Stage A: open + enumerate.
     try {
         master.init();
     } catch (const Error& e) {
         std::cerr << "init failed: " << e.what() << '\n';
-        oc.reason = StopReason::RtSetupFailed;
-        return oc;
+        return 1;
     }
     std::cout << "[A] bus up: A6 enumerated (1 slave, matches config).\n";
     const SlaveInfo info = master.slave_info(1);
@@ -165,8 +151,7 @@ CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc, std:
     } catch (const Error& e) {
         std::cerr << "[B] configure failed: " << e.what() << "\n"
                   << "    (an AL-reject at the SAFE-OP transition lands here; the AL status code in the message names why.)\n";
-        oc.reason = StopReason::BringupAborted;
-        return oc;
+        return 1;
     }
     std::cout << "[B] configured to SAFE-OP, DC enabled (expected WKC=" << master.expected_wkc()
               << "); handing the bus to the Runner (bring-up pump: SETTLE -> request OP -> AWAIT_OP)...\n";
@@ -201,6 +186,7 @@ CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc, std:
 
     StopReason reason = StopReason::None;
     std::string al_msg;
+    std::uint16_t al_code = 0;
     {
         Runner runner(master, rc);
         try {
@@ -209,8 +195,7 @@ CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc, std:
         } catch (const Error& e) {
             std::cerr << "[B] runner start failed: " << e.what() << '\n';
             master.close();
-            oc.reason = StopReason::RtSetupFailed;
-            return oc;
+            return 1;
         }
 
         const auto decode_modes = [](std::uint32_t bits) {
@@ -228,44 +213,9 @@ CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc, std:
 
         auto last_print = std::chrono::steady_clock::now() - std::chrono::seconds(1);
         auto last_sdo = std::chrono::steady_clock::now();
-        // #72 hold tracking: mark when Running first begins, then hold a fixed wall time and emit a
-        // per-minute health line (badWKC delta since OP + dcPhase) so a slow DC drift is visible.
-        bool saw_running = false;
-        std::chrono::steady_clock::time_point op_start;
-        std::uint64_t bad_at_op = 0;
-        auto last_health = std::chrono::steady_clock::now();
         while (runner.status().phase != RunnerPhase::Stopped) {
             if (g_stop.load()) {
                 runner.request_stop();  // SIGINT -> graceful stop (the window runs the disable policy)
-            }
-            const RunnerStatus st0 = runner.status();
-            if (st0.phase == RunnerPhase::Running && !saw_running) {
-                saw_running = true;
-                oc.reached_op = true;
-                op_start = std::chrono::steady_clock::now();
-                bad_at_op = tel.bad_wkc.load(std::memory_order_relaxed);
-                last_health = op_start;
-                if (hold.count() > 0) {
-                    std::cout << "[cycle " << cyc << "/" << ncycles << "] OP reached; holding " << hold.count()
-                              << "s, per-minute health below...\n";
-                }
-            }
-            if (hold.count() > 0 && saw_running && st0.phase == RunnerPhase::Running) {
-                const auto now2 = std::chrono::steady_clock::now();
-                const auto held = std::chrono::duration_cast<std::chrono::seconds>(now2 - op_start);
-                if (now2 - last_health >= std::chrono::seconds(60)) {
-                    last_health = now2;
-                    const Status status{tel.sw.load(std::memory_order_relaxed)};
-                    const std::uint64_t bad_now = tel.bad_wkc.load(std::memory_order_relaxed);
-                    std::cout << "[cycle " << cyc << "/" << ncycles << "] +" << held.count() << "s OP-HOLD: " << to_string(status.decode())
-                              << " sw=0x" << std::hex << status.raw << std::dec << " 0x603F=0x" << std::hex
-                              << tel.fc.load(std::memory_order_relaxed) << std::dec << " badWKC=" << bad_now << " (+"
-                              << (bad_now - bad_at_op) << " since OP)"
-                              << " dcPhase=" << tel.dc_phase_ns.load(std::memory_order_relaxed) << "ns\n";
-                }
-                if (held >= hold) {
-                    runner.request_stop();  // #72: hold elapsed -> teardown -> next cycle re-brings-up
-                }
             }
             // #22 mid-run direct non-RT SDO reads (only while Running; #15 -- the caller drives the mailbox exchange).
             if (opt.sdo_probe && runner.status().phase == RunnerPhase::Running &&
@@ -333,40 +283,33 @@ CycleOutcome run_one_cycle(const Options& opt, Cia402Mode mode, bool no_dc, std:
             // Prefer the LATCHED last-non-zero AL code from AWAIT (#71/#25): the live al_status_code()
             // can read 0 at the give-up (reack_op ACKs the SAFE_OP+ERROR on the timeout cycle), which
             // is exactly what defeated the first cut of this diagnostic (printed "0x0 No error").
-            oc.al_code = master.bringup_al_code();
-            if (oc.al_code == 0) {  // no non-zero code was seen the whole bring-up -- fall back to the live read
-                oc.al_code = master.al_status_code(slave);
+            al_code = master.bringup_al_code();
+            if (al_code == 0) {  // no non-zero code was seen the whole bring-up -- fall back to the live read
+                al_code = master.al_status_code(slave);
             }
-            al_msg = master.describe_al_code(oc.al_code);
+            al_msg = master.describe_al_code(al_code);
         }
     }  // <-- ~Runner: bounded stop -> join -> rt_active(false) -> master.close()
 
     const WkcStats stats = master.wkc_stats();
-    oc.reason = reason;
-    oc.bad_cycles = stats.bad_cycles;
-    oc.total_cycles = stats.total_cycles;
-    std::cout << "\n=== cycle " << cyc << "/" << ncycles << " done. stop=" << to_string(reason)
-              << (control.safety_abort() ? " (CSP SAFETY ABORT)" : "") << " | bad-WKC cycles: " << stats.bad_cycles << " / "
-              << stats.total_cycles << " ===\n";
+    std::cout << "\n=== done. stop=" << to_string(reason) << (control.safety_abort() ? " (CSP SAFETY ABORT)" : "")
+              << " | bad-WKC cycles: " << stats.bad_cycles << " / " << stats.total_cycles << " ===\n";
     if (reason == StopReason::BringupAborted) {
-        std::cout << "[#71] bring-up gave up. AL status = 0x" << std::hex << oc.al_code << std::dec << " (" << al_msg << ")"
-                  << (oc.al_code == 0x0027 ? " -- FREERUN NOT SUPPORTED: this drive requires DC (drop --no-dc)" : "") << '\n';
+        std::cout << "[#71] bring-up gave up. AL status = 0x" << std::hex << al_code << std::dec << " (" << al_msg << ")"
+                  << (al_code == 0x0027 ? " -- FREERUN NOT SUPPORTED: this drive requires DC" : "") << '\n';
     }
-    return oc;
-}  // <-- master dtor here (close already ran in ~Runner); NIC port released for the next cycle's init()
+    return (reason == StopReason::BringupAborted || reason == StopReason::RtSetupFailed || reason == StopReason::BusFault) ? 1 : 0;
+}  // <-- master dtor here (close already ran in ~Runner); NIC port released.
 
 }  // namespace
 
 int main(int argc, char** argv) {
     Options opt;
-    bool no_dc = false;  // #71: --no-dc -> free-run bring-up (the A6 refuses OP; AL-status give-up check)
     std::vector<std::string> args(argv + 1, argv + argc);
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         if (a == "--enable") {
             opt.enable = true;
-        } else if (a == "--no-dc") {
-            no_dc = true;  // #71: bring up under free-run (no SYNC0) -> the A6 refuses OP (AL 0x0027)
         } else if (a == "--reset-fault") {
             opt.reset_fault = true;
         } else if (a == "--move-pp" && i + 1 < args.size()) {
@@ -398,12 +341,6 @@ int main(int argc, char** argv) {
             opt.sine_period = std::stod(args[++i]);
         } else if (a == "--follow-err-limit" && i + 1 < args.size()) {
             opt.follow_err_limit = std::stoi(args[++i]);
-        } else if (a == "--cycle" && i + 1 < args.size()) {
-            opt.cycle_count = std::stoi(args[++i]);  // #72: N back-to-back reconfigure cycles
-        } else if (a == "--hold-seconds" && i + 1 < args.size()) {
-            opt.hold_seconds = std::stoi(args[++i]);  // #72: final-cycle soak seconds
-        } else if (a == "--early-hold" && i + 1 < args.size()) {
-            opt.early_hold_seconds = std::stoi(args[++i]);  // #72: per-early-cycle hold seconds
         } else if (a.rfind("--", 0) != 0) {
             opt.ifname = a;
         } else {
@@ -435,12 +372,7 @@ int main(int argc, char** argv) {
                       << "  --sdo-probe: #22 steady-state SDO -- while Running, read 0x6079 (DC-link V), 0x6078 (current),\n"
                       << "               0x6502 (supported modes) every ~500ms via the direct non-RT SDO path (#15); print\n"
                       << "               raw + converted. Safe with a plain hold (no --enable); exercises mid-run mailbox reads.\n"
-                      << "  --reset-fault: clear a latent drive fault at bring-up via the A6 vendor SDO 0x2031:01=1.\n"
-                      << "  --cycle N [--early-hold S] [--hold-seconds S]: #72 in-place-reconfigure repro -- run N\n"
-                      << "               back-to-back bring-up->hold->teardown lifecycles on the same NIC (no power cycle,\n"
-                      << "               the module's reconfigure). Early cycles hold --early-hold s (def 20); the LAST holds\n"
-                      << "               --hold-seconds s (def 600 = 10min soak). Per-minute WKC/dcPhase health line; a\n"
-                      << "               mid-hold WKC drop-out or a re-bring-up that won't reach OP is flagged [#72].\n";
+                      << "  --reset-fault: clear a latent drive fault at bring-up via the A6 vendor SDO 0x2031:01=1.\n";
             return 2;
         }
     }
@@ -486,49 +418,5 @@ int main(int argc, char** argv) {
               << "[dc] phase-lock target = auto(mid-cycle) | SYNC0 CyclShift = 0ns (config knob)"
               << " | fault-reset at bring-up = " << (opt.reset_fault ? "ON (vendor 0x2031:01=1)" : "off") << "\n\n";
 
-    const int ncycles = std::max(1, opt.cycle_count);
-    const std::chrono::seconds early_hold{opt.early_hold_seconds};
-    const std::chrono::seconds final_hold{opt.hold_seconds};
-    CycleOutcome last;
-    int worst_rc = 0;
-    for (int cyc = 1; cyc <= ncycles; ++cyc) {
-        if (opt.cycle_count > 0) {
-            std::cout << "\n========== CYCLE " << cyc << "/" << ncycles
-                      << (cyc == 1 ? " (fresh bring-up)" : " (in-place re-bring-up, NO power cycle -- #72 reconfigure repro)")
-                      << " ==========\n";
-        }
-        // #72: --cycle holds each cycle a fixed wall time -- short on early cycles, the long soak on the
-        // last -- then tears down and re-brings-up. Single-run (no --cycle) => hold 0 = run until
-        // SIGINT/abort (unchanged behavior).
-        const std::chrono::seconds hold = opt.cycle_count == 0 ? std::chrono::seconds{0} : (cyc == ncycles ? final_hold : early_hold);
-        last = run_one_cycle(opt, mode, no_dc, hold, cyc, ncycles);
-        if (last.reason == StopReason::BringupAborted || last.reason == StopReason::RtSetupFailed) {
-            worst_rc = 1;
-        }
-        if (last.reason == StopReason::BusFault) {
-            worst_rc = 1;
-            std::cout << "[#72] *** DROP-OUT on cycle " << cyc << "/" << ncycles
-                      << ": bus fault (WKC latch) mid-hold -- the reconfigure-DC-drift signature. ***\n";
-        }
-        if (opt.cycle_count > 0 && cyc >= 2 && !last.reached_op) {
-            worst_rc = 1;
-            std::cout << "[#72] *** re-bring-up on cycle " << cyc << "/" << ncycles << " never reached OP (stop=" << to_string(last.reason)
-                      << ") -- residual DC/config poisoning from the prior teardown. ***\n";
-        }
-        if (g_stop.load()) {
-            std::cout << "[cycle] SIGINT -- stopping the cycle loop.\n";
-            break;
-        }
-        if (cyc < ncycles) {
-            // Brief settle between teardown and the next init() -- the A6's enumeration is intermittent
-            // right after a close() (a known retry quirk); this does NOT mask the DC drift, which shows
-            // during the multi-minute OP hold, not at enumerate.
-            std::cout << "[cycle] teardown complete; re-bring-up next (no power cycle)...\n";
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-    }
-    if (opt.cycle_count > 0) {
-        std::cout << "\n========== --cycle SUMMARY: " << ncycles << " cycles, final stop=" << to_string(last.reason) << " ==========\n";
-    }
-    return worst_rc;
+    return run(opt, mode);
 }
