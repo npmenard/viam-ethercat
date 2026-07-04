@@ -11,7 +11,8 @@
 //                       holding torque, NO commanded motion).
 //   --move-pp R [RPM]  after enabling, command a RELATIVE PP move of R revs at
 //                       RPM (default 60) via the bit4 new-setpoint handshake and
-//                       watch convergence. *** MOTION -- opt-in only. ***
+//                       watch convergence. *** MOTION -- opt-in only. *** SINGLE-MODE:
+//                       needs the drive already in Profile-Position (no mode-ensure; #17/#18).
 //   --move-sine        after enabling, stream a CSP soft-started sine.
 //                       *** MOTION -- opt-in only. ***
 //
@@ -426,6 +427,9 @@ int main(int argc, char** argv) {
                       << "               (no jump) + ramped (no velocity step). --follow-err-limit N (counts, def 5000):\n"
                       << "               abort+disable if |commanded-actual| exceeds it. Mutually exclusive with --move-pp.\n"
                       << "  --move-pp REVS [RPM]: *** MOTION (needs --enable) *** PP-mode relative move via the bit4 handshake.\n"
+                      << "               NOTE (#17/#18): this tool is SINGLE-MODE -- it does NOT switch modes; --move-pp needs\n"
+                      << "               the drive already in Profile-Position. Runtime mode-switch is the VIAM DRIVER's job\n"
+                      << "               (validated by the RDK campaign); --move-sine is the tool's primary energized health check.\n"
                       << "  --csp-probe: NON-energizing diagnostic -- bring up in CSP mode (0x6060=8), hold at\n"
                       << "               ReadyToSwitchOn (NO enable), print feedback.\n"
                       << "  --sdo-probe: #22 steady-state SDO -- while Running, read 0x6079 (DC-link V), 0x6078 (current),\n"

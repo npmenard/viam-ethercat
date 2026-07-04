@@ -8,30 +8,24 @@
 // cyclic pacer, and the bring-up-to-OPERATIONAL pump. ADDITIVE in P3a -- neither
 // consumer is migrated yet (P3b/P3c do that, behavior-preserving + HW-gated).
 //
-// Layering: these live ABOVE Master (DcPacer + run_to_operational drive
+// Layering: these live ABOVE Master (DcPacer drives the phase-locked cadence around
 // Master::bringup_step / dc_time), keeping Master itself pure bus-policy. The DC
 // math is dc_sync.hpp's dc_phase_correction (the SOEM ec_sync PI), unchanged.
 //
 // RT-safety: setup()/lock_current() are non-RT prelude (called ONCE before the
 // loop). DcPacer::pace() and step() are noexcept and allocation-free -- safe on
-// the cyclic path. run_to_operational() is the bring-up pump (pre-steady-state).
+// the cyclic path. (#19: the standalone run_to_operational bring-up pump is gone --
+// the Runner inlines its own bring-up loop around bringup_step + the DcPacer.)
 
 #include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
-#include <functional>
 
 #include "ethercat/dc_sync.hpp"
 
 namespace ethercat {
-
-// Forward declarations (run_to_operational is defined in realtime.cpp, so the
-// header doesn't pull in master.hpp). BringupStatus has a fixed underlying type,
-// so it can be forward-declared.
-class Master;
-enum class BringupStatus : std::uint8_t;
 
 namespace realtime {
 
@@ -180,29 +174,6 @@ class DcPacer {
     std::uint64_t next_;
     std::int64_t integral_ = 0;
 };
-
-// Pump Master::bringup_step() to a terminal state, owning the phase-locked cadence
-// via `pacer`. Per iteration: query `sync_faulted()` (the caller's read of the
-// drive's Er74.1 "no SYNC0" from the prior step's feedback -- keeps Master free of
-// CiA402 semantics), step the bring-up, then pace() the cycle. Returns when the
-// bring-up reaches Operational or Aborted, or BringupStatus::Aborted if `timeout`
-// elapses first (a bounded give-up -- repeated Er74 OP-entry wedges the A6).
-//
-// OPTIONAL `observer` (#40 item 2): a lightweight callable invoked once per pump cycle
-// with (status-this-cycle, cycle-counter) -- the diagnostics seam that let a6_validate
-// migrate here without losing its per-N-tick dcPhase prints (the caller's lambda
-// captures &master for dc_time(); the observer runs ON THE PUMP THREAD, so that capture
-// is same-thread safe). Returning FALSE stops the pump -> BringupStatus::Aborted (one
-// defined return; doubles as the caller's stop channel, e.g. a SIGINT flag).
-// Default-empty = zero cost: the bare consumer (#21) stays a one-liner.
-//
-// The ServoController KEEPS its inline prelude (it publishes the drive-fault tier on
-// abort, which this thin pump does not) -- per the locked P3c scope.
-BringupStatus run_to_operational(Master& master,
-                                 DcPacer& pacer,
-                                 const std::function<bool()>& sync_faulted,
-                                 std::chrono::milliseconds timeout,
-                                 const std::function<bool(BringupStatus, std::uint64_t)>& observer = {});
 
 }  // namespace realtime
 }  // namespace ethercat

@@ -263,8 +263,9 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
     // Strategy selection is the INPUT: pace(dc ? dc_time : 0).
     realtime::DcPacer pacer(period_ns);  // mid-cycle phase target (the #40 default)
 
-    // --- BRING-UP (the run_to_operational internals, inlined so this pacer is THE
-    // pacer): pace + bringup_step(OR over the controls' sync_faulted), bounded by
+    // --- BRING-UP (inlined here so this pacer is THE pacer, #19: the standalone
+    // realtime::run_to_operational pump is gone): pace + bringup_step(OR over the
+    // controls' sync_faulted), bounded by
     // bringup_timeout. EXACTLY ONE OP request per start() -- bringup_step owns the
     // single request; every abort path below exits WITHOUT re-entering bring-up
     // (the no-hammer invariant; restart = the consumer's call via a fresh Runner).

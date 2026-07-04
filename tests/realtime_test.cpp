@@ -13,54 +13,15 @@
 #include <thread>
 
 #include "ethercat/dc_sync.hpp"
-#include "ethercat/master.hpp"
 #include "ethercat/realtime.hpp"
-#include "ethercat/sim_backend.hpp"
 #include "test_harness.hpp"
 
 namespace realtime = ethercat::realtime;
-using ethercat::BringupStatus;
-using ethercat::Cia402Mode;
 using ethercat::dc_phase_correction;
-using ethercat::Master;
-using ethercat::MasterConfig;
-using ethercat::SimBackend;
-using ethercat::SimSlaveModel;
-using ethercat::SlaveConfig;
 
 namespace {
 constexpr std::uint64_t kPeriod = 1'000'000;  // 1 ms
 constexpr std::int64_t kShift = static_cast<std::int64_t>(kPeriod) / 2;
-
-// A6-ish single-slave sim rig (the pdo_access_test shape) for run_to_operational.
-MasterConfig make_config() {
-    SlaveConfig sc;
-    sc.slave_id = 1;
-    sc.rxpdo.pdo_indices = {0x1600};
-    sc.rxpdo.entries[0x1600] = {{0x6040, 0, 16}, {0x607A, 0, 32}};
-    sc.txpdo.pdo_indices = {0x1A00};
-    sc.txpdo.entries[0x1A00] = {{0x6041, 0, 16}, {0x6064, 0, 32}};
-    sc.default_mode = Cia402Mode::ProfilePosition;
-
-    MasterConfig cfg;
-    cfg.ifname = "sim0";
-    cfg.use_distributed_clocks = true;  // SYNC0 framing: the bring-up path this pump exists for
-    cfg.dc_op_gate_cycles = 2;          // short SETTLE so the test runs in tens of ms
-    cfg.slaves = {sc};
-    return cfg;
-}
-
-std::vector<SimSlaveModel> make_models() {
-    SimSlaveModel m;
-    m.output_bytes = 6;
-    m.input_bytes = 6;
-    m.ctrlword_off = 0;
-    m.target_off = 2;
-    m.statusword_off = 0;
-    m.actual_off = 2;
-    m.mode = Cia402Mode::ProfilePosition;
-    return {m};
-}
 }  // namespace
 
 // monotonic_ns is the clock the pacer sleeps against; must be monotone non-decreasing.
@@ -185,37 +146,6 @@ TEST("realtime::setup + lock_current are noexcept + callable offline") {
     CHECK(true);           // reaching here = no throw/crash
 }
 
-// (#31 P3c) run_to_operational pump: a healthy sim bring-up reaches Operational, and the
-// bounded give-up returns Aborted (does not hang) when sync never establishes. This was
-// defined-but-unconsumed after P3b kept a6_validate's diagnostic loop explicit (its
-// production consumer is the thin #21 program) -- verified here so it never ships dead.
-TEST("realtime::run_to_operational drives a healthy sim Master to Operational") {
-    Master m{make_config(), std::make_unique<SimBackend>(make_models())};
-    m.init();
-    m.configure();
-    realtime::DcPacer pacer(kPeriod, kShift);
-    const BringupStatus bs = realtime::run_to_operational(m, pacer, /*sync_faulted=*/[] { return false; }, std::chrono::milliseconds(2000));
-    CHECK(bs == BringupStatus::Operational);
-    CHECK(m.all_operational());
-}
-
-TEST("realtime::run_to_operational gives up (Aborted) on a never-syncing drive -- no hang") {
-    Master m{make_config(), std::make_unique<SimBackend>(make_models())};
-    m.init();
-    m.configure();
-    realtime::DcPacer pacer(kPeriod, kShift);
-    const auto t0 = std::chrono::steady_clock::now();
-    // sync_faulted held TRUE: the held-synced confirm can never be met, and the Master's
-    // own give-up (~30 s default) is far beyond the pump's 100 ms timeout -- so the
-    // BOUNDED give-up path is what returns. Returning AT ALL (vs hanging) is the proof;
-    // the elapsed bound keeps it honest.
-    const BringupStatus bs = realtime::run_to_operational(m, pacer, /*sync_faulted=*/[] { return true; }, std::chrono::milliseconds(100));
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
-    CHECK(bs == BringupStatus::Aborted);
-    CHECK(!m.all_operational());
-    CHECK(elapsed < std::chrono::seconds(5));  // bounded give-up, not the 30 s Master window
-}
-
 // (#40 item 1) The delegating ctor defaults the phase target to period/2 -- identical
 // math to the explicit two-arg form.
 TEST("DcPacer(period) defaults the shift to period/2 (delegating ctor)") {
@@ -228,51 +158,6 @@ TEST("DcPacer(period) defaults the shift to period/2 (delegating ctor)") {
         CHECK_EQ(defaulted.step(dc, 0), explicit_shift.step(dc, 0));  // identical corrections
     }
     CHECK_EQ(defaulted.integral(), explicit_shift.integral());
-}
-
-// (#40 item 2) The observer hook: called once per pump cycle with an advancing counter;
-// returning false stops the pump -> Aborted; the default-empty path stays the bare
-// one-liner (#21) and is already covered by the two run_to_operational tests above.
-TEST("run_to_operational observer: per-cycle calls; observer-false aborts the pump") {
-    {  // observer sees every cycle and the terminal status; counter advances 1..N
-        Master m{make_config(), std::make_unique<SimBackend>(make_models())};
-        m.init();
-        m.configure();
-        realtime::DcPacer pacer(kPeriod);
-        std::uint64_t calls = 0;
-        std::uint64_t last_cycle = 0;
-        bool saw_operational = false;
-        const BringupStatus bs = realtime::run_to_operational(
-            m,
-            pacer,
-            [] { return false; },
-            std::chrono::milliseconds(2000),
-            [&](BringupStatus st, std::uint64_t cycle) {
-                ++calls;
-                CHECK_EQ(cycle, last_cycle + 1);  // once per cycle, monotonically
-                last_cycle = cycle;
-                saw_operational = saw_operational || st == BringupStatus::Operational;
-                return true;
-            });
-        CHECK(bs == BringupStatus::Operational);
-        CHECK(saw_operational);       // the observer saw the terminal status too
-        CHECK_EQ(calls, last_cycle);  // no skipped/duplicated cycles
-        CHECK(calls >= 3);            // settle(2) + confirm
-    }
-    {  // observer-false -> Aborted (the caller stop channel, e.g. SIGINT)
-        Master m{make_config(), std::make_unique<SimBackend>(make_models())};
-        m.init();
-        m.configure();
-        realtime::DcPacer pacer(kPeriod);
-        const BringupStatus bs = realtime::run_to_operational(
-            m,
-            pacer,
-            [] { return false; },
-            std::chrono::milliseconds(2000),
-            [&](BringupStatus, std::uint64_t cycle) { return cycle < 2; });  // stop on cycle 2
-        CHECK(bs == BringupStatus::Aborted);
-        CHECK(!m.all_operational());
-    }
 }
 
 TEST_MAIN()
