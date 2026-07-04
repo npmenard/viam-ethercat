@@ -1,36 +1,30 @@
-// a6_validate -- TEMPORARY hardware bring-up validation for the A6-EC servo.
+// a6_validate -- temporary hardware bring-up validation for the A6-EC servo.
 //
-// Exercises the ethercat master library against a REAL A6 drive in safe stages:
+// Exercises the ethercat master library against a real A6 drive in safe stages:
 //   Stage A (always):  open NIC -> enumerate -> SDO identity + key objects
 //                       (PRE-OP, read-only; no PDO config, no motion).
 //   Stage B (always):  configure (PDO remap + 0x6060 mode + OP) -> cyclic
-//                       process() -> drive controlword to READY-TO-SWITCH-ON
-//                       (motor NOT energized) and read live feedback.
-//   --enable           additionally step the CiA402 ladder to OPERATION-ENABLED
-//                       and HOLD at the current position (motor energizes,
-//                       holding torque, NO commanded motion).
-//   --move-pp R [RPM]  after enabling, command a RELATIVE PP move of R revs at
-//                       RPM (default 60) via the bit4 new-setpoint handshake and
-//                       watch convergence. *** MOTION -- opt-in only. *** SINGLE-MODE:
-//                       needs the drive already in Profile-Position (no mode-ensure; #17/#18).
-//   --move-sine        after enabling, stream a CSP soft-started sine.
-//                       *** MOTION -- opt-in only. ***
+//                       process() -> drive controlword to ReadyToSwitchOn
+//                       (motor not energized) and read live feedback.
+//   --enable           additionally step the CiA402 ladder to OperationEnabled
+//                       and hold at the current position (motor energizes,
+//                       holding torque, no commanded motion).
+//   --move-pp R [RPM]  after enabling, command a relative PP move of R revs at
+//                       RPM (default 60) via the bit-4 new-set-point handshake and
+//                       watch convergence. Motion, opt-in only. Single-mode: needs
+//                       the drive already in Profile-Position (no mode-ensure).
+//   --move-sine        after enabling, stream a CSP soft-started sine. Motion, opt-in only.
 //
-// #47 P2: this tool now runs on ethercat::Runner. The hand-rolled Phase-1 pump
-// (run_to_operational + observer), the Phase-2 steady loop, the local DcPacer,
-// and the two teardown loops are DELETED -- the Runner owns the RT thread,
-// realtime setup, the one pacer, bring-up, the steady cadence, the stopping
-// window, and master.close(). What remains HERE is pure POLICY:
-//   - A6Control::step()        = the old Phase-2 CiA402 branch tree, verbatim
-//   - A6Control::sync_faulted() = the old 0x603F==0x8700 bring-up gate (A6
-//                                 knowledge stays in the CONSUMER -- #41 layering)
-//   - the stopping window      = the old graceful teardown (CSP hold-then-disable)
-//   - main()                   = a NON-RT printer polling Runner status + the
-//                                 control's atomic telemetry (the old in-loop
-//                                 prints, moved off the RT thread)
+// This tool runs on ethercat::Runner, which owns the RT thread, realtime setup, the pacer,
+// bring-up, the steady cadence, the stopping window, and master.close(). What remains here is
+// policy:
+//   - A6Control::step()         = the CiA402 branch tree
+//   - A6Control::sync_faulted() = the 0x603F==0x8700 bring-up gate (A6 knowledge stays in the consumer)
+//   - the stopping window       = the graceful teardown (CSP hold-then-disable)
+//   - main()                    = a non-RT printer polling Runner status and the control's atomic telemetry
 //
-// Defaults are non-energizing and motionless. Runtime needs CAP_NET_RAW (raw
-// socket). NOT a production path; the real driver is the Viam module.
+// Defaults are non-energizing and motionless. Runtime needs CAP_NET_RAW (raw socket). Not a
+// production path; the real driver is the Viam module.
 
 #include <algorithm>
 #include <array>
@@ -61,53 +55,49 @@
 namespace {
 
 using namespace ethercat;
-using namespace ethercat::tools;  // #53: Options/Telemetry/A6Control + the k* object constants live here now
+using namespace ethercat::tools;  // Options/Telemetry/A6Control + the k* object constants live here
 
-// The A6 object-index constants, kCountsPerRev/kLoopHz, sdo_value<>(), Options,
-// Telemetry, and A6Control moved to tools/a6_control.hpp (#53) so the energized PP/PV
-// control policy is offline-testable. main() + build_a6_config() + the SIGINT relay stay.
+// The A6 object-index constants, kCountsPerRev/kLoopHz, sdo_value<>(), Options, Telemetry, and
+// A6Control live in tools/a6_control.hpp so the energized PP/PV control policy is offline-testable.
+// main(), build_a6_config(), and the SIGINT relay stay here.
 
 std::atomic<bool> g_stop{false};
 extern "C" void on_sigint(int) {
     g_stop.store(true);
 }
 
-// Build the MasterConfig for one A6, mirroring etc/a6-hardware.example.json (RxPDO
-// 0x1600 = ctrl + target-pos + profile-vel; TxPDO 0x1A00 = fault + status +
-// mode-display + pos + vel + torque). `mode` selects 0x6060: ProfilePosition (the
-// bit4-handshake --move-pp) or CyclicSyncPosition (the streamed --move-sine). Both
-// reuse the SAME PDO map -- 0x607A serves the PP target AND the CSP streamed target --
-// so one builder covers both; only the post-enable control semantics differ.
+// Build the MasterConfig for one A6 (RxPDO 0x1600 = ctrl + target-pos + profile-vel; TxPDO
+// 0x1A00 = fault + status + mode-display + pos + vel + torque). `mode` selects 0x6060:
+// ProfilePosition (the bit-4-handshake --move-pp) or CyclicSyncPosition (the streamed
+// --move-sine). Both reuse the same PDO map -- 0x607A serves the PP target and the CSP streamed
+// target -- so one builder covers both; only the post-enable control semantics differ.
 MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
     MasterConfig cfg;
     cfg.ifname = ifname;
     cfg.target_loop_rate_hz = kLoopHz;    // 1 ms SYNC0 = 4 x 250 us (A6-legal)
-    cfg.use_distributed_clocks = true;    // the A6 supports ONLY DC sync
+    cfg.use_distributed_clocks = true;    // the A6 supports only DC sync
     cfg.dc_settle_cycles = 1000;          // ~1 s post-OP grace while the phase finishes locking
     cfg.max_consecutive_wkc_errors = 5;
-    // The bring-up SETTLE bound uses MasterConfig's default (dc_op_gate_cycles). SYNC0 is
-    // armed in PRE-OP inside configure() (before config_map_group); the Runner's bring-up
-    // pump then runs SETTLE (phase-locked PD) -> request OP once -> AWAIT_OP, all gapless.
+    // The bring-up settle bound uses MasterConfig's default (dc_op_gate_cycles). SYNC0 is armed in
+    // PRE-OP inside configure() (before config_map_group); the Runner's bring-up pump then runs
+    // settle (phase-locked PD), requests OP once, and awaits OP, all gapless.
 
     SlaveConfig a6;
     a6.slave_id = 1;
     a6.default_mode = mode;  // 0x6060 set in configure(); PP=1 (handshake) or CSP=8 (streamed sine)
-    // #44: the A6 accepts only 250 us-multiple SYNC0 cycles (else Er74.0 at OP entry).
+    // The A6 accepts only 250 us-multiple SYNC0 cycles (else Er74.0 at OP entry).
     a6.sync_cycle_granularity_ns = 250'000;
-    // #39: the vendor fault-reset is CONSUMER policy -- this tool runs it itself
-    // post-configure via Master::sdo_write (see --reset-fault in main), BEFORE
-    // Runner::start() (still the single port owner; the #39 bracket is Runner-owned).
-    // #20: we DELIBERATELY do NOT write 0x1C32:01 (SM sync-type) -- CLAUDE.md.
+    // The vendor fault-reset is consumer policy: this tool runs it itself post-configure via
+    // Master::sdo_write (see --reset-fault in main), before Runner::start() (still the single port
+    // owner). Deliberately do not write 0x1C32:01 (SM sync-type).
 
     a6.rxpdo.pdo_indices = {0x1600};
     a6.rxpdo.entries[0x1600] = {
         {kControlword, 0, 16},
         {kTargetPosition, 0, 32},
         {kProfileVelocity, 0, 32},
-        {kTargetVelocity, 0, 32},  // #53: superset RxPDO -- mapped for the PV mode (target consumed by the held PV path); appended so
-                                   // PP/CSP offsets are unchanged
-        {kModeOfOperation, 0, 8},  // #47-P3b 5a (P3c): mode-of-operation in the RxPDO so the runtime PP<->PV mode-switch can write 0x6060
-                                   // cyclically (14->15 B; P3c HW step-1 = bring-up re-verify with this map)
+        {kTargetVelocity, 0, 32},  // superset RxPDO: mapped for the PV mode; appended so PP/CSP offsets are unchanged
+        {kModeOfOperation, 0, 8},  // mode-of-operation in the RxPDO so the runtime PP<->PV mode-switch can write 0x6060 cyclically
     };
 
     a6.txpdo.pdo_indices = {0x1A00};
@@ -124,9 +114,9 @@ MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
     return cfg;
 }
 
-// Run ONE full bring-up -> hold -> teardown lifecycle: construct a fresh Master + Runner, bring
-// the A6 to OP, run the control policy until SIGINT/abort, then tear down. Returns the process
-// exit code (0 = clean stop, 1 = an init/configure/RT-start failure or a bring-up/bus abort).
+// Run one full bring-up -> hold -> teardown lifecycle: construct a fresh Master and Runner, bring
+// the A6 to OP, run the control policy until SIGINT/abort, then tear down. Returns the process exit
+// code (0 = clean stop, 1 = an init/configure/RT-start failure or a bring-up/bus abort).
 int run(const Options& opt, Cia402Mode mode) {
     const std::uint16_t slave = 1;
 
@@ -217,7 +207,7 @@ int run(const Options& opt, Cia402Mode mode) {
             if (g_stop.load()) {
                 runner.request_stop();  // SIGINT -> graceful stop (the window runs the disable policy)
             }
-            // #22 mid-run direct non-RT SDO reads (only while Running; #15 -- the caller drives the mailbox exchange).
+            // Mid-run direct non-RT SDO reads (only while Running; the caller drives the mailbox exchange).
             if (opt.sdo_probe && runner.status().phase == RunnerPhase::Running &&
                 std::chrono::steady_clock::now() - last_sdo >= std::chrono::milliseconds(500)) {
                 last_sdo = std::chrono::steady_clock::now();
@@ -280,16 +270,15 @@ int run(const Options& opt, Cia402Mode mode) {
         }
         reason = runner.status().reason;  // read before the dtor teardown
         if (reason == StopReason::BringupAborted) {
-            // Prefer the LATCHED last-non-zero AL code from AWAIT (#71/#25): the live al_status_code()
-            // can read 0 at the give-up (reack_op ACKs the SAFE_OP+ERROR on the timeout cycle), which
-            // is exactly what defeated the first cut of this diagnostic (printed "0x0 No error").
+            // Prefer the latched last-non-zero AL code from AWAIT: the live al_status_code() can read
+            // 0 at the give-up (reack_op ACKs the SAFE_OP+ERROR on the timeout cycle).
             al_code = master.bringup_al_code();
             if (al_code == 0) {  // no non-zero code was seen the whole bring-up -- fall back to the live read
                 al_code = master.al_status_code(slave);
             }
             al_msg = master.describe_al_code(al_code);
         }
-    }  // <-- ~Runner: bounded stop -> join -> rt_active(false) -> master.close()
+    }  // <-- ~Runner: bounded stop, join, then master.close()
 
     const WkcStats stats = master.wkc_stats();
     std::cout << "\n=== done. stop=" << to_string(reason) << (control.safety_abort() ? " (CSP SAFETY ABORT)" : "")
@@ -313,28 +302,28 @@ int main(int argc, char** argv) {
         } else if (a == "--reset-fault") {
             opt.reset_fault = true;
         } else if (a == "--move-pp" && i + 1 < args.size()) {
-            opt.move_pp = true;  // requires an EXPLICIT --enable (checked below) -- no implicit energize
+            opt.move_pp = true;  // requires an explicit --enable (checked below); no implicit energize
             opt.move_revs = std::stod(args[++i]);
             if (i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0) {
                 opt.move_rpm = std::stod(args[++i]);
             }
         } else if (a == "--move-pos" && i + 1 < args.size()) {
-            opt.move_pos = true;  // #53 absolute PP move-to; requires --enable (checked below)
+            opt.move_pos = true;  // absolute PP move-to; requires --enable (checked below)
             opt.pos_target = std::stoi(args[++i]);
             if (i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0) {
                 opt.pp_vel_cps = std::stoi(args[++i]);  // optional profile velocity (counts/s)
             }
         } else if (a == "--move-vel" && i + 1 < args.size()) {
-            opt.move_vel = true;  // #53 continuous PV until Ctrl-C; requires --enable
+            opt.move_vel = true;  // continuous PV until Ctrl-C; requires --enable
             opt.pv_vel_cps = std::stoi(args[++i]);
         } else if (a == "--pos-tol" && i + 1 < args.size()) {
-            opt.pos_tol = std::stoi(args[++i]);  // #53 DA-C: reached tolerance (counts); default 300
+            opt.pos_tol = std::stoi(args[++i]);  // reached tolerance (counts); default 300
         } else if (a == "--move-sine") {
-            opt.move_sine = true;  // requires an EXPLICIT --enable (checked below) -- no implicit energize
+            opt.move_sine = true;  // requires an explicit --enable (checked below); no implicit energize
         } else if (a == "--sdo-probe") {
-            opt.sdo_probe = true;  // #22: read 0x6079/0x6078/0x6502 via the direct non-RT steady-state SDO while Running (#15)
+            opt.sdo_probe = true;  // read 0x6079/0x6078/0x6502 via the direct non-RT steady-state SDO while Running
         } else if (a == "--csp-probe") {
-            opt.csp_probe = true;  // CSP mode, NO enable -- read+print feedback only (diagnostic)
+            opt.csp_probe = true;  // CSP mode, no enable: read and print feedback only (diagnostic)
         } else if (a == "--sine-amplitude" && i + 1 < args.size()) {
             opt.sine_amplitude = std::stod(args[++i]);
         } else if (a == "--sine-period" && i + 1 < args.size()) {
@@ -383,8 +372,8 @@ int main(int argc, char** argv) {
                      "(one mode of operation at a time)\n";
         return 2;
     }
-    // SAFETY: a move must NOT silently energize. The move flags require an explicit
-    // --enable, so a forgotten --enable FAILS CLOSED instead of moving the shaft.
+    // A move must not silently energize. The move flags require an explicit --enable, so a forgotten
+    // --enable fails closed instead of moving the shaft.
     if ((opt.move_pp || opt.move_sine || opt.move_pos || opt.move_vel) && !opt.enable) {
         std::cerr << "error: --move-pp / --move-pos / --move-vel / --move-sine command ENERGIZED MOTION and require an "
                      "explicit --enable\n"

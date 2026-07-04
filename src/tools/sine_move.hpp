@@ -1,8 +1,8 @@
 #pragma once
 
-// Soft-started, relative-to-start position sine for the a6_validate CSP bench move
-// (#24). Pure + header-only so the trajectory math is unit-testable offline (the
-// safety-critical bits for first energized motion: CSP-safe init + soft-start).
+// Soft-started, relative-to-start position sine for the a6_validate CSP bench move. Pure and
+// header-only so the trajectory math is unit-testable offline (the safety-critical bits for first
+// energized motion: CSP-safe init and soft-start).
 //
 //   target(t) = pos_enable + amplitude * ramp(t) * sin(2*pi * t / period)
 //   ramp(t)   = min(1, t / period)   -- linear 0->1 over the first period, then 1

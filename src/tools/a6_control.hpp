@@ -1,14 +1,13 @@
 #pragma once
 
-// a6_control.hpp -- A6Control (the a6_validate bench SlaveControl policy) + Options +
-// Telemetry + the A6 object-index constants, extracted from a6_validate.cpp to a header
-// (#53) so the energized PP/PV control logic is offline-testable against a sim
-// Master+Runner (mirrors sine_move.hpp's pure-header pattern). a6_validate.cpp keeps
-// main() + build_a6_config() + the SIGINT relay and includes this.
+// A6Control (the a6_validate bench SlaveControl policy) plus Options, Telemetry, and the A6
+// object-index constants. Kept in a header so the energized PP/PV control logic is
+// offline-testable against a sim Master+Runner. a6_validate.cpp keeps main(),
+// build_a6_config(), and the SIGINT relay, and includes this.
 //
-// Lives in `namespace ethercat::tools`, so the library names (SlaveControl,
-// CycleContext, Cia402Fsm, ControlWord, cia402::*, ...) resolve unqualified from the
-// enclosing `ethercat` scope -- no `using namespace` at header scope.
+// Lives in namespace ethercat::tools, so the library names (SlaveControl, CycleContext,
+// Cia402Fsm, ControlWord, cia402::*, ...) resolve unqualified from the enclosing `ethercat`
+// scope.
 
 #include <array>
 #include <atomic>
@@ -31,10 +30,10 @@ namespace ethercat::tools {
 // --- CiA402 / A6 object indices (hex; the JSON config carries them in decimal) ---
 constexpr std::uint16_t kControlword = 0x6040;
 constexpr std::uint16_t kStatusword = 0x6041;
-constexpr std::uint16_t kModeOfOperation = 0x6060;  // #47-P3b 5a: RxPDO-mapped for the runtime mode-switch
+constexpr std::uint16_t kModeOfOperation = 0x6060;  // RxPDO-mapped for the runtime mode-switch
 constexpr std::uint16_t kModeDisplay = 0x6061;
 constexpr std::uint16_t kTargetPosition = 0x607A;
-constexpr std::uint16_t kTargetVelocity = 0x60FF;  // PV target (#53)
+constexpr std::uint16_t kTargetVelocity = 0x60FF;  // PV target
 constexpr std::uint16_t kPositionActual = 0x6064;
 constexpr std::uint16_t kProfileVelocity = 0x6081;
 constexpr std::uint16_t kVelocityActual = 0x606C;
@@ -42,29 +41,29 @@ constexpr std::uint16_t kTorqueActual = 0x6077;
 constexpr std::uint16_t kFaultCode = 0x603F;
 constexpr std::uint16_t kQuickStopDecel = 0x6085;   // PV quick-stop deceleration (counts/s^2)
 constexpr std::uint16_t kQuickStopOption = 0x605A;  // quick-stop option code (must read == 2)
-constexpr std::uint16_t kDcLinkVoltage = 0x6079;    // #22 probe: DC-link circuit voltage (U32, mV per CiA402)
-constexpr std::uint16_t kCurrentActual = 0x6078;    // #22 probe: current actual value (I16, per-mille of rated)
-constexpr std::uint16_t kSupportedModes = 0x6502;   // #22 probe: supported drive modes (U32 bitmask)
+constexpr std::uint16_t kDcLinkVoltage = 0x6079;    // probe: DC-link circuit voltage (U32, mV per CiA402)
+constexpr std::uint16_t kCurrentActual = 0x6078;    // probe: current actual value (I16, per-mille of rated)
+constexpr std::uint16_t kSupportedModes = 0x6502;   // probe: supported drive modes (U32 bitmask)
 
 constexpr std::uint16_t kErr741NoSync = 0x8700;  // A6 Er74.1 "no sync signal" (normal pre-OP)
 
 constexpr double kCountsPerRev = 131072.0;  // A6 single-turn encoder = 2^17
 constexpr std::uint32_t kLoopHz = 1000;
 
-// --- #53 PV / quick-stop / reached tuning ---------------------------------------------
-// Quick-stop controlword: enable-operation (0x0F) with bit2 (Quick-Stop) CLEARED -> 0x0B,
-// the CiA402 T11 OperationEnabled->QuickStopActive command (spec §PV). POLARITY: the QS
-// command is bit2=0, and 0x0F already has bit2 SET, so 0x0F & ~0x04 = 0x0B. (0x02 is the
-// textbook-minimal exact value; if the A6 decodes QS by exact match it's the fallback.)
+// --- PV / quick-stop / reached tuning ---------------------------------------------
+// Quick-stop controlword: enable-operation (0x0F) with bit 2 (quick-stop) cleared -> 0x0B, the
+// CiA402 OperationEnabled->QuickStopActive command. The QS command is bit 2 = 0, and 0x0F already
+// has bit 2 set, so 0x0F & ~0x04 = 0x0B. (0x02 is the textbook-minimal exact value, the fallback
+// if the A6 decodes QS by exact match.)
 constexpr std::uint16_t kQuickStopCw = ControlWord::enable_operation() & ~std::uint16_t{0x0004};
-// 0x606C velocity-estimate "stopped" threshold (just above the noise floor, DA) + debounce.
+// 0x606C velocity-estimate "stopped" threshold (just above the noise floor) plus debounce.
 constexpr std::int32_t kZeroVelThresh = 500;   // counts/s (~0.23 rev/s @ 2^17 c/rev)
 constexpr std::uint32_t kZeroVelDebounce = 5;  // consecutive sub-thresh cycles before the disable backstop
-// 0x6085 quick-stop decel default = 50 rev/s^2 (stops 600 rpm in ~200 ms; well inside W).
+// 0x6085 quick-stop decel default = 50 rev/s^2 (stops 600 rpm in ~200 ms, well inside the window).
 constexpr std::uint32_t kQuickStopDecelDefault = 6'553'600;  // counts/s^2
 constexpr std::int16_t kQuickStopOptionRequired = 2;         // 0x605A must read == 2 (decel on 0x6085 -> auto SwitchOnDisabled)
 constexpr std::uint32_t kPvTeardownCycles = 2000;            // PV stopping window = 2 s @ 1 kHz (generous upper bound)
-constexpr double kVelGuardMarginS = 0.1;                     // VEL-guard t_margin (s)
+constexpr double kVelGuardMarginS = 0.1;                     // velocity-guard margin (s)
 
 // Little-endian SDO-value bytes via the shared store_le (no hand-rolled packing).
 template <PdoScalar T>
@@ -79,25 +78,25 @@ struct Options {
     bool enable = false;
     bool move_pp = false;
     bool move_sine = false;  // --move-sine: CSP streamed soft-started sine (energized)
-    bool csp_probe = false;  // --csp-probe: bring up in CSP mode (0x6060=8) but DO NOT enable --
-                             // just read+print feedback. Non-energizing; safe.
+    bool csp_probe = false;  // --csp-probe: bring up in CSP mode (0x6060=8) but do not enable --
+                             // just read and print feedback. Non-energizing.
     bool reset_fault = false;
     double move_revs = 0.0;
     double move_rpm = 60.0;
     double sine_amplitude = 20000.0;       // counts (peak); --sine-amplitude
     double sine_period = 4.0;              // seconds; --sine-period
     std::int32_t follow_err_limit = 5000;  // counts; CSP tool-level following-error abort
-    // --- #53 new modes ---
+    // --- move modes ---
     bool move_pos = false;        // --move-pos POS [VEL]: absolute Profile-Position move-to (PP)
     bool move_vel = false;        // --move-vel VEL: continuous Profile-Velocity until Ctrl-C (PV)
     std::int32_t pos_target = 0;  // --move-pos POS (absolute, counts)
     std::int32_t pp_vel_cps = 0;  // --move-pos optional VEL (profile velocity, counts/s); 0 => default from move_rpm
     std::int32_t pv_vel_cps = 0;  // --move-vel VEL (counts/s)
-    std::int32_t pos_tol = 300;   // --pos-tol (DA-C: proven HW default 300; tighten only with a bench deadband measurement)
-    // #22 steady-state SDO probe: while Running, issue Master::sdo_read (direct non-RT, #15 --
-    // the caller drives the mailbox exchange) for 0x6079/0x6078/0x6502 every ~500ms and print raw + converted.
-    // Exercises the exact steady-state SDO path on real hardware WHILE PD flows -- the HW
-    // evidence for #22 (WKC/Er74/LRW-gap intact around each mid-run mailbox read).
+    std::int32_t pos_tol = 300;   // --pos-tol (default 300; tighten only with a bench deadband measurement)
+    // Steady-state SDO probe: while Running, issue Master::sdo_read (direct, non-RT; the caller drives
+    // the mailbox exchange) for 0x6079/0x6078/0x6502 every ~500ms and print raw plus converted.
+    // Exercises the steady-state SDO path on real hardware while PD flows (WKC/Er74/LRW-gap intact
+    // around each mid-run mailbox read).
     bool sdo_probe = false;  // --sdo-probe
 };
 
@@ -124,19 +123,18 @@ struct Telemetry {
     std::atomic<bool> enabled{false};
 };
 
-// The #47 P2 control: ALL the old Phase-2 policy, as a SlaveControl. One instance,
-// one slave. RT-thread-only state lives in plain members (step/hooks are single-
-// threaded by construction); main() reads only the Telemetry atomics + Runner status.
+// The bench control policy, as a SlaveControl. One instance, one slave. RT-thread-only state
+// lives in plain members (step and hooks are single-threaded by construction); main() reads only
+// the Telemetry atomics and Runner status.
 //
-// Console I/O note: edge events (fault edge, OE reached, safety abort, move done)
-// print ONE-SHOT from the RT thread -- technically blocking I/O in step(), accepted
-// for this validation tool exactly as the old loop accepted it (rare, bounded); the
-// PERIODIC telemetry print moved to main() where it belongs.
+// Edge events (fault edge, OE reached, safety abort, move done) print one-shot from the RT
+// thread -- technically blocking I/O in step(), accepted for this validation tool as rare and
+// bounded; the periodic telemetry print lives in main().
 class A6Control final : public SlaveControl {
    public:
-    // `mode` is the commanded 0x6060 (the CLI mode); its int8 value is what 0x6061 must
-    // echo before we enable (#53 DA-B). build_a6_config() set the SAME mode at configure.
-    // The policy carries only the two quick-stop VALUES now (#17: DeviceProfile is gone).
+    // `mode` is the commanded 0x6060 (the CLI mode); its int8 value is what 0x6061 must echo before
+    // enabling. build_a6_config() sets the same mode at configure. The policy carries only the two
+    // quick-stop values.
     A6Control(const Options& opt, Telemetry& tel, Cia402Mode mode) noexcept
         : opt_(opt), tel_(tel), policy_(kQuickStopDecelDefault, kQuickStopOptionRequired) {
         goal_ = opt_.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
@@ -146,9 +144,9 @@ class A6Control final : public SlaveControl {
         pp_profile_vel_ = opt_.pp_vel_cps > 0 ? static_cast<std::uint32_t>(opt_.pp_vel_cps) : profile_vel_;
     }
 
-    // NON-RT, pre-spawn, may throw: resolve every typed field ONCE (configure-time
-    // width asserts). This map is built in this file, so all eight are mapped. Uses the
-    // restricted ConfigContext -- resolve_rx/tx bound to the slave, no Master&.
+    // Non-RT, pre-spawn, may throw: resolve every typed field once (configure-time width asserts).
+    // This map is built in this file, so all are mapped. Uses the restricted ConfigContext
+    // (resolve_rx/tx bound to the slave, no Master&).
     void on_configured(ConfigContext& cfg) override {
         cw_loc_ = cfg.resolve_rx<cia402::ControlWord>();
         target_loc_ = cfg.resolve_rx<cia402::TargetPosition>();
@@ -158,12 +156,12 @@ class A6Control final : public SlaveControl {
         vel_loc_ = cfg.resolve_tx<cia402::VelocityActual>();
         fc_loc_ = cfg.resolve_tx<cia402::FaultCode>();
         mode_loc_ = cfg.resolve_tx<cia402::ModeDisplay>();
-        tv_loc_ = cfg.resolve_rx<cia402::TargetVelocity>();  // #53: PV target (also over-mapped in PP/CSP, inert)
+        tv_loc_ = cfg.resolve_rx<cia402::TargetVelocity>();  // PV target (also over-mapped in PP/CSP, inert)
 
-        // #47-P3b: the GENERIC policy owns the PV configure-time refusals (0x605A assert +
-        // 0x6085 write/readback-echo) -- it resolves its OWN field handles from the same cfg.
-        // The VEL guard stays a WRAPPER concern (it needs the commanded velocity + the window,
-        // both bench/units-known -- §4/FOLD 1). All fail-closed (a throw aborts start()).
+        // The generic policy owns the PV configure-time refusals (0x605A assert, 0x6085
+        // write/readback-echo) and resolves its own field handles from the same cfg. The velocity
+        // guard stays a wrapper concern (it needs the commanded velocity and the window). All
+        // fail-closed: a throw aborts start().
         if (uses_policy_()) {
             const std::uint32_t echoed = policy_.configure(cfg, /*needs_quick_stop=*/opt_.move_vel);
             if (opt_.move_vel) {
@@ -180,19 +178,18 @@ class A6Control final : public SlaveControl {
         }
     }
 
-    // RT, every bring-up cycle: the old run_to_operational gate, verbatim -- Er74.1
-    // pending == 0x603F reads 0x8700. A6 knowledge lives HERE (consumer), keeping the
-    // Runner vendor-free (#41). NOTE const-with-side-effect: the dc_phase store below
-    // is a deliberate TELEMETRY SIDE-CHANNEL (an atomic in the referenced Telemetry,
-    // not logical state of this control) -- it's how main's printer shows bring-up
-    // phase-lock progress without touching the master (single port owner).
+    // RT, every bring-up cycle: Er74.1 pending == 0x603F reads 0x8700. A6 knowledge lives here (the
+    // consumer), keeping the Runner vendor-free. The dc_phase store below is a deliberate telemetry
+    // side-channel (an atomic in the referenced Telemetry, not logical state of this control); it is
+    // how main's printer shows bring-up phase-lock progress without touching the master (single port
+    // owner).
     bool sync_faulted(const CycleContext& ctx) const noexcept override {
         tel_.dc_phase_ns.store(ctx.dc_time_ns() % static_cast<std::int64_t>(1'000'000'000ULL / kLoopHz), std::memory_order_relaxed);
         return ctx.load<cia402::FaultCode::type>(fc_loc_) == kErr741NoSync;
     }
 
-    // #71/#25: a live A6 always populates a non-zero statusword (bit10 held); a zombie-PDO drive
-    // (free-run OP refusal) leaves it 0x0. Gate OP-confirm on it so bring-up gives up on a dead drive.
+    // A live A6 always populates a non-zero statusword (bit 10 held); a zombie-PDO drive (free-run OP
+    // refusal) leaves it 0x0. Gate OP-confirm on it so bring-up gives up on a dead drive.
     bool drive_present(const CycleContext& ctx) const noexcept override {
         return ctx.load<cia402::Statusword::type>(sw_loc_) != 0;
     }
@@ -214,11 +211,11 @@ class A6Control final : public SlaveControl {
         }
     }
 
-    // RT, every steady cycle: the old Phase-2 branch tree. Loads at the top (this
-    // cycle's latched feedback), stores at the bottom (ship with the NEXT exchange --
-    // a +1-cycle latency: an output written this cycle rides the next exchange()).
+    // RT, every steady cycle. Loads at the top (this cycle's latched feedback), stores at the bottom
+    // (ship with the next exchange, one cycle of latency: an output written this cycle rides the next
+    // exchange()).
     void step(CycleContext& ctx) noexcept override {
-        if (uses_policy_()) {  // #47-P3b: --move-pos / --move-vel are driven by the generic policy
+        if (uses_policy_()) {  // --move-pos / --move-vel are driven by the generic policy
             step_policy_(ctx);
             return;
         }
@@ -234,25 +231,24 @@ class A6Control final : public SlaveControl {
             hold_captured_ = true;
         }
 
-        // --- the stopping WINDOW (#47 §5): the old graceful teardown as POLICY.
-        // CSP clean stop: hold the last commanded position ~100 cycles (cw 0x0F,
-        // target frozen -- do NOT snap, that yanks the shaft), then disable (0x00)
-        // for the rest of the window. Any unclean cause (safety abort, bus fault,
-        // drive fault) or a non-energized run: disable immediately.
+        // --- The stopping window. CSP clean stop: hold the last commanded position for ~100 cycles
+        // (cw 0x0F, target frozen -- do not snap, which yanks the shaft), then disable (0x00) for the
+        // rest of the window. Any unclean cause (safety abort, bus fault, drive fault) or a
+        // non-energized run: disable immediately.
         if (ctx.stopping()) {
             ++stopping_steps_;
-            // #53 PV clean stop = CiA402 Quick-Stop (NOT torque-cut-at-speed): command
-            // cw=0x0B (T11 OperationEnabled->QuickStopActive); the drive ramps via 0x6085.
+            // PV clean stop = CiA402 quick-stop (not torque-cut-at-speed): command cw=0x0B
+            // (OperationEnabled->QuickStopActive); the drive ramps via 0x6085.
             const bool clean_pv_stop =
                 opt_.move_vel && announced_op_ && !safety_abort_ && stop_reason_ == StopReason::Requested && !status.fault();
             const bool clean_csp_hold = opt_.move_sine && announced_op_ && !safety_abort_ && stop_reason_ == StopReason::Requested &&
                                         !status.fault() && stopping_steps_ <= 100;
             if (clean_pv_stop) {
-                // Hold cw=0x0B and observe. Under 0x605A=2 the DRIVE decelerates and
-                // auto-transitions to SwitchOnDisabled at its own zero (primary). The
-                // event-driven cw->0x00 is the BACKSTOP: only once |0x606C| is sub-threshold
-                // for kZeroVelDebounce cycles (so a velocity-estimate dip can't disable
-                // mid-decel) -- which also covers the 0x605A in {5,6,7} "stay in QSA" regime.
+                // Hold cw=0x0B and observe. Under 0x605A=2 the drive decelerates and auto-transitions
+                // to SwitchOnDisabled at its own zero. The event-driven cw->0x00 is the backstop: only
+                // once |0x606C| is sub-threshold for kZeroVelDebounce cycles (so a velocity-estimate
+                // dip cannot disable mid-decel), which also covers the 0x605A in {5,6,7} "stay in
+                // QuickStopActive" regime.
                 std::uint16_t qcw = kQuickStopCw;  // 0x0B
                 if (std::abs(vel) < kZeroVelThresh) {
                     ++zerovel_cycles_;
@@ -290,11 +286,10 @@ class A6Control final : public SlaveControl {
         }
         was_faulted_ = faulted;
 
-        // CSP energized-motion safety net (#24): once we're STREAMING the sine, ANY
-        // drive-unhappy signal -- Fault (bit3), following-error (bit13), a nonzero
-        // 0x603F, or the tool-level follow-err limit -- aborts and disables NOW (the
-        // stopping branch above sees safety_abort_ and skips the hold). We do NOT
-        // auto-reset + re-energize mid-motion.
+        // CSP energized-motion safety net: once streaming the sine, any drive-unhappy signal -- Fault
+        // (bit 3), following-error (bit 13), a nonzero 0x603F, or the tool-level follow-err limit --
+        // aborts and disables now (the stopping branch above sees safety_abort_ and skips the hold).
+        // It does not auto-reset and re-energize mid-motion.
         if (opt_.move_sine && announced_op_) {
             const std::int32_t follow_err = (cycle > enable_cycle_) ? (last_sine_target_ - pos) : 0;
             if (status.fault() || status.following_error() || fc != 0 || std::abs(follow_err) > opt_.follow_err_limit) {
@@ -310,19 +305,19 @@ class A6Control final : public SlaveControl {
             }
         }
 
-        // #53 DA-B -- MODE-ECHO fail-closed (load-bearing for PV). The A6 SILENTLY ignores
-        // unsupported 0x6060 mode-sets (#45), so a PV (0x6060=3) the drive doesn't honor would
-        // leave it in PP/CSP while we stream 0x60FF -> undefined ENERGIZED behavior. Before the
-        // FSM is allowed to climb to OperationEnabled, require 0x6061 == the commanded mode.
-        // Check ONCE at SwitchedOn (0x6061 is populated cyclically by then); a mismatch refuses
-        // to enable -- hold at ReadyToSwitchOn + end the run. (Applies to every --enable mode.)
+        // Mode-echo check (load-bearing for PV). The A6 silently ignores unsupported 0x6060
+        // mode-sets, so a PV (0x6060=3) the drive doesn't honor would leave it in PP/CSP while
+        // streaming 0x60FF -- undefined energized behavior. Before the FSM climbs to
+        // OperationEnabled, require 0x6061 == the commanded mode. Check once at SwitchedOn (0x6061 is
+        // populated cyclically by then); a mismatch refuses to enable, holds at ReadyToSwitchOn, and
+        // ends the run. Applies to every --enable mode.
         if (opt_.enable && !mode_checked_ && !mode_refused_ && status.switched_on() && !status.operation_enabled()) {
             const std::int8_t md = ctx.load<cia402::ModeDisplay::type>(mode_loc_);
             if (md == commanded_mode_disp_) {
                 mode_checked_ = true;  // echo confirmed -> allow the enable ladder
             } else {
                 mode_refused_ = true;
-                goal_ = Cia402State::ReadyToSwitchOn;  // REFUSE: do NOT energize
+                goal_ = Cia402State::ReadyToSwitchOn;  // refuse: do not energize
                 std::cerr << "[B] !!! MODE ECHO MISMATCH: 0x6061=" << static_cast<int>(md)
                           << " != commanded 0x6060=" << static_cast<int>(commanded_mode_disp_)
                           << " -- the A6 did not accept the commanded mode (#45); REFUSING to enable.\n";
@@ -330,11 +325,11 @@ class A6Control final : public SlaveControl {
             }
         }
 
-        // --- the old Phase-2 CiA402 branch tree, verbatim (policy only).
+        // --- The CiA402 branch tree (policy only).
         std::uint16_t cw = fsm_.step(status, goal_);
         if (faulted) {
-            // Generic CiA402 bit7 fault-reset edge (the A6's real reset is the vendor
-            // 0x2031:01 SDO, issued pre-start; this is the in-loop steady-state fallback).
+            // Generic CiA402 bit-7 fault-reset edge (the A6's real reset is the vendor 0x2031:01 SDO,
+            // issued pre-start; this is the in-loop steady-state fallback).
             cw = (last_cw_ & ControlWord::kFaultResetBit) ? 0x0000 : ControlWord::fault_reset();
         } else if (opt_.enable && status.operation_enabled()) {
             if (!announced_op_) {
@@ -345,32 +340,32 @@ class A6Control final : public SlaveControl {
                 std::cout << "[B] *** OPERATION ENABLED *** (motor energized at pos=" << pos_enable_ << ")\n";
             }
             if (opt_.move_sine) {
-                // CSP: stream the soft-started relative-to-enable sine every cycle; cw held
-                // at 0x0F, NO bit4 handshake (that's PP). CSP-safe: sin(0)=0 -> the first
-                // target == pos_enable (zero jump); amplitude ramps over the first period.
+                // CSP: stream the soft-started relative-to-enable sine every cycle; cw held at 0x0F,
+                // no bit-4 handshake (that's PP). CSP-safe: sin(0)=0, so the first target == pos_enable
+                // (zero jump); amplitude ramps over the first period.
                 const double t = static_cast<double>(cycle - enable_cycle_) / static_cast<double>(kLoopHz);
                 target_ = ethercat::tools::csp_target_counts(true, pos, pos_enable_, opt_.sine_amplitude, opt_.sine_period, t);
                 last_sine_target_ = target_;
                 ctx.store<cia402::TargetPosition::type>(target_loc_, target_);
                 cw = ControlWord::enable_operation();  // 0x0F
             } else if (opt_.move_vel) {
-                // #53 PV: stream 0x60FF = VEL each cycle; the drive ramps via 0x6083 (accel).
-                // (DA-G) mirror 0x607A = live actual position so the over-mapped target stays
-                // benign if the A6 cross-supervises position. cw held at 0x0F.
+                // PV: stream 0x60FF = VEL each cycle; the drive ramps via 0x6083 (accel). Mirror
+                // 0x607A = live actual position so the over-mapped target stays benign if the A6
+                // cross-supervises position. cw held at 0x0F.
                 ctx.store<cia402::TargetVelocity::type>(tv_loc_, opt_.pv_vel_cps);
                 ctx.store<cia402::TargetPosition::type>(target_loc_, pos);
                 target_ = opt_.pv_vel_cps;             // telemetry shows the commanded velocity
                 cw = ControlWord::enable_operation();  // 0x0F
             } else if (opt_.move_pos) {
-                // #53 absolute Profile-Position move-to: bit6 = 0 (NOT relative -- with_new_setpoint
-                // never sets kRelativeBit), 0x607A = absolute POS, 0x6081 = profile velocity.
+                // Absolute Profile-Position move-to: bit 6 = 0 (not relative; with_new_setpoint never
+                // sets kRelativeBit), 0x607A = absolute POS, 0x6081 = profile velocity.
                 target_ = opt_.pos_target;
                 ctx.store<cia402::TargetPosition::type>(target_loc_, target_);
                 ctx.store<cia402::ProfileVelocity::type>(pv_loc_, pp_profile_vel_);
-                std::uint16_t base = ControlWord::enable_operation();  // 0x0F (bit6 stays 0)
+                std::uint16_t base = ControlWord::enable_operation();  // 0x0F (bit 6 stays 0)
                 if (!move_done_) {
-                    // True rising-edge new-setpoint handshake, exactly ONE bit4 0->1 edge
-                    // (DA-I): assert bit4 -> await bit12 ack -> clear bit4 -> watch reached.
+                    // True rising-edge new-set-point handshake, exactly one bit-4 0->1 edge: assert
+                    // bit 4, await bit-12 ack, clear bit 4, watch reached.
                     if (!setpoint_latched_) {
                         base = ControlWord::with_new_setpoint(base, true);  // 0x1F
                         if (!bit4_high_) {
@@ -381,10 +376,10 @@ class A6Control final : public SlaveControl {
                             setpoint_latched_ = true;  // bit12 acked
                         }
                     } else {
-                        base = ControlWord::with_new_setpoint(base, false);  // clear bit4 (re-armable)
+                        base = ControlWord::with_new_setpoint(base, false);  // clear bit 4 (re-armable)
                         bit4_high_ = false;
-                        // Reached = actual within tol AND velocity ~0 (debounced). NEVER bit10
-                        // (A6 ties it high, #43). kPosReachedTol default 300 (DA-C proven).
+                        // Reached = actual within tolerance and velocity ~0 (debounced). Never bit 10
+                        // (the A6 ties it high). pos_tol default 300.
                         const bool pos_ok = std::abs(pos - target_) <= opt_.pos_tol;
                         if (std::abs(vel) < kZeroVelThresh) {
                             ++zerovel_cycles_;
@@ -400,8 +395,7 @@ class A6Control final : public SlaveControl {
                 }
                 cw = base;
             } else {
-                // --move-pp (bit4 handshake) or plain hold at the enable position.
-                // UNCHANGED (DA-C: --move-pp is a green HW-tested path; #53 does NOT flip it).
+                // --move-pp (bit-4 handshake) or plain hold at the enable position.
                 if (opt_.move_pp && !move_done_) {
                     target_ = hold_pos_ + static_cast<std::int32_t>(opt_.move_revs * kCountsPerRev);
                 }
@@ -409,8 +403,8 @@ class A6Control final : public SlaveControl {
                 ctx.store<cia402::ProfileVelocity::type>(pv_loc_, profile_vel_);
                 std::uint16_t base = ControlWord::enable_operation();  // 0x0F
                 if (opt_.move_pp && !move_done_) {
-                    // bit4 handshake: assert new-setpoint, hold until the drive acks (bit12),
-                    // then drop it so the next move can re-arm.
+                    // bit-4 handshake: assert new-set-point, hold until the drive acks (bit 12), then
+                    // drop it so the next move can re-arm.
                     if (!setpoint_latched_) {
                         base = ControlWord::with_new_setpoint(base, true);  // 0x1F
                         if (status.setpoint_acknowledged()) {
@@ -427,17 +421,17 @@ class A6Control final : public SlaveControl {
                 cw = base;
             }
         } else if (opt_.enable && opt_.move_sine) {
-            // CSP enable-jump fix: climbing the ladder (06->07->0F) toward OE. In CSP the
-            // drive latches its FIRST setpoint from the 0x607A on the cw=0x0F frame that
-            // TRIGGERS OE -- one of THESE ladder frames. Stream target = live actual every
-            // ladder cycle -> genuine zero jump. Without this, 0x607A stays 0 and the drive
-            // slews from the absolute-encoder position toward 0 on enable.
+            // CSP enable-jump fix: climbing the ladder (06->07->0F) toward OE. In CSP the drive latches
+            // its first setpoint from the 0x607A on the cw=0x0F frame that triggers OE, one of these
+            // ladder frames. Stream target = live actual every ladder cycle for a genuine zero jump.
+            // Without this, 0x607A stays 0 and the drive slews from the absolute-encoder position
+            // toward 0 on enable.
             target_ = ethercat::tools::csp_target_counts(false, pos, pos_enable_, opt_.sine_amplitude, opt_.sine_period, 0.0);
             last_sine_target_ = target_;  // keep coherent for the graceful-hold + follow-err seed
             ctx.store<cia402::TargetPosition::type>(target_loc_, target_);
             // cw left as fsm_.step()'s ladder climb (06/07/0F as appropriate).
         } else if (!opt_.enable) {
-            cw = ControlWord::shutdown();  // 0x06 -> ReadyToSwitchOn, NOT energized
+            cw = ControlWord::shutdown();  // 0x06 -> ReadyToSwitchOn, not energized
         }
         ctx.store<cia402::ControlWord::type>(cw_loc_, cw);
         last_cw_ = cw;
@@ -464,22 +458,22 @@ class A6Control final : public SlaveControl {
     }
 
    private:
-    // #47-P3b: drive the generic policy for --move-pos (PP absolute) / --move-vel (PV). The
-    // wrapper builds the per-cycle Command from the CLI opts, hands it to the policy, publishes
-    // telemetry from the policy's outputs + the ctx feedback, and ends a completed move-to. The
-    // policy owns ALL the CiA402 sequencing (enable ladder, mode-echo, bit4 handshake, quick-stop,
-    // reached). This tool keeps its own CSP-sine / PP-relative / plain-hold paths (bench-only).
+    // Drive the generic policy for --move-pos (PP absolute) and --move-vel (PV). The wrapper builds
+    // the per-cycle Command from the CLI opts, hands it to the policy, publishes telemetry from the
+    // policy's outputs and the ctx feedback, and ends a completed move-to. The policy owns the CiA402
+    // sequencing (enable ladder, mode-echo, bit-4 handshake, quick-stop). This tool keeps its own
+    // CSP-sine, PP-relative, and plain-hold paths.
     void step_policy_(CycleContext& ctx) noexcept {
-        // #18: the policy is now a dumb per-mode executor -- the bench drives ONE fixed mode per run
-        // (--move-pos PP or --move-vel PV). Runtime mode-switch orchestration is the VIAM DRIVER's job
-        // (ServoController), exercised HW-first by the RDK campaign, not this tool.
+        // The policy is a per-mode executor; the bench drives one fixed mode per run (--move-pos PP or
+        // --move-vel PV). Runtime mode-switch orchestration is the Viam driver's job (ServoController),
+        // not this tool.
         PolicyCommand cmd;
         cmd.mode = opt_.move_vel ? Cia402Mode::ProfileVelocity : Cia402Mode::ProfilePosition;
         cmd.enable = opt_.enable;
         cmd.target_counts = opt_.pos_target;
         cmd.profile_velocity = pp_profile_vel_;
         cmd.target_velocity = opt_.pv_vel_cps;
-        cmd.new_setpoint = opt_.move_pos && arm_setpoint_;  // arm the PP handshake ONCE for the single bench move
+        cmd.new_setpoint = opt_.move_pos && arm_setpoint_;  // arm the PP handshake once for the single bench move
         arm_setpoint_ = false;
         const std::uint16_t cw = policy_.step(ctx, cmd);
 
@@ -489,9 +483,8 @@ class A6Control final : public SlaveControl {
         const std::int32_t vel = ctx.load<cia402::VelocityActual::type>(vel_loc_);
         const std::uint16_t fc = ctx.load<cia402::FaultCode::type>(fc_loc_);
 
-        // #17: the DRIVER (this tool) owns reached now -- |pos-target| <= tol AND velocity ~0 (debounced;
-        // NEVER bit10, the A6 ties it high, #43). Latch once, then let a move-to finish (request_stop);
-        // continuous PV runs until Ctrl-C.
+        // This tool owns reached: |pos-target| <= tol and velocity ~0 (debounced; never bit 10, the A6
+        // ties it high). Latch once, then let a move-to finish (request_stop); continuous PV runs until Ctrl-C.
         if (opt_.move_pos && !policy_reached_) {
             const bool pos_ok = std::abs(pos - opt_.pos_target) <= opt_.pos_tol;
             if (std::abs(vel) < kZeroVelThresh) {
@@ -535,8 +528,8 @@ class A6Control final : public SlaveControl {
         tel_.bad_wkc.store(ctx.wkc().bad_cycles, std::memory_order_relaxed);
     }
 
-    // #47-P3b: --move-pos / --move-vel run through the GENERIC policy; the bench-only CSP-sine
-    // (--move-sine) + PP-relative (--move-pp) + plain-hold paths stay as this tool's own code.
+    // --move-pos / --move-vel run through the generic policy; the CSP-sine (--move-sine), PP-relative
+    // (--move-pp), and plain-hold paths stay as this tool's own code.
     bool uses_policy_() const noexcept {
         return opt_.move_pos || opt_.move_vel;
     }
@@ -552,18 +545,18 @@ class A6Control final : public SlaveControl {
     FieldLocation cw_loc_, target_loc_, pv_loc_, tv_loc_;
     FieldLocation sw_loc_, pos_loc_, vel_loc_, fc_loc_, mode_loc_;
 
-    // #53 commanded mode echo + PV/PP-abs config (set in ctor / on_configured)
+    // commanded mode echo + PV/PP-abs config (set in ctor / on_configured)
     std::int8_t commanded_mode_disp_ = 1;  // 0x6061 echo target (PP=1, PV=3, CSP=8)
     std::uint32_t pp_profile_vel_ = 0;     // 0x6081 for --move-pos
-    std::uint32_t qs_decel_echoed_ = 0;    // 0x6085 readback (DA-A; downstream math uses this)
+    std::uint32_t qs_decel_echoed_ = 0;    // 0x6085 readback (downstream math uses this)
 
     // RT-thread-only policy state (single-threaded by construction)
     std::uint16_t last_cw_ = 0;
     bool announced_op_ = false;
     bool setpoint_latched_ = false;
     bool move_done_ = false;
-    bool arm_setpoint_ = true;     // #17: arm the policy's PP handshake once (the single bench move)
-    bool policy_reached_ = false;  // #17: the tool owns reached now (|d|<=tol && vel~0), not the policy
+    bool arm_setpoint_ = true;     // arm the policy's PP handshake once (the single bench move)
+    bool policy_reached_ = false;  // the tool owns reached (|d|<=tol && vel~0), not the policy
     bool was_faulted_ = false;
     bool hold_captured_ = false;
     bool safety_abort_ = false;
@@ -574,11 +567,11 @@ class A6Control final : public SlaveControl {
     std::int32_t last_sine_target_ = 0;
     std::uint32_t stopping_steps_ = 0;
     StopReason stop_reason_ = StopReason::None;
-    // #53 mode-echo gate + PP-abs handshake-edge + zero-vel debounce
+    // mode-echo gate + PP-abs handshake-edge + zero-vel debounce
     bool mode_checked_ = false;         // 0x6061 echo confirmed -> enable allowed
     bool mode_refused_ = false;         // echo mismatch -> refused to enable (one-shot)
-    bool bit4_high_ = false;            // tracks the bit4 level for edge counting
-    int bit4_edges_ = 0;                // count of bit4 0->1 rising edges (#53 PP, DA-I: must be 1)
+    bool bit4_high_ = false;            // tracks the bit-4 level for edge counting
+    int bit4_edges_ = 0;                // count of bit-4 0->1 rising edges (PP: must be 1)
     std::uint32_t zerovel_cycles_ = 0;  // consecutive |vel|<thresh cycles (PV stop backstop + PP reached)
 };
 
