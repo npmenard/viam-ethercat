@@ -121,7 +121,7 @@ struct MasterConfig {
     std::uint32_t dc_op_gate_cycles = 400;
     // Post-OP grace: suppress the consecutive-WKC-error fault latch for this many
     // cycles after reaching OP, so any residual DC phase transient settles without
-    // tripping a BusError (the phase PI needs ~hundreds of cycles to fully lock; the
+    // tripping a WKC-fault latch (the phase PI needs ~hundreds of cycles to fully lock; the
     // latch fires in ~5). 0 = latch immediately. Bench-tunable.
     std::uint32_t dc_settle_cycles = 0;
     // SYNC0 pulse CyclShift (ns) passed to ecx_dcsync0: the SYNC0 edge fires this long
@@ -132,7 +132,7 @@ struct MasterConfig {
     // SYNC0 edge (mid-cycle margin -- locking on the edge leaves no room for jitter).
     // Bench-swept at first light. 0 = SYNC0 on the DC base.
     std::int32_t dc_sync0_shift_ns = 0;
-    // Latch a BusError only after this many CONSECUTIVE short/abnormal WKC
+    // Latch a bus fault only after this many CONSECUTIVE short/abnormal WKC
     // cycles (a single transient bad cycle should not hard-fault). Reset on any
     // good cycle.
     std::uint32_t max_consecutive_wkc_errors = 5;

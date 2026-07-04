@@ -1,7 +1,7 @@
 #pragma once
 
 // Validated configuration for one servo drive. Pure data + a validate() that
-// throws ethercat::ConfigError with clear text. No SDK, no hardware -- the
+// throws ethercat::Error with clear text. No SDK, no hardware -- the
 // module parses the Viam attributes into this struct and validates before any
 // hardware init (deferred-init pattern). The A6 PDO map lives here as CONFIG
 // DATA (never hardcoded in generic code).
@@ -111,7 +111,7 @@ struct ServoConfig {
     // #17: the blocking go_to/go_for wait has NO timeout at all -- a long move must not be killed by a
     // clock, and a stuck move parks until the client stops it / the drive faults / the RT loop exits.
 
-    // Throws ethercat::ConfigError (clear text) on any invalid field. Pure --
+    // Throws ethercat::Error (clear text) on any invalid field. Pure --
     // no I/O.
     void validate() const;
 

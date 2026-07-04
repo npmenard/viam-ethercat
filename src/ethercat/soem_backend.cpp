@@ -87,17 +87,17 @@ SoemBackend::~SoemBackend() {
 
 std::size_t SoemBackend::open(std::string_view ifname) {
     if (impl_->open) {
-        throw ConfigError("SoemBackend::open: bus already open (one master per backend; close() first)");
+        throw Error("SoemBackend::open: bus already open (one master per backend; close() first)");
     }
     const std::string name(ifname);
     if (ecx_init(&impl_->ctx, name.c_str()) <= 0) {
-        throw InitError("failed to open EtherCAT interface '" + name +
-                        "': need CAP_NET_RAW (run with setcap or as root) and the interface must exist");
+        throw Error("failed to open EtherCAT interface '" + name +
+                    "': need CAP_NET_RAW (run with setcap or as root) and the interface must exist");
     }
     const int count = ecx_config_init(&impl_->ctx);
     if (count <= 0) {
         ecx_close(&impl_->ctx);
-        throw InitError("no EtherCAT slaves found on '" + name + "' (is the bus wired and powered?)");
+        throw Error("no EtherCAT slaves found on '" + name + "' (is the bus wired and powered?)");
     }
     impl_->slave_count = count;
 
@@ -122,8 +122,8 @@ std::size_t SoemBackend::open(std::string_view ifname) {
                       " ALstatuscode=" + hex(static_cast<std::uint32_t>(al)) + " (" + ec_ALstatuscode2string(al) + ")]";
         }
         ecx_close(&impl_->ctx);
-        throw InitError("EtherCAT slaves did not reach PRE-OP on '" + name + "' (reached " + to_string(from_soem_state(reached)) + ")" +
-                        detail);
+        throw Error("EtherCAT slaves did not reach PRE-OP on '" + name + "' (reached " + to_string(from_soem_state(reached)) + ")" +
+                    detail);
     }
 
     // CRITICAL: refresh EACH slave's cached state to PRE-OP. statecheck(slave 0) only updates the
@@ -164,8 +164,8 @@ std::size_t SoemBackend::open(std::string_view ifname) {
             std::string detail = " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
                                  " ALstatuscode=" + hex(static_cast<std::uint32_t>(al)) + " (" + ec_ALstatuscode2string(al) + ")]";
             ecx_close(&impl_->ctx);
-            throw InitError("slave " + std::to_string(i) + " CoE mailbox-out (SM0) not writable within ~10s after PRE-OP on '" + name +
-                            "' -- mbxsend would not transmit" + detail);
+            throw Error("slave " + std::to_string(i) + " CoE mailbox-out (SM0) not writable within ~10s after PRE-OP on '" + name +
+                        "' -- mbxsend would not transmit" + detail);
         }
         // (2) PATIENT handler warm-up -- now that SM0 is writable, the read actually goes out.
         constexpr int kWarmupTries = 300;         // ~15s @ ~50ms/try -- patient, matching drive slowness
@@ -192,9 +192,8 @@ std::size_t SoemBackend::open(std::string_view ifname) {
             std::string detail = " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
                                  " ALstatuscode=" + hex(static_cast<std::uint32_t>(al)) + " (" + ec_ALstatuscode2string(al) + ")]";
             ecx_close(&impl_->ctx);
-            throw InitError("slave " + std::to_string(i) +
-                            " CoE handler did not answer a warm-up SDO read (0x1018:01) within ~15s after PRE-OP on '" + name + "'" +
-                            detail);
+            throw Error("slave " + std::to_string(i) +
+                        " CoE handler did not answer a warm-up SDO read (0x1018:01) within ~15s after PRE-OP on '" + name + "'" + detail);
         }
     }
 
@@ -204,7 +203,7 @@ std::size_t SoemBackend::open(std::string_view ifname) {
 
 SlaveInfo SoemBackend::slave_info(std::uint16_t slave) const {
     if (slave < 1 || slave > impl_->slave_count) {
-        throw ConfigError("SoemBackend::slave_info: slave " + std::to_string(slave) + " out of range");
+        throw Error("SoemBackend::slave_info: slave " + std::to_string(slave) + " out of range");
     }
     const ec_slavet& s = impl_->ctx.slavelist[slave];
     SlaveInfo info;
@@ -225,8 +224,8 @@ void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8
     // remap write, desyncing the map (the "OP did not hold" failure). A genuine CoE abort returns
     // WKC > 0 with an error pushed and is surfaced below; WKC 0 is now a real, reportable fault.
     if (slave < 1 || slave > impl_->slave_count) {
-        throw ConfigError("SoemBackend::sdo_write: slave " + std::to_string(slave) + " out of range (configured " +
-                          std::to_string(impl_->slave_count) + ")");
+        throw Error("SoemBackend::sdo_write: slave " + std::to_string(slave) + " out of range (configured " +
+                    std::to_string(impl_->slave_count) + ")");
     }
     const int size = static_cast<int>(data.size());
     const int wkc = ecx_SDOwrite(&impl_->ctx, slave, index, sub, FALSE, size, data.data(), EC_TIMEOUTRXM);
@@ -243,15 +242,15 @@ void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8
 
 std::size_t SoemBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
     if (slave < 1 || slave > impl_->slave_count) {
-        throw ConfigError("SoemBackend::sdo_read: slave " + std::to_string(slave) + " out of range (configured " +
-                          std::to_string(impl_->slave_count) + ")");
+        throw Error("SoemBackend::sdo_read: slave " + std::to_string(slave) + " out of range (configured " +
+                    std::to_string(impl_->slave_count) + ")");
     }
     int size = static_cast<int>(out.size());
     const int wkc = ecx_SDOread(&impl_->ctx, slave, index, sub, FALSE, &size, out.data(), EC_TIMEOUTRXM);
     if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {
         const std::string abort = pop_coe_abort(&impl_->ctx);
-        throw BusError("SDO read from slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" + std::to_string(sub) +
-                       " failed (working counter " + std::to_string(wkc) + ")" + abort);
+        throw Error("SDO read from slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" + std::to_string(sub) +
+                    " failed (working counter " + std::to_string(wkc) + ")" + abort);
     }
     return static_cast<std::size_t>(size < 0 ? 0 : size);
 }
@@ -289,8 +288,8 @@ void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
             detail += " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
                       " ALstatuscode=" + hex(static_cast<std::uint32_t>(al)) + " (" + ec_ALstatuscode2string(al) + ")]";
         }
-        throw InitError("slave " + std::to_string(slave) + " did not reach state " + to_string(target) + " (reached " +
-                        to_string(from_soem_state(reached)) + ")" + detail);
+        throw Error("slave " + std::to_string(slave) + " did not reach state " + to_string(target) + " (reached " +
+                    to_string(from_soem_state(reached)) + ")" + detail);
     }
 }
 
@@ -369,7 +368,7 @@ void SoemBackend::configure_dc_configdc() {
     const boolean dc_found = ecx_configdc(&impl_->ctx);
     std::cerr << "[dc] ecx_configdc() returned " << (dc_found == TRUE ? "TRUE (DC slaves found)" : "FALSE (NO DC slaves)") << '\n';
     if (dc_found == FALSE) {
-        throw InitError("use_distributed_clocks is set but ecx_configdc() found NO DC-capable slave on the bus");
+        throw Error("use_distributed_clocks is set but ecx_configdc() found NO DC-capable slave on the bus");
     }
 }
 

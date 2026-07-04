@@ -33,9 +33,9 @@
 #include "viam/lib/servo_config.hpp"
 #include "viam/lib/servo_controller.hpp"
 
-using ethercat::BusError;
 using ethercat::Cia402Mode;
 using ethercat::EcatBackend;
+using ethercat::Error;
 using ethercat::PdoEntry;
 using ethercat::SimBackend;
 using ethercat::SimSlaveModel;
@@ -317,8 +317,8 @@ TEST("ServoController(PP): R3 single-in-flight -- a 2nd blocking move is rejecte
 
     CHECK(wait_until([&] { return ctrl.is_moving(); }, std::chrono::milliseconds(500)));  // 1st move is live
     // A 2nd blocking move CANNOT claim the slot while one is live -> "already in progress". Both reject.
-    CHECK_THROWS_MSG(ctrl.go_to(500.0, 1.0), BusError, "already in progress");
-    CHECK_THROWS_MSG(ctrl.go_for(500.0, 1.0), BusError, "already in progress");
+    CHECK_THROWS_MSG(ctrl.go_to(500.0, 1.0), Error, "already in progress");
+    CHECK_THROWS_MSG(ctrl.go_for(500.0, 1.0), Error, "already in progress");
 
     ctrl.halt();  // R3 cancel -> the 1st move's waiter throws "motor stopped"
     mover.join();
@@ -360,7 +360,7 @@ TEST("ServoController(PP): R3 first-terminal-wins -- cancel AFTER completion is 
 // --- bus fault latch --------------------------------------------------------
 
 TEST("ServoController: a sustained short WKC latches a bus fault (de-powers + last_error)") {
-    // A sustained working-counter shortfall -> the Master latches a BusError; the controller
+    // A sustained working-counter shortfall -> the Master latches an Error; the controller
     // de-energizes and last_error() surfaces the working-counter tier.
     SimBackend* sim = nullptr;
     ServoController ctrl{make_config(), pp_factory(&sim)};
@@ -445,7 +445,7 @@ TEST("#22/#15: an SDO read after stop() fails cleanly (not running) and does not
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
     ctrl.stop();  // joins the RT thread + drops the Runner (bus closed)
 
-    // After stop() the controller is not running, so sdo_read refuses PROMPTLY (ConfigError)
+    // After stop() the controller is not running, so sdo_read refuses PROMPTLY (Error)
     // rather than reading a stale value off a closed bus. Bound the call to prove no hang.
     std::array<std::byte, 4> buf{};
     const auto t0 = std::chrono::steady_clock::now();

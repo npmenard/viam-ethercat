@@ -88,7 +88,7 @@ class ServoController : public SlaveControl {
     using BackendFactory = std::function<std::unique_ptr<EcatBackend>()>;
 
     // Production: backend factory = a SoemBackend maker (so reconfigure() can
-    // build a fresh backend). Validates config (no I/O); throws ConfigError.
+    // build a fresh backend). Validates config (no I/O); throws Error.
     explicit ServoController(ServoConfig config);
     // Test/DI: inject a backend factory (SimBackend maker in offline tests).
     ServoController(ServoConfig config, BackendFactory backend_factory);
@@ -100,7 +100,7 @@ class ServoController : public SlaveControl {
     ~ServoController();  // stop()
 
     // NON-RT lifecycle (exclusive api_mutex_). start(): build+init+configure the
-    // Master to SAFE-OP (may throw InitError), resolve field offsets ONCE, spawn the
+    // Master to SAFE-OP (may throw Error), resolve field offsets ONCE, spawn the
     // RT thread; the promise/future handshake makes start() throw if the RT thread
     // can't get SCHED_FIFO and require_realtime.
     //
@@ -168,7 +168,7 @@ class ServoController : public SlaveControl {
     // a single owner. Generic raw-bytes surface -- unit conversion is the module layer's job
     // (do_command). Takes the SHARED api_mutex_ so it can't race reconfigure() resetting
     // master_; the wait is bounded by `timeout`, so a mid-flight reconfigure blocks only that
-    // long (unlike a multi-second move, which releases the lock). Throws ConfigError if not
+    // long (unlike a multi-second move, which releases the lock). Throws Error if not
     // started / no RT servicer, SdoError on a CoE abort or timeout. Returns bytes read.
     std::size_t sdo_read(std::uint16_t index,
                          std::uint8_t sub,
@@ -245,7 +245,7 @@ class ServoController : public SlaveControl {
     };
 
     // The RT thread body (loop while !st.stop_requested()). `started` is fulfilled
-    // after a clean prelude (or set to an InitError exception on RT-sched failure
+    // after a clean prelude (or set to an Error exception on RT-sched failure
     // && require_realtime) -> bounded start() handshake. The promise lives in the
     // thread (reconfigure-safe). On exit: leave outputs safe (Halt/disable) + a
     // final process(), then return so join() completes.

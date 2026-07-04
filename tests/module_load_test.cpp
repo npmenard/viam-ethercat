@@ -40,8 +40,8 @@
 #include "viam/lib/servo_controller.hpp"
 #include "viam/module/servo_motor.hpp"
 
-using ethercat::ConfigError;
 using ethercat::EcatBackend;
+using ethercat::Error;
 using ethercat::PdoEntry;
 using ethercat::SimBackend;
 using ethercat::SimSlaveModel;
@@ -154,7 +154,7 @@ TEST("module-load: validate() accepts the sim config and rejects malformed ones 
     // always-switchable), so the surviving required datum is the kinematic counts_per_rev.
     ProtoStruct no_cpr = load_sim_attrs();
     no_cpr.erase("counts_per_rev");
-    CHECK_THROWS_MSG(ServoMotor::validate(make_resource_config(std::move(no_cpr), "no-cpr")), ConfigError, "counts_per_rev");
+    CHECK_THROWS_MSG(ServoMotor::validate(make_resource_config(std::move(no_cpr), "no-cpr")), Error, "counts_per_rev");
 }
 
 TEST("module-load: simulate defaults FALSE -- a config without it routes to real hardware") {
@@ -224,12 +224,12 @@ TEST("module-load: reconfigure rebuilds the controller; the drive stays always-s
     // #18: there is NO control_mode and NO mode-reject -- the drive is ALWAYS switch-capable, so
     // reconfigure just stops the old controller + rebuilds a fresh one (no mode to re-resolve). After
     // the rebuild BOTH verbs are accepted: go_to (PP) converges, and set_rpm (PV) is accepted without
-    // a ConfigError (the driver ensures each verb's own mode at runtime).
+    // an Error (the driver ensures each verb's own mode at runtime).
     motor.reconfigure(Dependencies{}, make_resource_config(load_sim_attrs(), "recfg-motor"));
     CHECK(wait_until([&] { return status_powered(motor); }, std::chrono::milliseconds(1000)));  // usable after rebuild
     motor.go_to(1000.0, 2.0, ProtoStruct{});                                                    // PP still accepted + converges
     CHECK(std::abs(motor.get_position(ProtoStruct{}) - 2.0) < 0.01);
-    motor.set_rpm(500.0, ProtoStruct{});  // PV accepted too (always-switchable) -- must NOT throw ConfigError
+    motor.set_rpm(500.0, ProtoStruct{});  // PV accepted too (always-switchable) -- must NOT throw Error
 }
 
 TEST("module-load: API-after-stop is fail-safe (not powered, last_error doesn't crash)") {

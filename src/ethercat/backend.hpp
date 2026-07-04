@@ -67,8 +67,8 @@ struct SlaveIo {
 };
 
 // Abstract EtherCAT bus backend. One instance per master/NIC. Setup methods run
-// non-RT at init/configure and MAY throw (InitError/PdoMappingError/BusError
-// with clear text). The cyclic methods are on the RT hot path: noexcept, no
+// non-RT at init/configure and MAY throw (Error/PdoMappingError/SdoError with
+// clear text). The cyclic methods are on the RT hot path: noexcept, no
 // allocation, no blocking.
 class EcatBackend {
    public:
@@ -83,8 +83,8 @@ class EcatBackend {
     // --- setup (non-RT; may throw) ------------------------------------------
 
     // Open the NIC and enumerate the bus into PRE-OP. Returns the slave count
-    // (>= 1) or throws InitError (no privileges / no NIC / no slaves). Throws
-    // ConfigError on a second open of an already-open backend (double-init
+    // (>= 1) or throws Error (no privileges / no NIC / no slaves). Throws
+    // Error on a second open of an already-open backend (double-init
     // guard; SOEM has process-global resources per NIC).
     virtual std::size_t open(std::string_view ifname) = 0;
 
@@ -93,17 +93,17 @@ class EcatBackend {
 
     // CoE SDO write/read of raw bytes (used by the master's PDO-remap
     // sub-protocol and arbitrary object access). Blocking with a timeout. Throws
-    // PdoMappingError/BusError (slave + index:sub + abort code in the text) on a
-    // CoE abort. sdo_read returns the byte count read.
+    // SdoError (slave + index:sub + abort code in the text) on a CoE abort, or
+    // base Error on a bad slave id / transport. sdo_read returns the byte count read.
     virtual void sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) = 0;
     virtual std::size_t sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) = 0;
 
     // Map the (already remapped) PDOs into the process-data image. Call AFTER the
     // SDO remap. After this, slave_io() returns valid spans. Throws
-    // PdoMappingError/BusError naming the offending slave.
+    // PdoMappingError/base Error naming the offending slave.
     virtual void map_process_data() = 0;
 
-    // Drive `slave` (0 = all) to `target` and wait. Throws InitError naming the
+    // Drive `slave` (0 = all) to `target` and wait. Throws Error naming the
     // slave + target (and the state actually reached) on timeout.
     virtual void request_state(std::uint16_t slave, EcatState target) = 0;
     virtual EcatState slave_state(std::uint16_t slave) const = 0;
@@ -181,7 +181,7 @@ class EcatBackend {
 
     // One cyclic exchange (send + receive process data). Returns the actual
     // working counter; < 0 signals a link error. Never throws -- the master
-    // interprets the WKC (consecutive-error threshold -> latched BusError).
+    // interprets the WKC (consecutive-error threshold -> latched Error).
     virtual int exchange() noexcept = 0;
 
     // Expected WKC for a fully-operational bus, computed at map time.

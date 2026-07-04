@@ -109,15 +109,15 @@ Runner::~Runner() {
 
 void Runner::attach(std::uint16_t slave_id, SlaveControl& control) {
     if (started_.load(std::memory_order_acquire)) {
-        throw ConfigError("Runner::attach: controls must be attached before start()");
+        throw Error("Runner::attach: controls must be attached before start()");
     }
     if (slave_id == 0 || slave_id > master_.slave_count()) {
-        throw ConfigError("Runner::attach: slave " + std::to_string(slave_id) + " out of range (bus has " +
-                          std::to_string(master_.slave_count()) + ")");
+        throw Error("Runner::attach: slave " + std::to_string(slave_id) + " out of range (bus has " +
+                    std::to_string(master_.slave_count()) + ")");
     }
     for (const RtCore::Attached& a : rt_core_->controls_) {
         if (a.slave_id == slave_id) {
-            throw ConfigError("Runner::attach: slave " + std::to_string(slave_id) + " already has a control attached");
+            throw Error("Runner::attach: slave " + std::to_string(slave_id) + " already has a control attached");
         }
     }
     rt_core_->controls_.emplace_back(slave_id, &control, rt_core_.get());  // ctx built in place (non-movable, #47 TODO-1)
@@ -125,10 +125,10 @@ void Runner::attach(std::uint16_t slave_id, SlaveControl& control) {
 
 void Runner::start() {
     if (started_.load(std::memory_order_acquire)) {
-        throw ConfigError("Runner::start: already started (one start() per Runner; restart = a fresh Runner)");
+        throw Error("Runner::start: already started (one start() per Runner; restart = a fresh Runner)");
     }
     if (rt_core_->controls_.empty()) {
-        throw ConfigError("Runner::start: no controls attached");
+        throw Error("Runner::start: no controls attached");
     }
     // NON-RT hooks first -- the ONLY throwing phase. A throw here aborts start()
     // cleanly: nothing locked, no thread, no rt_active bracket, master untouched.

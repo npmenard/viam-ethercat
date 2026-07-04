@@ -57,7 +57,7 @@ ProtoStruct load_attributes(const std::string& path) {
 
 TEST("a6-hardware.example.json parses through the real parser + validate()") {
     const ProtoStruct attrs = load_attributes(A6_HW_CONFIG_PATH);
-    const ServoConfig c = parse_servo_config(attrs);  // throws ConfigError on any invalid field
+    const ServoConfig c = parse_servo_config(attrs);  // throws Error on any invalid field
     CHECK(c.counts_per_rev == 131072.0);              // 2^17
     CHECK(c.require_realtime);
     CHECK(c.use_distributed_clocks);

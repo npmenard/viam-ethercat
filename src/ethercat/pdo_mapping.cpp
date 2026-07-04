@@ -15,7 +15,7 @@ namespace {
 // Write a little-endian scalar as an SDO download. These are the MAPPING-object writes
 // (0x1C1x/0x16xx/0x1Axx): the backend's generic sdo_write throws SdoError on a CoE abort, so
 // re-tag it as PdoMappingError HERE -- the one place the mapping context makes that name correct
-// (#32 note 14). A transport/bounds BusError propagates unchanged (not a "mapping rejected").
+// (#32 note 14). A transport/bounds base Error propagates unchanged (not a "mapping rejected").
 template <PdoScalar T>
 void sdo_write_scalar(EcatBackend& backend, std::uint16_t slave, std::uint16_t index, std::uint8_t sub, T value) {
     std::array<std::byte, sizeof(T)> buf{};

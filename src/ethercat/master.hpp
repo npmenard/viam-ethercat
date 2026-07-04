@@ -86,7 +86,7 @@ enum class BringupStatus : std::uint8_t {
 
 class Master {
    public:
-    // Validates config (no I/O). Throws ConfigError on a bad config.
+    // Validates config (no I/O). Throws Error on a bad config.
     Master(MasterConfig config, std::unique_ptr<EcatBackend> backend);
 
     Master(const Master&) = delete;
@@ -97,14 +97,14 @@ class Master {
 
     // --- non-RT lifecycle (may throw) ---------------------------------------
 
-    // Open the NIC and enumerate; throws InitError if the slave count doesn't
+    // Open the NIC and enumerate; throws Error if the slave count doesn't
     // match the config.
     void init();
 
     // PRE-OP -> apply the PDO remap per slave -> map the process image -> size the
     // PdoCaches + build the flat field tables -> [DC: configdc (PRE-OP)] -> SAFE-OP ->
     // [fault_reset: clear a latent drive fault via the vendor SDO]. Re-applies the map
-    // every call (A6 map isn't in EEPROM). Throws InitError/PdoMappingError naming the
+    // every call (A6 map isn't in EEPROM). Throws Error/PdoMappingError naming the
     // offending slave.
     //
     // configure() STOPS AT SAFE-OP: it does NOT arm SYNC0 and does NOT request OP. The
@@ -140,7 +140,7 @@ class Master {
 
     // --- RT hot path (noexcept, exception-free) -----------------------------
 
-    // One cyclic exchange: drive the bus, interpret the WKC (latch BusError
+    // One cyclic exchange: drive the bus, interpret the WKC (latch Error
     // after max_consecutive_wkc_errors consecutive bad cycles -- never throw),
     // and publish each slave's feedback into its PdoCache.
     void process() noexcept;
@@ -161,7 +161,7 @@ class Master {
     }
     // Identity + image sizes for a slave (1-based), from enumeration -- the library's
     // typed view of the bus, so tools/callers read identity through the API instead of
-    // poking CoE 0x1018 directly. Valid after init(). Throws ConfigError if out of range.
+    // poking CoE 0x1018 directly. Valid after init(). Throws Error if out of range.
     SlaveInfo slave_info(std::uint16_t slave) const {
         return backend_->slave_info(slave);
     }
@@ -245,7 +245,7 @@ class Master {
 
     // Resolve a Field<> to its byte location in the slave's command (rx) / feedback (tx) image
     // (#30 §5). Templated so it knows sizeof(F::type): clear-text throws on the throw-tier split
-    // -- PdoMappingError if the object isn't mapped (map-membership), PdoAccessError if
+    // -- PdoMappingError if the object isn't mapped (map-membership), Error if
     // sizeof(F::type)*8 != the mapped object's bit_length (a malformed/wrong-width access, e.g.
     // an int16 alias on a 32-bit-mapped object -- catches a silent wrong-width read). The RT path
     // calls this ONCE at configure to cache a FieldLocation (then the noexcept load_le/store_le(
@@ -262,7 +262,7 @@ class Master {
     // absent in a PP-only map, 0x607A in a PV-only map). Returns an UNMAPPED FieldLocation
     // (mapped()==false) when the object isn't in the map, instead of throwing -- the caller
     // guards its per-cycle load/store on mapped(). A mapped-but-WRONG-WIDTH object still throws
-    // PdoAccessError (a real misconfig, never silently tolerated). Configure-time only.
+    // Error (a real misconfig, never silently tolerated). Configure-time only.
     template <class F>
     FieldLocation resolve_rx_optional(std::uint16_t slave) const {
         try {
@@ -289,7 +289,7 @@ class Master {
     // getindex/tx/rx mutexes (nicdrv) -- and the mailbox SyncManager is distinct from the PDO SM, so
     // a one-shot SDO from a non-RT thread neither corrupts nor (being one-shot, not a tight poll)
     // starves the cyclic LRW. This reverses the pre-#15 contract ("single port owner only"; SOEM v1
-    // was not thread-safe). The backend's error tiers (SdoError on a CoE abort, ConfigError on a bad
+    // was not thread-safe). The backend's error tiers (SdoError on a CoE abort, Error on a bad
     // slave id) pass through; sdo_read returns the number of bytes read into `out`.
     void sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data);
     std::size_t sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out);
@@ -322,7 +322,7 @@ class Master {
     static std::map<std::uint32_t, MappedField> build_field_table(std::uint16_t slave, const PdoMap& map);
 
     // Shared resolution body for resolve_rx/resolve_tx (#30 §5): look the object up in `table`,
-    // clear-text throw PdoMappingError if it isn't mapped (map-membership) or PdoAccessError if
+    // clear-text throw PdoMappingError if it isn't mapped (map-membership) or Error if
     // its mapped bit_length/8 != want_width (malformed access; the templated callers pass
     // sizeof(F::type) so the width-vs-T check happens at resolve). Returns an offset-only
     // FieldLocation (present=true).

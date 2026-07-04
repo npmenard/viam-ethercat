@@ -68,7 +68,7 @@ class Cia402Policy {
     explicit Cia402Policy(std::uint32_t quick_stop_decel, std::int16_t quick_stop_option = 2) noexcept
         : quick_stop_decel_(quick_stop_decel), quick_stop_option_(quick_stop_option) {}
 
-    // NON-RT, pre-spawn, may throw (ConfigError -> Runner start aborts, wrapper -> Degraded):
+    // NON-RT, pre-spawn, may throw (Error -> Runner start aborts, wrapper -> Degraded):
     // resolve the standard fields + the quick-stop SDO setup (0x605A assert-==required;
     // 0x6085 write + readback-echo). Returns the ECHOED 0x6085 (the wrapper does the VEL guard
     // against the commanded velocity -- a wrapper/units concern). `needs_quick_stop` gates the
@@ -96,9 +96,8 @@ class Cia402Policy {
             const std::size_t n = cfg.sdo_read(kQuickStopOption, 0, qso);
             const std::int16_t qs_opt = n >= 2 ? load_le<std::int16_t>(qso) : std::int16_t{-1};
             if (qs_opt != quick_stop_option_) {
-                throw ConfigError("Cia402Policy: 0x605A (quick-stop option) = " + std::to_string(qs_opt) +
-                                  ", require == " + std::to_string(quick_stop_option_) +
-                                  " (decel on 0x6085 -> auto SwitchOnDisabled). Refusing to energize.");
+                throw Error("Cia402Policy: 0x605A (quick-stop option) = " + std::to_string(qs_opt) + ", require == " +
+                            std::to_string(quick_stop_option_) + " (decel on 0x6085 -> auto SwitchOnDisabled). Refusing to energize.");
             }
             // 0x6085 (quick-stop decel) write + readback-echo; use the ECHOED value downstream.
             cfg.sdo_write(kQuickStopDecel, 0, sdo_bytes<std::uint32_t>(quick_stop_decel_));
@@ -106,7 +105,7 @@ class Cia402Policy {
             const std::size_t m = cfg.sdo_read(kQuickStopDecel, 0, qd);
             echoed = m >= 4 ? load_le<std::uint32_t>(qd) : 0U;
             if (echoed == 0U) {
-                throw ConfigError("Cia402Policy: 0x6085 (quick-stop decel) readback = 0/absent after write. Refusing to energize.");
+                throw Error("Cia402Policy: 0x6085 (quick-stop decel) readback = 0/absent after write. Refusing to energize.");
             }
         }
         qs_decel_echoed_ = echoed;

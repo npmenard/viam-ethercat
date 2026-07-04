@@ -42,7 +42,7 @@ std::optional<T> opt_attr(const ProtoStruct& attrs, const std::string& key) {
     }
     const T* const p = v->get<T>();
     if (p == nullptr) {
-        throw ConfigError("config attribute '" + key + "' has the wrong type");
+        throw Error("config attribute '" + key + "' has the wrong type");
     }
     return *p;
 }
@@ -50,7 +50,7 @@ std::optional<T> opt_attr(const ProtoStruct& attrs, const std::string& key) {
 double req_num(const ProtoStruct& attrs, const std::string& key) {
     const auto v = opt_attr<double>(attrs, key);
     if (!v) {
-        throw ConfigError("required config attribute '" + key + "' is missing");
+        throw Error("required config attribute '" + key + "' is missing");
     }
     return *v;
 }
@@ -62,7 +62,7 @@ double opt_num(const ProtoStruct& attrs, const std::string& key, double dflt) {
 std::string req_str(const ProtoStruct& attrs, const std::string& key) {
     const auto v = opt_attr<std::string>(attrs, key);
     if (!v) {
-        throw ConfigError("required config attribute '" + key + "' is missing");
+        throw Error("required config attribute '" + key + "' is missing");
     }
     return *v;
 }
@@ -98,7 +98,7 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     c.command_queue_capacity = static_cast<std::size_t>(opt_num(attrs, "command_queue_capacity", 64.0));
     // #17: handshake_timeout_cycles is no longer a config attribute -- it is an internal policy constant.
 
-    c.validate();  // throws ConfigError (clear text) on any invalid field
+    c.validate();  // throws Error (clear text) on any invalid field
     return c;
 }
 
@@ -279,7 +279,7 @@ std::vector<std::shared_ptr<ModelRegistration>> ServoMotor::create_model_registr
 }
 
 std::vector<std::string> ServoMotor::validate(const ResourceConfig& cfg) {
-    (void)parse_servo_config(cfg.attributes());  // throws ConfigError on any problem
+    (void)parse_servo_config(cfg.attributes());  // throws Error on any problem
     return {};                                   // a motor has no dependencies
 }
 
@@ -291,7 +291,7 @@ ServoMotor::ServoMotor(const Dependencies& /*deps*/, const ResourceConfig& cfg)
 ServoMotor::ServoMotor(std::string name, std::unique_ptr<ServoController> controller)
     : Motor(std::move(name)), controller_(std::move(controller)) {
     if (!controller_) {
-        throw ConfigError("ServoMotor: null controller");
+        throw Error("ServoMotor: null controller");
     }
     controller_->start();
 }

@@ -170,11 +170,11 @@ class A6Control final : public SlaveControl {
                 const double window_s = static_cast<double>(kPvTeardownCycles) / static_cast<double>(kLoopHz);
                 const double vel_max = static_cast<double>(echoed) * (window_s - kVelGuardMarginS);
                 if (std::abs(static_cast<double>(opt_.pv_vel_cps)) > vel_max) {
-                    throw ConfigError("A6Control: --move-vel " + std::to_string(opt_.pv_vel_cps) +
-                                      " counts/s exceeds the quick-stop window budget (|VEL| <= 0x6085 * (W - margin) = " +
-                                      std::to_string(static_cast<long long>(vel_max)) + " counts/s for 0x6085=" + std::to_string(echoed) +
-                                      ", W=" + std::to_string(window_s) +
-                                      "s). Refusing to energize -- it could not ramp to 0 before de-energize.");
+                    throw Error("A6Control: --move-vel " + std::to_string(opt_.pv_vel_cps) +
+                                " counts/s exceeds the quick-stop window budget (|VEL| <= 0x6085 * (W - margin) = " +
+                                std::to_string(static_cast<long long>(vel_max)) + " counts/s for 0x6085=" + std::to_string(echoed) +
+                                ", W=" + std::to_string(window_s) +
+                                "s). Refusing to energize -- it could not ramp to 0 before de-energize.");
                 }
             }
         }

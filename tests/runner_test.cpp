@@ -136,7 +136,7 @@ class TestControl : public SlaveControl {
         (void)cfg;
         events.emplace_back("configured");
         if (fail_configure) {
-            throw ethercat::ConfigError("TestControl: deliberate on_configured failure");
+            throw ethercat::Error("TestControl: deliberate on_configured failure");
         }
     }
     void on_operational(CycleContext& ctx) noexcept override {
@@ -441,7 +441,7 @@ TEST("#47.8: attach-after-start throws; on_configured failure -> clean no-spawn 
         TestControl bad;
         bad.fail_configure = true;
         r.attach(1, bad);
-        CHECK_THROWS(r.start(), ethercat::ConfigError);
+        CHECK_THROWS(r.start(), ethercat::Error);
         CHECK(r.status().phase == RunnerPhase::Idle);  // nothing spawned
         // No bracket was set: the single-port-owner SDO surface still works.
         const std::array<std::byte, 2> one{std::byte{0x01}, std::byte{0x00}};
@@ -458,7 +458,7 @@ TEST("#47.8: attach-after-start throws; on_configured failure -> clean no-spawn 
         r.attach(1, c);
         r.start();
         TestControl late;
-        CHECK_THROWS(r.attach(1, late), ethercat::ConfigError);  // attach-after-start
+        CHECK_THROWS(r.attach(1, late), ethercat::Error);  // attach-after-start
         // No explicit stop() -- the control self-requests at cycle 3 and the r dtor runs
         // the bounded teardown at scope end (joining while c is still alive).
     }

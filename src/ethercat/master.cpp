@@ -28,16 +28,16 @@ std::uint32_t field_key(std::uint16_t index, std::uint8_t sub) noexcept {
 
 Master::Master(MasterConfig config, std::unique_ptr<EcatBackend> backend) : config_(std::move(config)), backend_(std::move(backend)) {
     if (!backend_) {
-        throw ConfigError("Master: null backend");
+        throw Error("Master: null backend");
     }
     if (config_.ifname.empty()) {
-        throw ConfigError("Master: empty interface name");
+        throw Error("Master: empty interface name");
     }
     if (config_.slaves.empty()) {
-        throw ConfigError("Master: no slaves configured");
+        throw Error("Master: no slaves configured");
     }
     if (config_.target_loop_rate_hz == 0 || config_.target_loop_rate_hz > 1000) {
-        throw ConfigError("Master: target_loop_rate_hz " + std::to_string(config_.target_loop_rate_hz) + " out of range (1..1000)");
+        throw Error("Master: target_loop_rate_hz " + std::to_string(config_.target_loop_rate_hz) + " out of range (1..1000)");
     }
     // Derive the AWAIT_OP bounds ONCE from config (#42) -- no per-cycle math/clamping on
     // the bring-up path. The counts clamp 0 -> 1 (a zero hold-confirm would declare OP on
@@ -87,12 +87,11 @@ Master::Master(MasterConfig config, std::unique_ptr<EcatBackend> backend) : conf
             if (higher != 0) {
                 nearest += std::string(lower != 0 ? " /" : "") + " " + std::to_string(higher) + " Hz";
             }
-            throw ConfigError("Master: slave " + std::to_string(sc.slave_id) + " declares sync_cycle_granularity_ns=" + std::to_string(g) +
-                              " but target_loop_rate_hz=" + std::to_string(config_.target_loop_rate_hz) + " gives a " +
-                              std::to_string(cycle_ns) +
-                              " ns SYNC0 cycle that is not a multiple -- the drive would reject it at OP entry. Nearest valid"
-                              " rates:" +
-                              (nearest.empty() ? " none in 1..1000 Hz" : nearest));
+            throw Error("Master: slave " + std::to_string(sc.slave_id) + " declares sync_cycle_granularity_ns=" + std::to_string(g) +
+                        " but target_loop_rate_hz=" + std::to_string(config_.target_loop_rate_hz) + " gives a " + std::to_string(cycle_ns) +
+                        " ns SYNC0 cycle that is not a multiple -- the drive would reject it at OP entry. Nearest valid"
+                        " rates:" +
+                        (nearest.empty() ? " none in 1..1000 Hz" : nearest));
         }
     }
 }
@@ -100,8 +99,8 @@ Master::Master(MasterConfig config, std::unique_ptr<EcatBackend> backend) : conf
 void Master::init() {
     const std::size_t count = backend_->open(config_.ifname);
     if (count != config_.slaves.size()) {
-        throw InitError("EtherCAT bus on '" + config_.ifname + "': found " + std::to_string(count) + " slaves, config expects " +
-                        std::to_string(config_.slaves.size()));
+        throw Error("EtherCAT bus on '" + config_.ifname + "': found " + std::to_string(count) + " slaves, config expects " +
+                    std::to_string(config_.slaves.size()));
     }
 }
 
@@ -407,7 +406,7 @@ Master::SlaveRuntime& Master::runtime_for(std::uint16_t slave) {
             return rt;
         }
     }
-    throw ConfigError("Master: unknown slave " + std::to_string(slave));
+    throw Error("Master: unknown slave " + std::to_string(slave));
 }
 
 const Master::SlaveRuntime& Master::runtime_for(std::uint16_t slave) const {
@@ -416,7 +415,7 @@ const Master::SlaveRuntime& Master::runtime_for(std::uint16_t slave) const {
             return rt;
         }
     }
-    throw ConfigError("Master: unknown slave " + std::to_string(slave));
+    throw Error("Master: unknown slave " + std::to_string(slave));
 }
 
 PdoCache& Master::cache(std::uint16_t slave) {
@@ -453,7 +452,8 @@ FieldLocation Master::resolve_field(const std::map<std::uint32_t, MappedField>& 
         // NOT-IN-MAP is a MAP-MEMBERSHIP failure -> PdoMappingError ("the map can't satisfy you";
         // distinct operator fix = "add it to the map"). PdoMappingError spans BOTH apply-time
         // (apply_pdo_map) and this runtime access of an un-mapped object. A MALFORMED access
-        // (wrong width / past frame) is the separate PdoAccessError tier below.
+        // (wrong width) throws the base Error below -- deliberately NOT PdoMappingError, so
+        // resolve_rx_optional/resolve_tx_optional don't swallow a wrong-width object as "absent".
         throw PdoMappingError("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
                               " is not in the " + which + " map");
     }
@@ -464,9 +464,9 @@ FieldLocation Master::resolve_field(const std::map<std::uint32_t, MappedField>& 
     // FieldLocation is offset-only post-P2c); build_field_table guarantees bit_length % 8 == 0.
     const std::size_t mapped_width = it->second.bit_length / 8U;
     if (mapped_width != want_width) {
-        throw PdoAccessError("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
-                             " width mismatch -- the Field type is " + std::to_string(want_width) + " byte(s) but the object is mapped " +
-                             std::to_string(mapped_width) + " byte(s)");
+        throw Error("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
+                    " width mismatch -- the Field type is " + std::to_string(want_width) + " byte(s) but the object is mapped " +
+                    std::to_string(mapped_width) + " byte(s)");
     }
     return FieldLocation{it->second.byte_offset, /*present=*/true};
 }

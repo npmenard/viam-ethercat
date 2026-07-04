@@ -10,7 +10,7 @@
 #include "test_harness.hpp"
 #include "viam/lib/servo_config.hpp"
 
-using ethercat::ConfigError;
+using ethercat::Error;
 using ethercat::servo::ServoConfig;
 
 namespace {
@@ -40,47 +40,47 @@ TEST("ServoConfig::validate rejects each invalid field with clear text") {
     {
         ServoConfig c = good_config();
         c.ifname.clear();
-        CHECK_THROWS_MSG(c.validate(), ConfigError, "ifname");
+        CHECK_THROWS_MSG(c.validate(), Error, "ifname");
     }
     {
         ServoConfig c = good_config();
         c.max_motor_speed_rpm = -1.0;
-        CHECK_THROWS_MSG(c.validate(), ConfigError, "max_motor_speed_rpm");
+        CHECK_THROWS_MSG(c.validate(), Error, "max_motor_speed_rpm");
     }
     {
         ServoConfig c = good_config();
         c.motor_rated_current_amps = 0.0;
-        CHECK_THROWS_MSG(c.validate(), ConfigError, "motor_rated_current_amps");
+        CHECK_THROWS_MSG(c.validate(), Error, "motor_rated_current_amps");
     }
     {
         ServoConfig c = good_config();
         c.gear_ratio = 0.0;
-        CHECK_THROWS_MSG(c.validate(), ConfigError, "gear_ratio");
+        CHECK_THROWS_MSG(c.validate(), Error, "gear_ratio");
     }
     {
         ServoConfig c = good_config();
         c.counts_per_rev = 0.0;
-        CHECK_THROWS_MSG(c.validate(), ConfigError, "counts_per_rev");
+        CHECK_THROWS_MSG(c.validate(), Error, "counts_per_rev");
     }
     {
         ServoConfig c = good_config();
         c.position_tolerance_counts = -1;
-        CHECK_THROWS_MSG(c.validate(), ConfigError, "position_tolerance_counts");
+        CHECK_THROWS_MSG(c.validate(), Error, "position_tolerance_counts");
     }
     {
         ServoConfig c = good_config();
         c.target_loop_rate_hz = 2000;
-        CHECK_THROWS_MSG(c.validate(), ConfigError, "target_loop_rate_hz");
+        CHECK_THROWS_MSG(c.validate(), Error, "target_loop_rate_hz");
     }
     {
         ServoConfig c = good_config();
         c.rt_priority = 0;
-        CHECK_THROWS_MSG(c.validate(), ConfigError, "rt_priority");
+        CHECK_THROWS_MSG(c.validate(), Error, "rt_priority");
     }
     {
         ServoConfig c = good_config();
         c.command_queue_capacity = 0;
-        CHECK_THROWS_MSG(c.validate(), ConfigError, "command_queue_capacity");
+        CHECK_THROWS_MSG(c.validate(), Error, "command_queue_capacity");
     }
 }
 

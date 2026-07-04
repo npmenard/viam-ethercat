@@ -49,10 +49,10 @@ SimBackend::SimBackend(std::vector<SimSlaveModel> slaves) {
 
 std::size_t SimBackend::open(std::string_view ifname) {
     if (open_) {
-        throw ConfigError("SimBackend::open: bus already open on '" + std::string(ifname) + "' (one master per backend; close() first)");
+        throw Error("SimBackend::open: bus already open on '" + std::string(ifname) + "' (one master per backend; close() first)");
     }
     if (slaves_.empty()) {
-        throw InitError("SimBackend::open: no simulated slaves configured on '" + std::string(ifname) + "'");
+        throw Error("SimBackend::open: no simulated slaves configured on '" + std::string(ifname) + "'");
     }
     open_ = true;
     for (auto& slave : slaves_) {
@@ -64,8 +64,7 @@ std::size_t SimBackend::open(std::string_view ifname) {
 
 SlaveInfo SimBackend::slave_info(std::uint16_t slave) const {
     if (slave < 1 || slave > slaves_.size()) {
-        throw ConfigError("SimBackend::slave_info: slave " + std::to_string(slave) + " out of range (1.." + std::to_string(slaves_.size()) +
-                          ")");
+        throw Error("SimBackend::slave_info: slave " + std::to_string(slave) + " out of range (1.." + std::to_string(slaves_.size()) + ")");
     }
     const Slave& s = slaves_[slave - 1];
     SlaveInfo info;
@@ -80,8 +79,8 @@ SlaveInfo SimBackend::slave_info(std::uint16_t slave) const {
 
 void SimBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
     if (slave < 1 || slave > slaves_.size()) {
-        throw ConfigError("SimBackend::sdo_write: slave " + std::to_string(slave) + " out of range (configured " +
-                          std::to_string(slaves_.size()) + ")");
+        throw Error("SimBackend::sdo_write: slave " + std::to_string(slave) + " out of range (configured " +
+                    std::to_string(slaves_.size()) + ")");
     }
     Slave& s = slaves_[slave - 1];
     s.dictionary[sdo_key(index, sub)] = std::vector<std::byte>(data.begin(), data.end());
@@ -90,8 +89,8 @@ void SimBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_
 
 std::size_t SimBackend::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
     if (slave < 1 || slave > slaves_.size()) {
-        throw ConfigError("SimBackend::sdo_read: slave " + std::to_string(slave) + " out of range (configured " +
-                          std::to_string(slaves_.size()) + ")");
+        throw Error("SimBackend::sdo_read: slave " + std::to_string(slave) + " out of range (configured " + std::to_string(slaves_.size()) +
+                    ")");
     }
     const Slave& s = slaves_[slave - 1];
     // Conformant quick-stop configure gate: 0x605A (quick-stop option) reads 2 so a
@@ -122,8 +121,8 @@ void SimBackend::map_process_data() {
         const SimSlaveModel& m = s.model;
         if (m.ctrlword_off + 2 > m.output_bytes || m.target_off + 4 > m.output_bytes || m.statusword_off + 2 > m.input_bytes ||
             m.actual_off + 4 > m.input_bytes) {
-            throw ConfigError("SimSlaveModel offsets exceed the image sizes (out=" + std::to_string(m.output_bytes) +
-                              ", in=" + std::to_string(m.input_bytes) + ")");
+            throw Error("SimSlaveModel offsets exceed the image sizes (out=" + std::to_string(m.output_bytes) +
+                        ", in=" + std::to_string(m.input_bytes) + ")");
         }
         s.output_image.assign(s.model.output_bytes, std::byte{0});
         s.input_image.assign(s.model.input_bytes, std::byte{0});
@@ -145,8 +144,8 @@ void SimBackend::request_state(std::uint16_t slave, EcatState target) {
         return;
     }
     if (slave > slaves_.size()) {
-        throw ConfigError("SimBackend::request_state: slave " + std::to_string(slave) + " out of range (configured " +
-                          std::to_string(slaves_.size()) + ")");
+        throw Error("SimBackend::request_state: slave " + std::to_string(slave) + " out of range (configured " +
+                    std::to_string(slaves_.size()) + ")");
     }
     slaves_[slave - 1].state = target;
 }

@@ -403,7 +403,7 @@ class Runner {
     // state it still holds; the supervisor restarts the module).
     ~Runner();
 
-    // Attach a control to a slave (1-based). PRE-start only. Throws ConfigError on
+    // Attach a control to a slave (1-based). PRE-start only. Throws Error on
     // attach-after-start, an unknown slave id, or a duplicate attach for the slave.
     // LIFETIME CONTRACT (#TODO-3): the control is held by reference and the RT thread
     // calls control->step() until teardown JOINS that thread (in ~Runner). So the control
@@ -416,7 +416,7 @@ class Runner {
     // Non-RT hooks (on_configured(ConfigContext&), may throw -> nothing spawned) ->
     // lock_current -> set_rt_active(true) -> spawn the RT thread INSIDE the RtCore
     // (realtime::setup -> bring-up -> steady -> stopping window, per §5). Throws
-    // ConfigError on no-controls/restart.
+    // Error on no-controls/restart.
     void start();
     // Convenience (the a6_validate / #21 shape): start() + block until the RT loop ends
     // (poll status()), then the teardown. SIGINT integration = the consumer's handler

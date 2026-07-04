@@ -91,7 +91,7 @@ MasterConfig build_master_config(const ServoConfig& c) {
     mc.use_distributed_clocks = c.use_distributed_clocks;
     // #15: op_await_timeout_ms is no longer a config knob -- MasterConfig's fixed 30s default (bring-up give-up patience) applies.
     // Post-OP DC settle grace (cycles) while the SYNC0 phase finishes locking: suppress
-    // the WKC-fault latch so a residual transient doesn't trip a spurious BusError. The
+    // the WKC-fault latch so a residual transient doesn't trip a spurious Error. The
     // bring-up SETTLE bound uses MasterConfig's own default (dc_op_gate_cycles);
     // bench-tune it at first light if needed.
     constexpr std::uint32_t kDefaultDcSettleCycles = 1000;
@@ -134,7 +134,7 @@ ServoController::ServoController(ServoConfig config, BackendFactory backend_fact
       policy_(config_.quick_stop_decel, 2),
       commands_(config_.command_queue_capacity) {
     if (!backend_factory_) {
-        throw ConfigError("ServoController: null backend factory");
+        throw Error("ServoController: null backend factory");
     }
 }
 
@@ -156,7 +156,7 @@ void ServoController::start() {
     // window opens.
     master_ = std::make_unique<Master>(build_master_config(config_), backend_factory_());
     master_->init();
-    master_->configure();  // -> SAFE-OP (may throw InitError; propagated as today -- the SDK retries)
+    master_->configure();  // -> SAFE-OP (may throw Error; propagated as today -- the SDK retries)
     bring_up();            // #17 item 7: resolve + clear-errors + reach OP, with bounded retry
 }
 
@@ -985,7 +985,7 @@ void ServoController::on_stop(StopReason reason) noexcept {
                                : "");
     } else if (reason == StopReason::RtSetupFailed) {
         // §8: realtime scheduling unavailable && require_realtime -> Degraded-but-alive (the
-        // old start() InitError throw is REPLACED by this, the task's explicit §8 addition).
+        // old start() Error throw is REPLACED by this, the task's explicit §8 addition).
         rt_error_.store(RtError::NotOperational, std::memory_order_release);
         degraded_.store(true, std::memory_order_release);
     }
@@ -996,14 +996,14 @@ void ServoController::on_stop(StopReason reason) noexcept {
 void ServoController::set_rpm(double rpm) {
     const std::shared_lock<std::shared_mutex> lk(api_mutex_);
     if (degraded_.load(std::memory_order_acquire)) {  // §8 Degraded-but-alive: motion APIs throw, never act
-        throw BusError("set_rpm unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
+        throw Error("set_rpm unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
     }
     // #18: always switch-capable -- set_rpm ensures PV at runtime, never rejected on mode.
     // R3 exclusion matrix (§3): a PV setpoint yields to a LIVE blocking move (a go_for timed run) --
     // reject "operation ongoing" (set_rpm(0) too; halt() is the stop verb). PV setpoints are
     // latest-wins AMONG THEMSELVES (no slot), so this rejects ONLY under a live blocking move.
     if (motion_slot_busy()) {
-        throw BusError("set_rpm: a motion operation is already in progress");
+        throw Error("set_rpm: a motion operation is already in progress");
     }
     push_velocity(rpm);
 }
@@ -1077,13 +1077,13 @@ void ServoController::await_move(std::uint32_t generation) {
             return;  // completed (or superseded by a newer move -- benign)
         }
         if (stopping_.load(std::memory_order_acquire) || rt_exited_.load(std::memory_order_acquire)) {
-            throw BusError("move: controller stopped / RT loop not alive");  // RT loop exited (stop / bus fault / bring-up abort)
+            throw Error("move: controller stopped / RT loop not alive");  // RT loop exited (stop / bus fault / bring-up abort)
         }
         if (state_.failed_generation.load(std::memory_order_acquire) >= g) {
-            throw BusError("move aborted (" + last_error() + ")");
+            throw Error("move aborted (" + last_error() + ")");
         }
         if (state_.faulted.load(std::memory_order_acquire)) {
-            throw BusError("move: drive faulted during the move");
+            throw Error("move: drive faulted during the move");
         }
         wake_seq_.wait(seq, std::memory_order_acquire);  // block until a wake bump (or a spurious wake -> re-check)
     }
@@ -1094,7 +1094,7 @@ void ServoController::go_to(double rpm, double position) {
     {
         const std::shared_lock<std::shared_mutex> lk(api_mutex_);
         if (degraded_.load(std::memory_order_acquire)) {  // §8
-            throw BusError("go_to unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
+            throw Error("go_to unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
         }
         // #18: always switch-capable -- go_to ensures PP at runtime, never rejected on mode.
         // ABSOLUTE target in the ZEROED frame: add zero_offset_counts to map the
@@ -1106,7 +1106,7 @@ void ServoController::go_to(double rpm, double position) {
         const std::int32_t prof = clamp_to_stop_budget(rpm_to_device_velocity(clamped_rpm, config_.counts_per_rev, config_.gear_ratio));
         g = next_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!try_claim_motion_slot(g)) {  // R3 single-in-flight: a live blocking move already owns the slot
-            throw BusError("go_to: a motion operation is already in progress");
+            throw Error("go_to: a motion operation is already in progress");
         }
         (void)commands_.push(Command{SetTarget{counts, static_cast<std::uint32_t>(std::abs(prof)), false, g}});
     }  // release the shared lock BEFORE parking (so reconfigure isn't blocked for the whole move)
@@ -1122,7 +1122,7 @@ void ServoController::go_for(double rpm, double revs) {
     {
         const std::shared_lock<std::shared_mutex> lk(api_mutex_);
         if (degraded_.load(std::memory_order_acquire)) {  // §8
-            throw BusError("go_for unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
+            throw Error("go_for unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
         }
         // RELATIVE move (frame-agnostic): push SetTarget{relative=true} so the FSM
         // computes target = actual + delta. Do NOT route through go_to -- go_to now
@@ -1132,7 +1132,7 @@ void ServoController::go_for(double rpm, double revs) {
         const std::int32_t prof = rpm_to_device_velocity(clamped_rpm, config_.counts_per_rev, config_.gear_ratio);
         g = next_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!try_claim_motion_slot(g)) {  // R3 single-in-flight
-            throw BusError("go_for: a motion operation is already in progress");
+            throw Error("go_for: a motion operation is already in progress");
         }
         (void)commands_.push(Command{SetTarget{delta, static_cast<std::uint32_t>(std::abs(prof)), true, g}});
     }
@@ -1214,8 +1214,8 @@ std::size_t ServoController::sdo_read(std::uint16_t index, std::uint8_t sub, std
     // return stale data or hit a closed port), so refuse unless a Runner is live. rt_runner_ is written
     // only under the EXCLUSIVE api_mutex_ (start/stop/reconfigure), so this shared-lock read is safe.
     if (master_ == nullptr || rt_runner_ == nullptr) {
-        throw ConfigError("ServoController::sdo_read: not running -- call while operational (object " + std::to_string(index) + ":" +
-                          std::to_string(sub) + ")");
+        throw Error("ServoController::sdo_read: not running -- call while operational (object " + std::to_string(index) + ":" +
+                    std::to_string(sub) + ")");
     }
     return master_->sdo_read(config_.slave_id, index, sub, out);
 }

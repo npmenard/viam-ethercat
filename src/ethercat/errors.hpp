@@ -5,11 +5,16 @@
 
 namespace ethercat {
 
-// Exception hierarchy for the EtherCAT master library.
+// Exceptions for the EtherCAT master library. THREE types only: the `Error`
+// base and the two that a caller actually catches DISTINCTLY (PdoMappingError,
+// SdoError). Config/init/bring-up/bus faults all throw the base `Error` -- no
+// call site ever discriminated them by type, and every message already carries
+// a self-identifying scope (component::method or a plain description of the
+// config/bring-up/bus failure), so the text, not the type, is the diagnostic.
 //
 // Every exception carries human-readable text describing exactly what went
 // wrong (slave id, object index/subindex, byte offset, expected vs actual
-// state, ...). Callers can catch the specific type they care about, or the
+// state, ...). Callers catch PdoMappingError/SdoError when they care, or the
 // `Error` base to handle anything originating from this library.
 //
 // RT-safety note: these are constructed/thrown only on the NON-RT path
@@ -17,24 +22,12 @@ namespace ethercat {
 // catches at its boundary and latches a fault flag + last-error string; it
 // never lets an exception cross the RT/non-RT boundary (see pdo_cache).
 
-// Base class for all errors raised by this library.
+// Base class for all errors raised by this library. Config validation, bring-up
+// (NIC open / enumeration / AL-state), and cyclic bus faults all throw this
+// directly; the message names the cause.
 class Error : public std::runtime_error {
    public:
     explicit Error(const std::string& what) : std::runtime_error(what) {}
-};
-
-// Invalid/inconsistent configuration supplied by the caller (bad ifname,
-// contradictory PDO map, out-of-range loop rate, ...). Detected before any I/O.
-class ConfigError : public Error {
-   public:
-    explicit ConfigError(const std::string& what) : Error(what) {}
-};
-
-// Failure bringing the bus up: NIC open (needs CAP_NET_RAW), slave enumeration,
-// or a slave failing to reach a requested EtherCAT state within a timeout.
-class InitError : public Error {
-   public:
-    explicit InitError(const std::string& what) : Error(what) {}
 };
 
 // A MAP-MEMBERSHIP failure ("the map can't satisfy you"), spanning two cases:
@@ -43,9 +36,10 @@ class InitError : public Error {
 //     rejected, or the requested map is invalid for the slave); OR
 //   - a RUNTIME PDO access referenced an object NOT in the applied map
 //     (resolve_rx / resolve_tx) -- distinct operator fix: "add it to the map".
-// A generic non-mapping SDO abort is SdoError; a MALFORMED access (wrong width /
-// past frame) is PdoAccessError; a bad slave id is ConfigError -- so the error type
-// matches the operator's mental model on the bench.
+// resolve_rx_optional/resolve_tx_optional catch THIS specifically to treat a
+// not-in-map object as absent; a wrong-width access throws the base Error instead
+// (a malformed access, deliberately NOT swallowed as "absent"). A generic
+// non-mapping SDO abort is SdoError.
 class PdoMappingError : public Error {
    public:
     explicit PdoMappingError(const std::string& what) : Error(what) {}
@@ -54,26 +48,11 @@ class PdoMappingError : public Error {
 // A generic CoE SDO transfer was aborted by the drive (a non-mapping object: mode
 // 0x6060, a vendor/tuning write, a consumer-side vendor reset, ...). Carries the drive's
 // CoE abort code in the message. Distinct from PdoMappingError (which is specific
-// to the 0x1C1x/0x16xx/0x1Axx mapping writes) and from BusError (WKC/transport).
+// to the 0x1C1x/0x16xx/0x1Axx mapping writes). apply_pdo_map catches this to
+// re-tag a mapping-object abort as a PdoMappingError.
 class SdoError : public Error {
    public:
     explicit SdoError(const std::string& what) : Error(what) {}
-};
-
-// A MALFORMED PDO field access ("your access is malformed"): the Field's typed
-// width disagrees with the mapping. Thrown by the resolve_rx/resolve_tx width
-// check; the message names the cause + offset/size. (Object-not-in-map is the
-// separate PdoMappingError -- a map-membership concern, not a malformed access.)
-class PdoAccessError : public Error {
-   public:
-    explicit PdoAccessError(const std::string& what) : Error(what) {}
-};
-
-// A runtime bus fault during cyclic exchange: bad working counter, slave
-// dropped out of OP, lost link. Raised/flagged from the process path.
-class BusError : public Error {
-   public:
-    explicit BusError(const std::string& what) : Error(what) {}
 };
 
 }  // namespace ethercat
