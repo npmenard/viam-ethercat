@@ -78,9 +78,10 @@ struct ServoConfig {
     // config below.
 
     // --- health / boundary ---
-    int max_consecutive_wkc_errors = 5;         // WKC latch threshold (passed to Master)
-    std::uint64_t stall_threshold_cycles = 10;  // cycle-stall -> stale
-    std::size_t command_queue_capacity = 64;    // > 0
+    int max_consecutive_wkc_errors = 5;       // WKC latch threshold (passed to Master)
+    std::size_t command_queue_capacity = 64;  // > 0
+    // #17: the no-progress (stuck-move) watchdog is GONE -- a stuck move parks until the client stops it
+    // / the drive faults / the RT loop exits (client-owned cancellation). stall_threshold_cycles removed.
     // #17: the PP new-setpoint ack timeout is no longer a config knob -- it is an internal Cia402Policy
     // constant (kHandshakeTimeoutCycles). The 4-phase handshake is always bounded by it.
     // Quick-stop deceleration (0x6085, counts/s^2) for the R1 controlled stop. 0 = quick-stop not
@@ -108,7 +109,8 @@ struct ServoConfig {
     // don't delay genuine recovery. (Risky direction is too-SMALL fault_reset_window_cycles
     // -- below the drive's clear-reflect latency it false-fails; keep it >= that latency.)
     std::uint32_t fault_reset_clear_confirm_cycles = 3;
-    // #15: move_timeout_ms removed -- the RT no-progress watchdog (4x stall) + a fixed 10min blocking-API backstop.
+    // #17: the blocking go_to/go_for wait has NO timeout at all -- a long move must not be killed by a
+    // clock, and a stuck move parks until the client stops it / the drive faults / the RT loop exits.
 
     // Throws ethercat::ConfigError (clear text) on any invalid field. Pure --
     // no I/O.

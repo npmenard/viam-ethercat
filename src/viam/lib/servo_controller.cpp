@@ -27,17 +27,11 @@ constexpr std::uint16_t kTargetVel = 0x60FF;
 constexpr std::uint16_t kProfileVel = 0x6081;   // PP move speed (carries the GoTo/GoFor rpm); optional in the map
 constexpr std::uint16_t kModeOfOp = 0x6060;     // runtime mode-of-operation (RxPDO); present => PV->PP hold-switch (M6)
 constexpr std::uint16_t kModeDisplay = 0x6061;  // mode display (TxPDO); present => enable-time mode-echo gate (#45/#57)
-// #15: fixed generous backstop on the BLOCKING go_to/go_for wait (was the config move_timeout_ms).
-// A hard total-time cap breaks legitimately-long moves, so this is deliberately generous -- the RT
-// no-progress watchdog (4x stall threshold) is the real stuck-move safety; this only bounds a move
-// that hangs AND somehow evades the watchdog. 10 min covers any realistic move.
-constexpr std::chrono::milliseconds kMoveWaiterTimeout{600'000};
-constexpr std::uint16_t kFaultCode = 0x603F;  // drive error code (TxPDO, optional feedback)
+constexpr std::uint16_t kFaultCode = 0x603F;    // drive error code (TxPDO, optional feedback)
 // #TODO-4: the A6's "no-SYNC0" code (0x8700 / Er74.1) is NO LONGER a constant here --
 // it's CONFIG DATA (ServoConfig::sync_fault_code), so this generic core carries no
 // vendor value. The bring-up gate reads it from config (nullopt ⇒ no detection).
 constexpr std::uint16_t kVelActual = 0x606C;  // velocity actual value (TxPDO, optional feedback)
-constexpr std::uint64_t kNsPerSec = 1'000'000'000ULL;
 // #47-P3b R1 controlled-stop watchdog headroom: the teardown window / VEL budget reserve this much
 // time below the full window so the ramp finishes strictly BEFORE close() (A6 sync watchdog ~50ms).
 constexpr double kStopWindowMarginS = 0.05;
@@ -47,10 +41,6 @@ constexpr double kStopWindowMarginS = 0.05;
 // SettleCycles: max to await the 0x6061 echo of the new mode before giving up (silent-mismatch, #45).
 constexpr std::uint32_t kModeSwitchStopCycles = 1000;
 constexpr std::uint32_t kModeSwitchSettleCycles = 200;
-
-// #40 item 7: ONE clock helper -- alias the shared realtime::monotonic_ns (the local
-// duplicate is gone; watchdog + last_cycle_time are the users).
-using realtime::monotonic_ns;
 
 Cia402Mode to_cia402_mode(ControlMode mode) noexcept {
     return mode == ControlMode::ProfileVelocity ? Cia402Mode::ProfileVelocity : Cia402Mode::ProfilePosition;
@@ -174,7 +164,6 @@ void ServoController::reset_run_state() {
     state_.drive_faulted.store(false, std::memory_order_relaxed);  // #71: clear a prior bring-up drive tier on restart
     state_.bringup_al_code.store(0, std::memory_order_relaxed);    // #71: clear a prior AL-refusal code on restart
     state_.loop_cycle.store(0, std::memory_order_relaxed);
-    state_.last_cycle_time_ns.store(0, std::memory_order_relaxed);
     state_.active_generation.store(0, std::memory_order_relaxed);
     state_.completed_generation.store(0, std::memory_order_relaxed);
     state_.failed_generation.store(0, std::memory_order_relaxed);
@@ -193,12 +182,8 @@ void ServoController::reset_run_state() {
     at_rest_ = false;
     pending_new_setpoint_ = false;  // #17: no armed handshake on a fresh run
     latched_ctrl_error_ = RtError::None;
-    last_progress_actual_ = 0;
-    stall_cycles_ = 0;
     last_sync_code_ = 0;
-    const std::uint64_t period_ns = kNsPerSec / config_.target_loop_rate_hz;
-    const std::uint64_t stall_ns = config_.stall_threshold_cycles * period_ns;
-    watchdog_ns_.store(std::max<std::uint64_t>(stall_ns, 20'000'000ULL), std::memory_order_release);
+    rt_exited_.store(false, std::memory_order_release);  // #17: event-based RT aliveness -- fresh run, loop is live
 }
 
 // The Runner's stopping-window CAP (cycles): sized so a Quick-Stop ramp completes before
@@ -246,7 +231,7 @@ void ServoController::spawn_runner() {
 void ServoController::stop() noexcept {
     const std::unique_lock<std::shared_mutex> lk(api_mutex_);
     stopping_.store(true, std::memory_order_release);
-    completion_cv_.notify_all();  // wake any parked go_to/go_for waiters
+    bump_wake();  // wake any parked go_to/go_for waiters
     // Drop the Runner: ~Runner runs the BOUNDED teardown (join the RT thread -> set_rt_active(false)
     // -> master.close()->INIT). A WEDGED step() fail-stops the process (#52), not an unbounded hang.
     rt_runner_.reset();
@@ -258,7 +243,7 @@ void ServoController::reconfigure(ServoConfig config) {
     // Drop the Runner FIRST (its ~Runner joins the RT thread + close()->INIT) before touching
     // master_ -- the RT thread is master_'s only cyclic user, so this is the join barrier.
     stopping_.store(true, std::memory_order_release);
-    completion_cv_.notify_all();
+    bump_wake();
     rt_runner_.reset();
     master_.reset();  // safe: Runner (master_'s only cyclic user) is destroyed
     config_ = std::move(next);
@@ -345,16 +330,20 @@ bool ServoController::txpdo_has(std::uint16_t index) const noexcept {
     return false;
 }
 
-bool ServoController::watchdog_expired() const noexcept {
-    const std::uint64_t last = state_.last_cycle_time_ns.load(std::memory_order_acquire);
-    if (last == 0) {
-        return true;  // never published yet
-    }
-    return (monotonic_ns() - last) > watchdog_ns_.load(std::memory_order_acquire);
+bool ServoController::rt_alive() const noexcept {
+    // #17 EVENT-BASED aliveness (no clocks): the RT loop's on_stop() sets rt_exited_ on ANY exit
+    // (clean stop / bus fault / bring-up abort / RT-setup failure), so a lock-free accessor sees the
+    // loop is no longer servicing without touching rt_runner_ (which reconfigure() resets). A drive
+    // fault also counts as not-alive for command purposes.
+    return !rt_exited_.load(std::memory_order_acquire) && !state_.faulted.load(std::memory_order_acquire);
 }
 
-bool ServoController::rt_alive() const noexcept {
-    return !watchdog_expired() && !state_.faulted.load(std::memory_order_acquire);
+// #17: wake every parked await_move waiter. Bumped + notified by every terminal transition (move
+// completed/failed), by a drive-fault onset, by stop()/reconfigure(), and by the RT loop's on_stop()
+// (async exit). Replaces the completion condvar -- C++20 atomic wait/notify, no mutex, RT-safe.
+void ServoController::bump_wake() noexcept {
+    wake_seq_.fetch_add(1, std::memory_order_release);
+    wake_seq_.notify_all();
 }
 
 std::uint16_t ServoController::fault_reset_with_rearm(Status status) noexcept {
@@ -376,7 +365,7 @@ void ServoController::abort_active_move(RtError reason) noexcept {
     const std::uint32_t g = state_.active_generation.load(std::memory_order_relaxed);
     if (g != 0 && state_.completed_generation.load(std::memory_order_relaxed) != g) {
         state_.failed_generation.store(g, std::memory_order_release);  // abort tier: wakes the go_to waiter
-        completion_cv_.notify_all();                                   // RT never LOCKS completion_mutex_
+        bump_wake();
     }
 }
 
@@ -519,8 +508,6 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         if (t.generation != state_.active_generation.load(std::memory_order_relaxed)) {
             target_counts_ = t.relative ? static_cast<std::int32_t>(actual + t.counts) : t.counts;
             profile_vel_ = t.profile_velocity;
-            last_progress_actual_ = actual;
-            stall_cycles_ = 0;
             latched_ctrl_error_ = RtError::None;  // a fresh move starts with a clean diagnostic slate
             pending_new_setpoint_ = true;         // #17: arm the policy's PP handshake for this new target (consumed post-switch)
             state_.active_generation.store(t.generation, std::memory_order_release);
@@ -613,11 +600,10 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
 
         // No switch in flight -- DELEGATE the Operational healthy-path (enable-hold + PP new-setpoint
         // handshake + 0x6081 move-speed / PV 0x60FF stream + Halt) to the shared generic policy. The
-        // wrapper KEEPS completion-generations, the two-tier fault, #18 fault-reset, and the stall
-        // watchdog (rev-6 boundary). The opaque token = the active move generation (the policy resets its
-        // reached-latch + restarts the handshake when it changes -- FOLD 3). The policy writes the
-        // controlword + command objects into ctx and returns the cw; publish_state below reads its
-        // handshake-idle for the completion gate.
+        // wrapper KEEPS completion-generations, the two-tier fault, #18 fault-reset, and is-moving/reached
+        // (#17). pending_new_setpoint_ arms the policy's handshake on the cycle a new target is adopted.
+        // The policy writes the controlword + command objects into ctx and returns the cw; publish_state
+        // below reads its handshake-idle for the completion gate.
         PolicyCommand pcmd;
         if (pv_hold_as_pp_) {
             // M6: PV motion-hold as PP-at-current-counts. The switch above brought PV->PP (position loop
@@ -737,31 +723,15 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
         commanded_is_pp() ? (powered && move_active && !at_target) : (powered && !pv_stopped);  // #61: switchable uses the live intent
     state_.moving.store(moving, std::memory_order_relaxed);
 
-    // PP generation protocol: completion + no-progress watchdog (PP-only via move_active).
+    // PP generation protocol: completion (PP-only via move_active). #17: the no-progress watchdog is
+    // GONE -- a stuck move parks in await_move until the client stops it, the drive faults, or the RT
+    // loop exits (client-owned cancellation, consistent with the no-timeout wait).
     if (powered && move_active && at_target && policy_.state().handshake_idle) {
-        state_.completed_generation.store(g, std::memory_order_release);  // publish BEFORE notify
-        completion_cv_.notify_all();                                      // no completion_mutex_ held
-    } else if (move_active && switch_phase_ == SwitchPhase::None) {
-        // #18: skip the no-progress watchdog WHILE a driver mode-switch is orchestrating (the motor is
-        // deliberately held at rest during a PV->PP go_to switch, which would else read as "no progress").
-        // No-progress watchdog: if the actual isn't advancing toward target for too long, fail the
-        // move (wakes its waiter to throw, instead of a silent wait). #15: this is the REAL stuck-move
-        // safety and is DURATION-INDEPENDENT -- a progressing move resets the counter and never trips
-        // it, however long the move. Fixed window = 4x the stall threshold (move_timeout_ms is gone).
-        if (std::abs(actual - last_progress_actual_) <= config_.position_tolerance_counts) {
-            ++stall_cycles_;
-        } else {
-            stall_cycles_ = 0;
-            last_progress_actual_ = actual;
-        }
-        const std::uint32_t limit = static_cast<std::uint32_t>(config_.stall_threshold_cycles * 4);
-        if (stall_cycles_ > limit) {
-            abort_active_move(RtError::MoveStalled);  // latch + wake the waiter (same invariant as the handshake timeout)
-        }
+        state_.completed_generation.store(g, std::memory_order_release);  // publish BEFORE the wake
+        bump_wake();
     }
 
-    // Per-tier fault publish (spec #16; AFTER the watchdog so a stall set this cycle
-    // shows now). last_error() COMPOSES every active tier -- never picks one -- so a
+    // Per-tier fault publish (spec #16). last_error() COMPOSES every active tier -- never picks one -- so a
     // both-true Er74 (drive 0x603F + bus WKC->0) reports root cause AND symptom. In
     // each tier the payload is relaxed-stored BEFORE the flag is release-stored, so a
     // master_-free reader never sees a true flag with a stale payload (cross-tier skew
@@ -779,13 +749,17 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
     state_.drive_faulted.store(status.fault(), std::memory_order_release);
     // CTRL tier: the published mirror of the latch (tracks abort, clears on fault_reset).
     rt_error_.store(latched_ctrl_error_, std::memory_order_release);
-    // state_.faulted is the DRIVE/BUS gate ONLY (de-powers the motor + wakes the
-    // waiter's fault branch). Controller move-errors (HandshakeTimeout/MoveStalled)
-    // deliberately stay OUT: they fail the in-flight move (via failed_generation) but
-    // must NOT de-power an otherwise-healthy drive.
-    state_.faulted.store(bus_fault || status.fault(), std::memory_order_release);
+    // state_.faulted is the DRIVE/BUS gate ONLY (de-powers the motor + wakes the waiter's fault
+    // branch). Controller move-errors (HandshakeTimeout) deliberately stay OUT: they fail the
+    // in-flight move (via failed_generation) but must NOT de-power an otherwise-healthy drive. On a
+    // fault ONSET wake any parked waiter (event-based; no clock watchdog to catch it now).
+    const bool now_faulted = bus_fault || status.fault();
+    const bool was_faulted = state_.faulted.load(std::memory_order_relaxed);
+    state_.faulted.store(now_faulted, std::memory_order_release);
+    if (now_faulted && !was_faulted) {
+        bump_wake();
+    }
 
-    state_.last_cycle_time_ns.store(monotonic_ns(), std::memory_order_release);
     state_.loop_cycle.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -905,6 +879,11 @@ void ServoController::step(CycleContext& ctx) noexcept {
 }
 
 void ServoController::on_stop(StopReason reason) noexcept {
+    // #17 EVENT-BASED aliveness: the RT loop is exiting (ANY reason). Latch it + wake parked waiters so
+    // a go_to blocked on an ASYNC exit (bus fault / bring-up abort, where the API never set stopping_)
+    // returns promptly instead of hanging (there is no clock watchdog to catch it now).
+    rt_exited_.store(true, std::memory_order_release);
+    bump_wake();
     if (reason == StopReason::BringupAborted) {
         // Bring-up gave up. WHY has two independent sources, and #71 taught us to surface BOTH, not
         // just assume the sync fault: (1) the DC-sync gate -- 0x603F == the configured no-sync code
@@ -1021,46 +1000,37 @@ bool ServoController::try_claim_motion_slot(std::uint32_t gen) noexcept {
     }
 }
 
-void ServoController::await_move(std::uint32_t generation, std::chrono::milliseconds timeout) {
+void ServoController::await_move(std::uint32_t generation) {
     const std::uint32_t g = generation;
-    // Bounded wait_for re-check loop (lost-wakeup-immune; RT never locks the CV).
-    // Predicate is master_-FREE (state_ atomics + stopping_ + watchdog).
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    constexpr auto slice = std::chrono::milliseconds(2);
-    std::unique_lock<std::mutex> lk(completion_mutex_);
-    auto done = [&] {
-        return state_.completed_generation.load(std::memory_order_acquire) >= g ||
-               state_.active_generation.load(std::memory_order_acquire) > g ||
-               state_.failed_generation.load(std::memory_order_acquire) >= g || state_.faulted.load(std::memory_order_acquire) ||
-               stopping_.load(std::memory_order_acquire) || watchdog_expired();
-    };
-    while (!done() && std::chrono::steady_clock::now() < deadline) {
-        completion_cv_.wait_for(lk, slice);
+    // #17: NO timeout -- a legitimately-long move must not be killed by a wall clock (there is no
+    // no-progress watchdog either; a stuck move waits until the client stops it / the drive faults /
+    // the RT loop exits). C++20 atomic wait on wake_seq_ (bumped + notified by EVERY terminal
+    // transition, fault onset, stop/reconfigure, and the RT loop's on_stop) replaces the 2ms condvar
+    // slices -- lost-wakeup-immune by the seq re-check, no mutex, RT never blocks. master_-FREE.
+    for (;;) {
+        const std::uint64_t seq = wake_seq_.load(std::memory_order_acquire);
+        // Classify (order matters: this move's own completion first; then stop/dead; then its own abort
+        // -- handshake-timeout sets failed_generation but NOT faulted, so check it BEFORE the generic
+        // drive-fault branch; last_error() carries the precise reason; then a real drive/bus fault).
+        if (state_.completed_generation.load(std::memory_order_acquire) >= g ||
+            state_.active_generation.load(std::memory_order_acquire) > g) {
+            return;  // completed (or superseded by a newer move -- benign)
+        }
+        if (stopping_.load(std::memory_order_acquire) || rt_exited_.load(std::memory_order_acquire)) {
+            throw BusError("move: controller stopped / RT loop not alive");  // RT loop exited (stop / bus fault / bring-up abort)
+        }
+        if (state_.failed_generation.load(std::memory_order_acquire) >= g) {
+            throw BusError("move aborted (" + last_error() + ")");
+        }
+        if (state_.faulted.load(std::memory_order_acquire)) {
+            throw BusError("move: drive faulted during the move");
+        }
+        wake_seq_.wait(seq, std::memory_order_acquire);  // block until a wake bump (or a spurious wake -> re-check)
     }
-    lk.unlock();
-
-    // Classify the wake (order matters: stop/dead first; then this move's own
-    // abort -- handshake-timeout or stall, which set failed_generation but NOT
-    // faulted, so check it BEFORE the generic drive-fault branch; last_error()
-    // carries the precise reason enum; then a real drive/bus fault; then success).
-    if (stopping_.load(std::memory_order_acquire) || watchdog_expired()) {
-        throw BusError("move: controller stopped / RT loop not alive");
-    }
-    if (state_.failed_generation.load(std::memory_order_acquire) >= g && state_.completed_generation.load(std::memory_order_acquire) < g) {
-        throw BusError("move aborted (" + last_error() + ")");
-    }
-    if (state_.faulted.load(std::memory_order_acquire)) {
-        throw BusError("move: drive faulted during the move");
-    }
-    if (state_.completed_generation.load(std::memory_order_acquire) >= g || state_.active_generation.load(std::memory_order_acquire) > g) {
-        return;  // completed (or superseded by a newer move -- benign)
-    }
-    throw BusError("move timed out");
 }
 
 void ServoController::go_to(double rpm, double position) {
     std::uint32_t g = 0;
-    std::chrono::milliseconds move_timeout{0};
     {
         const std::shared_lock<std::shared_mutex> lk(api_mutex_);
         if (degraded_.load(std::memory_order_acquire)) {  // §8
@@ -1078,11 +1048,10 @@ void ServoController::go_to(double rpm, double position) {
         if (!try_claim_motion_slot(g)) {  // R3 single-in-flight: a live blocking move already owns the slot
             throw BusError("go_to: a motion operation is already in progress");
         }
-        move_timeout = kMoveWaiterTimeout;  // #15: fixed backstop (no-progress watchdog is the real safety)
         (void)commands_.push(Command{SetTarget{counts, static_cast<std::uint32_t>(std::abs(prof)), false, g}});
     }  // release the shared lock BEFORE parking (so reconfigure isn't blocked for the whole move)
 
-    await_move(g, move_timeout);
+    await_move(g);
 }
 
 void ServoController::go_for(double rpm, double revs) {
@@ -1090,7 +1059,6 @@ void ServoController::go_for(double rpm, double revs) {
     // delta). The old fixed-PV "timed run" branch is gone with control_mode (a switchable drive does the
     // real position move). set_rpm remains the PV-jog verb.
     std::uint32_t g = 0;
-    std::chrono::milliseconds move_timeout{0};
     {
         const std::shared_lock<std::shared_mutex> lk(api_mutex_);
         if (degraded_.load(std::memory_order_acquire)) {  // §8
@@ -1106,10 +1074,9 @@ void ServoController::go_for(double rpm, double revs) {
         if (!try_claim_motion_slot(g)) {  // R3 single-in-flight
             throw BusError("go_for: a motion operation is already in progress");
         }
-        move_timeout = kMoveWaiterTimeout;  // #15: fixed backstop (see go_to)
         (void)commands_.push(Command{SetTarget{delta, static_cast<std::uint32_t>(std::abs(prof)), true, g}});
     }
-    await_move(g, move_timeout);
+    await_move(g);
 }
 
 void ServoController::halt() noexcept {
@@ -1162,7 +1129,7 @@ bool ServoController::is_powered() const noexcept {
 }
 
 bool ServoController::is_disconnected() const noexcept {
-    return stopping_.load(std::memory_order_acquire) || watchdog_expired();
+    return stopping_.load(std::memory_order_acquire) || rt_exited_.load(std::memory_order_acquire);
 }
 
 std::uint64_t ServoController::loop_cycle() const noexcept {
@@ -1248,9 +1215,6 @@ std::string ServoController::last_error() const {
     switch (rt_error_.load(std::memory_order_acquire)) {
         case RtError::HandshakeTimeout:
             append("Profile-Position set-point acknowledge timed out");
-            break;
-        case RtError::MoveStalled:
-            append("move stalled (no progress)");
             break;
         case RtError::NotOperational:
             append("drive not operational");

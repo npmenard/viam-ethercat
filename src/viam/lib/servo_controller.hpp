@@ -30,7 +30,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -73,11 +72,10 @@ struct ControllerState {
     std::atomic<std::uint16_t> drive_fault_code{0};      // 0x603F live-read every faulted cycle; relaxed before drive_faulted release
     std::atomic<std::uint16_t> bringup_al_code{0};       // #71: ESC AL status code at a bring-up give-up (e.g. 0x0027 free-run); 0 = none
     std::atomic<std::uint64_t> loop_cycle{0};            // heartbeat counter
-    std::atomic<std::uint64_t> last_cycle_time_ns{0};    // CLOCK_MONOTONIC ns at last iteration (watchdog; 0 = never published)
     std::atomic<std::int32_t> zero_offset_counts{0};     // SetZero software offset
     std::atomic<std::uint32_t> active_generation{0};     // gen RT adopted from the applied SetTarget (post-coalescing)
     std::atomic<std::uint32_t> completed_generation{0};  // gen that reached target; RT stores-release then notify (no lock)
-    std::atomic<std::uint32_t> failed_generation{0};     // gen that stalled/timed out; wakes its waiter to throw
+    std::atomic<std::uint32_t> failed_generation{0};     // gen that failed (handshake timeout / cancelled); wakes its waiter to throw
 };
 
 // #47-P3a: ServoController IS the module SlaveControl -- it already owns all the RT
@@ -118,11 +116,10 @@ class ServoController : public SlaveControl {
     //                     drive tier + RtError::NotOperational via last_error() and
     //                     EXITS without auto-retry (repeated Er74 OP-entry wedges the
     //                     A6); recovery is an explicit reconfigure()/restart.
-    // A command issued before OP+enabled degrades gracefully: await_move() waits/
-    // times-out (the FSM never reaches the completion generation) rather than acting
-    // on a non-operational drive.
+    // A command issued before OP+enabled degrades gracefully: await_move() blocks until the RT loop
+    // exits or the drive faults (there is no completion), rather than acting on a non-operational drive.
     void start();
-    // Teardown: stopping_=true + notify_all (wake parked waiters) -> request_stop
+    // Teardown: stopping_=true + bump_wake (wake parked waiters) -> request_stop
     // + join (RETURNS before any reset/destroy).
     void stop() noexcept;
     void reconfigure(ServoConfig config);  // stop() -> rebuild master_ from the factory -> start()
@@ -240,7 +237,6 @@ class ServoController : public SlaveControl {
     enum class RtError : std::uint8_t {
         None,
         HandshakeTimeout,
-        MoveStalled,
         NotOperational,
         FaultResetFailed,
         MotorStopped,   // #47-P3b R3: an in-flight move CANCELLED by stop()/halt() -> waiter throws
@@ -283,8 +279,8 @@ class ServoController : public SlaveControl {
     // this thread is still the SINGLE port owner (after Master::configure(), before the RT thread
     // spawns). Best-effort: a failed clear is logged, not fatal. nullopt seam => no-op (generic drive).
     void run_vendor_fault_reset();
-    bool rt_alive() const noexcept;          // !watchdog_expired() && !state_.faulted  (master_-FREE)
-    bool watchdog_expired() const noexcept;  // (now - last_cycle_time_ns) > watchdog_ns
+    bool rt_alive() const noexcept;  // #17: !rt_exited_ && !faulted (event-based, no clock; master_-FREE)
+    void bump_wake() noexcept;       // #17: wake every parked await_move waiter (C++20 atomic notify)
 
     ServoConfig config_;
     BackendFactory backend_factory_;
@@ -352,7 +348,11 @@ class ServoController : public SlaveControl {
     // already TERMINAL (completed/failed) -- no check-then-claim TOCTOU between two gRPC callers. The
     // waiter does NOT release it (reclaim-if-terminal on the next claim). Non-RT (API-thread) owned.
     std::atomic<std::uint32_t> motion_slot_{0};
-    std::atomic<std::uint64_t> watchdog_ns_{0};  // RT-liveness window (set at start; config-free reads)
+    // #17 EVENT-BASED RT aliveness (no clock watchdog): rt_exited_ is set by the RT loop's on_stop()
+    // on ANY exit; wake_seq_ is bumped + C++20-notified by every terminal transition / fault onset /
+    // stop / on_stop, and await_move blocks on it (no timeout, no condvar). Both lock-free.
+    std::atomic<bool> rt_exited_{false};
+    std::atomic<std::uint64_t> wake_seq_{0};
     // #54 P3a §8 Degraded-but-alive: set when start()/bring-up fails (RT-spawn / on_configured
     // refusal / drive AL-reject) -- motion APIs throw "{degraded_reason_}", accessors fail-safe,
     // the process NEVER crashes; reconfigure()/start() clear it on a clean retry. degraded_
@@ -362,9 +362,6 @@ class ServoController : public SlaveControl {
 
     mutable std::shared_mutex api_mutex_;  // API=shared, lifecycle(start/stop/reconfigure)=exclusive
 
-    std::mutex completion_mutex_;  // go_to/go_for waiter side only; RT NEVER locks it
-    std::condition_variable completion_cv_;
-
     // --- RT-ONLY working state (single-thread; plain members, no atomics/locks).
     // Touched exclusively by run_rt_loop() / the lifecycle step()s. ---
     std::uint16_t last_cw_ = 0;                 // for the fault-reset rising-edge re-arm
@@ -373,10 +370,8 @@ class ServoController : public SlaveControl {
     std::int32_t target_counts_ = 0;            // latched PP target
     std::uint32_t profile_vel_ = 0;             // latched PP profile velocity
     std::int32_t pv_velocity_ = 0;              // latched PV target velocity
-    std::int32_t last_progress_actual_ = 0;     // move no-progress watchdog
-    std::uint32_t stall_cycles_ = 0;
-    std::int32_t prev_actual_ = 0;  // previous-cycle actual (instantaneous velocity estimate)
-    bool first_cycle_ = true;       // skip the velocity estimate on the first cycle
+    std::int32_t prev_actual_ = 0;              // previous-cycle actual (instantaneous velocity estimate)
+    bool first_cycle_ = true;                   // skip the velocity estimate on the first cycle
     // #59 noise-robust "stopped": a ring of the last N actual positions; STABLE when the window's range
     // (max-min) <= position_tolerance_counts. Sized in resolve_fields (~20ms @ the loop rate). RT-only.
     std::vector<std::int32_t> pos_hist_;
@@ -417,7 +412,7 @@ class ServoController : public SlaveControl {
     std::uint32_t switch_cycles_ = 0;  // stop-first / settle window counter
     bool at_rest_ = false;             // last publish_state's "stopped" verdict; run_mode_switch's stop-first gate reads it (1-cycle stale)
     bool stop_at_rest_ = false;  // RT-only (#47-P3b R1): drive reached SwitchOnDisabled during the stopping window -> teardown early-out
-    // Controller-error tier: one-shot latches (HandshakeTimeout/MoveStalled) set by
+    // Controller-error tier: one-shot latches (HandshakeTimeout) set by
     // the FSM, cleared ONLY by an explicit fault_reset. The bus WkcFault tier is
     // LIVE (recomputed from master_->fault() each cycle) and is NOT stored here, so a
     // persistent bus fault correctly reappears after a fault_reset.
@@ -439,10 +434,10 @@ class ServoController : public SlaveControl {
     // for last_error) AND failed_generation+notify (to wake the go_to waiter
     // PROMPTLY). The invariant: every FSM path that fails the active move calls this.
     void abort_active_move(RtError reason) noexcept;
-    // Park on generation `g`'s completion (bounded wait_for, lost-wakeup-immune)
-    // then classify the wake and THROW on stop/abort/fault/timeout. Shared by
-    // go_to (absolute) and go_for (relative) so both get identical semantics.
-    void await_move(std::uint32_t generation, std::chrono::milliseconds timeout);
+    // Park on generation `g`'s completion (#17: NO timeout -- C++20 atomic wait on wake_seq_, lost-
+    // wakeup-immune via the seq re-check) then classify the wake and THROW on stop/abort/fault. Shared
+    // by go_to (absolute) and go_for (relative) so both get identical semantics.
+    void await_move(std::uint32_t generation);
     // #47-P3b R3 single-in-flight slot (non-RT / API thread). gen_terminal: has this move reached a
     // terminal (completed|failed) state? try_claim_motion_slot: CAS the slot to `gen`, reclaiming it
     // only if FREE or holding a TERMINAL gen -> false if a LIVE blocking move owns it (M7b, no TOCTOU).

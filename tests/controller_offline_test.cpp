@@ -299,10 +299,9 @@ TEST("#15: consumer SDO works during the RT phase and after stop (no port-owners
 // --- single-in-flight move slot (#47-P3b R3) --------------------------------
 
 TEST("ServoController(PP): R3 single-in-flight -- a 2nd blocking move is rejected; halt cancels the 1st") {
-    // Keep the first move reliably IN-FLIGHT: a FROZEN drive (counts_per_step=0) never reaches target,
-    // and a huge stall threshold disables the no-progress abort, so the move parks until WE cancel it.
+    // Keep the first move reliably IN-FLIGHT: a FROZEN drive (counts_per_step=0) never reaches target.
+    // #17: there is no no-progress watchdog anymore, so the move parks NATURALLY until WE cancel it.
     ServoConfig cfg = make_config();
-    cfg.stall_threshold_cycles = 1'000'000'000;
     ServoController ctrl{cfg, sim_factory(Cia402Mode::ProfilePosition, /*counts_per_step=*/0)};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
@@ -327,8 +326,7 @@ TEST("ServoController(PP): R3 single-in-flight -- a 2nd blocking move is rejecte
 }
 
 TEST("ServoController(PP): R3 disable cancels an in-flight move -> waiter throws 'motor disabled'") {
-    ServoConfig cfg = make_config();
-    cfg.stall_threshold_cycles = 1'000'000'000;
+    ServoConfig cfg = make_config();  // #17: frozen drive parks the move naturally (no stall watchdog)
     ServoController ctrl{cfg, sim_factory(Cia402Mode::ProfilePosition, /*counts_per_step=*/0)};
     ctrl.start();
     CHECK(wait_until([&] { return ctrl.is_powered(); }, std::chrono::milliseconds(500)));
