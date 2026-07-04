@@ -56,9 +56,9 @@ struct ControllerState {
     std::atomic<std::int32_t> velocity{0};         // device velocity units
     std::atomic<bool> powered{false};              // OperationEnabled this cycle
     std::atomic<bool> moving{false};               // !move-complete
-    std::atomic<bool> faulted{false};              // drive/bus only: master_->fault() || status.fault() (move errors are the controller tier, not here)
-    std::atomic<std::int32_t> fault_wkc{0};        // WKC at a live bus fault (payload; published before the wkc_faulted release)
-    std::atomic<std::int32_t> expected_wkc{0};     // constant after start(); for last_error() (lock-free, master_-free)
+    std::atomic<bool> faulted{false};  // drive/bus only: master_->fault() || status.fault() (move errors are the controller tier, not here)
+    std::atomic<std::int32_t> fault_wkc{0};     // WKC at a live bus fault (payload; published before the wkc_faulted release)
+    std::atomic<std::int32_t> expected_wkc{0};  // constant after start(); for last_error() (lock-free, master_-free)
     // Per-tier fault liveness: last_error() composes every active tier, so a both-true Er74
     // (drive 0x603F plus bus WKC -> 0) reports root cause and symptom without masking either. In
     // each (flag, payload) pair the payload is relaxed-stored before the flag is release-stored
@@ -398,7 +398,7 @@ class ServoController : public SlaveControl {
     SwitchPhase switch_phase_ = SwitchPhase::None;
     std::uint32_t switch_cycles_ = 0;  // stop-first / settle window counter
     bool at_rest_ = false;             // last publish_state's "stopped" verdict; run_mode_switch's stop-first gate reads it (1-cycle stale)
-    bool stop_at_rest_ = false;  // RT-only: drive reached SwitchOnDisabled during the stopping window -> teardown early-out
+    bool stop_at_rest_ = false;        // RT-only: drive reached SwitchOnDisabled during the stopping window -> teardown early-out
     // Controller-error tier: one-shot latches (e.g. HandshakeTimeout) set by the FSM, cleared only
     // by an explicit fault_reset. The bus WkcFault tier is live (recomputed from master_->fault()
     // each cycle) and is not stored here, so a persistent bus fault correctly reappears after a

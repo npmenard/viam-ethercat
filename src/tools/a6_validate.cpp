@@ -74,9 +74,9 @@ extern "C" void on_sigint(int) {
 MasterConfig build_a6_config(const std::string& ifname, Cia402Mode mode) {
     MasterConfig cfg;
     cfg.ifname = ifname;
-    cfg.target_loop_rate_hz = kLoopHz;    // 1 ms SYNC0 = 4 x 250 us (A6-legal)
-    cfg.use_distributed_clocks = true;    // the A6 supports only DC sync
-    cfg.dc_settle_cycles = 1000;          // ~1 s post-OP grace while the phase finishes locking
+    cfg.target_loop_rate_hz = kLoopHz;  // 1 ms SYNC0 = 4 x 250 us (A6-legal)
+    cfg.use_distributed_clocks = true;  // the A6 supports only DC sync
+    cfg.dc_settle_cycles = 1000;        // ~1 s post-OP grace while the phase finishes locking
     cfg.max_consecutive_wkc_errors = 5;
     // The bring-up settle bound uses MasterConfig's default (dc_op_gate_cycles). SYNC0 is armed in
     // PRE-OP inside configure() (before config_map_group); the Runner's bring-up pump then runs

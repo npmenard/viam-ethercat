@@ -594,7 +594,7 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // 0. Inert when 0x6060 is SDO-set only: f_mode_wr_ !mapped().
         if (f_mode_wr_.mapped()) {
             ctx.store<cia402::ModeOfOperation::type>(
-                f_mode_wr_, static_cast<std::int8_t>(commanded_cia402_mode()));  // switchable: current intent
+                f_mode_wr_, static_cast<std::int8_t>(commanded_cia402_mode()));  // switchable: the current mode intent
         }
         // Mode-echo gate, in the module's own ladder: once the drive is SwitchedOn the commanded mode
         // should be adopted (SDO-set at configure, or PDO-seeded above), so require 0x6061 == commanded
