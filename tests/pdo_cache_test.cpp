@@ -45,7 +45,6 @@ using ethercat::RxSnapshot;
 using ethercat::SetTarget;
 using ethercat::SetVelocity;
 using ethercat::SetZero;
-using ethercat::TxStaging;
 
 namespace {
 
@@ -140,46 +139,6 @@ TEST("RxSnapshot: retry-exhaustion (writer stuck) returns valid=false/stale") {
 }
 
 // ---------------------------------------------------------------------------
-// Functional: TxStaging single-thread semantics
-// ---------------------------------------------------------------------------
-
-TEST("TxStaging: take with nothing pending returns 0") {
-    TxStaging tx{kPayload};
-    std::array<std::byte, kPayload> out{};
-    CHECK_EQ(tx.take_outputs(out), std::size_t{0});
-}
-
-TEST("TxStaging: stage then take returns the frame, then empties") {
-    TxStaging tx{kPayload};
-    std::array<std::byte, kPayload> a{};
-    fill_uniform(a, 0x11);
-    tx.stage_outputs(a);
-
-    std::array<std::byte, kPayload> out{};
-    CHECK_EQ(tx.take_outputs(out), kPayload);
-    CHECK_EQ(std::to_integer<int>(out[0]), 0x11);
-    CHECK(all_equal(out, kPayload));
-
-    // Empty after take.
-    CHECK_EQ(tx.take_outputs(out), std::size_t{0});
-}
-
-TEST("TxStaging: newest-wins -- staging twice before a take yields the latest") {
-    TxStaging tx{kPayload};
-    std::array<std::byte, kPayload> a{};
-    std::array<std::byte, kPayload> b{};
-    fill_uniform(a, 0x11);
-    fill_uniform(b, 0x22);
-    tx.stage_outputs(a);
-    tx.stage_outputs(b);  // overwrites the unsent frame
-
-    std::array<std::byte, kPayload> out{};
-    CHECK_EQ(tx.take_outputs(out), kPayload);
-    CHECK_EQ(std::to_integer<int>(out[0]), 0x22);
-    CHECK_EQ(tx.take_outputs(out), std::size_t{0});
-}
-
-// ---------------------------------------------------------------------------
 // Functional: CommandQueue ordering / coalescing / capacity
 // ---------------------------------------------------------------------------
 
@@ -236,10 +195,9 @@ TEST("CommandQueue: push returns false when full (fixed capacity, no RT alloc)")
 // ---------------------------------------------------------------------------
 
 TEST("PdoCache: oversized image throws PdoMappingError with a clear message") {
-    CHECK_THROWS_MSG(PdoCache(ethercat::kMaxPdoBytes + 1, 8), ethercat::PdoMappingError, "exceeds kMaxPdoBytes");
-    CHECK_THROWS_MSG(PdoCache(8, ethercat::kMaxPdoBytes + 1), ethercat::PdoMappingError, "exceeds kMaxPdoBytes");
+    CHECK_THROWS_MSG(PdoCache(ethercat::kMaxPdoBytes + 1), ethercat::PdoMappingError, "exceeds kMaxPdoBytes");
     // In-range sizes construct fine.
-    PdoCache ok{kPayload, kPayload};
+    PdoCache ok{kPayload};
     (void)ok;
 }
 
@@ -316,37 +274,6 @@ TEST("RxSnapshot stress: no torn frames, cycle monotone (1 writer, 4 readers)") 
     // bug), tears would be 0 trivially. Require that readers actually observed
     // many valid frames (load-independent: the writer extended until they did).
     CHECK(valid_reads.load() >= kReadGoal);
-}
-
-// ---------------------------------------------------------------------------
-// Concurrency stress: TxStaging 1 stager + 1 RT taker
-// ---------------------------------------------------------------------------
-
-TEST("TxStaging stress: every taken frame is internally uniform (no torn Tx)") {
-    TxStaging tx{kPayload};
-    std::atomic<bool> stop{false};
-    std::atomic<int> tears{0};
-
-    std::thread taker([&] {
-        std::array<std::byte, kPayload> out{};
-        while (!stop.load(std::memory_order_relaxed)) {
-            if (tx.take_outputs(out) != 0) {
-                if (!all_equal(out, kPayload)) {
-                    tears.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-        }
-    });
-
-    std::array<std::byte, kPayload> frame{};
-    for (std::uint64_t c = 1; c <= kStressIters; ++c) {
-        fill_uniform(frame, static_cast<std::uint8_t>(c & 0xFFU));
-        tx.stage_outputs(frame);
-    }
-    stop.store(true, std::memory_order_relaxed);
-    taker.join();
-
-    CHECK_EQ(tears.load(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -449,17 +376,14 @@ void operator delete[](void* p, std::size_t) noexcept {
 }
 
 TEST("RT path performs ZERO heap allocations after warm-up") {
-    PdoCache cache{kPayload, kPayload};
+    PdoCache cache{kPayload};
     CommandQueue q{256};
     std::array<std::byte, kPayload> frame{};
-    std::array<std::byte, kPayload> out{};
 
     // Warm up: prime everything so first-touch allocation (if any) is excluded.
     for (int i = 0; i < 1000; ++i) {
         cache.publish_inputs(frame, 1, static_cast<std::uint64_t>(i));
         (void)cache.read_inputs();
-        cache.stage_outputs(frame);
-        (void)cache.take_outputs(out);
         (void)q.push(Command{SetTarget{i, 0, false}});
         (void)q.drain();
     }
@@ -469,8 +393,6 @@ TEST("RT path performs ZERO heap allocations after warm-up") {
         cache.publish_inputs(frame, 2, c);
         const PdoSnapshot s = cache.read_inputs();
         (void)s;
-        cache.stage_outputs(frame);
-        (void)cache.take_outputs(out);
         (void)q.push(Command{SetVelocity{static_cast<std::int32_t>(c)}});
         (void)q.drain();
     }
@@ -479,7 +401,7 @@ TEST("RT path performs ZERO heap allocations after warm-up") {
 }
 
 TEST("boundary op latency: report percentiles (informational, no hard bound)") {
-    PdoCache cache{kPayload, kPayload};
+    PdoCache cache{kPayload};
     std::array<std::byte, kPayload> frame{};
     constexpr int kN = 200'000;
     std::vector<std::uint64_t> ns;

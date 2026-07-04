@@ -42,7 +42,7 @@ class InitError : public Error {
 //     the SM, an SDO write to a mapping object 0x1C12/0x1C13/0x1600/0x1A00 was
 //     rejected, or the requested map is invalid for the slave); OR
 //   - a RUNTIME PDO access referenced an object NOT in the applied map
-//     (Rpdo::get / Tpdo::put resolve) -- distinct operator fix: "add it to the map".
+//     (resolve_rx / resolve_tx) -- distinct operator fix: "add it to the map".
 // A generic non-mapping SDO abort is SdoError; a MALFORMED access (wrong width /
 // past frame) is PdoAccessError; a bad slave id is ConfigError -- so the error type
 // matches the operator's mental model on the bench.
@@ -61,9 +61,8 @@ class SdoError : public Error {
 };
 
 // A MALFORMED PDO field access ("your access is malformed"): the Field's typed
-// width disagrees with the mapping, or the access runs past the buffer (cursor
-// overrun / short frame). Thrown by PdoReader/PdoWriter and the Rpdo/Tpdo resolve
-// path; the message names the cause + offset/size. (Object-not-in-map is the
+// width disagrees with the mapping. Thrown by the resolve_rx/resolve_tx width
+// check; the message names the cause + offset/size. (Object-not-in-map is the
 // separate PdoMappingError -- a map-membership concern, not a malformed access.)
 class PdoAccessError : public Error {
    public:

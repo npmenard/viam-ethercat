@@ -96,9 +96,9 @@ class RtCore;
 struct RunnerTestPeer;
 
 // The per-cycle, per-slave RT surface handed to SlaveControl -- the #30 RT FORM ONLY.
-// Rpdo/Tpdo (the throwing copy forms) are deliberately NOT here: they resolve
-// per-call and throw, which the step() contract bans. Non-RT consumers keep the
-// copy forms (read_rpdo / their own atomics) OUTSIDE step(), as before.
+// The per-call-resolving, throwing forms (resolve_rx/resolve_tx) are deliberately NOT
+// here: they resolve per-call and throw, which the step() contract bans. Non-RT
+// consumers keep those (or their own atomics) OUTSIDE step(), as before.
 // No Master&, no SDO, no map access, no raw image pointers -- load/store at
 // pre-resolved FieldLocation handles is the whole hot-path surface.
 //

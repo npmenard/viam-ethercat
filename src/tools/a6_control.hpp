@@ -223,7 +223,7 @@ class A6Control final : public SlaveControl {
 
     // RT, every steady cycle: the old Phase-2 branch tree. Loads at the top (this
     // cycle's latched feedback), stores at the bottom (ship with the NEXT exchange --
-    // the same +1-cycle latency the old make_tpdo/submit had).
+    // a +1-cycle latency: an output written this cycle rides the next exchange()).
     void step(CycleContext& ctx) noexcept override {
         if (uses_policy_()) {  // #47-P3b: --move-pos / --move-vel are driven by the generic policy
             step_policy_(ctx);

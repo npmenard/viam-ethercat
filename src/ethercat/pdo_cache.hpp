@@ -1,6 +1,6 @@
 #pragma once
 
-// The RT <-> non-RT boundary for one EtherCAT servo. Three independent
+// The RT <-> non-RT boundary for one EtherCAT servo. Two independent
 // primitives, each owning exactly one direction of sharing:
 //
 //   1. RxSnapshot   -- RT writes the latest input image; non-RT reads it.
@@ -10,14 +10,13 @@
 //   2. CommandQueue -- non-RT enqueues commands; RT drains + coalesces them.
 //                      boost::lockfree::spsc_queue + producer-mutex (MPSC),
 //                      fixed capacity, pimpl'd.
-//   3. TxStaging    -- non-RT stages an output image; RT takes it. LOCK-FREE
-//                      3-slot announce/re-validate handoff (no RT mutex). This
-//                      is the advanced/raw path -- the common path has the RT
-//                      loop build outputs directly.
+//
+// The command image (RxPDO/outputs) is NOT staged here: the RT loop builds it
+// directly into the backend's output span.
 //
 // RT rules honored: no heap allocation after construction, no exceptions across
-// the boundary, no map walks, and the RT side never blocks (snapshot writer is
-// wait-free; Tx take and command drain are lock-free).
+// the boundary, no map walks, and the RT side never blocks (the snapshot writer
+// is wait-free; the command drain is lock-free).
 
 #include <array>
 #include <atomic>
@@ -195,74 +194,15 @@ class CommandQueue {
 };
 
 // ----------------------------------------------------------------------------
-// (3) TxPDO staging -- lock-free 3-slot announce/re-validate handoff
-// ----------------------------------------------------------------------------
-
-// "Rewritable until sent" output slot, lock-free. The non-RT side stages a
-// frame; if the RT side has not yet taken it, a subsequent stage overwrites it
-// (newest-wins). The RT side takes the newest unsent frame. Three slots
-// guarantee the writer always has a free slot that is neither pending nor being
-// read. The announce-FIRST / re-validate protocol (mirrors the seqlock reader)
-// is the correctness crux against a torn Tx.
-//
-// TRIPWIRE: this hazard scheme is married to exactly ONE non-RT writer (the
-// advanced/raw staging path) and ONE RT reader. Two concurrent stagers would
-// break the 3-slot/hazard invariant. There is no way to static_assert this, so
-// stage_outputs has a debug-only reentrancy guard. If an advanced path ever
-// needs multiple stagers, wrap stage_outputs in a producer-side mutex the RT
-// thread never touches.
-//
-// All pending_/reading_ accesses are seq_cst on BOTH sides: the announce/
-// validate handshake is a Dekker StoreLoad, and release/acquire is insufficient
-// for StoreLoad ordering (it reorders on arm64). Slot payload bytes do NOT need
-// atomic_ref -- the pending_ release/acquire edge plus the mutual-exclusion
-// invariant give a clean happens-before, so a plain memcpy of the slot is
-// race-free.
-class TxStaging {
-   public:
-    explicit TxStaging(std::size_t payload_size);
-
-    // Non-RT. Overwrite-if-unsent (newest-wins). Copy clamped to size_.
-    void stage_outputs(std::span<const std::byte> payload) noexcept;
-
-    // RT. If a staged frame is pending, copy it into `out` and return the number
-    // of bytes written (== size_); returns 0 if nothing new is pending.
-    std::size_t take_outputs(std::span<std::byte> out) noexcept;
-
-   private:
-    static constexpr std::uint32_t kNone = 0xFFFFFFFFU;  // distinct 4th sentinel (slots are 0/1/2)
-    // Cap on the re-validate loop. This is a FRESHNESS bound, not a safety bound:
-    // copying a slightly-stale idx is still safe (reading_==idx is held), so the
-    // cap just stops a pathological concurrent stager from livelocking the RT
-    // thread.
-    static constexpr unsigned kMaxTakeSpins = 8;
-
-    // Atomics first (the alignas(64) anchor) so the large slots_ array does not
-    // wedge padding between fields.
-    alignas(64) std::atomic<std::uint32_t> pending_{kNone};  // newest unsent slot, or kNone
-    std::atomic<std::uint32_t> reading_{kNone};              // slot the RT reader is copying (hazard cell)
-    std::size_t size_;
-    std::array<std::array<std::byte, kMaxPdoBytes>, 3> slots_{};
-    // Debug-only single-writer tripwire (see TRIPWIRE above): the member EXISTS only
-    // in debug builds, where stage_outputs's #ifndef NDEBUG reentrancy guard uses it.
-    // Guarding the member to match its uses (rather than tagging it [[maybe_unused]])
-    // keeps it conforming on GCC, whose -Werror=attributes rejects [[maybe_unused]] on
-    // a non-static data member -- and leaves no unused field under NDEBUG on clang.
-#ifndef NDEBUG
-    std::atomic<bool> staging_{false};
-#endif
-};
-
-// ----------------------------------------------------------------------------
-// PdoCache -- aggregates the Rx snapshot + Tx staging for one slave, matching
-// the plan's publish_inputs/read_inputs/stage_outputs/take_outputs surface. The
-// CommandQueue is a separate channel owned alongside this by ServoController.
+// PdoCache -- wraps the Rx feedback snapshot for one slave, matching the plan's
+// publish_inputs/read_inputs surface. The CommandQueue is a separate channel
+// owned alongside this by ServoController.
 // ----------------------------------------------------------------------------
 class PdoCache {
    public:
-    // Validates sizes (non-RT setup, so throwing is correct): throws
-    // PdoMappingError if either image exceeds kMaxPdoBytes.
-    PdoCache(std::size_t rx_size, std::size_t tx_size);
+    // Validates the size (non-RT setup, so throwing is correct): throws
+    // PdoMappingError if the feedback image exceeds kMaxPdoBytes.
+    explicit PdoCache(std::size_t rx_size);
 
     void publish_inputs(std::span<const std::byte> payload, std::uint16_t wkc, std::uint64_t cycle) noexcept {
         rx_.publish(payload, wkc, cycle);
@@ -270,16 +210,9 @@ class PdoCache {
     PdoSnapshot read_inputs() const noexcept {
         return rx_.read();
     }
-    void stage_outputs(std::span<const std::byte> payload) noexcept {
-        tx_.stage_outputs(payload);
-    }
-    std::size_t take_outputs(std::span<std::byte> out) noexcept {
-        return tx_.take_outputs(out);
-    }
 
    private:
     RxSnapshot rx_;
-    TxStaging tx_;
 };
 
 }  // namespace ethercat

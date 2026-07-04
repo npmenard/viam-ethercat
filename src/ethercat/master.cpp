@@ -194,8 +194,9 @@ void Master::configure() {
                                   " / " + std::to_string(tx_bytes) + " B (remap did not take)");
         }
 
-        // PdoCache(rx = FEEDBACK size (TxPDO/inputs), tx = COMMAND size (RxPDO/outputs)).
-        slaves_.emplace_back(sc.slave_id, info.input_bytes, info.output_bytes);
+        // PdoCache holds the FEEDBACK snapshot (TxPDO/inputs); the command image (RxPDO/outputs)
+        // is written directly via outputs(), so the cache is sized to the feedback image only.
+        slaves_.emplace_back(sc.slave_id, info.input_bytes);
         SlaveRuntime& rt = slaves_.back();
         rt.io = backend_->slave_io(sc.slave_id);
         rt.rx_fields = build_field_table(sc.slave_id, sc.rxpdo);
@@ -326,14 +327,6 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted, bool drive_present) 
 }
 
 void Master::process() noexcept {
-    // Drain any Tpdo-submitted frame into the live command image BEFORE the exchange, so a
-    // submit() lands on the very next process(). take_outputs is the RT-side lock-free take
-    // (this runs on the RT thread); it returns 0 and leaves the image untouched when nothing
-    // is staged -- so the direct-write path (servo module / a6_validate writing outputs()
-    // directly) is unaffected (#30 §3: "submit() -> transmitted next cycle, via TxStaging").
-    for (SlaveRuntime& rt : slaves_) {
-        (void)rt.cache.take_outputs(rt.io.outputs);
-    }
     const int wkc = backend_->exchange();
     last_wkc_.store(wkc, std::memory_order_relaxed);  // raw, every cycle (diagnostic)
     // WKC stats (#40 item 4): two relaxed increments per cycle (one conditional). Steady
@@ -476,16 +469,6 @@ FieldLocation Master::resolve_field(const std::map<std::uint32_t, MappedField>& 
                              std::to_string(mapped_width) + " byte(s)");
     }
     return FieldLocation{it->second.byte_offset, /*present=*/true};
-}
-
-Rpdo Master::read_rpdo(std::uint16_t slave) const {
-    (void)runtime_for(slave);                      // validate the slave id (throws ConfigError, clear text)
-    return Rpdo(read_inputs(slave), this, slave);  // ONE seqlock read, copied into the frame-consistent snapshot
-}
-
-Tpdo Master::make_tpdo(std::uint16_t slave) {
-    SlaveRuntime& rt = runtime_for(slave);               // validate + get the cache (throws ConfigError, clear text)
-    return Tpdo(rt.io.outputs, this, &rt.cache, slave);  // seed from the CURRENT command image
 }
 
 void Master::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {

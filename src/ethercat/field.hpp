@@ -5,14 +5,14 @@
 // A `Field<Index, Sub, T>` is a COMPILE-TIME bundle of a CoE object index +
 // subindex + its C++ wire type. It is the way to never get the type wrong at a
 // PDO access site: the `cia402::` aliases below pin the correct T to each
-// canonical object, so `rpdo.get<cia402::Statusword>()` is statically a
-// std::uint16_t and `tpdo.put<cia402::TargetPosition>(v)` only accepts an
-// std::int32_t. (The locked design drops runtime width-validation; the alias IS
-// the per-field type contract -- a raw Field<..., wrongT> is the caller's risk.)
+// canonical object, so `resolve_tx<cia402::Statusword>()` is statically a
+// std::uint16_t field and `resolve_rx<cia402::TargetPosition>()` an std::int32_t
+// one. (The locked design drops runtime width-validation; the alias IS the
+// per-field type contract -- a raw Field<..., wrongT> is the caller's risk.)
 //
-// Field carries no storage and no logic -- Rpdo/Tpdo (master.hpp) resolve a
-// Field's index:sub to a byte offset in the process image and read/write
-// sizeof(T) little-endian there.
+// Field carries no storage and no logic -- Master::resolve_rx/resolve_tx
+// (master.hpp) resolve a Field's index:sub to a byte offset, and the load_le/
+// store_le free fns read/write sizeof(T) little-endian there.
 
 #include <cstdint>
 

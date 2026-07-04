@@ -11,12 +11,10 @@
 // (a bus fault is LATCHED into an atomic flag, never thrown). Everything else
 // runs non-RT at init/configure/shutdown and may throw with clear text.
 
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <deque>
 #include <map>
 #include <memory>
@@ -34,8 +32,8 @@ namespace ethercat {
 
 // Byte location of a mapped PDO object within a process-data image (#30 §5).
 // OFFSET-ONLY: every access derives its width from the Field's T (sizeof) at the
-// call site (the load_le/store_le free fns below, Rpdo::get/Tpdo::put), so the
-// location carries no width. The per-object mapped width (bit_length) lives in
+// call site (the load_le/store_le free fns below), so the location carries no
+// width. The per-object mapped width (bit_length) lives in
 // the Master's INTERNAL field table (Master::MappedField), where the
 // configure-time width-assert in resolve_field verifies sizeof(F::type)*8 ==
 // bit_length -- it never needs to ride along on the RT-cached location.
@@ -55,9 +53,8 @@ struct FieldLocation {
 // FieldLocation on a live process image. noexcept + NO bounds-check -- PRECONDITION: `loc`
 // came from Master::resolve_rx/resolve_tx<F>() (width-asserted vs the mapped bit_length +
 // in-image) at configure, so offset + sizeof(T) is valid. This is the RT hot-path form
-// (cached loc + these free fns);
-// the THROWING resolve/bounds surface lives ONLY on Rpdo/Tpdo (the copy types), so the 1 kHz
-// path physically can't throw/resolve/alloc. (Overloads the span forms in pdo_buffer.hpp.)
+// (cached loc + these free fns): resolve/bounds-check happens ONCE at configure, so the
+// 1 kHz path physically can't throw/resolve/alloc. (Overloads the span forms in pdo_buffer.hpp.)
 template <PdoScalar T>
 T load_le(std::span<const std::byte> image, FieldLocation loc) noexcept {
     return load_le<T>(image.subspan(loc.byte_offset, sizeof(T)));
@@ -66,11 +63,6 @@ template <PdoScalar T>
 void store_le(std::span<std::byte> image, FieldLocation loc, T value) noexcept {
     store_le<T>(image.subspan(loc.byte_offset, sizeof(T)), value);
 }
-
-// PDO access types (#30), defined in full after Master (they hold a Master* and
-// call its resolve/cache surface). read_rpdo()/make_tpdo() return them.
-class Rpdo;
-class Tpdo;
 
 // Cyclic WKC health counters (#40 item 4), published RT -> non-RT. Consolidates the
 // per-tool tallying (a6_validate's raw/badWKC counters) into the library.
@@ -249,42 +241,15 @@ class Master {
     FieldLocation rx_field(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const;
     FieldLocation tx_field(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const;
 
-    // --- typed PDO access (#30, ergonomic non-RT/bench form) ----------------
-    // These are the throwing, per-call-resolve, COPY form (NOT the 1 kHz hot path -- the RT
-    // loop keeps cached-offset load_le/store_le). Both resolve the SAME field tables as
-    // rx_field/tx_field; the width comes from the Field's T.
-
-    // Immutable, frame-consistent feedback snapshot for a slave (1-based): ONE seqlock read
-    // of the PdoCache RxSnapshot, copied by value. Every get<F>() on the returned Rpdo reads
-    // the SAME frame (no tearing across fields); call again for a newer frame. Throws
-    // ConfigError on an unknown slave.
-    Rpdo read_rpdo(std::uint16_t slave) const;
-
-    // Seeded output builder for a slave (1-based): a COPY of the current command image, so
-    // fields you don't put() carry over unchanged. put<F>(v) writes into the copy; submit()
-    // hands it to TxStaging (transmitted next process()). An UNSUBMITTED Tpdo never touches
-    // the bus (drop it = no-op). BENCH/direct-PDO path only (#30 §6: the servo module command
-    // path stays CommandQueue+FSM). Throws ConfigError on an unknown slave.
-    //
-    // CONTRACT (it's a per-cycle transient, single-consumer; no runtime guard -- the doc IS it):
-    //  1. Do NOT MIX a direct outputs() write with a Tpdo/submit() on the SAME slave in the SAME
-    //     cycle. make_tpdo() snapshots the seed AT CALL TIME, and process() drains the staged
-    //     frame OVER the command image, so submit() wins at drain. The order bites:
-    //     make_tpdo -> direct outputs() write -> submit() silently overwrites the direct write
-    //     with the pre-write seed (make-EARLY is the trap; a direct write BEFORE make_tpdo is
-    //     captured into the seed and is fine). Pick one writer per slave per cycle.
-    //  2. Do NOT HOLD a Tpdo across cycles. The seed goes stale; a late submit() lands a stale
-    //     frame on the bus. Make -> put -> submit all in one cycle, then drop it.
-    Tpdo make_tpdo(std::uint16_t slave);
+    // --- typed PDO field resolution (#30 §5) --------------------------------
 
     // Resolve a Field<> to its byte location in the slave's command (rx) / feedback (tx) image
     // (#30 §5). Templated so it knows sizeof(F::type): clear-text throws on the throw-tier split
     // -- PdoMappingError if the object isn't mapped (map-membership), PdoAccessError if
     // sizeof(F::type)*8 != the mapped object's bit_length (a malformed/wrong-width access, e.g.
-    // an int16 alias on a 32-bit-mapped object -- catches a silent wrong-width read). This is the
-    // resolution used by Rpdo/Tpdo per-call AND the one the RT path calls ONCE at configure to
-    // cache a FieldLocation (then the noexcept load_le/store_le(image, loc) free fns run per cycle
-    // -- no per-cycle resolve).
+    // an int16 alias on a 32-bit-mapped object -- catches a silent wrong-width read). The RT path
+    // calls this ONCE at configure to cache a FieldLocation (then the noexcept load_le/store_le(
+    // image, loc) free fns run per cycle -- no per-cycle resolve).
     template <class F>
     FieldLocation resolve_rx(std::uint16_t slave) const {
         return resolve_field(runtime_for(slave).rx_fields, F::index, F::sub, sizeof(typename F::type), slave, /*is_tx=*/false);
@@ -343,13 +308,12 @@ class Master {
     // Per-slave runtime state. Holds a (non-movable) PdoCache, so it lives in a
     // std::deque (stable addresses, never moved) rather than a vector.
     struct SlaveRuntime {
-        SlaveRuntime(std::uint16_t id, std::size_t rx_feedback_bytes, std::size_t tx_command_bytes)
-            : slave_id(id), cache(rx_feedback_bytes, tx_command_bytes) {}
+        SlaveRuntime(std::uint16_t id, std::size_t rx_feedback_bytes) : slave_id(id), cache(rx_feedback_bytes) {}
         std::uint16_t slave_id;
         SlaveIo io;                                      // spans into backend storage (valid after map_process_data)
         std::map<std::uint32_t, MappedField> rx_fields;  // command image (RxPDO/outputs)
         std::map<std::uint32_t, MappedField> tx_fields;  // feedback image (TxPDO/inputs)
-        PdoCache cache;                                  // NOTE: rx snapshot = FEEDBACK (TxPDO), tx staging = COMMAND (RxPDO)
+        PdoCache cache;                                  // rx snapshot = FEEDBACK (TxPDO); command image is written directly via outputs()
     };
 
     SlaveRuntime& runtime_for(std::uint16_t slave);
@@ -407,103 +371,6 @@ class Master {
     // #15: the RT-phase gate (rt_active_) and the #22 RT-serviced SDO request slot are GONE --
     // sdo_read/sdo_write now run the mailbox transfer directly on the caller's thread, concurrency-safe
     // against the RT PDO loop via SOEM v2's thread-safe port (see the public sdo_read/sdo_write doc).
-};
-
-// ---------------------------------------------------------------------------
-// Rpdo -- immutable, frame-consistent feedback snapshot (#30 §2)
-// ---------------------------------------------------------------------------
-// Holds a COPY of one feedback frame (the seqlock read) + a back-reference to
-// the Master for offset resolution. Every get<F>() reads the SAME copied frame,
-// so there is no tearing across fields. NOT a live view (re-call read_rpdo for a
-// newer frame). Per-call resolve + bounds-throw -- the ergonomic, non-RT form.
-class Rpdo {
-   public:
-    // Resolve F's index:sub in the slave's TxPDO (feedback) field table and read
-    // sizeof(F::type) little-endian at that offset. Throws PdoMappingError if the
-    // object isn't mapped (map-membership), or PdoAccessError if the width disagrees
-    // with the mapping or the read runs past the frame (malformed access).
-    template <class F>
-    typename F::type get() const {
-        // resolve_tx: PdoMappingError on not-in-map, PdoAccessError on width-mismatch (#30 §5).
-        const FieldLocation loc = master_->template resolve_tx<F>(slave_);
-        if (loc.byte_offset + sizeof(typename F::type) > snap_.size) {
-            throw PdoAccessError("Rpdo::get object " + std::to_string(F::index) + ":" + std::to_string(F::sub) + " reads " +
-                                 std::to_string(sizeof(typename F::type)) + " byte(s) at offset " + std::to_string(loc.byte_offset) +
-                                 " past feedback frame size " + std::to_string(snap_.size));
-        }
-        return load_le<typename F::type>(std::span<const std::byte>(snap_.bytes.data() + loc.byte_offset, sizeof(typename F::type)));
-    }
-
-    // The underlying snapshot (WKC / cycle / liveness) behind this view.
-    const PdoSnapshot& snapshot() const noexcept {
-        return snap_;
-    }
-
-   private:
-    friend class Master;
-    Rpdo(const PdoSnapshot& snap, const Master* master, std::uint16_t slave) noexcept : snap_(snap), master_(master), slave_(slave) {}
-
-    PdoSnapshot snap_;      // the frame-consistent COPY
-    const Master* master_;  // non-owning; for offset resolution
-    std::uint16_t slave_;
-};
-
-// ---------------------------------------------------------------------------
-// Tpdo -- seeded write builder, submit-to-transmit (#30 §3)
-// ---------------------------------------------------------------------------
-// Holds a COPY of the CURRENT command image (the seed), so fields you don't put()
-// carry over unchanged. put<F>() writes into the copy; submit() hands it to the
-// slave's TxStaging (the RT process() takes it and transmits next cycle). An
-// unsubmitted Tpdo never touches the bus -- dropping it is a no-op.
-//
-// PER-CYCLE TRANSIENT (see make_tpdo): do NOT hold it across cycles (the seed goes
-// stale -> a late submit() lands a stale frame), and do NOT mix it with a direct
-// outputs() write on the same slave in the same cycle (submit() wins at drain, and
-// make_tpdo's seed is snapshotted at call time). Make -> put -> submit -> drop.
-class Tpdo {
-   public:
-    // Resolve F's index:sub in the slave's RxPDO (command) field table and write
-    // sizeof(F::type) little-endian at that offset into the staged copy. Throws
-    // PdoMappingError if not mapped (map-membership); PdoAccessError on width-mismatch
-    // or past the frame (malformed access).
-    template <class F>
-    void put(typename F::type v) {
-        // resolve_rx: PdoMappingError on not-in-map, PdoAccessError on width-mismatch (#30 §5).
-        const FieldLocation loc = master_->template resolve_rx<F>(slave_);
-        if (loc.byte_offset + sizeof(typename F::type) > size_) {
-            throw PdoAccessError("Tpdo::put object " + std::to_string(F::index) + ":" + std::to_string(F::sub) + " writes " +
-                                 std::to_string(sizeof(typename F::type)) + " byte(s) at offset " + std::to_string(loc.byte_offset) +
-                                 " past command frame size " + std::to_string(size_));
-        }
-        store_le<typename F::type>(std::span<std::byte>(staged_.data() + loc.byte_offset, sizeof(typename F::type)), v);
-    }
-
-    // Hand the staged frame to TxStaging -> the RT process() transmits it next cycle.
-    void submit() noexcept {
-        cache_->stage_outputs(std::span<const std::byte>(staged_.data(), size_));
-        submitted_ = true;
-    }
-
-    bool submitted() const noexcept {
-        return submitted_;
-    }
-
-   private:
-    friend class Master;
-    Tpdo(std::span<const std::byte> seed, Master* master, PdoCache* cache, std::uint16_t slave) noexcept
-        : size_(seed.size()), master_(master), cache_(cache), slave_(slave) {
-        if (size_ > staged_.size()) {
-            size_ = staged_.size();  // defensive clamp (image sizes are validated <= kMaxPdoBytes at configure)
-        }
-        std::memcpy(staged_.data(), seed.data(), size_);
-    }
-
-    std::array<std::byte, kMaxPdoBytes> staged_{};  // seed copy, mutated by put()
-    std::size_t size_;
-    Master* master_;   // non-owning; for offset resolution
-    PdoCache* cache_;  // non-owning; submit() target
-    std::uint16_t slave_;
-    bool submitted_ = false;
 };
 
 }  // namespace ethercat

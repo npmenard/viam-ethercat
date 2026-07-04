@@ -1,8 +1,6 @@
 #include "ethercat/pdo_cache.hpp"
 
 #include <algorithm>
-#include <cassert>
-#include <cstring>
 #include <mutex>
 #include <string>
 
@@ -166,81 +164,12 @@ CommandBatch CommandQueue::drain() noexcept {
 }
 
 // ----------------------------------------------------------------------------
-// TxStaging -- lock-free 3-slot announce/re-validate handoff
-// ----------------------------------------------------------------------------
-
-TxStaging::TxStaging(std::size_t payload_size) : size_(std::min(payload_size, kMaxPdoBytes)) {}
-
-void TxStaging::stage_outputs(std::span<const std::byte> payload) noexcept {
-#ifndef NDEBUG
-    // Single-writer tripwire (see TRIPWIRE in the header): catch a second
-    // concurrent stager in tests. Compiles out under NDEBUG.
-    const bool already = staging_.exchange(true, std::memory_order_acq_rel);
-    assert(!already && "TxStaging::stage_outputs is single-writer-only");
-#endif
-
-    // seq_cst on BOTH pending_ loads/stores forms the Dekker StoreLoad with the
-    // RT take's announce/validate. A free slot always exists: at most one slot
-    // is pending and one is being read, leaving a third.
-    const std::uint32_t pend = pending_.load(std::memory_order_seq_cst);
-    const std::uint32_t rd = reading_.load(std::memory_order_seq_cst);  // observe the RT reader's hazard
-    std::uint32_t slot = 0;
-    for (; slot < 3; ++slot) {
-        if (slot != pend && slot != rd) {
-            break;
-        }
-    }
-
-    std::memcpy(slots_[slot].data(), payload.data(), std::min(payload.size(), size_));
-    pending_.store(slot, std::memory_order_seq_cst);  // newest-wins: overwrites any prior unsent slot
-
-#ifndef NDEBUG
-    staging_.store(false, std::memory_order_release);
-#endif
-}
-
-std::size_t TxStaging::take_outputs(std::span<std::byte> out) noexcept {
-    // Protocol: load pending -> ANNOUNCE reading -> RE-VALIDATE pending -> copy
-    // -> compare_exchange (consume iff unchanged). Never a bare exchange: that
-    // would clear pending_ before the announce, reopening the window for the
-    // stager to reuse the slot mid-copy (torn Tx). reading_==idx is held across
-    // the whole copy, and the stager's self-exclusion (slot != pend) keeps idx
-    // out of its pick set, so the copied slot is never concurrently written.
-    // All pending_/reading_ ops are seq_cst (Dekker StoreLoad).
-    std::uint32_t idx = pending_.load(std::memory_order_seq_cst);
-    for (unsigned spins = 0;; ++spins) {
-        if (idx == kNone) {
-            reading_.store(kNone, std::memory_order_seq_cst);
-            return 0;  // nothing new pending
-        }
-        reading_.store(idx, std::memory_order_seq_cst);                      // ANNOUNCE
-        const std::uint32_t cur = pending_.load(std::memory_order_seq_cst);  // RE-VALIDATE
-        if (cur == idx) {
-            break;  // stable: safe to copy
-        }
-        if (spins >= kMaxTakeSpins) {
-            break;  // freshness cap: copying idx is still safe (reading_==idx held)
-        }
-        idx = cur;  // a newer frame was staged; re-announce it
-    }
-
-    std::memcpy(out.data(), slots_[idx].data(), std::min(out.size(), size_));
-    std::atomic_thread_fence(std::memory_order_acquire);
-    // Consume: clear pending_ iff it is still our idx (a newer staged frame is
-    // left pending for the next take). Strong CAS; on failure do not reuse idx
-    // without re-reading (the CAS already wrote the observed value into idx).
-    pending_.compare_exchange_strong(idx, kNone, std::memory_order_seq_cst, std::memory_order_seq_cst);
-    reading_.store(kNone, std::memory_order_seq_cst);
-    return size_;
-}
-
-// ----------------------------------------------------------------------------
 // PdoCache
 // ----------------------------------------------------------------------------
 
-PdoCache::PdoCache(std::size_t rx_size, std::size_t tx_size) : rx_(rx_size), tx_(tx_size) {
-    if (rx_size > kMaxPdoBytes || tx_size > kMaxPdoBytes) {
-        throw PdoMappingError("slave PDO image (" + std::to_string(std::max(rx_size, tx_size)) + " B) exceeds kMaxPdoBytes (" +
+PdoCache::PdoCache(std::size_t rx_size) : rx_(rx_size) {
+    if (rx_size > kMaxPdoBytes) {
+        throw PdoMappingError("slave feedback image (" + std::to_string(rx_size) + " B) exceeds kMaxPdoBytes (" +
                               std::to_string(kMaxPdoBytes) + " B); raise kMaxPdoBytes or remap the slave");
     }
 }
