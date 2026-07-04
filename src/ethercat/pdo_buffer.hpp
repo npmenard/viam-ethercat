@@ -53,9 +53,7 @@ using uint_of_t = typename uint_of<N>::type;
 // ---------------------------------------------------------------------------
 // The RT loop calls these on pre-resolved {offset,width} field spans (Phase 4
 // builds that flat table at configure()), so they must not throw and must not
-// bounds-check. PRECONDITION: field.size() == sizeof(T). The throwing
-// PdoReader/PdoWriter cursors below bounds-check and then delegate here, so
-// there is exactly one little-endian implementation.
+// bounds-check. PRECONDITION: field.size() == sizeof(T).
 
 template <PdoScalar T>
 T load_le(std::span<const std::byte> field) noexcept {
@@ -77,115 +75,5 @@ void store_le(std::span<std::byte> field, T value) noexcept {
         field[i] = static_cast<std::byte>(static_cast<std::uint8_t>(octet));
     }
 }
-
-// Cursor over a read-only PDO byte span. All multi-byte scalars are decoded as
-// explicit little-endian (EtherCAT wire order), independent of host endianness.
-// Any access that would read past the end throws PdoAccessError naming the
-// offset and size; the cursor is not advanced on failure.
-class PdoReader {
-   public:
-    explicit PdoReader(std::span<const std::byte> data) noexcept : data_(data) {}
-
-    // Read a scalar at the cursor and advance past it.
-    template <PdoScalar T>
-    T get() {
-        const T value = peek<T>();
-        pos_ += sizeof(T);
-        return value;
-    }
-
-    // Read a scalar at the cursor WITHOUT advancing.
-    template <PdoScalar T>
-    T peek() const {
-        require(sizeof(T));
-        return load_le<T>(data_.subspan(pos_, sizeof(T)));
-    }
-
-    // Advance the cursor by n bytes (must stay within bounds).
-    void skip(std::size_t n) {
-        require(n);
-        pos_ += n;
-    }
-
-    // Move the cursor to an absolute byte offset (0..size()).
-    void seek(std::size_t pos) {
-        if (pos > size()) {
-            throw PdoAccessError("pdo reader seek to offset " + std::to_string(pos) + " exceeds buffer size " + std::to_string(size()));
-        }
-        pos_ = pos;
-    }
-
-    std::size_t remaining() const noexcept {
-        return size() - pos_;
-    }
-    std::size_t size() const noexcept {
-        return data_.size();
-    }
-    std::size_t tell() const noexcept {
-        return pos_;
-    }
-
-   private:
-    void require(std::size_t n) const {
-        if (n > remaining()) {
-            throw PdoAccessError("pdo reader access of " + std::to_string(n) + " byte(s) at offset " + std::to_string(pos_) +
-                                 " exceeds buffer size " + std::to_string(size()));
-        }
-    }
-
-    std::span<const std::byte> data_;
-    std::size_t pos_ = 0;
-};
-
-// Cursor over a writable PDO byte span. Scalars are encoded as explicit
-// little-endian. Any access that would write past the end throws
-// PdoAccessError; the cursor is not advanced on failure.
-class PdoWriter {
-   public:
-    explicit PdoWriter(std::span<std::byte> data) noexcept : data_(data) {}
-
-    // Write a scalar at the cursor and advance past it.
-    template <PdoScalar T>
-    void write(T value) {
-        require(sizeof(T));
-        store_le<T>(data_.subspan(pos_, sizeof(T)), value);
-        pos_ += sizeof(T);
-    }
-
-    // Advance the cursor by n bytes (must stay within bounds).
-    void skip(std::size_t n) {
-        require(n);
-        pos_ += n;
-    }
-
-    // Move the cursor to an absolute byte offset (0..size()).
-    void seek(std::size_t pos) {
-        if (pos > size()) {
-            throw PdoAccessError("pdo writer seek to offset " + std::to_string(pos) + " exceeds buffer size " + std::to_string(size()));
-        }
-        pos_ = pos;
-    }
-
-    std::size_t remaining() const noexcept {
-        return size() - pos_;
-    }
-    std::size_t size() const noexcept {
-        return data_.size();
-    }
-    std::size_t tell() const noexcept {
-        return pos_;
-    }
-
-   private:
-    void require(std::size_t n) const {
-        if (n > remaining()) {
-            throw PdoAccessError("pdo writer access of " + std::to_string(n) + " byte(s) at offset " + std::to_string(pos_) +
-                                 " exceeds buffer size " + std::to_string(size()));
-        }
-    }
-
-    std::span<std::byte> data_;
-    std::size_t pos_ = 0;
-};
 
 }  // namespace ethercat
