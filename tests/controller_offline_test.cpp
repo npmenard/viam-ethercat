@@ -62,7 +62,6 @@ ServoConfig make_config() {
     c.target_loop_rate_hz = 1000;
     c.require_realtime = false;  // CI has no CAP_SYS_NICE
     c.command_queue_capacity = 64;
-    c.handshake_timeout_cycles = 1000;
     c.quick_stop_decel = 500'000;  // exercise the quick-stop configure gate (0x605A assert + 0x6085 write/readback)
     return c;
 }

@@ -5,12 +5,14 @@
 // so it is unit-testable on a SimBackend with no Viam SDK and no hardware. It
 // owns: the EtherCAT Master, the CommandQueue, the RT thread, the resolved field
 // offsets, the lifecycle FSM, and the published ControllerState atomics. The
-// library left four behaviors to the driver; this is where they live:
+// library left these behaviors to the driver; this is where they live:
 //   (a) fault-reset RISING-EDGE re-arm (Cia402Fsm::step returns the level),
-//   (b) last-good + staleness -> fail-safe is_powered()/is_moving(),
-//   (c) move-complete predicate |target-actual|<=tol && |vel|<=vthresh (NEVER
-//       statusword bit10), and
-//   (d) the std::variant lifecycle FSM.
+//   (b) staleness -> fail-safe is_powered()/is_moving(),
+//   (c) is-moving/reached (#17): the generic base trusts statusword bit10; the
+//       A6ServoDriver subclass overrides reached_target() to a position-stability
+//       heuristic (the A6 ties bit10 high, #43),
+//   (d) the runtime mode-switch orchestration (#18, run_mode_switch), and
+//   (e) the std::variant lifecycle FSM.
 //
 // CONCURRENCY CONTRACT (load-bearing):
 //  * The RT thread is the ONLY toucher of master_ / the queue's pop during
@@ -201,6 +203,22 @@ class ServoController : public SlaveControl {
     // 0x603F code -> human label for last_error() (cold path). Empty (base) => bare hex, so the
     // line is never wrong, just less descriptive. The A6 glosses its 0x8700 as "Er74.1 / no SYNC0".
     virtual std::string fault_description(std::uint16_t code) const;
+    // #17 MOVE-COMPLETE SEAM (the DRIVER owns is-moving/reached, not the policy). Given this cycle's
+    // "actual is within tolerance of target" + "the shaft is position-stable" (the #59 heuristic) +
+    // the statusword, decide whether a PP move has REACHED. The generic base TRUSTS the drive's
+    // statusword bit10 (target-reached); A6ServoDriver overrides to `pos_near_target && pos_stable`
+    // because the A6 ties bit10 permanently high (#43). RT-only (publish_state); position_stable() has
+    // already advanced its ring this cycle, so an override composes the two booleans -- it must NOT call
+    // position_stable() again.
+    virtual bool reached_target(bool pos_near_target, bool pos_stable, Status status) noexcept {
+        (void)pos_near_target;
+        (void)pos_stable;
+        return status.target_reached();
+    }
+    // The #59 noise-robust "shaft is still" heuristic: STABLE once the last-N-cycles position range is
+    // within position_tolerance_counts. Protected so the A6 reach override can compose it. Advances a
+    // ring -- call EXACTLY ONCE per cycle (publish_state does).
+    bool position_stable(std::int32_t actual) noexcept;
 
    private:
     // --- lifecycle FSM (std::variant; each state's step() in the .cpp) ---
@@ -301,12 +319,10 @@ class ServoController : public SlaveControl {
     FieldLocation f_fault_code_;       // 0x603F U16 drive error code (last_error gloss)
     FieldLocation f_velocity_actual_;  // 0x606C S32 velocity-actual (wire velocity; else estimate)
 
-    // #47-P3b: the GENERIC CiA402 motion policy (shared with a6_validate's A6Control). The
-    // module's Operational healthy-path (enable-hold + PP handshake + PV stream + Halt) delegates
-    // HERE; the wrapper keeps the two-tier fault + #18 fault-reset machine + completion-generations
-    // + stall watchdog (rev-6 signed boundary). Parameterized by a DeviceProfile mapped from
-    // ServoConfig (module flags: bit8 Halt, no PV pos-mirror, 4-phase handshake + ack timeout).
-    static DeviceProfile build_device_profile(const ServoConfig& c) noexcept;
+    // #47-P3b: the GENERIC CiA402 motion policy (shared with a6_validate's A6Control). The module's
+    // Operational healthy-path (enable-hold + PP handshake + PV stream + Halt) delegates HERE; the
+    // wrapper keeps the two-tier fault + #18 fault-reset machine + completion-generations + the driver
+    // mode-switch + is-moving/reached (#17). Constructed with just the quick-stop decel value (config).
     Cia402Policy policy_;
     // 0x6085 readback from policy_.configure (0 = quick-stop not configured). WRITTEN once by the
     // RT thread in on_configured (pre-steady), READ by the non-RT velocity guard -> atomic.
@@ -366,9 +382,7 @@ class ServoController : public SlaveControl {
     std::vector<std::int32_t> pos_hist_;
     std::size_t pos_hist_idx_ = 0;
     std::uint32_t pos_hist_filled_ = 0;  // entries written so far (window not "full" until == pos_hist_.size())
-    // Push `actual` into the ring and return whether the position is STABLE over the full window (needs a
-    // full window first). velocity_threshold>0 bypasses this (a velocity gate); 0 => this method (#59).
-    bool position_stable(std::int32_t actual) noexcept;
+    // (position_stable() is declared protected above -- the A6 reach override composes it.)
     // #61: the Cia402 mode to command THIS cycle -- the fixed config mode (PP/PV) or, for a switchable
     // config, the current switch_intent_. RT-only (reads switch_intent_).
     Cia402Mode commanded_cia402_mode() const noexcept;
@@ -380,26 +394,28 @@ class ServoController : public SlaveControl {
     // load -- the drive has no position loop in PV. When the map is switch-capable (0x6060 + 0x607A both
     // RxPDO-mapped), a Halt of a PV move instead switches the drive to PP-at-current-counts (the DRIVER
     // mode-switch below, then a PP setpoint = the position latched AT the halt) so the drive's position
-    // loop LOCKS the shaft. pv_hold_token_ (high-bit base, never collides with real move gens which start
-    // at 1) kicks the policy's PP handshake for the hold WITHOUT touching active_generation (the halt
-    // already failed the in-flight move -- the hold is not a completable move). On a switch give-up the
-    // hold reverts to the interim PV-at-0 bit8 hold (accept small drift, never de-energize -- spec §A R1).
+    // loop LOCKS the shaft. pending_new_setpoint_ arms the policy's PP handshake for the hold WITHOUT
+    // touching active_generation (the halt already failed the in-flight move -- the hold is not a
+    // completable move). On a switch give-up the hold reverts to the interim PV-at-0 bit8 hold (accept
+    // small drift, never de-energize -- spec §A R1).
     // #18: the current motion INTENT (RT-only), always meaningful (the drive is always switch-capable).
     // The command batch sets it (go_to/go_for -> PP, set_rpm -> PV). Default PP so the drive enables in
     // PP. commanded_cia402_mode() maps it to the Cia402Mode the policy commands this cycle.
     ControlMode switch_intent_ = ControlMode::ProfilePosition;
-    bool pv_hold_capable_ = false;               // set at resolve: 0x6060 AND 0x607A both mapped (always, fixed superset)
-    bool pv_hold_as_pp_ = false;                 // STICKY: currently holding a halted PV motor via PP-at-counts
-    std::uint32_t pv_hold_token_ = 0x80000000u;  // policy token that kicks the PP hold handshake (never a real gen)
+    bool pv_hold_capable_ = false;  // set at resolve: 0x6060 AND 0x607A both mapped (always, fixed superset)
+    bool pv_hold_as_pp_ = false;    // STICKY: currently holding a halted PV motor via PP-at-counts
+    // #17: the policy lost its opaque token; the DRIVER signals a new setpoint explicitly. Set true when a
+    // new PP target is adopted (or an M6 PP hold begins); consumed on the next Operational policy step
+    // (a switch defers consumption -- run_mode_switch returns before the consume, keeping this pending).
+    bool pending_new_setpoint_ = false;
     // #18 DRIVER-OWNED runtime mode-switch (moved out of Cia402Policy): when the drive's CONFIRMED 0x6061
     // mode differs from the intent's Cia402 mode, the wrapper HOLDS energized, brings the motor to REST
     // (Stopping), commands the target mode via the dumb policy + awaits the 0x6061 echo (Settling), then
     // runs the target mode's motion body. Fail-safe give-up (never a throw). RT-only.
     enum class SwitchPhase : std::uint8_t { None, Stopping, Settling };
     SwitchPhase switch_phase_ = SwitchPhase::None;
-    std::uint32_t switch_cycles_ = 0;                // stop-first / settle window counter
-    std::uint32_t switch_hold_token_ = 0x40000000u;  // policy hold token during a switch (distinct from real gens + pv_hold_token_)
-    bool at_rest_ = false;       // last publish_state's "stopped" verdict; run_mode_switch's stop-first gate reads it (1-cycle stale)
+    std::uint32_t switch_cycles_ = 0;  // stop-first / settle window counter
+    bool at_rest_ = false;             // last publish_state's "stopped" verdict; run_mode_switch's stop-first gate reads it (1-cycle stale)
     bool stop_at_rest_ = false;  // RT-only (#47-P3b R1): drive reached SwitchOnDisabled during the stopping window -> teardown early-out
     // Controller-error tier: one-shot latches (HandshakeTimeout/MoveStalled) set by
     // the FSM, cleared ONLY by an explicit fault_reset. The bus WkcFault tier is

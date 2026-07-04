@@ -143,11 +143,9 @@ class A6Control final : public SlaveControl {
    public:
     // `mode` is the commanded 0x6060 (the CLI mode); its int8 value is what 0x6061 must
     // echo before we enable (#53 DA-B). build_a6_config() set the SAME mode at configure.
-    // `profile_override` swaps the DeviceProfile without touching ANY other code -- the genericity
-    // thesis in one parameter (#47-P3b M56S): the SAME A6Control + SAME generic policy drive a second
-    // device by data alone. Default (nullopt) = the A6 profile.
-    A6Control(const Options& opt, Telemetry& tel, Cia402Mode mode, std::optional<DeviceProfile> profile_override = std::nullopt) noexcept
-        : opt_(opt), tel_(tel), policy_(profile_override ? *profile_override : make_a6_profile(opt)) {
+    // The policy carries only the two quick-stop VALUES now (#17: DeviceProfile is gone).
+    A6Control(const Options& opt, Telemetry& tel, Cia402Mode mode) noexcept
+        : opt_(opt), tel_(tel), policy_(kQuickStopDecelDefault, kQuickStopOptionRequired) {
         goal_ = opt_.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
         profile_vel_ = static_cast<std::uint32_t>(opt_.move_rpm / 60.0 * kCountsPerRev);
         commanded_mode_disp_ = static_cast<std::int8_t>(mode);  // 0x6061 echo target (PP=1, PV=3, CSP=8)
@@ -460,7 +458,7 @@ class A6Control final : public SlaveControl {
 
     // --- read-after-stop accessors (offline tests; the join is the happens-before edge) ---
     bool move_done() const noexcept {
-        return uses_policy_() ? policy_.state().reached : move_done_;
+        return uses_policy_() ? policy_reached_ : move_done_;
     }
     bool mode_refused() const noexcept {
         return uses_policy_() ? policy_.state().mode_mismatch : mode_refused_;
@@ -488,18 +486,35 @@ class A6Control final : public SlaveControl {
         cmd.target_counts = opt_.pos_target;
         cmd.profile_velocity = pp_profile_vel_;
         cmd.target_velocity = opt_.pv_vel_cps;
-        cmd.token = 1;  // one bench move per invocation
+        cmd.new_setpoint = opt_.move_pos && arm_setpoint_;  // arm the PP handshake ONCE for the single bench move
+        arm_setpoint_ = false;
         const std::uint16_t cw = policy_.step(ctx, cmd);
 
-        // move-to finishes on reached; continuous PV runs until Ctrl-C -> request_stop.
-        if (opt_.move_pos && policy_.state().reached && ctx.cycle() % 500 == 0) {
-            ctx.request_stop();
-        }
-        // Bench telemetry: the same feedback the policy read this cycle.
+        // Bench feedback (the same the policy read this cycle).
         const Status status{ctx.load<cia402::Statusword::type>(sw_loc_)};
         const std::int32_t pos = ctx.load<cia402::PositionActual::type>(pos_loc_);
         const std::int32_t vel = ctx.load<cia402::VelocityActual::type>(vel_loc_);
         const std::uint16_t fc = ctx.load<cia402::FaultCode::type>(fc_loc_);
+
+        // #17: the DRIVER (this tool) owns reached now -- |pos-target| <= tol AND velocity ~0 (debounced;
+        // NEVER bit10, the A6 ties it high, #43). Latch once, then let a move-to finish (request_stop);
+        // continuous PV runs until Ctrl-C.
+        if (opt_.move_pos && !policy_reached_) {
+            const bool pos_ok = std::abs(pos - opt_.pos_target) <= opt_.pos_tol;
+            if (std::abs(vel) < kZeroVelThresh) {
+                ++zerovel_cycles_;
+            } else {
+                zerovel_cycles_ = 0;
+            }
+            if (pos_ok && zerovel_cycles_ >= kZeroVelDebounce) {
+                policy_reached_ = true;
+                std::cout << "[B] move-pos reached: pos=" << pos << " target=" << opt_.pos_target << " (|d|<=" << opt_.pos_tol
+                          << " counts, vel~0)\n";
+            }
+        }
+        if (opt_.move_pos && policy_reached_ && ctx.cycle() % 500 == 0) {
+            ctx.request_stop();
+        }
         if (status.operation_enabled() && !announced_op_) {
             announced_op_ = true;
             tel_.enabled.store(true, std::memory_order_relaxed);
@@ -532,19 +547,6 @@ class A6Control final : public SlaveControl {
     bool uses_policy_() const noexcept {
         return opt_.move_pos || opt_.move_vel;
     }
-    // The A6 DeviceProfile -- the tiny per-device residual. In-loop reset = CiA402 bit7 (the
-    // A6's vendor 0x2031:01 reset is a pre-start SDO run by main(), not the policy); the rest
-    // are the standard CiA402 tunables the bench uses. NO A6 codes leak into the generic policy.
-    static DeviceProfile make_a6_profile(const Options& opt) noexcept {
-        DeviceProfile p;
-        p.fault_reset = DeviceProfile::FaultReset::Cia402Bit7;
-        p.position_tolerance = opt.pos_tol;
-        p.zero_vel_threshold = kZeroVelThresh;
-        p.zero_vel_debounce = kZeroVelDebounce;
-        p.quick_stop_decel = kQuickStopDecelDefault;
-        p.quick_stop_option = kQuickStopOptionRequired;
-        return p;
-    }
 
     const Options& opt_;
     Telemetry& tel_;
@@ -567,6 +569,8 @@ class A6Control final : public SlaveControl {
     bool announced_op_ = false;
     bool setpoint_latched_ = false;
     bool move_done_ = false;
+    bool arm_setpoint_ = true;     // #17: arm the policy's PP handshake once (the single bench move)
+    bool policy_reached_ = false;  // #17: the tool owns reached now (|d|<=tol && vel~0), not the policy
     bool was_faulted_ = false;
     bool hold_captured_ = false;
     bool safety_abort_ = false;

@@ -78,10 +78,11 @@ struct ServoConfig {
     // config below.
 
     // --- health / boundary ---
-    int max_consecutive_wkc_errors = 5;            // WKC latch threshold (passed to Master)
-    std::uint64_t stall_threshold_cycles = 10;     // cycle-stall -> stale
-    std::size_t command_queue_capacity = 64;       // > 0
-    std::uint32_t handshake_timeout_cycles = 100;  // PP bit12 ack timeout
+    int max_consecutive_wkc_errors = 5;         // WKC latch threshold (passed to Master)
+    std::uint64_t stall_threshold_cycles = 10;  // cycle-stall -> stale
+    std::size_t command_queue_capacity = 64;    // > 0
+    // #17: the PP new-setpoint ack timeout is no longer a config knob -- it is an internal Cia402Policy
+    // constant (kHandshakeTimeoutCycles). The 4-phase handshake is always bounded by it.
     // Quick-stop deceleration (0x6085, counts/s^2) for the R1 controlled stop. 0 = quick-stop not
     // configured -> the policy's quick-stop SDO setup (0x605A assert + 0x6085 write/readback) is
     // SKIPPED (the drive falls back to disable-voltage on stop). >0 -> configured + asserted at

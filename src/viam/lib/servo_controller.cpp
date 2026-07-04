@@ -129,40 +129,13 @@ void ServoController::run_vendor_fault_reset() {
     }
 }
 
-DeviceProfile ServoController::build_device_profile(const ServoConfig& c) noexcept {
-    DeviceProfile p;
-    // NOTE (#15 item 2): the DeviceProfile fault-reset fields (fault_reset / vendor_fault_reset) are
-    // DORMANT -- the policy's in-loop reset always uses standard CiA402 bit7 today, and the ACTIVE
-    // vendor reset is the pre-RT-spawn run_vendor_fault_reset() seam. Left at their generic defaults;
-    // when the policy's R2/sub-step-4 in-loop vendor reset lands it will read the subclass seam too.
-    p.position_tolerance = c.position_tolerance_counts;  // effective value (validated() defaulted 0 -> counts_per_rev/720)
-    // #59 (2nd consumer): the policy's zero_vel_threshold gates the quick-stop-AT-REST de-energize
-    // (:209/:335) -- a BACKSTOP; the PRIMARY is 0x605A=2 auto-SwitchOnDisabled (P3c-proven). Keep it a
-    // velocity gate (position-delta lives in the wrapper, not the pure-counts generic policy -- #41). Only
-    // override the profile's sane 500 default when the config set an explicit velocity_threshold (>0);
-    // do NOT propagate the 0 "unset" sentinel (that would zero the gate -> break the backstop for a
-    // non-auto-disable device). Flagged to team-lead + DA.
-    if (c.velocity_threshold > 0) {
-        p.zero_vel_threshold = c.velocity_threshold;
-    }
-    p.quick_stop_decel = c.quick_stop_decel;  // 0 => configure() skips the quick-stop SDO setup
-    // --- MODULE behavior flags (vs the bench A6 defaults): full 4-phase new-setpoint handshake
-    //     with the module's ack timeout; Stop = CiA402 bit8 Halt; no PV position mirror. ---
-    p.handshake_timeout_cycles = c.handshake_timeout_cycles;
-    // A MOTION-stop (Halt) of a PV move. On a SWITCH-CAPABLE map (0x6060 + 0x607A mapped) the wrapper
-    // instead switches the drive to PP-at-current-counts (M6, resolve_fields/step_lifecycle) so the
-    // POSITION loop locks the shaft. This bit8 setting is the FALLBACK for a NON-switch-capable PV map:
-    // Halt asserts CiA402 bit8 (the drive's own halt ramp) -> holds zero VELOCITY, not zero POSITION, so
-    // under an external load the axis drifts (safe on the no-load sim / bench). (spec §A R1 / M6.)
-    p.halt_uses_bit8 = true;
-    p.pv_mirror_position = false;
-    return p;
-}
-
 ServoController::ServoController(ServoConfig config, BackendFactory backend_factory)
     : config_(validated(std::move(config))),
       backend_factory_(std::move(backend_factory)),
-      policy_(build_device_profile(config_)),
+      // #17/#18: the policy carries only the two quick-stop VALUES now (DeviceProfile is gone). 0x6085
+      // decel from config (0 => configure() skips the quick-stop SDO setup + stop coasts); 0x605A option
+      // asserted == 2 (decel-then-auto-SwitchOnDisabled). is-moving/reached + mode-switch are the driver's.
+      policy_(config_.quick_stop_decel, 2),
       commands_(config_.command_queue_capacity) {
     if (!backend_factory_) {
         throw ConfigError("ServoController: null backend factory");
@@ -218,6 +191,7 @@ void ServoController::reset_run_state() {
     switch_phase_ = SwitchPhase::None;  // #18: no mode-switch in flight on a fresh run
     switch_cycles_ = 0;
     at_rest_ = false;
+    pending_new_setpoint_ = false;  // #17: no armed handshake on a fresh run
     latched_ctrl_error_ = RtError::None;
     last_progress_actual_ = 0;
     stall_cycles_ = 0;
@@ -453,9 +427,9 @@ std::uint16_t ServoController::run_mode_switch(CycleContext& ctx, std::int32_t a
     pcmd.enable = true;
     pcmd.halt = false;
     pcmd.profile_velocity = profile_vel_;
-    pcmd.target_counts = actual;      // PP hold at the current position (no lunge)
-    pcmd.target_velocity = 0;         // PV ramp to 0
-    pcmd.token = switch_hold_token_;  // constant through the switch -> policy holds (handshake -> Idle, no re-arm)
+    pcmd.target_counts = actual;  // PP hold at the current position (no lunge)
+    pcmd.target_velocity = 0;     // PV ramp to 0
+    pcmd.new_setpoint = false;    // HOLD -- never arm the handshake during a switch (the policy settles to Idle)
 
     if (switch_phase_ == SwitchPhase::Stopping) {
         // Command the CURRENT confirmed mode so the drive stays in its present control loop while it ramps
@@ -519,17 +493,15 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // true (the common case) => behavior UNCHANGED.
         if (batch.halt_supersedes) {
             halted_ = true;  // STICKY: stays asserted across cycles until a new motion command
-            // M6: on a switch-capable PV map, hold POSITION via PP (below). pv_hold_token_ kicks the policy's
-            // PP handshake for the hold target WITHOUT disturbing the move-generation space. The hold target is
-            // the LIVE actual (passed each cycle) -- the PP handshake latches it once, on its bit4 edge, which
-            // fires only AFTER the mode-switch stop-first ramp has brought the motor to REST -> the latched
-            // target IS the rest position (spec M6 "seed 0x607A=ACTUAL counts"), so no back-jump/lunge. Not
+            // M6: on a switch-capable PV map, hold POSITION via PP (below). The driver mode-switch brings
+            // PV->PP; then pending_new_setpoint_ arms the policy's PP handshake ONCE for the hold target,
+            // which latches the LIVE actual at REST (post stop-first ramp) -> no back-jump/lunge. Not
             // switch-capable -> pv_hold_as_pp_ stays false -> interim bit8 zero-velocity hold.
             // #61: only when the drive is currently in PV (fixed-PV always; switchable only after set_rpm) --
             // a PP-intent halt already holds in PP, no switch. commanded_is_pp() reads the live switch_intent_.
             if (pv_hold_capable_ && !commanded_is_pp()) {
                 pv_hold_as_pp_ = true;
-                ++pv_hold_token_;
+                pending_new_setpoint_ = true;  // arm the PP hold handshake once (consumed post-switch)
             }
         }
     }
@@ -550,9 +522,8 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             last_progress_actual_ = actual;
             stall_cycles_ = 0;
             latched_ctrl_error_ = RtError::None;  // a fresh move starts with a clean diagnostic slate
+            pending_new_setpoint_ = true;         // #17: arm the policy's PP handshake for this new target (consumed post-switch)
             state_.active_generation.store(t.generation, std::memory_order_release);
-            // The policy restarts its new-setpoint handshake off the token (= this generation)
-            // change on the next step() -- no wrapper-side handshake state to prime (#47-P3b).
         }
     }
     // #18: a velocity setpoint (set_rpm) routes the always-switchable drive to PV intent.
@@ -634,7 +605,6 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             if (switch_phase_ == SwitchPhase::None && confirmed != 0 && confirmed != want_i8) {
                 switch_phase_ = SwitchPhase::Stopping;
                 switch_cycles_ = 0;
-                ++switch_hold_token_;  // arm the hold: the policy re-arms its handshake off the token change, then settles to Idle
             }
             if (switch_phase_ != SwitchPhase::None) {
                 return run_mode_switch(ctx, actual, want);
@@ -652,16 +622,15 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         if (pv_hold_as_pp_) {
             // M6: PV motion-hold as PP-at-current-counts. The switch above brought PV->PP (position loop
             // active); command PP with target = the position latched at the halt so the drive's position
-            // loop LOCKS the shaft (no drift). The PP handshake (kicked by pv_hold_token_) latches it once
-            // at rest -> no lunge. halt=false so the handshake actually runs (a bit8 halt would freeze the
-            // profile generator and never latch the setpoint). Not a completable move -> pv_hold_token_,
-            // not active_generation, so completion tracking is untouched (the halt already failed it).
+            // loop LOCKS the shaft (no drift). pending_new_setpoint_ (armed when the hold began) arms the
+            // PP handshake ONCE to latch the LIVE actual at rest -> no lunge. halt=false so the handshake
+            // actually runs (a bit8 halt would freeze the profile generator and never latch the setpoint).
+            // Not a completable move -> completion tracking is untouched (the halt already failed it).
             pcmd.mode = Cia402Mode::ProfilePosition;
             pcmd.target_counts = actual;  // LIVE actual: the handshake latches it at REST -> no lunge
             pcmd.profile_velocity = profile_vel_;
             pcmd.enable = true;
             pcmd.halt = false;
-            pcmd.token = pv_hold_token_;
         } else {
             pcmd.mode = commanded_cia402_mode();  // #18: the current intent (the switch above ensured 0x6061 matches)
             pcmd.target_counts = target_counts_;
@@ -669,8 +638,9 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             pcmd.target_velocity = pv_velocity_;
             pcmd.enable = true;
             pcmd.halt = halted_;
-            pcmd.token = state_.active_generation.load(std::memory_order_relaxed);
         }
+        pcmd.new_setpoint = pending_new_setpoint_;  // #17: arm the policy's handshake on the cycle a new target is adopted
+        pending_new_setpoint_ = false;              // consume (a switch defers this -- run_mode_switch returns before here)
         const std::uint16_t cw = policy_.step(ctx, pcmd);
         // The 4-phase handshake's ack (or ack-clear) timeout is the policy's per-cycle signal; the
         // WRAPPER owns the disposition -> abort the in-flight move (latch + wake the waiter), same as
@@ -750,22 +720,21 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
     const bool move_active = g != 0 && state_.completed_generation.load(std::memory_order_relaxed) != g &&
                              state_.failed_generation.load(std::memory_order_relaxed) != g;
 
-    // #59 noise-robust "stopped" (NEVER bit10): position STABLE over the last N cycles (its range <=
-    // position_tolerance_counts) -- immune to encoder jitter at rest. velocity_threshold>0 is an OPTIONAL
-    // override (a classic velocity gate); 0 (the default) uses the position-delta method. position_stable
-    // MUST be called once per cycle (it advances the ring), so evaluate it unconditionally.
+    // #59/#17: reach + rest signals. position_stable MUST be called once per cycle (it advances the
+    // ring), so evaluate it unconditionally; its verdict feeds at_rest_ (the mode-switch stop-first
+    // gate) and the A6 reach heuristic. The move-complete predicate is a DRIVER SEAM (reached_target):
+    // the generic base trusts statusword bit10; A6ServoDriver overrides to the position-stability
+    // heuristic (the A6 ties bit10 high, #43). velocity_threshold>0 stays an optional PV is-moving gate.
     const bool pos_stable = position_stable(actual);
-    const bool stopped = (config_.velocity_threshold > 0) ? (std::abs(velocity) <= config_.velocity_threshold) : pos_stable;
-    at_rest_ = stopped;  // #18: the driver's rest verdict, read (1-cycle stale) by run_mode_switch's stop-first gate
-
-    // Move-complete predicate: |target - actual| <= tol AND the axis has come to rest (stopped).
-    // Only meaningful in PP (move_active implies a go_to generation).
-    const bool at_target = std::abs(actual - target_counts_) <= config_.position_tolerance_counts && stopped;
+    at_rest_ = pos_stable;  // #18: the driver's rest verdict, read (1-cycle stale) by run_mode_switch's stop-first gate
+    const bool pos_near_target = std::abs(actual - target_counts_) <= config_.position_tolerance_counts;
+    const bool at_target = reached_target(pos_near_target, pos_stable, status);
+    const bool pv_stopped = (config_.velocity_threshold > 0) ? (std::abs(velocity) <= config_.velocity_threshold) : pos_stable;
 
     // is_moving: PP = an active positioned move not yet at target; PV = the drive is not at rest.
     // target_counts_ is never assigned in PV, so the PP position predicate must NOT drive PV moving.
     const bool moving =
-        commanded_is_pp() ? (powered && move_active && !at_target) : (powered && !stopped);  // #61: switchable uses the live intent
+        commanded_is_pp() ? (powered && move_active && !at_target) : (powered && !pv_stopped);  // #61: switchable uses the live intent
     state_.moving.store(moving, std::memory_order_relaxed);
 
     // PP generation protocol: completion + no-progress watchdog (PP-only via move_active).
@@ -893,8 +862,7 @@ void ServoController::step(CycleContext& ctx) noexcept {
             PolicyCommand scmd;
             scmd.mode = commanded_cia402_mode();  // #61
             scmd.enable = false;                  // stopping is not a motion intent; the policy's stopping branch owns the cw
-            scmd.token = state_.active_generation.load(std::memory_order_relaxed);
-            (void)policy_.step(ctx, scmd);  // writes cw (kQuickStopCw / disable backstop) into ctx
+            (void)policy_.step(ctx, scmd);        // writes cw (kQuickStopCw / disable backstop) into ctx
         } else {
             ctx.store<std::uint16_t>(f_ctrlword_, ControlWord::disable_voltage());
         }

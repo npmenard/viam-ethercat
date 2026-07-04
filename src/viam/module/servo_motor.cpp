@@ -99,7 +99,7 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     c.max_consecutive_wkc_errors = static_cast<int>(opt_num(attrs, "max_consecutive_wkc_errors", 5.0));
     c.stall_threshold_cycles = static_cast<std::uint64_t>(opt_num(attrs, "stall_threshold_cycles", 10.0));
     c.command_queue_capacity = static_cast<std::size_t>(opt_num(attrs, "command_queue_capacity", 64.0));
-    c.handshake_timeout_cycles = static_cast<std::uint32_t>(opt_num(attrs, "handshake_timeout_cycles", 100.0));
+    // #17: handshake_timeout_cycles is no longer a config attribute -- it is an internal policy constant.
 
     c.validate();  // throws ConfigError (clear text) on any invalid field
     return c;

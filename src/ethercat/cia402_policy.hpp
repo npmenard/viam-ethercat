@@ -3,136 +3,87 @@
 // cia402_policy.hpp -- the GENERIC CiA402 motion policy (#47-P3b sub-step 1).
 //
 // The proven bench sequencing (a6_validate A6Control, #53) collapsed to a library-grade,
-// device-AGNOSTIC policy: BOTH a6_validate's A6Control AND the Viam module's SlaveControl
-// wrap THIS, parameterized only by a tiny DeviceProfile. The genericity thesis (spec §1):
-// a correct CiA402 driver needs almost no per-device code.
+// device-AGNOSTIC policy: BOTH a6_validate's A6Control AND the Viam module's ServoController
+// wrap THIS. The genericity thesis (spec §1): a correct CiA402 driver needs almost no
+// per-device code.
 //
-// BOUNDARY (architect-reviewed, spec §2/§4/§9):
+// BOUNDARY (architect-reviewed, spec §2/§4/§9; #17/#18 diet):
 //  * The policy is PURE-COUNTS + unit-agnostic -- it never sees a rev / rpm / gear ratio
-//    (the wrapper converts, §4 / FOLD 1). It never knows completion-generations -- an
-//    intent carries an OPAQUE token the policy echoes in its state (FOLD 3). Disposition is
-//    STRUCTURAL by hook -- a Halt intent HOLDS, ctx.stopping()/on_stop() DE-ENERGIZE via
-//    Quick-Stop, always, both consumers (FOLD 4); no disposition parameter.
-//  * DeviceProfile carries ONLY device CODES/VALUES/mechanism -- NEVER baked into the policy
-//    (TODO-41 discipline): standard CiA402 object indices + controlword/statusword bit
-//    semantics ARE the standard and live here; device fault/sync CODES, vendor reset objects,
-//    and the quick-stop deceleration/option VALUES arrive via DeviceProfile. No coded sync gate
-//    (FOLD 2): bring-up success = reach+hold-OP; sync_faulted is informational.
+//    (the wrapper converts, §4 / FOLD 1). It does NO motion monitoring: is-moving / reached
+//    are the DRIVER's job (statusword bit10 for a generic drive, a position-stability
+//    heuristic for the A6 whose bit10 is broken) -- the policy owns only the CiA402
+//    SEQUENCING (enable ladder, mode-echo gate, the 4-phase new-setpoint handshake,
+//    quick-stop). Runtime mode-SWITCH orchestration is the DRIVER's job too (#18): the
+//    policy is a DUMB per-mode executor -- it writes 0x6060 = cmd.mode + that mode's command
+//    objects every cycle and never decides to switch.
+//  * The only device residuals are the two quick-stop VALUES (0x6085 decel, 0x605A option),
+//    passed to the ctor. Standard CiA402 object indices + controlword/statusword bit
+//    semantics ARE the standard and live here. Disposition is STRUCTURAL by hook -- a Halt
+//    intent HOLDS (CiA402 bit8), ctx.stopping()/on_stop() DE-ENERGIZE via Quick-Stop (FOLD 4).
 //
 // The policy operates on a CycleContext (library RT boundary) + typed cia402::Field aliases.
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
+#include <vector>
 
 #include "ethercat/cia402.hpp"
 #include "ethercat/errors.hpp"
-#include "ethercat/master.hpp"  // FieldLocation, SdoWrite
+#include "ethercat/master.hpp"  // FieldLocation
 #include "ethercat/pdo_buffer.hpp"
 #include "ethercat/runner.hpp"  // CycleContext, ConfigContext, StopReason
 
 namespace ethercat {
 
-// --- The ONE device residual (spec §1). Config DATA, never code. Unit-agnostic. ---
-struct DeviceProfile {
-    // THE genuine device-specific: how a fault clears. On some drives the standard CiA402
-    // controlword bit7 reset SILENTLY fails and a vendor SDO reset is required instead. bit7 =
-    // the standard in-loop reset. (Also selects R2 recovery LOCATION at P3b sub-step 4.)
-    enum class FaultReset : std::uint8_t { Cia402Bit7, VendorSdo };
-    FaultReset fault_reset = FaultReset::Cia402Bit7;
-    std::optional<SdoWrite> vendor_fault_reset;  // the vendor reset SDO, when fault_reset == VendorSdo
-
-    // Standard CiA402 tunables (VALUES arrive here; the standard OBJECTS are in the policy).
-    std::int32_t position_tolerance = 300;  // reached: |target-actual| <= this
-    // Quick-stop-at-rest de-energize gate (:209/:335). NOTE (#59/DA): 500 c/s is BELOW a real drive's
-    // velocity-estimate noise floor (A6 dithers ~+/-3300 c/s at rest), so this |vel|-debounce rarely
-    // completes -- it is a DECORATIVE backstop, NOT the live de-energize. The PRIMARY quick-stop disable
-    // is 0x605A=2 auto-SwitchOnDisabled (asserted-==2 at configure, P3c-proven), with the Runner's
-    // close()->INIT as the ultimate fallback. Kept velocity-based on purpose (the wrapper owns the
-    // position-delta rest detection, #59; the pure-counts policy stays position-history-free, #41). If a
-    // future device ever needed this FUNCTIONAL, raise it above that device's noise floor (~5-10k c/s).
-    std::int32_t zero_vel_threshold = 500;  // reached / quick-stop: |vel| <= this (counts/s)
-    std::uint32_t zero_vel_debounce = 5;    // consecutive sub-thresh cycles before disable/reached latch
-    std::uint32_t quick_stop_decel =
-        0;  // 0x6085 write (counts/s^2); 0 = unset -> a quick-stop consumer MUST set it (fail-closed at configure)
-    std::int16_t quick_stop_option = 2;  // 0x605A required (decel-then-auto-SwitchOnDisabled)
-
-    // --- PP new-setpoint handshake shape (P3b sub-step 2/3, profile-gated superset) ---
-    // 0 => the SIMPLE 2-phase handshake (raise bit4 until the drive acks, then clear + a
-    //   debounced reach-check). No ack-clear wait, no timeout. The bench (a6_validate) default.
-    // >0 => the FULL CiA402 4-phase new-setpoint handshake (WriteTarget -> AwaitAck ->
-    //   ClearBit4 -> AwaitAckClear) with THIS ack timeout (cycles). On timeout the policy sets
-    //   PolicyState.handshake_timed_out (a per-cycle signal); the WRAPPER owns the abort/gen
-    //   disposition (FOLD 3 / rev-6 boundary -- the policy never touches completion). The Viam
-    //   module (config_.handshake_timeout_cycles) uses this.
-    std::uint32_t handshake_timeout_cycles = 0;
-    // Halt (R1 HOLD) mechanism. false => setpoint-hold: command the target = current position
-    //   (PP) / target velocity = 0 (PV) -- the drive ramps to a stop at the current point (bench
-    //   default). true => assert CiA402 controlword bit8 (Halt) and LEAVE the command objects
-    //   (the drive's own halt ramp stops it) -- the Viam module's Stop semantics.
-    bool halt_uses_bit8 = false;
-    // PV over-mapped 0x607A (target position): true => mirror it to the live actual each cycle so
-    //   a position target mapped alongside PV stays benign (DA-G, bench default). false => leave it
-    //   (the module maps only the fields it drives).
-    bool pv_mirror_position = true;
-};
-
 // --- What the wrapper commands the policy each cycle (pure counts). ---
 struct PolicyCommand {
-    Cia402Mode mode = Cia402Mode::ProfilePosition;  // 0x6060 mode this command wants
+    Cia402Mode mode = Cia402Mode::ProfilePosition;  // 0x6060 mode to command THIS cycle
     std::int32_t target_counts = 0;                 // PP absolute target (counts)
     std::uint32_t profile_velocity = 0;             // PP move speed 0x6081 (counts/s)
     std::int32_t target_velocity = 0;               // PV target (counts/s)
     bool enable = false;                            // energize to OperationEnabled
-    bool halt = false;                              // R1 motion-stop: HOLD energized (ramp->0)
-    bool fault_reset = false;                       // operator fault-reset intent
-    // OPAQUE correlation token (FOLD 3): the policy echoes it in state.active_token + resets
-    // the reached-latch when it changes; it NEVER interprets it. The wrapper maps token->gen.
-    std::uint32_t token = 0;
+    bool halt = false;                              // R1 motion-stop: assert CiA402 Halt (bit8), HOLD energized
+    // WRAPPER signal: (re)arm the PP new-setpoint handshake THIS cycle (a new target was adopted).
+    // Replaces the old opaque token -- the driver, not the policy, decides when a move begins.
+    bool new_setpoint = false;
 };
 
 // --- What the policy publishes each cycle (the wrapper reads pos/vel from ctx directly). ---
 struct PolicyState {
-    enum class Phase : std::uint8_t { Init, Enabling, Holding, Moving, Switching, Faulted, Resetting };
-    Phase phase = Phase::Init;
-    bool reached = false;            // move-complete for active_token (|d|<=tol && |vel|~0, NOT bit10)
-    std::uint32_t active_token = 0;  // the token `reached` refers to
-    std::int8_t current_mode = 0;    // 0x6061 echo (confirmed device mode)
-    std::uint16_t fault_code = 0;    // raw 0x603F (device error code; generic never names it)
-    bool mode_mismatch = false;      // mode-echo fail-closed refused to enable (#45)
-    // --- PP 4-phase handshake signals (only meaningful when handshake_timeout_cycles > 0) ---
-    bool handshake_idle = true;  // the new-setpoint handshake is quiescent (WRAPPER gates completion on this + its own at-target)
-    bool handshake_timed_out =
-        false;  // PER-CYCLE: the ack (or ack-clear) timed out THIS cycle -> WRAPPER maps to abort_active_move (FOLD 3)
+    std::int8_t current_mode = 0;  // 0x6061 echo (confirmed device mode)
+    std::uint16_t fault_code = 0;  // raw 0x603F (device error code; generic never names it)
+    bool mode_mismatch = false;    // mode-echo fail-closed refused to enable (#45)
+    // --- PP 4-phase new-setpoint handshake signals ---
+    bool handshake_idle = true;        // the new-setpoint handshake is quiescent (WRAPPER gates completion on this + its own at-target)
+    bool handshake_timed_out = false;  // PER-CYCLE: the ack (or ack-clear) timed out THIS cycle -> WRAPPER maps to abort_active_move
 };
 
 // The generic policy. Owns its resolved FieldLocations + the RT-only sequencing state.
 // Not a SlaveControl -- the wrapper's SlaveControl hooks delegate here.
 class Cia402Policy {
    public:
-    explicit Cia402Policy(DeviceProfile profile) noexcept : profile_(profile) {}
+    // The two device residuals (spec §1): the quick-stop deceleration VALUE written to 0x6085
+    // (counts/s^2; 0 => quick-stop not configured, configure() skips the SDO setup) and the
+    // 0x605A option the drive is ASSERTED to already hold (2 = decel-then-auto-SwitchOnDisabled).
+    explicit Cia402Policy(std::uint32_t quick_stop_decel, std::int16_t quick_stop_option = 2) noexcept
+        : quick_stop_decel_(quick_stop_decel), quick_stop_option_(quick_stop_option) {}
 
     // NON-RT, pre-spawn, may throw (ConfigError -> Runner start aborts, wrapper -> Degraded):
-    // resolve the standard fields + the PV quick-stop SDO setup (0x605A assert-==required;
+    // resolve the standard fields + the quick-stop SDO setup (0x605A assert-==required;
     // 0x6085 write + readback-echo). Returns the ECHOED 0x6085 (the wrapper does the VEL guard
     // against the commanded velocity -- a wrapper/units concern). `needs_quick_stop` gates the
-    // PV SDO setup (a PP-only consumer skips it).
+    // SDO setup (a consumer that stops by coast skips it).
     std::uint32_t configure(ConfigContext& cfg, bool needs_quick_stop) {
         // REQUIRED fields (any CiA402 drive maps them; a missing one is a real misconfig -> throw).
         cw_loc_ = cfg.resolve_rx<cia402::ControlWord>();
         sw_loc_ = cfg.resolve_tx<cia402::Statusword>();
-        pos_loc_ = cfg.resolve_tx<cia402::PositionActual>();
         // OPTIONAL / mode-conditional fields: a generic consumer maps only what its mode drives
-        // (a PV-only map omits 0x607A/0x6081; a PP-only map omits 0x60FF; feedback objects 0x606C/
-        // 0x603F/0x6061 are optional). Resolve tolerantly; every per-cycle access guards on mapped().
-        // (The bench A6 maps them all -> these resolve present -> behavior is unchanged.)
+        // (a PV-only map omits 0x607A/0x6081; a PP-only map omits 0x60FF; feedback objects 0x603F/
+        // 0x6061 are optional). Resolve tolerantly; every per-cycle access guards on mapped().
         target_loc_ = cfg.resolve_rx_optional<cia402::TargetPosition>();
         pv_loc_ = cfg.resolve_rx_optional<cia402::ProfileVelocity>();
         tv_loc_ = cfg.resolve_rx_optional<cia402::TargetVelocity>();
-        mode_wr_loc_ = cfg.resolve_rx_optional<cia402::ModeOfOperation>();  // 0x6060 RxPDO (sub-step 5 runtime mode-switch); absent -> mode
-                                                                            // is SDO-set only
-        vel_loc_ = cfg.resolve_tx_optional<cia402::VelocityActual>();
+        mode_wr_loc_ = cfg.resolve_rx_optional<cia402::ModeOfOperation>();  // 0x6060 RxPDO; absent -> mode is SDO-set only
         fc_loc_ = cfg.resolve_tx_optional<cia402::FaultCode>();
         mode_loc_ = cfg.resolve_tx_optional<cia402::ModeDisplay>();
 
@@ -144,13 +95,13 @@ class Cia402Policy {
             std::array<std::byte, 2> qso{};
             const std::size_t n = cfg.sdo_read(kQuickStopOption, 0, qso);
             const std::int16_t qs_opt = n >= 2 ? load_le<std::int16_t>(qso) : std::int16_t{-1};
-            if (qs_opt != profile_.quick_stop_option) {
+            if (qs_opt != quick_stop_option_) {
                 throw ConfigError("Cia402Policy: 0x605A (quick-stop option) = " + std::to_string(qs_opt) +
-                                  ", require == " + std::to_string(profile_.quick_stop_option) +
+                                  ", require == " + std::to_string(quick_stop_option_) +
                                   " (decel on 0x6085 -> auto SwitchOnDisabled). Refusing to energize.");
             }
             // 0x6085 (quick-stop decel) write + readback-echo; use the ECHOED value downstream.
-            cfg.sdo_write(kQuickStopDecel, 0, sdo_bytes<std::uint32_t>(profile_.quick_stop_decel));
+            cfg.sdo_write(kQuickStopDecel, 0, sdo_bytes<std::uint32_t>(quick_stop_decel_));
             std::array<std::byte, 4> qd{};
             const std::size_t m = cfg.sdo_read(kQuickStopDecel, 0, qd);
             echoed = m >= 4 ? load_le<std::uint32_t>(qd) : 0U;
@@ -174,13 +125,9 @@ class Cia402Policy {
 
     // RT, every steady cycle. Consumes `cmd` + the cycle feedback (ctx), writes the controlword
     // + the mode's command objects, updates state_. Returns the controlword written (telemetry).
-    // ctx.stopping() -> Quick-Stop de-energize (FOLD 4); Halt intent -> HOLD (ramp->0, cw 0x0F).
+    // ctx.stopping() -> Quick-Stop de-energize (FOLD 4); Halt intent -> HOLD (CiA402 bit8, cw 0x0F).
     std::uint16_t step(CycleContext& ctx, const PolicyCommand& cmd) noexcept {
         const Status status{ctx.load<cia402::Statusword::type>(sw_loc_)};
-        const std::int32_t pos = ctx.load<cia402::PositionActual::type>(pos_loc_);
-        // Optional feedback: 0 when unmapped (the wrapper may compute its own velocity estimate;
-        // the policy's reached/quick-stop use this when present).
-        const std::int32_t vel = vel_loc_.mapped() ? ctx.load<cia402::VelocityActual::type>(vel_loc_) : 0;
         state_.fault_code = fc_loc_.mapped() ? ctx.load<cia402::FaultCode::type>(fc_loc_) : std::uint16_t{0};
         state_.current_mode = mode_loc_.mapped() ? ctx.load<cia402::ModeDisplay::type>(mode_loc_) : std::int8_t{0};
         state_.handshake_timed_out = false;  // PER-CYCLE signal: re-armed each step, set only on the timeout cycle
@@ -194,58 +141,38 @@ class Cia402Policy {
             ++halt_clear_cycles_;
         }
 
-        // FOLD 3: a new token resets the reached latch (a stale reach can't resolve a new move).
-        if (cmd.token != state_.active_token) {
-            state_.active_token = cmd.token;
-            state_.reached = false;
-            setpoint_latched_ = false;
+        // WRAPPER-signalled new setpoint: (re)arm the 4-phase handshake for the new target.
+        if (cmd.new_setpoint) {
+            handshake_ = Handshake::WriteTarget;
+            state_.handshake_idle = false;
             bit4_high_ = false;
-            zerovel_cycles_ = 0;
-            // 4-phase mode: restart the new-setpoint handshake for the new target (WRITE -> ACK ->
-            // CLEAR -> ACK-CLEAR). Simple 2-phase mode leaves handshake_ Idle (unused).
-            if (profile_.handshake_timeout_cycles != 0) {
-                handshake_ = Handshake::WriteTarget;
-                state_.handshake_idle = false;
-            }
         }
 
-        // FOLD 4: the stopping window (ctx.stopping) DE-ENERGIZES via CiA402 Quick-Stop -- the
-        // drive ramps via 0x6085 then auto-SwitchOnDisabled (0x605A==required); the event-driven
-        // cw->0x00 is the backstop once |vel| is sub-threshold for the debounce.
+        // FOLD 4: the stopping window (ctx.stopping) DE-ENERGIZES via CiA402 Quick-Stop -- the drive
+        // ramps via 0x6085 then auto-SwitchOnDisabled (0x605A==required). The status-based cw->0x00 is
+        // the backstop: once the drive reports SwitchOnDisabled (reached rest + auto-disabled) drop to
+        // disable-voltage. (No velocity debounce -- the 0x605A auto-transition is the live de-energize.)
         if (ctx.stopping()) {
             std::uint16_t qcw = kQuickStopCw;  // 0x0B: enable_operation() with bit2 (QS) cleared
-            if (announced_op_ && !status.fault()) {
-                if (std::abs(vel) < profile_.zero_vel_threshold) {
-                    ++zerovel_cycles_;
-                } else {
-                    zerovel_cycles_ = 0;
-                }
-                if (status.switch_on_disabled() || zerovel_cycles_ >= profile_.zero_vel_debounce) {
-                    qcw = ControlWord::disable_voltage();
-                }
-                if (tv_loc_.mapped()) {
-                    ctx.store<cia402::TargetVelocity::type>(tv_loc_, 0);
-                }
-            } else {
-                qcw = ControlWord::disable_voltage();  // never energized / faulted -> straight off
+            if (!announced_op_ || status.fault() || status.switch_on_disabled()) {
+                qcw = ControlWord::disable_voltage();  // never energized / faulted / already at rest -> straight off
+            }
+            if (tv_loc_.mapped()) {
+                ctx.store<cia402::TargetVelocity::type>(tv_loc_, 0);
             }
             ctx.store<cia402::ControlWord::type>(cw_loc_, qcw);
             return qcw;
         }
 
         const bool faulted = status.decode() == Cia402State::Fault;
-        state_.phase = faulted ? PolicyState::Phase::Faulted : state_.phase;
 
         // #47-P3c (WIRE-CONFIRMED bug fix): a MAPPED 0x6060 must carry the commanded mode from CYCLE 0
         // -- BEFORE the mode-echo gate below and through the WHOLE enable ladder. The A6 follows the
         // RxPDO mode-of-operation over the SDO default once it is cycling, so if 0x6060 is only written
-        // post-OperationEnabled (drive_operational_) it stays 0 through the ladder, the drive never
-        // adopts the commanded mode, and the gate sees 0x6061 != commanded -> SILENT request_stop (the
-        // move never happens; observed on the wire, cw stuck at 0x07). Seed it here every cycle. The
-        // policy is a DUMB per-mode executor (#18): it always writes 0x6060 = cmd.mode -- the WRAPPER
-        // owns the runtime mode-switch orchestration and picks cmd.mode (the transitional mode during a
-        // stop-first/settle, the target mode once confirmed). Post-OE-steady this matches
-        // drive_operational_'s write (redundant, harmless).
+        // post-OperationEnabled it stays 0 through the ladder and the gate sees 0x6061 != commanded ->
+        // SILENT request_stop. Seed it here every cycle: the policy is a DUMB per-mode executor (#18) --
+        // it always writes 0x6060 = cmd.mode; the WRAPPER owns the runtime mode-switch orchestration and
+        // picks cmd.mode (the transitional mode during a stop-first/settle, the target mode once confirmed).
         if (mode_wr_loc_.mapped()) {
             ctx.store<cia402::ModeOfOperation::type>(mode_wr_loc_, static_cast<std::int8_t>(cmd.mode));
         }
@@ -267,12 +194,9 @@ class Cia402Policy {
             // In-loop CiA402 bit7 fault-reset EDGE (the standard reset; the vendor mechanism is
             // pre-start SDO). Level-toggle so the drive sees a rising edge, no spin.
             cw = (last_cw_ & ControlWord::kFaultResetBit) ? std::uint16_t{0x0000} : ControlWord::fault_reset();
-            state_.phase = PolicyState::Phase::Resetting;
         } else if (cmd.enable && !state_.mode_mismatch && status.operation_enabled()) {
-            if (!announced_op_) {
-                announced_op_ = true;
-            }
-            cw = drive_operational_(ctx, cmd, status, pos, vel);
+            announced_op_ = true;
+            cw = drive_operational_(ctx, cmd, status);
         } else if (!cmd.enable) {
             cw = ControlWord::shutdown();  // 0x06 -> ReadyToSwitchOn, not energized
         }
@@ -284,8 +208,8 @@ class Cia402Policy {
     void on_stop(StopReason /*reason*/) noexcept {}
 
     // Reset the per-run RT SEQUENCING state (published state + handshake + latches) for REUSE
-    // across a wrapper stop/restart. Leaves profile_ + the resolved FieldLocations + qs_decel_echoed_
-    // intact (configure() owns those and re-runs before the next RT phase). A single-shot wrapper
+    // across a wrapper stop/restart. Leaves the resolved FieldLocations + qs_decel_echoed_ intact
+    // (configure() owns those and re-runs before the next RT phase). A single-shot wrapper
     // (a6_validate builds a fresh A6Control per run) never needs this; the module (persistent
     // ServoController across reconfigure) calls it from reset_run_state().
     void reset() noexcept {
@@ -295,88 +219,41 @@ class Cia402Policy {
         last_cw_ = 0;
         announced_op_ = false;
         mode_checked_ = false;
-        setpoint_latched_ = false;
         bit4_high_ = false;
         bit4_edges_ = 0;
-        zerovel_cycles_ = 0;
         halt_clear_cycles_ = kSetpointHaltSettleCycles;  // #70: fresh run starts "halt settled"
     }
 
    private:
-    // The OperationEnabled body: PP absolute move (bit4 handshake + reached) or PV stream, +
-    // Halt (R1 HOLD). Pure counts; the reached predicate is actual-vs-target + vel~0 (NEVER bit10).
-    std::uint16_t drive_operational_(
-        CycleContext& ctx, const PolicyCommand& cmd, Status status, std::int32_t pos, std::int32_t vel) noexcept {
+    // The OperationEnabled body: PP absolute move (4-phase bit4 handshake) or PV stream, + Halt (R1
+    // HOLD via CiA402 bit8). Pure counts; NO reach predicate (the DRIVER owns is-moving/reached).
+    std::uint16_t drive_operational_(CycleContext& ctx, const PolicyCommand& cmd, Status status) noexcept {
         std::uint16_t base = ControlWord::enable_operation();  // 0x0F
-        // DUMB per-mode executor (#18): when 0x6060 is RxPDO-mapped, write it = cmd.mode every steady
-        // cycle. The WRAPPER owns the runtime mode-switch orchestration (bring-to-rest -> command the
-        // transitional mode via cmd.mode -> await the 0x6061 echo -> revert-safe on fail); the policy
-        // never decides to switch -- it just commands whatever mode the wrapper hands it this cycle.
         if (mode_wr_loc_.mapped()) {
             ctx.store<cia402::ModeOfOperation::type>(mode_wr_loc_, static_cast<std::int8_t>(cmd.mode));
         }
-        const bool bit8_halt = cmd.halt && profile_.halt_uses_bit8;
         if (cmd.mode == Cia402Mode::ProfileVelocity) {
-            // PV: stream target velocity. Halt: setpoint-halt (halt_uses_bit8==false) ramps the
-            // command to 0; bit8-halt leaves the command and asserts the drive's Halt ramp.
-            const std::int32_t v = (cmd.halt && !profile_.halt_uses_bit8) ? 0 : cmd.target_velocity;
+            // PV: stream target velocity. Halt asserts the drive's own Halt ramp (bit8).
             if (tv_loc_.mapped()) {
-                ctx.store<cia402::TargetVelocity::type>(tv_loc_, v);
+                ctx.store<cia402::TargetVelocity::type>(tv_loc_, cmd.target_velocity);
             }
-            if (profile_.pv_mirror_position && target_loc_.mapped()) {
-                ctx.store<cia402::TargetPosition::type>(target_loc_, pos);  // benign over-mapped 0x607A (DA-G)
-            }
-            if (bit8_halt) {
+            if (cmd.halt) {
                 base = ControlWord::with_halt(base, true);
             }
-            state_.phase = (std::abs(vel) > profile_.zero_vel_threshold) ? PolicyState::Phase::Moving : PolicyState::Phase::Holding;
             return base;
         }
-        // ProfilePosition absolute move-to. setpoint-halt holds at the current point (target=pos);
-        // bit8-halt keeps the latched target and lets the drive's Halt ramp stop it.
-        const bool setpoint_halt = cmd.halt && !profile_.halt_uses_bit8;
-        const std::int32_t tgt = setpoint_halt ? pos : cmd.target_counts;
+        // ProfilePosition absolute move-to.
         if (target_loc_.mapped()) {
-            ctx.store<cia402::TargetPosition::type>(target_loc_, tgt);
+            ctx.store<cia402::TargetPosition::type>(target_loc_, cmd.target_counts);
         }
         if (pv_loc_.mapped()) {
             ctx.store<cia402::ProfileVelocity::type>(pv_loc_, cmd.profile_velocity);  // 0x6081 move speed (optional)
         }
 
-        if (profile_.handshake_timeout_cycles == 0) {
-            // --- SIMPLE 2-phase handshake (bench default): raise bit4 until ack, then clear +
-            //     debounced reach. Halt (setpoint-hold) skips the handshake and holds. ---
-            if (!state_.reached && !cmd.halt) {
-                if (halt_clear_cycles_ < kSetpointHaltSettleCycles) {
-                    // #70: halt just released -- hold (bit4 LOW, cw 0x0F) until the drive has observed
-                    // Halt clear a full cycle, or it won't ack the coincident new-setpoint edge.
-                    state_.phase = PolicyState::Phase::Moving;
-                } else if (!setpoint_latched_) {
-                    base = ControlWord::with_new_setpoint(base, true);  // bit4 rising edge (0x1F)
-                    if (!bit4_high_) {
-                        ++bit4_edges_;  // count the 0->1 edge once (DA-I)
-                        bit4_high_ = true;
-                    }
-                    if (status.setpoint_acknowledged()) {
-                        setpoint_latched_ = true;
-                    }
-                    state_.phase = PolicyState::Phase::Moving;
-                } else {
-                    base = ControlWord::with_new_setpoint(base, false);  // clear bit4 (re-armable)
-                    bit4_high_ = false;
-                    update_reached_(pos, vel, tgt);
-                    state_.phase = state_.reached ? PolicyState::Phase::Holding : PolicyState::Phase::Moving;
-                }
-            } else {
-                state_.phase = PolicyState::Phase::Holding;  // reached or halted -> hold at target
-            }
-            return base;
-        }
-
-        // --- FULL 4-phase CiA402 new-setpoint handshake (module): WriteTarget -> AwaitAck ->
-        //     ClearBit4 -> AwaitAckClear. Ack/ack-clear timeout -> handshake_timed_out (WRAPPER
-        //     owns the abort). The reach predicate runs INDEPENDENTLY every cycle. Halt asserts
-        //     bit8 (below) and does NOT gate the handshake. ---
+        // FULL 4-phase CiA402 new-setpoint handshake (WriteTarget -> AwaitAck -> ClearBit4 ->
+        // AwaitAckClear), armed by cmd.new_setpoint and bounded by kHandshakeTimeoutCycles. On an
+        // ack/ack-clear timeout it sets handshake_timed_out (WRAPPER owns the abort). Halt asserts bit8
+        // (below) and does NOT gate the handshake.
         switch (handshake_) {
             case Handshake::Idle:
                 break;  // quiescent: bit4 low
@@ -386,11 +263,11 @@ class Cia402Policy {
                 }
                 base = ControlWord::with_new_setpoint(base, true);
                 if (!bit4_high_) {
-                    ++bit4_edges_;
+                    ++bit4_edges_;  // count the 0->1 edge once (DA-I)
                     bit4_high_ = true;
                 }
                 handshake_ = Handshake::AwaitAck;
-                handshake_cycles_remaining_ = profile_.handshake_timeout_cycles;
+                handshake_cycles_remaining_ = kHandshakeTimeoutCycles;
                 break;
             case Handshake::AwaitAck:
                 if (status.setpoint_acknowledged()) {
@@ -407,7 +284,7 @@ class Cia402Policy {
                 break;
             case Handshake::ClearBit4:
                 handshake_ = Handshake::AwaitAckClear;
-                handshake_cycles_remaining_ = profile_.handshake_timeout_cycles;
+                handshake_cycles_remaining_ = kHandshakeTimeoutCycles;
                 bit4_high_ = false;
                 break;  // bit4 dropped
             case Handshake::AwaitAckClear:
@@ -422,25 +299,10 @@ class Cia402Policy {
                 break;  // bit4 low
         }
         state_.handshake_idle = (handshake_ == Handshake::Idle);
-        update_reached_(pos, vel, tgt);  // independent of the handshake FSM
-        state_.phase = state_.reached ? PolicyState::Phase::Holding : PolicyState::Phase::Moving;
-        if (bit8_halt) {
+        if (cmd.halt) {
             base = ControlWord::with_halt(base, true);
         }
         return base;
-    }
-
-    // Latch state_.reached once |pos-target| <= tol AND |vel| sub-threshold for the debounce.
-    void update_reached_(std::int32_t pos, std::int32_t vel, std::int32_t tgt) noexcept {
-        const bool pos_ok = std::abs(pos - tgt) <= profile_.position_tolerance;
-        if (std::abs(vel) < profile_.zero_vel_threshold) {
-            ++zerovel_cycles_;
-        } else {
-            zerovel_cycles_ = 0;
-        }
-        if (!state_.reached && pos_ok && zerovel_cycles_ >= profile_.zero_vel_debounce) {
-            state_.reached = true;
-        }
     }
 
     // Standard CiA402 object indices used by the policy (THE STANDARD, not device facts).
@@ -449,13 +311,12 @@ class Cia402Policy {
     // Quick-stop controlword: enable_operation() with bit2 (Quick-Stop) CLEARED = 0x0B.
     static constexpr std::uint16_t kQuickStopCw = ControlWord::enable_operation() & ~std::uint16_t{0x0004};
     // #70 (WIRE-PROVEN, task #9): the A6 does NOT honor a new-setpoint (bit4) rising edge until it
-    // has observed Halt (bit8) CLEAR for a full cycle -- a bit4 edge coincident with (or one cycle
-    // after) halt release is ignored, so a PP move issued right after Stop() never acks and times
-    // out. Require this many consecutive cycles with the WRITTEN controlword's Halt bit clear before
-    // raising bit4 (2 => the drive sees >=2 clear cycles first; ~2 ms @ 1 kHz -- small, with margin).
-    // Counted off last_cw_ (what went on the wire), so the §6 mode-switch -- which holds cw=0x0F,
-    // bit8 already clear -- never trips it.
+    // has observed Halt (bit8) CLEAR for a full cycle. Require this many consecutive cycles with the
+    // WRITTEN controlword's Halt bit clear before raising bit4 (2 => ~2 ms @ 1 kHz, small with margin).
     static constexpr std::uint32_t kSetpointHaltSettleCycles = 2;
+    // 4-phase new-setpoint ack (and ack-clear) timeout, in cycles. Internal constant (#17: the config
+    // knob died) -- 100 ms @ 1 kHz is generous; the A6 acks within a few cycles.
+    static constexpr std::uint32_t kHandshakeTimeoutCycles = 100;
 
     template <PdoScalar T>
     static std::vector<std::byte> sdo_bytes(T v) {
@@ -464,31 +325,29 @@ class Cia402Policy {
         return b;
     }
 
-    // 4-phase PP new-setpoint handshake sub-FSM (used only when handshake_timeout_cycles > 0).
+    // 4-phase PP new-setpoint handshake sub-FSM.
     enum class Handshake : std::uint8_t { Idle, WriteTarget, AwaitAck, ClearBit4, AwaitAckClear };
 
-    DeviceProfile profile_;
     Cia402Fsm fsm_;
     PolicyState state_;
     Handshake handshake_ = Handshake::Idle;
     std::uint32_t handshake_cycles_remaining_ = 0;
     // #70: consecutive recent cycles the WRITTEN controlword had Halt (bit8) clear (capped at
     // kSetpointHaltSettleCycles). Init "settled" so the first move isn't delayed; reset to 0 on any
-    // written Halt. Gates the bit4 raise in BOTH handshake variants so a coincident halt-release +
-    // bit4 edge never reaches the wire.
+    // written Halt. Gates the bit4 raise so a coincident halt-release + bit4 edge never reaches the wire.
     std::uint32_t halt_clear_cycles_ = kSetpointHaltSettleCycles;
 
     FieldLocation cw_loc_, target_loc_, pv_loc_, tv_loc_, mode_wr_loc_;
-    FieldLocation sw_loc_, pos_loc_, vel_loc_, fc_loc_, mode_loc_;
+    FieldLocation sw_loc_, fc_loc_, mode_loc_;
 
+    const std::uint32_t quick_stop_decel_;  // 0x6085 write value (0 = quick-stop not configured)
+    const std::int16_t quick_stop_option_;  // 0x605A asserted value
     std::uint32_t qs_decel_echoed_ = 0;
     std::uint16_t last_cw_ = 0;
     bool announced_op_ = false;
     bool mode_checked_ = false;
-    bool setpoint_latched_ = false;
     bool bit4_high_ = false;
     int bit4_edges_ = 0;
-    std::uint32_t zerovel_cycles_ = 0;
 };
 
 }  // namespace ethercat

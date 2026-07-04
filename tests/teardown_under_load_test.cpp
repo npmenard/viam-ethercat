@@ -57,7 +57,6 @@ ServoConfig make_config() {
     c.target_loop_rate_hz = 500;  // gentler under TSan
     c.require_realtime = false;
     c.command_queue_capacity = 64;
-    c.handshake_timeout_cycles = 1000;
     return c;
 }
 

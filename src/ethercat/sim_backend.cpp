@@ -232,12 +232,13 @@ void SimBackend::step_device(Slave& s) noexcept {
             }
             break;
         case St::QuickStopActive:
-            // No decel ramp modeled (bench-only): the quick-stop de-energizes at rest as
-            // soon as the control drops the voltage, or re-enables on enable_operation.
-            if (disable_voltage) {
-                s.device_state = St::SwitchOnDisabled;
-            } else if (enable_op) {
+            // 0x605A=2 (decel-then-auto-SwitchOnDisabled): the stub has no decel ramp, so it
+            // auto-transitions to SwitchOnDisabled at once -- modelling the real drive's auto-disable
+            // that the policy's status-based teardown exit (#17) depends on. enable_operation re-energizes.
+            if (enable_op) {
                 s.device_state = St::OperationEnabled;
+            } else {
+                s.device_state = St::SwitchOnDisabled;
             }
             break;
         case St::FaultReactionActive:

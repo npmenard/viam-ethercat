@@ -47,6 +47,14 @@ class A6ServoDriver final : public ServoController {
     std::string fault_description(std::uint16_t code) const override {
         return code == kNoSyncCode ? std::string{"Er74.1 / no SYNC0"} : std::string{};
     }
+    // #17: the A6 ties statusword bit10 (target-reached) permanently HIGH (#43), so the generic base's
+    // bit10 reach signal is useless here. Use the #59 position-stability heuristic instead: a PP move has
+    // REACHED once the actual is within tolerance of the target AND the shaft is position-stable. (The
+    // base already advanced the stability ring this cycle -- compose the two booleans, don't re-sample.)
+    bool reached_target(bool pos_near_target, bool pos_stable, ethercat::Status status) noexcept override {
+        (void)status;
+        return pos_near_target && pos_stable;
+    }
 
    private:
     static constexpr std::uint16_t kFaultResetIndex = 0x2031;
