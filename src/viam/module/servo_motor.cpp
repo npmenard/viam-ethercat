@@ -71,9 +71,9 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     ServoConfig c;
     c.ifname = req_str(attrs, "interface");
     c.slave_id = static_cast<std::uint16_t>(opt_num(attrs, "slave", 1.0));
-    // #18: no control_mode attribute -- the driver is ALWAYS switch-capable (each API call ensures
-    // its own mode at runtime). No rxpdo/txpdo attributes either -- the driver defines ONE fixed
-    // superset PDO map (ServoConfig::set_fixed_pdo_map(), applied in validated()).
+    // No control_mode attribute: the driver is always switch-capable (each API call ensures its own
+    // mode at runtime). No rxpdo/txpdo attributes either: the driver defines one fixed superset PDO
+    // map (ServoConfig::set_fixed_pdo_map(), applied in validated()).
 
     c.max_motor_speed_rpm = req_num(attrs, "max_rpm");
     c.counts_per_rev = req_num(attrs, "counts_per_rev");
@@ -86,17 +86,17 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     c.require_realtime = opt_attr<bool>(attrs, "require_realtime").value_or(true);
     c.rt_priority = static_cast<int>(opt_num(attrs, "rt_priority", 80.0));
     c.use_distributed_clocks = opt_attr<bool>(attrs, "use_distributed_clocks").value_or(false);
-    // #44: optional drive datum -- the SYNC0 cycle granularity the drive accepts (A6: 250000 ns).
-    // When set, the Master validates loop rate vs granularity at config time (clear text)
-    // instead of the drive rejecting the cycle cryptically at OP entry.
+    // Optional drive datum: the SYNC0 cycle granularity the drive accepts (A6: 250000 ns). When set,
+    // the Master validates loop rate vs granularity at config time (clear text) instead of the drive
+    // rejecting the cycle cryptically at OP entry.
     c.sync_cycle_granularity_ns = static_cast<std::uint32_t>(opt_num(attrs, "sync_cycle_granularity_ns", 0.0));
-    // #15 item 2: the A6 "no-sync" 0x603F code, the vendor fault-reset SDO, and the 0x603F gloss are
-    // NO LONGER config attributes -- they moved to the A6ServoDriver subclass (the viam:ethercat:a6-servo
-    // model). A generic config carries none of them; the generic base drives standard CiA402 only.
+    // The A6 "no-sync" 0x603F code, the vendor fault-reset SDO, and the 0x603F gloss are not config
+    // attributes; they live in the A6ServoDriver subclass (the viam:ethercat:a6-servo model). A generic
+    // config carries none of them; the generic base drives standard CiA402 only.
 
     c.max_consecutive_wkc_errors = static_cast<int>(opt_num(attrs, "max_consecutive_wkc_errors", 5.0));
     c.command_queue_capacity = static_cast<std::size_t>(opt_num(attrs, "command_queue_capacity", 64.0));
-    // #17: handshake_timeout_cycles is no longer a config attribute -- it is an internal policy constant.
+    // handshake_timeout_cycles is an internal policy constant, not a config attribute.
 
     c.validate();  // throws Error (clear text) on any invalid field
     return c;
@@ -109,12 +109,12 @@ bool wants_simulation(const ProtoStruct& attrs, const ServoConfig& sc) {
     return sc.ifname == "sim";
 }
 
-// Derive an in-memory SimSlaveModel from the configured PDO offsets, so the module
-// can load + run in a Viam robot config with no hardware (DoD: loads in sim).
+// Derive an in-memory SimSlaveModel from the configured PDO offsets, so the module can load and
+// run in a Viam robot config with no hardware.
 SimSlaveModel sim_model_from_config(const ServoConfig& sc_in) {
-    // #18: the sim reads the driver's FIXED superset map (config carries no map). Materialize it on a
-    // copy so the SimSlaveModel offsets match what the Master will remap. (Slice 6 reworks the sim to a
-    // loopback stub; for now it models a Profile-Position drive -- the sim smoke path does go_to.)
+    // The sim reads the driver's fixed superset map (config carries no map). Materialize it on a copy
+    // so the SimSlaveModel offsets match what the Master will remap. It models a Profile-Position
+    // drive; the sim smoke path does go_to.
     ServoConfig sc = sc_in;
     sc.set_fixed_pdo_map();
     SimSlaveModel m;
@@ -167,7 +167,7 @@ ServoController::BackendFactory sim_factory_from_config(const ServoConfig& sc) {
 }
 
 // Build the controller for a model. `Controller` is the generic ServoController (viam:ethercat:servo)
-// or the A6ServoDriver subclass (viam:ethercat:a6-servo); both share the SAME config parser + ctors
+// or the A6ServoDriver subclass (viam:ethercat:a6-servo); both share the same config parser and ctors
 // (A6 inherits them) and differ only in the three device seams. Returns a base-typed unique_ptr so
 // ServoMotor stays subclass-agnostic (reconfigure() rebuilds the master in place, preserving the type).
 template <class Controller>
@@ -189,18 +189,18 @@ bool command_flag(const ProtoStruct& command, const char* key) {
     return b != nullptr && *b;
 }
 
-// --- #15 do_command SDO reads: ALWAYS the STANDARD CiA402 objects (no config, no override) -----
-// get_motor_voltage=0x6079 (U32 mV -> V /1000), get_motor_current=0x6078 (I16 per-mille of the motor's
-// rated current -> A), get_motor_drive_modes=0x6502 (U32 bitmask). A drive that lacks an object (the A6
-// aborts 0x6079/0x6078) reports value 0 + the abort text under a "<key>_diag" key at the do_command
-// site -- tests pass, moves are unaffected; the A6 controller is purely a test vehicle ("0V is valid").
+// --- do_command SDO reads: always the standard CiA402 objects (no config, no override) -----
+// get_motor_voltage=0x6079 (U32 mV -> V /1000), get_motor_current=0x6078 (I16 per-mille of the
+// motor's rated current -> A), get_motor_drive_modes=0x6502 (U32 bitmask). A drive that lacks an
+// object (the A6 aborts 0x6079/0x6078) reports value 0 plus the abort text under a "<key>_diag" key
+// at the do_command site, so moves are unaffected.
 constexpr std::uint16_t kDcLinkVoltage = 0x6079;        // U32, milliVolts
 constexpr std::uint16_t kCurrentActual = 0x6078;        // I16, per-mille of the motor's rated current
 constexpr std::uint16_t kSupportedDriveModes = 0x6502;  // U32 bitmask of supported modes
 constexpr std::chrono::milliseconds kSdoTimeout{200};
 
-// Read a standard little-endian integer object via the controller's direct SDO (#15). Throws
-// ethercat::Error on abort/timeout/short-read; the caller maps that to value-0 + a "<key>_diag" key.
+// Read a standard little-endian integer object via the controller's direct SDO. Throws
+// ethercat::Error on abort/timeout/short-read; the caller maps that to value 0 plus a "<key>_diag" key.
 template <typename T>
 T read_std_sdo(ServoController& ctrl, std::uint16_t index) {
     std::array<std::byte, sizeof(T)> buf{};
@@ -258,8 +258,8 @@ Model ServoMotor::a6_model() {
 }
 
 std::vector<std::shared_ptr<ModelRegistration>> ServoMotor::create_model_registrations() {
-    // Both models are rdk:component:motor with the SAME validator (one config parser). They differ
-    // ONLY in the controller subclass the factory builds: the generic base vs the A6ServoDriver seams.
+    // Both models are rdk:component:motor with the same validator (one config parser). They differ
+    // only in the controller subclass the factory builds: the generic base vs the A6ServoDriver seams.
     return {
         std::make_shared<ModelRegistration>(
             API::get<Motor>(),
@@ -270,7 +270,7 @@ std::vector<std::shared_ptr<ModelRegistration>> ServoMotor::create_model_registr
             [](const auto& cfg) { return ServoMotor::validate(cfg); }),
         std::make_shared<ModelRegistration>(
             API::get<Motor>(),
-            a6_model(),  // viam:ethercat:a6-servo -- A6ServoDriver subclass (test vehicle)
+            a6_model(),  // viam:ethercat:a6-servo -- A6ServoDriver subclass
             [](const auto& /*deps*/, const auto& cfg) {
                 return std::make_shared<ServoMotor>(cfg.name(), build_controller<A6ServoDriver>(cfg));
             },
@@ -303,8 +303,8 @@ ServoMotor::~ServoMotor() {
 }
 
 void ServoMotor::reconfigure(const Dependencies& /*deps*/, const ResourceConfig& cfg) {
-    // Validate-before-mutate: parse + validate the new config (throws) BEFORE any
-    // teardown. The controller owns the stop->join->rebuild->restart lifecycle.
+    // Validate before mutate: parse and validate the new config (throws) before any teardown. The
+    // controller owns the stop->join->rebuild->restart lifecycle.
     ServoConfig sc = parse_servo_config(cfg.attributes());
     controller_->reconfigure(std::move(sc));
 }
@@ -345,7 +345,7 @@ Motor::properties ServoMotor::get_properties(const ProtoStruct& /*extra*/) {
 
 Motor::power_status ServoMotor::get_power_status(const ProtoStruct& /*extra*/) {
     const bool on = controller_->is_powered();
-    return power_status{/*is_on=*/on, /*power_pct=*/on ? 1.0 : 0.0};  // no torque feedback in MVP -> 1.0/0.0
+    return power_status{/*is_on=*/on, /*power_pct=*/on ? 1.0 : 0.0};  // no torque feedback, so 1.0/0.0
 }
 
 bool ServoMotor::is_moving() {
@@ -379,10 +379,10 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
         status.emplace("last_error", ProtoValue(controller_->last_error()));
         result.emplace("status", ProtoValue(std::move(status)));
     }
-    // #15 STANDARD-CiA402 SDO reads (no config, no override). On success -> the converted value under
-    // the clear key. On SDO abort/failure (e.g. the A6 does not implement 0x6079/0x6078) -> the value
-    // is reported as 0 (user: "a voltage of 0v would be valid") AND the abort text lands under a
-    // secondary "<key>_diag" key -- NOT a *_error key -- so Test6 passes and moves are unaffected.
+    // Standard-CiA402 SDO reads (no config, no override). On success, the converted value goes under
+    // the clear key. On SDO abort/failure (e.g. the A6 does not implement 0x6079/0x6078), the value is
+    // reported as 0 and the abort text lands under a secondary "<key>_diag" key (not a *_error key), so
+    // moves are unaffected.
     if (command_flag(command, "get_motor_voltage")) {
         try {
             const auto mv = read_std_sdo<std::uint32_t>(*controller_, kDcLinkVoltage);

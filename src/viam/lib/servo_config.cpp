@@ -18,9 +18,9 @@ const char* to_string(ControlMode mode) noexcept {
 }
 
 void ServoConfig::set_fixed_pdo_map() {
-    // #18: the ONE fixed driver-defined superset (standard CiA402 objects only, #41). Always
-    // switch-capable (0x6060 mapped) so any API call can ensure PP or PV at runtime. Unconditional
-    // -- there is no per-mode choice and no user override; overwrites whatever was there.
+    // The one fixed driver-defined superset (standard CiA402 objects only). Always switch-capable
+    // (0x6060 mapped) so any API call can ensure PP or PV at runtime. Unconditional: no per-mode
+    // choice and no user override; overwrites whatever was there.
     constexpr std::uint16_t kCtrl = 0x6040, kMode = 0x6060, kTargetPos = 0x607A, kProfileVel = 0x6081, kTargetVel = 0x60FF;
     constexpr std::uint16_t kFault = 0x603F, kStatus = 0x6041, kModeDisp = 0x6061, kActualPos = 0x6064, kVelAct = 0x606C,
                             kTorqueAct = 0x6077;

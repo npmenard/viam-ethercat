@@ -2,19 +2,16 @@
 
 // ServoMotor -- the Viam rdk:component:motor implementation over a ServoController.
 //
-// This is THIN SDK glue: every Motor method forwards to the ServoController (the
-// RT/concurrency engine from Phase 5), mapping the generic motor API onto CiA402
-// Profile-Position / Profile-Velocity. ServoMotor adds NO locking of its own --
-// all API-vs-Reconfigure serialization lives in the controller's api_mutex_.
+// This is thin SDK glue: every Motor method forwards to the ServoController, mapping the generic
+// motor API onto CiA402 Profile-Position / Profile-Velocity. ServoMotor adds no locking of its
+// own; all API-vs-reconfigure serialization lives in the controller's api_mutex_.
 //
-// CONCURRENCY-COVERAGE INVARIANT (load-bearing, DA): ServoMotor MUST stay a thin
-// pass-through -- `controller_` is NEVER reassigned (reconfigure() forwards in-place
-// to controller_->reconfigure()) and the wrapper holds no lock/state of its own. So
-// the module layer's entire concurrency surface IS the controller's api_mutex_, which
-// teardown_under_load_test already proves race-free under TSan. That is WHY there is
-// no module-level concurrency/TSan test. If a future change reassigns controller_ or
-// adds a wrapper lock, this invariant breaks and module-level concurrency testing
-// becomes required -- treat such a change as the trigger to add it.
+// Concurrency-coverage invariant (load-bearing): ServoMotor must stay a thin pass-through --
+// `controller_` is never reassigned (reconfigure() forwards in-place to
+// controller_->reconfigure()) and the wrapper holds no lock or state of its own. So the module
+// layer's entire concurrency surface is the controller's api_mutex_. If a future change reassigns
+// controller_ or adds a wrapper lock, this invariant breaks and module-level concurrency testing
+// becomes required.
 //
 // A6 specifics never appear here: the PDO map, counts/rev, gear ratio, etc. are
 // parsed from the Viam resource config into a ServoConfig (config data, not code).
@@ -41,13 +38,13 @@ ServoConfig parse_servo_config(const ProtoStruct& attributes);
 
 class ServoMotor final : public Motor, public Reconfigurable {
    public:
-    // Two models in the viam:ethercat family (#15 item 2): the GENERIC standard-CiA402 driver
+    // Two models in the viam:ethercat family: the generic standard-CiA402 driver
     // (viam:ethercat:servo) and the A6 specialization (viam:ethercat:a6-servo), whose factory
-    // constructs an A6ServoDriver. Both are rdk:component:motor and share this ServoMotor glue +
+    // constructs an A6ServoDriver. Both are rdk:component:motor and share this ServoMotor glue and
     // config parser; they differ only in which ServoController subclass they build.
     static const ModelFamily& model_family();
     static Model model();     // viam:ethercat:servo (generic base)
-    static Model a6_model();  // viam:ethercat:a6-servo (A6ServoDriver subclass -- a test vehicle)
+    static Model a6_model();  // viam:ethercat:a6-servo (A6ServoDriver subclass)
     static std::vector<std::shared_ptr<ModelRegistration>> create_model_registrations();
 
     // Static validator for ModelRegistration: parse+validate the config, throwing

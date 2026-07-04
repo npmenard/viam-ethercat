@@ -1,10 +1,8 @@
 // Entrypoint for the Viam EtherCAT servo motor module.
 //
-// Mirrors the reference yaskawa/UR module main: an Instance, a boost::asio
-// io_context running on its own thread, and a ModuleService serving the
-// viam:ethercat:servo (rdk:component:motor) registration. The motor's RT work
-// lives in ServoController's own jthread; the io_context backs the SDK's async
-// gRPC serving.
+// Sets up an Instance, a boost::asio io_context running on its own thread, and a ModuleService
+// serving the viam:ethercat:servo (rdk:component:motor) registration. The motor's RT work lives in
+// ServoController's own jthread; the io_context backs the SDK's async gRPC serving.
 
 #include <cstdlib>
 #include <exception>

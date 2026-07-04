@@ -1,26 +1,19 @@
 #pragma once
 
-// A6ServoDriver -- the ANCTL AS715N (A6-EC) specialization of the generic ServoController
-// (#15 item 2). The base ServoController IS the generic CiA402 servo driver; this subclass
-// overrides EXACTLY the three seams that carry A6 vendor knowledge -- knowledge that USED to
-// ride in the hardware JSON as config (sync_fault_code / vendor_fault_reset / fault_code_labels).
-// Specialization by subclass is now the sanctioned extension mechanism (it reverses the old
-// "drive specifics live only as config data" rule).
+// A6ServoDriver -- the ANCTL AS715N (A6-EC) specialization of the generic ServoController. The
+// base ServoController is the generic CiA402 servo driver; this subclass overrides the three
+// seams that carry A6 vendor knowledge.
 //
 // The three A6 residuals, each a one-line override:
-//   1. vendor fault-reset: write u16 1 to 0x2031:01 -- the A6's reset is a vendor SDO, NOT the
-//      standard CiA402 controlword bit7 (CLAUDE.md lesson 4).
+//   1. vendor fault-reset: write u16 1 to 0x2031:01 -- the A6's reset is a vendor SDO, not the
+//      standard CiA402 controlword bit 7.
 //   2. the DC "no-SYNC0" bring-up fault code: 0x8700 (Er74.1) -- the 0x603F value the drive
 //      reports while SYNC0 has not yet established (the bring-up gate reads it).
 //   3. the 0x603F gloss for that code -> "Er74.1 / no SYNC0" in last_error().
 //
-// The A6 model (viam:ethercat:a6-servo) is a TEST VEHICLE: correctness bar = moves work + the
-// RDK campaign tests pass. Everything else (PDO map, limits, kinematics) stays per-machine config.
-//
-// HW-VERIFY (not modeled in sim): that writing 0x2031:01=1 actually CLEARS the A6's fault, and
-// that 0x8700 is the exact code the drive parks at pre-sync, are drive behaviors proven on the
-// bench, not offline. What IS offline-testable (and tested): the seam EMITS the 0x2031 write and
-// reports the 0x8700 gloss, where the generic base does neither.
+// Two A6 behaviors are proven on the bench, not in sim: that writing 0x2031:01=1 clears the A6's
+// fault, and that 0x8700 is the exact code the drive parks at pre-sync. What is offline-testable
+// is that the seam emits the 0x2031 write and reports the 0x8700 gloss, where the base does neither.
 
 #include <cstdint>
 #include <optional>
@@ -47,10 +40,10 @@ class A6ServoDriver final : public ServoController {
     std::string fault_description(std::uint16_t code) const override {
         return code == kNoSyncCode ? std::string{"Er74.1 / no SYNC0"} : std::string{};
     }
-    // #17: the A6 ties statusword bit10 (target-reached) permanently HIGH (#43), so the generic base's
-    // bit10 reach signal is useless here. Use the #59 position-stability heuristic instead: a PP move has
-    // REACHED once the actual is within tolerance of the target AND the shaft is position-stable. (The
-    // base already advanced the stability ring this cycle -- compose the two booleans, don't re-sample.)
+    // The A6 ties statusword bit 10 (target-reached) permanently high, so the base's bit-10 reach
+    // signal is unusable here. Use the position-stability heuristic instead: a PP move has reached once
+    // the actual is within tolerance of the target and the shaft is position-stable. (The base already
+    // advanced the stability ring this cycle, so compose the two booleans, don't re-sample.)
     bool reached_target(bool pos_near_target, bool pos_stable, ethercat::Status status) noexcept override {
         (void)status;
         return pos_near_target && pos_stable;
