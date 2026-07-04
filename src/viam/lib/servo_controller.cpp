@@ -41,6 +41,12 @@ constexpr double kStopWindowMarginS = 0.05;
 // SettleCycles: max to await the 0x6061 echo of the new mode before giving up (silent-mismatch, #45).
 constexpr std::uint32_t kModeSwitchStopCycles = 1000;
 constexpr std::uint32_t kModeSwitchSettleCycles = 200;
+// #17 item 7 bring-up retry: attempt OP up to this many times, clearing drive errors + fully rebuilding
+// the master (INIT bounce) between attempts. Bounded (a persistent fault must GIVE UP, not hammer -- a
+// repeated Er74 OP-entry can wedge the A6, CLAUDE.md). kBringupWaitCap is a defensive backstop above the
+// Runner's own bring-up bound (120s), so the async-outcome poll never hangs if a signal is missed.
+constexpr unsigned kMaxBringupAttempts = 5;
+constexpr std::chrono::milliseconds kBringupWaitCap{130'000};
 
 Cia402Mode to_cia402_mode(ControlMode mode) noexcept {
     return mode == ControlMode::ProfileVelocity ? Cia402Mode::ProfileVelocity : Cia402Mode::ProfilePosition;
@@ -151,9 +157,7 @@ void ServoController::start() {
     master_ = std::make_unique<Master>(build_master_config(config_), backend_factory_());
     master_->init();
     master_->configure();  // -> SAFE-OP (may throw InitError; propagated as today -- the SDK retries)
-    resolve_fields();
-    run_vendor_fault_reset();  // #15 item 2: device seam, single port owner (pre-Runner-start)
-    spawn_runner();
+    bring_up();            // #17 item 7: resolve + clear-errors + reach OP, with bounded retry
 }
 
 // Zero the per-run published atomics + RT-only working state (shared by start()/reconfigure()).
@@ -228,6 +232,64 @@ void ServoController::spawn_runner() {
     }
 }
 
+// #17 item 7: bring the drive to OPERATIONAL with bounded RETRY (user rule). Drive errors are cleared
+// before EACH attempt (run_vendor_fault_reset). A failed attempt -- bring-up aborted by intermittent
+// enumeration / mailbox-not-ready / a transient sync miss -- is RECOVERED by a full master rebuild (INIT
+// bounce + PRE-OP settle + DC re-arm: the #72-proven reconfigure path, requesting OP exactly ONCE per
+// attempt, NOT an OP re-request hammer that would wedge the A6). After kMaxBringupAttempts the drive
+// stays Degraded (§8) with the AL/fault surfaced by on_stop. Caller holds the exclusive api_mutex_ and
+// has already built+configured master_ (SAFE-OP) for the first attempt.
+void ServoController::bring_up() {
+    for (unsigned attempt = 1;; ++attempt) {
+        resolve_fields();
+        run_vendor_fault_reset();  // clear drive errors BEFORE bring-up (device seam; single port owner)
+        if (attempt_bringup()) {
+            return;  // reached OP
+        }
+        if (attempt >= kMaxBringupAttempts) {
+            (void)std::fprintf(stderr,
+                               "[servo] slave %u: bring-up FAILED after %u attempts -- giving up (Degraded): %s\n",
+                               static_cast<unsigned>(config_.slave_id),
+                               attempt,
+                               last_error().c_str());
+            return;  // §8 Degraded: degraded_ + the AL/fault tier are already set by on_stop(BringupAborted)
+        }
+        (void)std::fprintf(stderr,
+                           "[servo] slave %u: bring-up attempt %u failed -- clearing errors + retrying...\n",
+                           static_cast<unsigned>(config_.slave_id),
+                           attempt);
+        // Full recovery for the next attempt: drop the Runner (join the exited RT thread + close()->INIT)
+        // + master, then rebuild (INIT bounce, PRE-OP settle, DC re-arm). Requests OP once next attempt.
+        rt_runner_.reset();
+        master_.reset();
+        master_ = std::make_unique<Master>(build_master_config(config_), backend_factory_());
+        master_->init();
+        master_->configure();  // -> SAFE-OP
+    }
+}
+
+// Start the RT bring-up + bounded-poll its ASYNC outcome. true = reached OP (Runner phase Running);
+// false = bring-up aborted (on_stop set rt_exited_ / the §8 attach-refusal set degraded_).
+bool ServoController::attempt_bringup() {
+    spawn_runner();  // reset_run_state (clears rt_exited_) -> start the RT thread's DC bring-up pump
+    if (degraded_.load(std::memory_order_acquire)) {
+        return false;  // §8: Runner attach/start refusal -- no RT thread, immediate fail
+    }
+    // The Runner bounds bring-up itself (op-await + bringup_timeout); poll for EITHER outcome. The cap is
+    // a defensive backstop above that bound, so this never hangs if a signal is somehow missed.
+    const auto deadline = std::chrono::steady_clock::now() + kBringupWaitCap;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (rt_runner_ != nullptr && rt_runner_->status().phase == RunnerPhase::Running) {
+            return true;  // OP reached -- steady loop running
+        }
+        if (rt_exited_.load(std::memory_order_acquire) || degraded_.load(std::memory_order_acquire)) {
+            return false;  // bring-up aborted
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return rt_runner_ != nullptr && rt_runner_->status().phase == RunnerPhase::Running;
+}
+
 void ServoController::stop() noexcept {
     const std::unique_lock<std::shared_mutex> lk(api_mutex_);
     stopping_.store(true, std::memory_order_release);
@@ -252,9 +314,7 @@ void ServoController::reconfigure(ServoConfig config) {
     master_ = std::make_unique<Master>(build_master_config(config_), backend_factory_());
     master_->init();
     master_->configure();
-    resolve_fields();
-    run_vendor_fault_reset();  // #15 item 2: device seam, single port owner (pre-Runner-start)
-    spawn_runner();
+    bring_up();  // #17 item 7: resolve + clear-errors + reach OP, with bounded retry
 }
 
 void ServoController::resolve_fields() {

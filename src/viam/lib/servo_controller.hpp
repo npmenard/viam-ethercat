@@ -268,6 +268,11 @@ class ServoController : public SlaveControl {
         return stop_at_rest_;
     }
 
+    // #17 item 7: reach OP with bounded retry (clear errors + full master rebuild between attempts);
+    // Degraded (§8) after kMaxBringupAttempts. Shared by start()/reconfigure() (master_ built + SAFE-OP).
+    void bring_up();
+    // One bring-up attempt: start the RT pump + bounded-poll the async outcome. true = reached OP.
+    bool attempt_bringup();
     // Reset per-run state + construct/attach/start the one-shot Runner; on a start-time
     // failure → Degraded-but-alive (§8), never rethrows past here. Shared by start()/reconfigure().
     void spawn_runner();
