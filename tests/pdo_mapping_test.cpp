@@ -93,9 +93,9 @@ TEST("apply_pdo_map throws PdoMappingError when a PDO has no entry list") {
     CHECK_THROWS_MSG(apply_pdo_map(be, 1, m, ethercat::PdoDirection::Rx), PdoMappingError, "no entry list");
 }
 
-// #TODO-8: the SM assign-index is DERIVED from direction (Rx -> SM2 0x1C12, Tx ->
+// the SM assign-index is DERIVED from direction (Rx -> SM2 0x1C12, Tx ->
 // SM3 0x1C13); the user no longer supplies it. An override covers exotic layouts.
-TEST("#TODO-8: assign-index is derived from direction (override when set)") {
+TEST("assign-index is derived from direction (override when set)") {
     // the pure helper + the PdoMap accessor agree on the standard mapping
     CHECK_EQ(ethercat::sm_assign_index(ethercat::PdoDirection::Rx), std::uint16_t{0x1C12});
     CHECK_EQ(ethercat::sm_assign_index(ethercat::PdoDirection::Tx), std::uint16_t{0x1C13});

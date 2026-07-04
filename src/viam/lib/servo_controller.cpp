@@ -28,7 +28,7 @@ constexpr std::uint16_t kProfileVel = 0x6081;   // PP move speed (carries the Go
 constexpr std::uint16_t kModeOfOp = 0x6060;     // runtime mode-of-operation (RxPDO); present => PV->PP hold-switch (M6)
 constexpr std::uint16_t kModeDisplay = 0x6061;  // mode display (TxPDO); present => enable-time mode-echo gate (#45/#57)
 constexpr std::uint16_t kFaultCode = 0x603F;    // drive error code (TxPDO, optional feedback)
-// #TODO-4: the A6's "no-SYNC0" code (0x8700 / Er74.1) is NO LONGER a constant here --
+// the A6's "no-SYNC0" code (0x8700 / Er74.1) is NO LONGER a constant here --
 // it's CONFIG DATA (ServoConfig::sync_fault_code), so this generic core carries no
 // vendor value. The bring-up gate reads it from config (nullopt ⇒ no detection).
 constexpr std::uint16_t kVelActual = 0x606C;  // velocity actual value (TxPDO, optional feedback)
@@ -145,7 +145,7 @@ ServoController::~ServoController() {
 void ServoController::start() {
     const std::unique_lock<std::shared_mutex> lk(api_mutex_);
 
-    // NOTE: configure() reaches SAFE-OP and does NO memory lock (TODO-6: residency is
+    // NOTE: configure() reaches SAFE-OP and does NO memory lock (residency is
     // RT-setup's job, not thread-free bus policy). The RT thread then runs the DC
     // bring-up prelude (SETTLE -> request OP -> AWAIT_OP) to OPERATIONAL; its
     // setup_realtime() = realtime::setup() does the full MCL_CURRENT|MCL_FUTURE
@@ -863,7 +863,7 @@ bool ServoController::drive_present(const CycleContext& ctx) const noexcept {
 }
 
 bool ServoController::sync_faulted(const CycleContext& ctx) const noexcept {
-    // The old bring-up gate (#TODO-4): drive-sync-faulted = mapped 0x603F == the configured
+    // The old bring-up gate: drive-sync-faulted = mapped 0x603F == the configured
     // no-sync code; nullopt (none declared) => always false. Stash the read code for on_stop's
     // bring-up-abort diagnostic (sync_faulted + on_stop both run on the RT thread).
     const std::uint16_t code = f_fault_code_.mapped() ? ctx.load<std::uint16_t>(f_fault_code_) : 0;

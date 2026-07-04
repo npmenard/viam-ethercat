@@ -191,7 +191,7 @@ TEST("Master: configure() sets modes-of-operation 0x6060 from default_mode (SDO)
     CHECK_EQ(static_cast<int>(std::to_integer<std::uint8_t>(mode[0])), 1);  // PP = 1
 }
 
-// #TODO-2: the generic preop_sdo_writes / postremap_sdo_writes orchestration was
+// the generic preop_sdo_writes / postremap_sdo_writes orchestration was
 // EVICTED from Master (setup-SDO policy is the consumer's, run via Master::sdo_write
 // post-configure -- the #39 pattern). The two tests that exercised those lists are
 // gone with the mechanism; the surviving consumer-side path (vendor_fault_reset) is

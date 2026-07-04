@@ -148,7 +148,7 @@ class A6Control final : public SlaveControl {
 
     // NON-RT, pre-spawn, may throw: resolve every typed field ONCE (configure-time
     // width asserts). This map is built in this file, so all eight are mapped. Uses the
-    // restricted ConfigContext (#TODO-10) -- resolve_rx/tx bound to the slave, no Master&.
+    // restricted ConfigContext -- resolve_rx/tx bound to the slave, no Master&.
     void on_configured(ConfigContext& cfg) override {
         cw_loc_ = cfg.resolve_rx<cia402::ControlWord>();
         target_loc_ = cfg.resolve_rx<cia402::TargetPosition>();

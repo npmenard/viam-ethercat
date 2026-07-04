@@ -69,17 +69,17 @@ bool CycleContext::fault() const noexcept {
 }
 
 void CycleContext::check_live() const noexcept {
-    // Debug-only (#47 TODO-1): a control that touches the ctx outside its dispatch
+    // Debug-only (#47): a control that touches the ctx outside its dispatch
     // window gets a loud, immediate failure in debug builds. In release this compiles
     // to nothing -- and per the owned-data design (inputs_/outputs_ are by-value, not
     // spans into live buffers) the worst case there is SAFE-STALE: a valid object with
     // last-cycle data, never a dangling/in-flight read. There is no release-mode
     // counter (the old contract_violations was dropped: owned data makes the escape
     // harmless rather than merely counted).
-    assert(live_ && "CycleContext used outside its dispatch window (#47 TODO-1: valid on the RT thread, during dispatch only)");
+    assert(live_ && "CycleContext used outside its dispatch window (#47 valid on the RT thread, during dispatch only)");
 }
 
-// --- RtCore (the RT-thread-shared cyclic state; #TODO-3 / #52) ---------------
+// --- RtCore (the RT-thread-shared cyclic state; #52) ---------------
 
 void RtCore::request_stop() noexcept {
     latch_reason(StopReason::Requested);
@@ -120,7 +120,7 @@ void Runner::attach(std::uint16_t slave_id, SlaveControl& control) {
             throw Error("Runner::attach: slave " + std::to_string(slave_id) + " already has a control attached");
         }
     }
-    rt_core_->controls_.emplace_back(slave_id, &control, rt_core_.get());  // ctx built in place (non-movable, #47 TODO-1)
+    rt_core_->controls_.emplace_back(slave_id, &control, rt_core_.get());  // ctx built in place (non-movable, #47)
 }
 
 void Runner::start() {
@@ -132,7 +132,7 @@ void Runner::start() {
     }
     // NON-RT hooks first -- the ONLY throwing phase. A throw here aborts start()
     // cleanly: nothing locked, no thread, no rt_active bracket, master untouched.
-    // on_configured gets the RESTRICTED ConfigContext (§3a, TODO-10), never a raw Master&.
+    // on_configured gets the RESTRICTED ConfigContext (§3a), never a raw Master&.
     for (RtCore::Attached& a : rt_core_->controls_) {
         ConfigContext cfg{master_, a.slave_id};
         a.control->on_configured(cfg);
@@ -154,11 +154,11 @@ void Runner::stop() noexcept {
         return;  // never started (or a failed start): nothing to tear down
     }
     RtCore& core = *rt_core_;
-    // PRIVATE (#TODO-3): only ~Runner + run() reach here, both owner-thread -- so this
+    // PRIVATE: only ~Runner + run() reach here, both owner-thread -- so this
     // never runs on the RT thread and the old self-join guard is gone by construction.
     core.request_stop();  // latch Requested (first-cause) + set the flag
 
-    // BOUNDED wait (#TODO-3 H1): wait for the RT loop to finish its stopping window and
+    // BOUNDED wait (H1): wait for the RT loop to finish its stopping window and
     // mark Stopped, up to a derived/configured ceiling. A non-wedged teardown reaches
     // Stopped well inside it; a WEDGED step() never does.
     std::chrono::nanoseconds bound = core.cfg_.stop_join_timeout;
@@ -217,7 +217,7 @@ void RtCore::dispatch(Attached& a, std::uint64_t cycle, std::int64_t dc, bool st
     const std::span<const std::byte> in = master_.input_image(a.slave_id);
     const std::span<std::byte> out = master_.outputs(a.slave_id);
 
-    // COPY-IN (#47 TODO-1): refresh the ctx's OWNED input from this cycle's latched
+    // COPY-IN (#47): refresh the ctx's OWNED input from this cycle's latched
     // feedback. Applies to EVERY ctx-touching hook -- incl. sync_faulted() during
     // bring-up, which loads FaultCode and must see the refreshed input.
     ctx.input_size_ = in.size();
@@ -226,14 +226,14 @@ void RtCore::dispatch(Attached& a, std::uint64_t cycle, std::int64_t dc, bool st
     // store carries its current wire value over (exactly the old direct-span semantic;
     // a read-only hook then copies back a no-op). Owned buffers also persist across
     // cycles, but seeding makes a read-only or partial-write hook behavior-identical to
-    // the pre-TODO-1 span that wrote through to the live image.
+    // the earlier direct span that wrote through to the live image.
     ctx.output_size_ = out.size();
     std::memcpy(ctx.outputs_.data(), out.data(), out.size());
 
     ctx.cycle_ = cycle;
     ctx.dc_time_ = dc;
     ctx.stopping_ = stopping;
-    ctx.live_ = true;  // the dispatch window (#47 TODO-1): ctx is legal ONLY in here
+    ctx.live_ = true;  // the dispatch window (#47): ctx is legal ONLY in here
     fn(ctx);
     ctx.live_ = false;
 

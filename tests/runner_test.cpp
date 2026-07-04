@@ -69,8 +69,8 @@ namespace {
 SlaveConfig make_slave(std::uint16_t id) {
     SlaveConfig sc;
     sc.slave_id = id;
-    // TODO-8: assign-index is derived from direction (Rx->0x1C12, Tx->0x1C13);
-    // the user no longer sets it. (Merge fix: this test predated TODO-8.)
+    // assign-index is derived from direction (Rx->0x1C12, Tx->0x1C13);
+    // the user no longer sets it. (Merge fix: this test predated the direction-derived assign-index.)
     sc.rxpdo.pdo_indices = {0x1600};
     sc.rxpdo.entries[0x1600] = {{0x6040, 0, 16}, {0x607A, 0, 32}};
     sc.txpdo.pdo_indices = {0x1A00};
@@ -256,7 +256,7 @@ TEST("#47.3: (phase,event) matrix -- steady fault, steady request, bring-up stop
             r.attach(1, c);
             r.start();
             std::this_thread::sleep_for(std::chrono::milliseconds(20));  // a few bring-up cycles
-            // #TODO-3: stop() is private now -- request the stop, wait for the RT loop to mark
+            // stop() is private now -- request the stop, wait for the RT loop to mark
             // Stopped, then drop r (dtor JOINS). PROMPTNESS pinned (P2 cell-check): the pump must
             // exit on the stop FLAG -- a flag-ignoring pump reaching the same end-state via its
             // give-up bound (bringup_timeout) is a DIFFERENT exit path with identical values;
@@ -448,7 +448,7 @@ TEST("#47.8: attach-after-start throws; on_configured failure -> clean no-spawn 
         m.sdo_write(1, 0x5FFF, 0x01, one);  // generic test object; throws if rt_active leaked
     }
     {
-        // #TODO-3 ORDERING: the control MUST outlive the Runner -- the RT thread calls
+        // ORDERING: the control MUST outlive the Runner -- the RT thread calls
         // control->step() until ~Runner joins it, so a control destroyed first (declared
         // AFTER the Runner) would be touched dead during the dtor's bounded join. Declare
         // c BEFORE r so r (and its thread-join) tears down first, c still alive.
@@ -510,19 +510,19 @@ TEST("#47.9: stopping window delivers the disable policy; ignoring it is still s
     }
 }
 
-// CycleContext is non-copyable AND non-movable (#47 TODO-1): a stash is a COMPILE
+// CycleContext is non-copyable AND non-movable (#47): a stash is a COMPILE
 // error, not a silent value-copy aliasing the owned buffers. (Was implicitly
 // copyable -- only the ctor was private, so `auto saved = ctx;` compiled.)
 static_assert(!std::is_copy_constructible_v<CycleContext> && !std::is_move_constructible_v<CycleContext>,
-              "#47 TODO-1: CycleContext must be non-copyable and non-movable");
+              "#47 CycleContext must be non-copyable and non-movable");
 
-// (10) OWNED-DATA value semantics (#47 TODO-1): the ctx holds its images BY VALUE, so
+// (10) OWNED-DATA value semantics (#47): the ctx holds its images BY VALUE, so
 // a control that ESCAPES the ctx (stashes &ctx and touches it outside its dispatch
 // window) reads a VALID object with STALE data -- never a dangling/in-flight read --
 // and a store through the escaped handle lands in the owned buffer and NEVER reaches
-// the wire. (Pre-TODO-1 the ctx held spans into the live process buffers: the same
+// the wire. (Earlier the ctx held spans into the live process buffers: the same
 // escape was UB / a wild read that at 1 kHz could command dangerous motion.)
-// (The old stop()-from-RT smoke-check is GONE: #TODO-3 made stop() private, so a control
+// (The old stop()-from-RT smoke-check is GONE: stop() is now private, so a control
 // literally cannot name r.stop() from step() -- the self-join scenario is now a COMPILE
 // error, structurally impossible, not a runtime-degraded guard.) NDEBUG only: in a debug
 // build the out-of-window touch would (correctly) trip check_live's assert -- see the
@@ -594,7 +594,7 @@ TEST("#47.11: a bus fault mid-window does NOT cut the window short") {
     CHECK(r.status().phase == RunnerPhase::Stopped);
 }
 
-// White-box access to the PRIVATE teardown (#TODO-3): consumers stop by dropping the
+// White-box access to the PRIVATE teardown: consumers stop by dropping the
 // Runner, but H1/H4 must drive stop() directly. Declared a friend in runner.hpp.
 namespace ethercat {
 struct RunnerTestPeer {
@@ -605,7 +605,7 @@ struct RunnerTestPeer {
 }  // namespace ethercat
 
 namespace {
-// A control whose step() BLOCKS until released -- models a WEDGED RT loop (TODO-3 H1).
+// A control whose step() BLOCKS until released -- models a WEDGED RT loop (H1).
 class WedgeControl : public SlaveControl {
    public:
     std::atomic<bool> release{false};
@@ -679,7 +679,7 @@ inline ChildResult run_in_child(const std::function<void()>& body, std::chrono::
 #endif  // ETHERCAT_WEDGE_DEATH_TESTS
 }  // namespace
 
-// (12) TODO-3 H1 / #52 -- a wedged step() is an unrecoverable RT fault: stop() bounded-waits,
+// (12) H1 / #52 -- a wedged step() is an unrecoverable RT fault: stop() bounded-waits,
 // then FAIL-STOPS via std::abort(). It does NOT detach-and-return (that UAFs the externally-
 // owned control the parked thread still holds, #52) and does NOT hang (the H1 liveness goal:
 // the process restarts under its supervisor instead of wedging the operator). The drive is
@@ -719,7 +719,7 @@ void wedge_child(Teardown&& teardown) {
 }
 }  // namespace
 
-TEST("#47.12 (TODO-3 H1/#52): wedged step() -> stop() FAIL-STOPS (SIGABRT), no hang") {
+TEST("#47.12 (H1/#52): wedged step() -> stop() FAIL-STOPS (SIGABRT), no hang") {
     // Drives the PRIVATE stop() directly (the SDK Stoppable::stop() / request-and-confirm
     // shape). A wedge must abort the process, not hang and not return.
     const ChildResult cr = run_in_child(
@@ -731,7 +731,7 @@ TEST("#47.12 (TODO-3 H1/#52): wedged step() -> stop() FAIL-STOPS (SIGABRT), no h
     CHECK(!cr.exited);           // not a clean exit (a detach+return baseline would exit 0)
 }
 
-TEST("#47.12b (TODO-3 #52): ~Runner on a wedged step() -> FAIL-STOP, no UAF teardown") {
+TEST("#47.12b (#52): ~Runner on a wedged step() -> FAIL-STOP, no UAF teardown") {
     // The exact PRODUCTION dtor path (no peer, no manual stop): a scoped Runner is DROPPED
     // mid-wedge, so ~Runner -> stop() -> abort BEFORE any member (or the consumer's control)
     // is destroyed. This is the path the old leak-test sidestepped; under ASAN it is the
@@ -746,11 +746,11 @@ TEST("#47.12b (TODO-3 #52): ~Runner on a wedged step() -> FAIL-STOP, no UAF tear
 }
 #endif  // ETHERCAT_WEDGE_DEATH_TESTS
 
-// (13) TODO-3 -- de-energize on destruction is STRUCTURAL: destroying the Runner with NO
+// (13) de-energize on destruction is STRUCTURAL: destroying the Runner with NO
 // explicit stop still runs the graceful teardown (the disable policy ships, then close()).
 // This is the Tier-2 dtor path (SDK never called stop()). *Baseline (declared): a
 // non-owning Runner whose dtor doesn't chain -> the disable never ships -> this fails.*
-TEST("#47.13 (TODO-3): ~Runner de-energizes even with NO explicit stop (Tier-2 dtor)") {
+TEST("#47.13: ~Runner de-energizes even with NO explicit stop (Tier-2 dtor)") {
     auto sim = std::make_unique<SimBackend>(make_models());
     SimBackend* simp = sim.get();
     Master m{make_config(), std::move(sim)};

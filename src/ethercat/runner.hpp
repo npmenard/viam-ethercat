@@ -43,7 +43,7 @@ enum class StopReason : std::uint8_t {
     BusFault,        // Master's consecutive-WKC fault latch fired in steady state
     BringupAborted,  // bring-up gave up (bounded -- the no-hammer invariant; no auto-retry)
     RtSetupFailed,   // SCHED_FIFO unavailable && RunnerConfig::require_realtime
-    Wedged,          // teardown (#TODO-3 H1): a wedged step() did not reach Stopped within the
+    Wedged,          // teardown (H1): a wedged step() did not reach Stopped within the
                      // bounded join -> the thread was DETACHED so stop() returns (liveness). The
                      // drive is still SAFE (PD gapped upstream of the wedge -> SM watchdog fires);
                      // the MODULE is wedged. The HW watchdog is the de-energize backstop, never
@@ -74,7 +74,7 @@ struct RunnerConfig {
     // still flowing (e.g. CiA402 cw->0x00). Floor 1. Safety does NOT depend on it: a
     // window-ignoring control still ends at master.close()'s proven INIT teardown.
     std::uint32_t teardown_cycles = 100;  // ~100 ms @ 1 kHz
-    // The BOUNDED-JOIN ceiling (#TODO-3 H1): the most wall time stop()/~Runner waits for
+    // The BOUNDED-JOIN ceiling (H1): the most wall time stop()/~Runner waits for
     // the RT loop to finish its stopping window and exit before declaring it WEDGED and
     // DETACHING it (so teardown returns -- liveness -- instead of hanging on a wedged
     // step()). 0 = derive: max(250ms, (teardown_cycles + 20 slack) x period x 4) -- the
@@ -84,12 +84,12 @@ struct RunnerConfig {
 };
 
 class Runner;
-// The heap-held, RT-thread-shared cyclic state (#TODO-3 / #52). The Runner owns it by
+// The heap-held, RT-thread-shared cyclic state (#52). The Runner owns it by
 // unique_ptr; the RT thread lives INSIDE it (capturing the RtCore*, not the Runner), so
 // the clean teardown's join is a clean barrier and a wedge fail-stops rather than tearing
 // down under the parked thread. See the class def below.
 class RtCore;
-// White-box test access to the PRIVATE teardown (#TODO-3): consumers stop by dropping
+// White-box test access to the PRIVATE teardown: consumers stop by dropping
 // the Runner, but the H1 bounded-join / Wedged + H4 concurrency tests must drive stop()
 // directly. Defined only in runner_test; never in production. (The API stays private:
 // a consumer cannot name stop(); only this declared peer can.)
@@ -102,7 +102,7 @@ struct RunnerTestPeer;
 // No Master&, no SDO, no map access, no raw image pointers -- load/store at
 // pre-resolved FieldLocation handles is the whole hot-path surface.
 //
-// OWNED DATA (#47 §3b, TODO-1): the input/output images are held BY VALUE (fixed
+// OWNED DATA (#47 §3b): the input/output images are held BY VALUE (fixed
 // arrays @ kMaxPdoBytes), NOT spans into the Runner's live process buffers.
 // dispatch() copies the slave's input image IN before each hook and the owned
 // output buffer OUT after. The win: a control that stashes the ctx and touches it
@@ -123,7 +123,7 @@ struct RunnerTestPeer;
 // only WITHIN THE RtCore'S LIFETIME. The ctx lives in the RtCore's controls_ deque
 // (heap-owned by the Runner), so a handle that OUTLIVES the Runner+RtCore (used after a
 // clean teardown destroys them) is a use-after-free, not safe-stale. Deterministic
-// owner-side teardown/ownership is TODO-3's territory; within a live Runner, escape is
+// owner-side teardown/ownership is a separate concern; within a live Runner, escape is
 // harmless. (A wedge never destroys the RtCore -- it fail-stops, #52.)
 class CycleContext {
    public:
@@ -174,7 +174,7 @@ class CycleContext {
     // Runner itself uses to latch StopReason::BusFault.
     bool fault() const noexcept;
 
-    // Deleted copy AND move (#47 TODO-1): the ctx is a long-lived Runner-owned
+    // Deleted copy AND move (#47): the ctx is a long-lived Runner-owned
     // member, handed out by reference per dispatch. It was IMPLICITLY copyable
     // (only the ctor is private, so the copy ctor was implicitly public --
     // `auto saved = ctx;` compiled). Deleting both makes a stash a compile error,
@@ -187,7 +187,7 @@ class CycleContext {
    private:
     friend class RtCore;
     explicit CycleContext(RtCore* core) noexcept : core_(core) {}
-    // Contract check (#47 §3b, TODO-1): the ctx is valid ONLY during its own
+    // Contract check (#47 §3b): the ctx is valid ONLY during its own
     // dispatch window (the Runner sets live_ around each hook/step call). A control
     // that caches the ctx and touches it outside its window trips this in DEBUG --
     // a loud, immediate failure pointing at the misuse. In release it compiles to
@@ -212,7 +212,7 @@ class CycleContext {
     bool live_ = false;  // set by the Runner around dispatch only
 };
 
-// The configure-time surface handed to on_configured (#47 §3a, TODO-10): the RESTRICTED,
+// The configure-time surface handed to on_configured (#47 §3a): the RESTRICTED,
 // pre-spawn analog of CycleContext. Exposes ONLY the legitimate configure-time operations
 // -- typed field resolution (the width assert fires here) + one-time SDOs -- bound to this
 // control's slave. It NEVER exposes process()/cyclic PD or a raw Master&.
@@ -334,7 +334,7 @@ class SlaveControl {
     }
 };
 
-// The RT-thread-shared cyclic state (#TODO-3 / #52). EVERYTHING the RT thread touches that
+// The RT-thread-shared cyclic state (#52). EVERYTHING the RT thread touches that
 // the Runner OWNS lives HERE, on the heap, owned by the Runner via unique_ptr -- and the
 // thread itself lives here too (thread_). The RT loop captures the RtCore* (NOT the Runner),
 // so it never reaches a Runner member; on a CLEAN stop the Runner joins thread_ (the barrier)
@@ -355,7 +355,7 @@ class RtCore {
     void rt_body(const std::stop_token& st) noexcept;
 
     // Holds a control + its owned-data CycleContext. The ctx is non-copyable AND
-    // non-movable (#47 TODO-1), so Attached is too -- hence controls_ is a std::deque
+    // non-movable (#47), so Attached is too -- hence controls_ is a std::deque
     // (node-based: stable addresses) populated by in-place emplace_back. The ctor builds
     // the ctx in place from the RtCore* (CycleContext's private ctor; Attached, a member
     // of RtCore which is its friend, may call it).
@@ -367,7 +367,7 @@ class RtCore {
     };
 
     // Refresh a ctx for this cycle (copy the slave input IN), dispatch one hook/step with
-    // the live window set, then copy the ctx output OUT to the wire (#47 TODO-1).
+    // the live window set, then copy the ctx output OUT to the wire (#47).
     template <class Fn>
     void dispatch(Attached& a, std::uint64_t cycle, std::int64_t dc, bool stopping, Fn&& fn) noexcept;
 
@@ -393,7 +393,7 @@ class Runner {
     Runner& operator=(const Runner&) = delete;
     Runner(Runner&&) = delete;
     Runner& operator=(Runner&&) = delete;
-    // RAII teardown (#TODO-3): the destructor IS the teardown -- it runs the graceful stop
+    // RAII teardown: the destructor IS the teardown -- it runs the graceful stop
     // (request -> bounded-join the stopping window -> set_rt_active(false) -> master.close()),
     // so de-energize-on-destruction is STRUCTURAL on every non-wedged path. The OWNER stops
     // deterministically by DROPPING the Runner. There is NO public stop(); the only two stop
@@ -405,7 +405,7 @@ class Runner {
 
     // Attach a control to a slave (1-based). PRE-start only. Throws Error on
     // attach-after-start, an unknown slave id, or a duplicate attach for the slave.
-    // LIFETIME CONTRACT (#TODO-3): the control is held by reference and the RT thread
+    // LIFETIME CONTRACT: the control is held by reference and the RT thread
     // calls control->step() until teardown JOINS that thread (in ~Runner). So the control
     // MUST OUTLIVE the Runner -- declare/own it BEFORE the Runner (the dtor joins first,
     // the control dies after). A control destroyed while the thread still runs is a UAF.
@@ -440,9 +440,9 @@ class Runner {
     }
 
    private:
-    friend struct RunnerTestPeer;  // #TODO-3: white-box access to private stop() in tests only
+    friend struct RunnerTestPeer;  // white-box access to private stop() in tests only
 
-    // The teardown, PRIVATE (#TODO-3): called only by ~Runner and run() (both non-RT,
+    // The teardown, PRIVATE: called only by ~Runner and run() (both non-RT,
     // owner-thread). request -> BOUNDED-wait the stopping window -> on success join + clear
     // the #39 bracket + master.close(); on timeout (a wedged step()) FAIL-STOP via
     // std::abort() after a loud log (#52: the parked thread holds the externally-owned

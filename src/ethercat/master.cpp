@@ -136,13 +136,13 @@ void Master::configure() {
     backend_->request_state(0, EcatState::PreOp);
 
     for (const SlaveConfig& sc : config_.slaves) {
-        // The STRUCTURAL PDO remap (#TODO-2 keeps this in Master -- it's intrinsic to the
+        // The STRUCTURAL PDO remap (keeps this in Master -- it's intrinsic to the
         // init->map sequence, not consumer policy): assign 0x1600/0x1A00 to SM2/SM3
         // (0x1C12/0x1C13) + write the entry lists. The generic preop/postremap SDO lists
         // that used to bracket this are GONE -- setup-SDO policy is the consumer's, run
         // via Master::sdo_write() post-configure while it is the single port owner.
         //
-        // ETG ORDERING LESSON (preserve for a future named SM-sync hook, #TODO-2 / DA):
+        // ETG ORDERING LESSON (preserve for a future named SM-sync hook, DA):
         // an SM-sync-type write (0x1C32:01 / 0x1C33:01) MUST go AFTER this apply_pdo_map,
         // not before -- several drives RE-DEFAULT 0x1C32 when the PDO assignment changes,
         // so a sync-type write done before the assignment is silently clobbered. (The A6
@@ -208,7 +208,7 @@ void Master::configure() {
     // write 0x1C32:01 (the drive self-selects DC from the armed SYNC0).
     if (config_.use_distributed_clocks) {
         backend_->configure_dc_configdc();
-        // NOTE (#TODO-6): no mlockall here. Memory locking is an RT-SETUP concern, and
+        // NOTE: no mlockall here. Memory locking is an RT-SETUP concern, and
         // realtime::setup() already does it (mlockall MCL_CURRENT|MCL_FUTURE) when the
         // Runner's RT thread starts -- which is the only point the SYNC0 PLL cares about
         // (pacing begins post-start, after configure() returns at SAFE-OP). A second

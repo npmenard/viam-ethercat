@@ -32,7 +32,7 @@ struct PdoEntry {
 // TxPDO) through SM3 -- so the SM PDO-assignment objects are fixed too.
 enum class PdoDirection : std::uint8_t { Rx, Tx };
 
-// The SM PDO-assignment object index for a direction (#TODO-8): RxPDO -> SM2 0x1C12,
+// The SM PDO-assignment object index for a direction: RxPDO -> SM2 0x1C12,
 // TxPDO -> SM3 0x1C13. Universal for CiA402 servos -- the library derives it; the
 // user does not supply it.
 constexpr std::uint16_t sm_assign_index(PdoDirection dir) noexcept {
@@ -41,7 +41,7 @@ constexpr std::uint16_t sm_assign_index(PdoDirection dir) noexcept {
 
 // A Sync-Manager PDO assignment: which PDO(s) (e.g. 0x1600) are assigned to the SM,
 // and the entry list of each (keyed by PDO index). The assign-index is DERIVED from
-// the map's direction (#TODO-8): the user names only the PDO(s) + entries. An escape
+// the map's direction: the user names only the PDO(s) + entries. An escape
 // hatch (assign_index_override) covers exotic non-standard SM layouts; no CiA402
 // servo should need it.
 struct PdoMap {
@@ -63,7 +63,7 @@ struct PdoMap {
 
 // A raw SDO write descriptor: {object index:subindex, little-endian value bytes}.
 // `data`'s length MUST match the object's CoE data type or the drive aborts.
-// CONSUMER-issued (#TODO-2): the Master no longer runs lists of these at configure()
+// CONSUMER-issued: the Master no longer runs lists of these at configure()
 // time -- setup-SDO POLICY belongs to the consumer, which issues its writes via
 // Master::sdo_write() while it is the single port owner (post-configure, pre-RT).
 // The surviving use is a data carrier for the consumer's vendor fault-reset (#39:
@@ -80,10 +80,10 @@ struct SdoWrite {
 // generic code).
 struct SlaveConfig {
     std::uint16_t slave_id = 1;  // 1-based ring position
-    PdoMap rxpdo;                // outputs -> SM2 0x1C12 (assign-index derived, #TODO-8)
-    PdoMap txpdo;                // inputs  -> SM3 0x1C13 (assign-index derived, #TODO-8)
+    PdoMap rxpdo;                // outputs -> SM2 0x1C12 (assign-index derived)
+    PdoMap txpdo;                // inputs  -> SM3 0x1C13 (assign-index derived)
     Cia402Mode default_mode = Cia402Mode::ProfilePosition;
-    // NOTE (#TODO-2): the generic preop_sdo_writes / postremap_sdo_writes lists are
+    // NOTE: the generic preop_sdo_writes / postremap_sdo_writes lists are
     // GONE -- "run these extra SDOs for me at configure()" was the same orchestration
     // anti-pattern #39 evicted for the vendor fault-reset. Setup-SDO POLICY is the
     // consumer's: it issues its own writes via Master::sdo_write() while still the
@@ -91,7 +91,7 @@ struct SlaveConfig {
     // vendor_fault_reset / a6_validate's --reset-fault). The STRUCTURAL remap SDOs
     // (0x1C12/0x1C13 assign + 0x1600/0x1A00 entries) STAY in configure() -- they're
     // intrinsic to the init->map sequence, not consumer policy. (No A6 setup write
-    // needs to run before the remap, audited at #TODO-2, so no pre-remap hook exists;
+    // needs to run before the remap, audited, so no pre-remap hook exists;
     // a drive that needed one would get a narrow named hook, not a generic list.)
     // OPTIONAL SYNC0 cycle granularity this slave accepts, in ns (#44). Some drives only
     // accept SYNC0 cycles that are an integer multiple of a base tick -- the A6 requires a

@@ -6,8 +6,8 @@
 // hex(): one "0x"-prefixed, zero-padded, UPPERCASE hex formatter, sized to the
 // argument type -- hex(u16) -> "0x1C12", hex(u32) -> "0x00000000". Templated on
 // the unsigned width so a single definition serves every object index / AL code /
-// abort code (#TODO-5). std::format is the idiomatic implementation -- requires
-// libstdc++ 13 / the GCC-13 toolchain floor (#TODO-9).
+// abort code. std::format is the idiomatic implementation -- requires
+// libstdc++ 13 / the GCC-13 toolchain floor.
 
 #include <concepts>
 #include <cstddef>
