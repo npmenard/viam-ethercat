@@ -107,27 +107,27 @@ class EcatBackend {
     // slave + target (and the state actually reached) on timeout.
     virtual void request_state(std::uint16_t slave, EcatState target) = 0;
     virtual EcatState slave_state(std::uint16_t slave) const = 0;
-    // #71: the ESC AL STATUS CODE for a slave (1-based) -- the standard EtherCAT "why the drive
-    // refused an AL state transition" (e.g. 0x0027 "Freerun not supported", 0x0030 "Invalid DC
-    // sync config", 0x001B "SM watchdog"). Cached from the last state check (no port I/O), so it
-    // is safe to read at a bring-up give-up. 0 = no error. Default 0 (the sim overrides to model a
-    // refusal); describe_al_code() below turns the code into text.
+    // The ESC AL status code for a slave (1-based): the standard EtherCAT reason a drive refused
+    // an AL state transition (e.g. 0x0027 "Freerun not supported", 0x0030 "Invalid DC sync
+    // config", 0x001B "SM watchdog"). Cached from the last state check (no port I/O), so it is
+    // safe to read at a bring-up give-up. 0 means no error. Default 0 (the sim overrides to model
+    // a refusal); describe_al_code() below turns the code into text.
     virtual std::uint16_t al_status_code(std::uint16_t slave) const noexcept {
         (void)slave;
         return 0;
     }
-    // #71/#25: human string for an ARBITRARY AL code (not a per-slave live read) -- lets a consumer
-    // describe a latched code (Master::bringup_al_code()). Default: a bare hex rendering; SoemBackend
-    // overrides with SOEM's ec_ALstatuscode2string. Non-RT.
+    // Human string for an arbitrary AL code (not a per-slave live read), so a consumer can
+    // describe a latched code (Master::bringup_al_code()). Default is a bare hex rendering;
+    // SoemBackend overrides with SOEM's ec_ALstatuscode2string. Non-RT.
     virtual std::string describe_al_code(std::uint16_t code) const {
         char b[16];
         std::snprintf(b, sizeof b, "0x%04X", code);
         return b;
     }
-    // REQUEST `slave` (0 = all) to `target` -- writes the state request only; does
-    // NOT pump process data, wait, or throw. The caller's cyclic loop drives the
-    // transition (so a DC drive sees CONTINUOUS process data through SAFE-OP->OP,
-    // no gap -> no Er74). Default: best-effort no-throw wrapper over request_state.
+    // Request `slave` (0 = all) to `target`: writes the state request only; does not pump
+    // process data, wait, or throw. The caller's cyclic loop drives the transition, so a DC
+    // drive sees continuous process data through SAFE-OP -> OP with no gap. Default is a
+    // best-effort no-throw wrapper over request_state.
     virtual void set_state(std::uint16_t slave, EcatState target) noexcept {
         try {
             request_state(slave, target);
@@ -135,33 +135,29 @@ class EcatBackend {
         }
     }
 
-    // ec_sample's SAFE-OP->OP recovery nudge (ec_sample.c:143-155), for the OP-await wait:
-    // refresh AL state and, per slave (0 = all), ACK a SAFE_OP+ERROR (write SAFE_OP+ACK) or
-    // RE-REQUEST OP from a plain SAFE_OP (write OP). The A6's SAFE-OP->OP can take many seconds;
-    // ec_sample waits it out with PD flowing + these repeated nudges (NOT a single request).
-    // Writes the AL-control register only -- the caller's loop keeps pumping process data, so
-    // PD never gaps. Default no-op (sim / free-run drives reach OP from the single set_state).
+    // SAFE-OP -> OP recovery nudge for the OP-await wait: refresh AL state and, per slave
+    // (0 = all), ACK a SAFE_OP+ERROR (write SAFE_OP+ACK) or re-request OP from a plain SAFE_OP
+    // (write OP). The A6's SAFE-OP -> OP can take many seconds; it is waited out with PD flowing
+    // and these repeated nudges, not a single request. Writes the AL-control register only, so
+    // the caller's loop keeps pumping process data and PD never gaps. Default no-op (sim /
+    // free-run drives reach OP from the single set_state).
     virtual void reack_op(std::uint16_t slave) noexcept {
         (void)slave;
     }
 
-    // DC step 1, in PRE-OP: ecx_configdc -- detect DC-capable slaves, designate the
-    // reference clock, write each slave's system-time offset (0x0920) + propagation
-    // delay (0x0928). Offsets only; SYNC0 is NOT armed here. Per the SOEM author
-    // (Arthur Ketels), a DC drive proves sync from synchronized PDO traffic in
-    // SAFE-OP, so the canonical order is configdc(PRE-OP) -> SAFE-OP -> dcsync0 ->
-    // phase-locked PD -> OP. Default no-op (sim / free-run drives).
+    // ecx_configdc: detect DC-capable slaves, designate the reference clock, and write each
+    // slave's system-time offset (0x0920) and propagation delay (0x0928). Offsets only; SYNC0 is
+    // not armed here (arm_dc_sync does that). Default no-op (sim / free-run drives).
     virtual void configure_dc_configdc() {}
 
-    // DC step 2, AFTER SAFE-OP is reached, called IN the caller's RT loop once
-    // phase-locked process data is already flowing continuously: arm the ESC SYNC-out
-    // unit via stock `ecx_dcsync0`. No prime pump and no hand-rolled ESC sequence --
-    // the caller's loop is already pumping PD, so SYNC0 is armed against a live,
-    // disciplined clock and is never armed into a process-data gap (the lesson from
-    // #17/CLAUDE.md). `cycle_ns` must be valid for the drive (A6: multiple of 250000
-    // ns). `sync0_shift_ns` is the SYNC0 pulse phase offset (ecx_dcsync0 CyclShift):
-    // the edge fires `sync0_shift_ns` after the DC base time. Default no-op (sim /
-    // free-run drives).
+    // Arm the ESC SYNC-out unit via stock `ecx_dcsync0`. Called in PRE-OP, before
+    // config_map_group: the A6 latches its DC sync-type at the PRE-OP -> SAFE-OP transition from
+    // whether SYNC0 is already armed, so arming here is what makes it self-select DC. The first
+    // edge is about 100 ms out (stock SyncDelay), covered by config_map, configdc, and the RT
+    // loop pumping PD before that edge, so SYNC0 is never armed into a process-data gap.
+    // `cycle_ns` must be valid for the drive (A6: multiple of 250000 ns). `sync0_shift_ns` is the
+    // SYNC0 pulse phase offset (ecx_dcsync0 CyclShift): the edge fires `sync0_shift_ns` after the
+    // DC base time. Default no-op (sim / free-run drives).
     virtual void arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
         (void)cycle_ns;
         (void)sync0_shift_ns;

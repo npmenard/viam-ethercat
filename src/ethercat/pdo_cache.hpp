@@ -47,9 +47,9 @@ struct PdoSnapshot {
     std::uint16_t working_counter = 0;  // EtherCAT WKC at publish time
     std::uint64_t cycle = 0;            // RT cycle counter at publish time
     bool valid = false;                 // this read succeeded (was not retry-exhausted)
-    // == !valid: the read retry-exhausted. The cross-cycle "RT loop is dead"
-    // staleness that drives is_powered()/is_moving()=false is computed by
-    // ServoController (Phase 5), not here.
+    // Equals !valid: the read retry-exhausted. The cross-cycle "RT loop is dead"
+    // staleness that drives is_powered()/is_moving() = false is computed by
+    // ServoController, not here.
     bool stale = false;
 
     // A real frame has been published at least once. `cycle == 0` is the
@@ -141,12 +141,12 @@ struct CommandBatch {
     bool quick_stop = false;
     bool fault_reset = false;
     bool set_zero = false;
-    // #70 ORDER-PRESERVING sticky-Halt disposition: when a Halt and a new motion command
-    // (SetTarget/SetVelocity) coalesce into one drain, the STICKY halt must stick only if the
-    // Halt was the LATEST of the two -- a motion issued AFTER a halt (Stop() then GoTo()) means
-    // the caller wants to move, so the halt is superseded. drain() sets this to the disposition
-    // of the last stop-relevant command. (A Halt still CANCELS any in-flight move regardless; only
-    // whether the sticky-halt LATCHES is order-dependent.) Default false = no superseding halt.
+    // Order-preserving sticky-Halt disposition: when a Halt and a new motion command
+    // (SetTarget/SetVelocity) coalesce into one drain, the sticky halt latches only if the Halt
+    // was the later of the two. A motion issued after a halt (Stop() then GoTo()) means the caller
+    // wants to move, so the halt is superseded. drain() sets this from the last stop-relevant
+    // command. A Halt still cancels any in-flight move regardless; only whether the sticky halt
+    // latches is order-dependent. Default false means no superseding halt.
     bool halt_supersedes = false;
 
     bool any() const noexcept {
@@ -194,9 +194,9 @@ class CommandQueue {
 };
 
 // ----------------------------------------------------------------------------
-// PdoCache -- wraps the Rx feedback snapshot for one slave, matching the plan's
-// publish_inputs/read_inputs surface. The CommandQueue is a separate channel
-// owned alongside this by ServoController.
+// PdoCache -- wraps the Rx feedback snapshot for one slave and exposes
+// publish_inputs/read_inputs. The CommandQueue is a separate channel owned
+// alongside this by ServoController.
 // ----------------------------------------------------------------------------
 class PdoCache {
    public:

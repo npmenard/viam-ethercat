@@ -1,28 +1,25 @@
 #pragma once
 
-// SimBackend -- a loopback STUB EtherCAT bus for offline tests (no NIC, no SOEM,
-// no SDK). It is a PIPE, NOT A DRIVE: its only charter is to let a Master / the
-// ServoController / the Runner CYCLE so the CONCURRENCY + PLUMBING suites can run
-// off hardware -- the seqlock publish/read handoff, the command queue, the
-// completion-waiter wakeups, the SDO-teardown races, the WKC-fault latch, the
-// PDO-remap SDO ordering, and the DC-arm bookkeeping.
+// SimBackend -- a loopback stub EtherCAT bus for offline tests (no NIC, no SOEM, no SDK). It is
+// a pipe, not a drive: its only job is to let a Master, the ServoController, or the Runner cycle
+// so the concurrency and plumbing suites can run off hardware -- the seqlock publish/read
+// handoff, the command queue, the completion-waiter wakeups, the SDO-teardown races, the
+// WKC-fault latch, the PDO-remap SDO ordering, and the DC-arm bookkeeping.
 //
-// It models EXACTLY the generic-CiA402 minimum those suites need to reach
-// OperationEnabled and complete a Profile-Position move:
+// It models the generic-CiA402 minimum those suites need to reach OperationEnabled and complete
+// a Profile-Position move:
 //   * the CiA402 enable ladder (controlword -> device state -> statusword),
-//   * the Profile-Position set-point-acknowledge handshake (bit4 -> bit12),
-//   * a position loopback (actual chases the latched target at counts_per_step)
-//     and a Profile-Velocity integrator (actual += target velocity),
-//   * a conformant instant mode echo (0x6060 -> 0x6061) so the driver's
-//     enable-time mode gate energizes,
-//   * a conformant quick-stop configure gate (0x605A reads 2; 0x6085 echoes the
-//     write) so a PV/switchable configure() does not refuse.
+//   * the Profile-Position set-point-acknowledge handshake (bit 4 -> bit 12),
+//   * a position loopback (actual chases the latched target at counts_per_step) and a
+//     Profile-Velocity integrator (actual += target velocity),
+//   * a conformant instant mode echo (0x6060 -> 0x6061) so the driver's enable-time mode gate
+//     energizes,
+//   * a conformant quick-stop configure gate (0x605A reads 2; 0x6085 echoes the write) so a
+//     PV/switchable configure() does not refuse.
 //
-// It deliberately models NO DRIVE FIDELITY: no fault injection / clear FSM, no
-// quick-stop deceleration ramp, no mode-switch latency, no encoder noise, no
-// unsupported-mode rejection, no forced/stale error codes. Those behaviors are
-// HW-first now -- proven on the bench (a6_validate) and the RDK campaign, not in
-// sim. See docs/offline-test-retirement.md for the retired-case -> HW-check map.
+// It models no drive fidelity: no fault injection or clear FSM, no quick-stop deceleration ramp,
+// no mode-switch latency, no encoder noise, no unsupported-mode rejection, no forced or stale
+// error codes. Those behaviors are verified on hardware, not in sim.
 
 #include <atomic>
 #include <cstddef>
@@ -101,10 +98,9 @@ class SimBackend final : public EcatBackend {
     void force_short_wkc(bool on) noexcept;
     // SYNC0 cycle (ns) the bring-up armed via arm_dc_sync, or 0 if it never did.
     std::uint32_t configured_dc_cycle_ns() const noexcept;
-    // SYNC0 CyclShift (ns) the bring-up passed to arm_dc_sync (config dc_sync0_shift_ns; #32 note 4).
+    // SYNC0 CyclShift (ns) the bring-up passed to arm_dc_sync (config dc_sync0_shift_ns).
     std::int32_t configured_dc_sync0_shift_ns() const noexcept;
-    // How many times set_state(_, Op) was requested (the no-hammer invariant metric:
-    // the Runner/bring-up must request OP exactly once per start).
+    // How many times set_state(_, Op) was requested. Bring-up must request OP exactly once per start.
     int op_requests() const noexcept {
         return op_requests_;
     }
@@ -137,7 +133,7 @@ class SimBackend final : public EcatBackend {
     std::deque<Slave> slaves_;
     int expected_wkc_ = 0;
     std::uint32_t dc_cycle_ns_ = 0;       // last arm_dc_sync cycle (0 = never armed)
-    std::int32_t dc_sync0_shift_ns_ = 0;  // last arm_dc_sync SYNC0 CyclShift (config dc_sync0_shift_ns; #32 note 4)
+    std::int32_t dc_sync0_shift_ns_ = 0;  // last arm_dc_sync SYNC0 CyclShift (config dc_sync0_shift_ns)
     std::int64_t synthetic_dc_ns_ = 0;    // synthetic DC clock, advanced each exchange() (dc_time())
     bool open_ = false;
     bool short_wkc_once_ = false;

@@ -4,11 +4,11 @@
 
 namespace ethercat {
 
-// CiA402 "modes of operation" (object 0x6060 / display 0x6061). Values match the
-// DS402 wire encoding. The enable ladder (0x06->0x07->0x0F via Cia402Fsm::step) is
-// MODE-AGNOSTIC -- it only advances the DS402 state machine, so every mode reaches
-// OperationEnabled the same way; only post-enable streaming differs (PP = bit4
-// new-set-point handshake; CSP = stream 0x607A every cycle with cw held at 0x0F).
+// CiA402 modes of operation (object 0x6060, display 0x6061). Values match the DS402
+// wire encoding. The enable ladder (0x06 -> 0x07 -> 0x0F via Cia402Fsm::step) is
+// mode-agnostic: it only advances the DS402 state machine, so every mode reaches
+// OperationEnabled the same way. Only post-enable streaming differs (PP uses the bit-4
+// new-set-point handshake; CSP streams 0x607A every cycle with the controlword held at 0x0F).
 enum class Cia402Mode : std::int8_t {
     None = 0,
     ProfilePosition = 1,
@@ -70,10 +70,9 @@ struct Status {
         return bit(11);
     }
 
-    // bit10 "target reached". A6-EC QUIRK: this drive ties bit10 permanently
-    // high, so it is USELESS for move-completion there -- use position deviation
-    // (following_error / bit13) or actual-vs-target instead. Exposed only for
-    // completeness on conformant drives.
+    // bit 10 "target reached". The A6-EC ties bit 10 permanently high, so it cannot
+    // signal move-completion there; use position deviation (following_error / bit 13)
+    // or actual-vs-target instead. Exposed for conformant drives.
     bool target_reached() const noexcept {
         return bit(10);
     }
@@ -141,18 +140,14 @@ struct ControlWord {
     }
 };
 
-// The stateless goal-seeking CiA402 helper. statusword + goal -> ONE controlword toward the goal,
-// re-planned fresh each cycle from the CURRENT decoded state (drive auto-transitions T1/T12/T13/T14 are
-// absorbed, not fought). The caller loops step() per RT cycle toward OperationEnabled; a fault yields a
-// reset LEVEL (bit7) the caller edges. Pure sw-in/cw-out: noexcept, no stored state, no I/O.
-//
-// #19: the stateful goal-walking SHELL (update/get_cw/set_state/set_point/halt/quick_stop/set_mode +
-// the bit4-handshake phase + FaultControl + the next_cw/sustain_cw routing core + Expected/FsmError)
-// was an unadopted duplicate -- every consumer (the policy, the module driver, the bench) always used
-// step(). Deleted, leaving step() as the sole surface.
+// Stateless goal-seeking CiA402 helper. Maps statusword plus goal to one controlword toward the
+// goal, re-planned fresh each cycle from the current decoded state (drive auto-transitions are
+// absorbed, not fought). The caller loops step() per RT cycle toward OperationEnabled; a fault
+// yields a reset level (bit 7) the caller edges. Pure statusword-in, controlword-out: noexcept,
+// no stored state, no I/O.
 class Cia402Fsm {
    public:
-    // step() is a (const) member rather than static: Cia402Fsm is the extensible policy seam, and a
+    // step() is a const member rather than static so Cia402Fsm stays an extensible policy seam: a
     // future version may carry per-drive config (e.g. quick-stop option codes) that step() consults.
     // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
     std::uint16_t step(Status current, Cia402State goal) const noexcept;

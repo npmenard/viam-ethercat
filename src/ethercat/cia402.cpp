@@ -42,10 +42,10 @@ namespace {
 // DS402 statusword state decode (CiA 402, statusword 0x6041, Table "State coding").
 // Two masks isolate the state-defining bits, then each state is a fixed pattern
 // under one of them:
-//   - kStateMaskLow (0x4F) = bits 0,1,2,3,6 -- the four states that DON'T care about
-//     bit5 (quick-stop): NotReadyToSwitchOn, SwitchOnDisabled, FaultReactionActive, Fault.
-//   - kStateMaskFull (0x6F) = bits 0,1,2,3,5,6 -- adds bit5, distinguishing the states
-//     that DO (ReadyToSwitchOn, SwitchedOn, OperationEnabled, QuickStopActive).
+//   - kStateMaskLow (0x4F) = bits 0,1,2,3,6 -- the four states that do not depend on
+//     bit 5 (quick-stop): NotReadyToSwitchOn, SwitchOnDisabled, FaultReactionActive, Fault.
+//   - kStateMaskFull (0x6F) = bits 0,1,2,3,5,6 -- adds bit 5, distinguishing the states
+//     that do (ReadyToSwitchOn, SwitchedOn, OperationEnabled, QuickStopActive).
 // Patterns are mutually exclusive, so test order matters only for ill-formed words,
 // which the defensive fall-through maps to Fault.
 constexpr unsigned kStateMaskLow = 0x4FU;
@@ -91,17 +91,15 @@ Cia402State Status::decode() const noexcept {
     return Cia402State::Fault;
 }
 
-// step() is intentionally a (const) member rather than static: Cia402Fsm is the
-// extensible policy seam, and future versions may carry per-drive config (e.g.
-// quick-stop option codes) that step() consults. Keep it instance-callable.
+// step() is a const member rather than static so Cia402Fsm stays an extensible policy seam: a
+// future version may carry per-drive config (e.g. quick-stop option codes) that step() consults.
 // NOLINTNEXTLINE(readability-convert-member-functions-to-static)
 std::uint16_t Cia402Fsm::step(Status current, Cia402State goal) const noexcept {
     const Cia402State state = current.decode();
 
-    // Fault handling takes priority over the goal. In Fault, request a reset
-    // LEVEL (bit7) -- the driver turns this into the rising edge. While the
-    // drive runs its own fault reaction, we can only wait it out with voltage
-    // disabled until it settles into Fault.
+    // Fault handling takes priority over the goal. In Fault, return a reset level
+    // (bit 7); the driver turns this into the rising edge. While the drive runs its
+    // own fault reaction, wait it out with voltage disabled until it settles into Fault.
     if (state == Cia402State::Fault) {
         return ControlWord::fault_reset();
     }

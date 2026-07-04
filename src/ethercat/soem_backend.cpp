@@ -63,11 +63,10 @@ std::string pop_coe_abort(ecx_contextt* ctx) {
 
 }  // namespace
 
-// All SOEM-touching state lives here, behind the pimpl. SOEM v2's ecx_contextt
-// OWNS its buffers as direct members (port, slavelist[], slavecount, grouplist[],
-// DCtime, the internal eeprom/SM/PDO/mailbox pools, ...) -- so unlike v1.4.0 (where
-// the context was a struct of pointers we wired to per-instance arrays), we just
-// hold ONE zero-initialized context per Master. Still no SOEM global state.
+// All SOEM-touching state lives here, behind the pimpl. SOEM v2's ecx_contextt owns its buffers
+// as direct members (port, slavelist[], slavecount, grouplist[], DCtime, the internal
+// eeprom/SM/PDO/mailbox pools, ...), so this holds one zero-initialized context per Master. No
+// SOEM global state.
 struct SoemBackend::Impl {
     ecx_contextt ctx{};
 
@@ -101,13 +100,11 @@ std::size_t SoemBackend::open(std::string_view ifname) {
     }
     impl_->slave_count = count;
 
-    // PRE-OP confirm -- matches ec_sample's bring-up (ec_sample.c:300-327). config_init leaves
-    // slaves nominally in PRE-OP; manualstatechange=1 makes WE own every AL transition (stops
-    // config_map_group auto-jumping to SAFE-OP, so configdc still runs in PRE-OP, #20), then we
-    // drive all slaves to PRE-OP and CONFIRM it. (We do NOT do an INIT->PRE-OP writestate bounce
-    // or an SM/mailbox-counter reprogram -- those were a misdiagnosis; ec_sample does neither, and
-    // the wire showed the steady case reaches PRE-OP cleanly without them.) The one thing the A6
-    // DOES need after PRE-OP is the patient CoE-handler warm-up below.
+    // Confirm PRE-OP. config_init leaves slaves nominally in PRE-OP; manualstatechange=1 makes
+    // this code own every AL transition (so config_map_group does not auto-jump to SAFE-OP and
+    // configdc still runs in PRE-OP), then drive all slaves to PRE-OP and confirm it. No
+    // INIT->PRE-OP writestate bounce and no SM/mailbox-counter reprogram are needed. The A6 does
+    // need the patient CoE-handler warm-up below after PRE-OP.
     impl_->ctx.manualstatechange = 1;
     ecx_readstate(&impl_->ctx);
     impl_->ctx.slavelist[0].state = EC_STATE_PRE_OP;
@@ -126,38 +123,31 @@ std::size_t SoemBackend::open(std::string_view ifname) {
                     detail);
     }
 
-    // CRITICAL: refresh EACH slave's cached state to PRE-OP. statecheck(slave 0) only updates the
-    // group state (slavelist[0]); slavelist[1..n].state stays at whatever the pre-transition
-    // readstate saw (INIT). ecx_mbxsend's direct-send path is gated on slavelist[slave].state >=
-    // PRE_OP -- with a stale INIT it takes NEITHER the cyclic NOR the direct path and returns 0
-    // WITHOUT transmitting (verified on the wire: 0 mailbox frames). ec_sample calls ecx_readstate
-    // after reaching PRE-OP (ec_sample.c:303) for exactly this reason.
+    // Refresh each slave's cached state to PRE-OP. statecheck(slave 0) only updates the group
+    // state (slavelist[0]); slavelist[1..n].state stays at whatever the pre-transition readstate
+    // saw (INIT). ecx_mbxsend's direct-send path is gated on slavelist[slave].state >= PRE_OP,
+    // so with a stale INIT it takes neither the cyclic nor the direct path and returns 0 without
+    // transmitting. ec_sample calls ecx_readstate after reaching PRE-OP for the same reason.
     ecx_readstate(&impl_->ctx);
 
-    // PATIENT CoE mailbox readiness gate (two parts, per CoE-capable slave). The A6 in some
-    // states is SLOW on EVERYTHING -- the same drive-slowness that makes SAFE-OP->OP take >10s
-    // (handled by the patient OP-await) also makes its CoE mailbox slow to ready after the PRE-OP
-    // transition. Two distinct slow phases, both waited out patiently here, BEFORE configure()'s
-    // first stateful remap write:
-    //   (1) SEND side  -- SM0 (mailbox-out) must be writable or ecx_mbxsend never transmits.
-    //   (2) HANDLER side -- even once writable, the A6 ignores the FIRST SDO for up to seconds
-    //                       (mailbox-out ACKs, mailbox-in never fills), then every SDO works.
-    // ec_sample tolerates both by being patient (and its config_init happens to cycle the mailbox
-    // first -- its first real send is already counter 5). We do NOT reprogram SMs / reset the
-    // mailbox counter / bounce through INIT (2009d47's misdiagnosis -- ec_sample does none of it).
+    // CoE mailbox readiness gate (two parts, per CoE-capable slave). The A6 in some states is slow
+    // on everything: the same slowness that makes SAFE-OP->OP take over 10s also makes its CoE
+    // mailbox slow to ready after the PRE-OP transition. Two distinct slow phases, both waited out
+    // here, before configure()'s first stateful remap write:
+    //   (1) send side: SM0 (mailbox-out) must be writable or ecx_mbxsend never transmits.
+    //   (2) handler side: even once writable, the A6 ignores the first SDO for up to seconds
+    //                     (mailbox-out ACKs, mailbox-in never fills), then every SDO works.
+    // No SM reprogram, mailbox-counter reset, or INIT bounce is needed.
     for (int i = 1; i <= count; ++i) {
         const auto slave = static_cast<std::uint16_t>(i);
         if (impl_->ctx.slavelist[i].mbx_l == 0) {
             continue;  // no CoE mailbox on this slave (e.g. simple I/O) -> nothing to warm up
         }
-        // (1) PATIENT send-side gate -- SM0 mailbox-out must be EMPTY/WRITABLE. If it is not,
-        // ecx_mbxsend bails WITHOUT putting a frame on the wire (no FPWR to 0x1000), so the warm-up
-        // read below never actually asks the slave anything -- it just times out. (Wire-proven:
-        // 60583c7 dropped this wait on the theory that the read's own mbxsend covers it; it does
-        // NOT on the A6 -> 0 mailbox frames sent, 0/7.) The A6's mailbox-out can stay non-writable
-        // for SECONDS when cold (ec_sample's config_init cycles the mailbox first -- its first real
-        // send is already counter 5; we hit a cold mailbox), so wait it out PATIENTLY.
-        constexpr int kMbxEmptyTimeoutUs = 10'000'000;  // ~10s patient -- same philosophy as the warm-up/OP-await
+        // (1) Send-side gate: SM0 mailbox-out must be empty/writable. If it is not, ecx_mbxsend
+        // bails without putting a frame on the wire (no FPWR to 0x1000), so the warm-up read below
+        // never asks the slave anything and just times out. The A6's mailbox-out can stay
+        // non-writable for seconds when cold, so wait it out.
+        constexpr int kMbxEmptyTimeoutUs = 10'000'000;  // ~10s
         if (ecx_mbxempty(&impl_->ctx, slave, kMbxEmptyTimeoutUs) <= 0) {
             ecx_readstate(&impl_->ctx);
             const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
@@ -167,8 +157,8 @@ std::size_t SoemBackend::open(std::string_view ifname) {
             throw Error("slave " + std::to_string(i) + " CoE mailbox-out (SM0) not writable within ~10s after PRE-OP on '" + name +
                         "' -- mbxsend would not transmit" + detail);
         }
-        // (2) PATIENT handler warm-up -- now that SM0 is writable, the read actually goes out.
-        constexpr int kWarmupTries = 300;         // ~15s @ ~50ms/try -- patient, matching drive slowness
+        // (2) Handler warm-up: now that SM0 is writable, the read actually goes out.
+        constexpr int kWarmupTries = 300;         // ~15s at ~50ms/try, matching drive slowness
         constexpr int kWarmupTimeoutUs = 50'000;  // 50 ms/try: warm round-trip ~1.4ms, cold fails fast
         constexpr std::uint32_t kWarmupGapUs = 2'000;
         std::uint32_t vendor = 0;
@@ -218,21 +208,21 @@ SlaveInfo SoemBackend::slave_info(std::uint16_t slave) const {
 }
 
 void SoemBackend::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
-    // SOEM's psize is an int; PDO/SDO payloads are tiny, so the cast is safe. Single-shot, NO
-    // WKC-0 retry: with the mailbox-counter resync in open() the first SDO lands first time, and
-    // a blind re-send is actively harmful -- it advances the mailbox counter / can double-apply a
-    // remap write, desyncing the map (the "OP did not hold" failure). A genuine CoE abort returns
-    // WKC > 0 with an error pushed and is surfaced below; WKC 0 is now a real, reportable fault.
+    // SOEM's psize is an int; PDO/SDO payloads are tiny, so the cast is safe. Single-shot, no
+    // WKC-0 retry: the first SDO lands first time, and a blind re-send is harmful -- it advances
+    // the mailbox counter and can double-apply a remap write, desyncing the map. A genuine CoE
+    // abort returns WKC > 0 with an error pushed and is surfaced below; WKC 0 is a real,
+    // reportable fault.
     if (slave < 1 || slave > impl_->slave_count) {
         throw Error("SoemBackend::sdo_write: slave " + std::to_string(slave) + " out of range (configured " +
                     std::to_string(impl_->slave_count) + ")");
     }
     const int size = static_cast<int>(data.size());
     const int wkc = ecx_SDOwrite(&impl_->ctx, slave, index, sub, FALSE, size, data.data(), EC_TIMEOUTRXM);
-    // A CoE abort can return wkc > 0 but push an error, so check both. This is the GENERIC SDO
-    // tier -> SdoError (carries the abort code); it is NOT PdoMappingError. apply_pdo_map wraps
-    // its mapping-object writes (0x1C1x/0x16xx/0x1Axx) to surface PdoMappingError where that name
-    // is correct -- a non-mapping abort (mode 0x6060, vendor/tuning, fault-reset) stays SdoError.
+    // A CoE abort can return wkc > 0 but push an error, so check both. This is the generic SDO
+    // tier, so it throws SdoError (carrying the abort code), not PdoMappingError. apply_pdo_map
+    // wraps its mapping-object writes (0x1C1x/0x16xx/0x1Axx) to surface PdoMappingError where that
+    // name is correct; a non-mapping abort (mode 0x6060, vendor/tuning, fault-reset) stays SdoError.
     if (wkc <= 0 || ecx_iserror(&impl_->ctx)) {
         const std::string abort = pop_coe_abort(&impl_->ctx);
         throw SdoError("SDO write to slave " + std::to_string(slave) + " object " + std::to_string(index) + ":" + std::to_string(sub) +
@@ -266,10 +256,9 @@ void SoemBackend::map_process_data() {
 }
 
 void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
-    // OP is reached ONLY via set_state() + bringup_step()'s pumped RT loop; request_state
-    // is PRE-OP/SAFE-OP only. It statechecks WITHOUT pumping process data, so requesting OP
-    // here would gap a DC drive (no PD during the transition -> Er74). Loud trap, not a
-    // silent one (the old OP-pump branch here was dead after the #20 fold).
+    // OP is reached only via set_state() plus bringup_step()'s pumped RT loop; request_state is
+    // PRE-OP/SAFE-OP only. It statechecks without pumping process data, so requesting OP here
+    // would gap a DC drive (no PD during the transition, so Er74). The assert is a loud trap.
     assert(target != EcatState::Op && "request_state: OP goes via set_state + bringup_step; this path doesn't pump PD");
 
     const std::uint16_t want = to_soem_state(target);
@@ -278,9 +267,9 @@ void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
 
     const std::uint16_t reached = ecx_statecheck(&impl_->ctx, slave, want, EC_TIMEOUTSTATE);
     if (reached != want) {
-        // Refresh every slave's AL state + AL status code so the error names WHY
-        // (e.g. "Invalid DC SYNC Configuration", "SM watchdog") -- a SAFE-OP->OP
-        // refusal is otherwise opaque on the bench.
+        // Refresh every slave's AL state and AL status code so the error names why (e.g.
+        // "Invalid DC SYNC Configuration", "SM watchdog"); a SAFE-OP->OP refusal is otherwise
+        // opaque.
         std::string detail;
         ecx_readstate(&impl_->ctx);
         for (int i = 1; i <= impl_->ctx.slavecount; ++i) {
@@ -294,30 +283,30 @@ void SoemBackend::request_state(std::uint16_t slave, EcatState target) {
 }
 
 void SoemBackend::set_state(std::uint16_t slave, EcatState target) noexcept {
-    // Write the state request ONLY -- no pump, no statecheck, no throw. The caller's
-    // cyclic loop pumps process data through the transition so a DC drive never sees
-    // a gap. slave_state() reports progress.
+    // Write the state request only: no pump, no statecheck, no throw. The caller's cyclic loop
+    // pumps process data through the transition so a DC drive never sees a gap. slave_state()
+    // reports progress.
     impl_->ctx.slavelist[slave].state = to_soem_state(target);
     ecx_writestate(&impl_->ctx, slave);
 }
 
 void SoemBackend::reack_op(std::uint16_t slave) noexcept {
-    // ec_sample's SAFE-OP->OP recovery nudge (ec_sample.c:143-155): refresh AL state, then per
-    // slave ACK a SAFE_OP+ERROR (write SAFE_OP+ACK) or RE-REQUEST OP from a plain SAFE_OP (write
-    // OP). The A6's SAFE-OP->OP can take many seconds; ec_sample waits it out with PD flowing +
-    // these repeated nudges (NOT a single request), so the bring-up FSM calls this periodically
-    // during the OP-await wait. Writes the AL-control register only (the caller keeps pumping PD,
-    // so the SyncManager watchdog never starves -> no AL 0x001B). Best-effort, no throw.
+    // SAFE-OP->OP recovery nudge: refresh AL state, then per slave ACK a SAFE_OP+ERROR (write
+    // SAFE_OP+ACK) or re-request OP from a plain SAFE_OP (write OP). The A6's SAFE-OP->OP can take
+    // many seconds and is waited out with PD flowing and these repeated nudges, not a single
+    // request, so the bring-up FSM calls this periodically during the OP-await wait. Writes the
+    // AL-control register only; the caller keeps pumping PD, so the SyncManager watchdog never
+    // starves (no AL 0x001B). Best-effort, no throw.
     ecx_readstate(&impl_->ctx);
     const int lo = (slave == 0) ? 1 : slave;
     const int hi = (slave == 0) ? impl_->slave_count : slave;
     for (int i = lo; i <= hi; ++i) {
         ec_slavet& s = impl_->ctx.slavelist[i];
         if (s.state == (EC_STATE_SAFE_OP + EC_STATE_ERROR)) {
-            s.state = EC_STATE_SAFE_OP + EC_STATE_ACK;  // ACK the error (ec_sample.c:143-147)
+            s.state = EC_STATE_SAFE_OP + EC_STATE_ACK;  // ACK the error
             ecx_writestate(&impl_->ctx, static_cast<std::uint16_t>(i));
         } else if (s.state == EC_STATE_SAFE_OP) {
-            s.state = EC_STATE_OPERATIONAL;  // re-request OP (ec_sample.c:149-154)
+            s.state = EC_STATE_OPERATIONAL;  // re-request OP
             if (s.mbxhandlerstate == ECT_MBXH_LOST) {
                 s.mbxhandlerstate = ECT_MBXH_CYCLIC;
             }
@@ -334,7 +323,7 @@ EcatState SoemBackend::slave_state(std::uint16_t slave) const {
 }
 
 std::uint16_t SoemBackend::al_status_code(std::uint16_t slave) const noexcept {
-    // #71: the ESC AL status code cached from the last state check -- WHY the drive refused an AL
+    // The ESC AL status code cached from the last state check: why the drive refused an AL
     // transition (e.g. 0x0027 free-run not supported on the DC-only A6). A plain field read, no I/O.
     if (slave < 1 || slave > impl_->slave_count) {
         return 0;
@@ -343,7 +332,7 @@ std::uint16_t SoemBackend::al_status_code(std::uint16_t slave) const noexcept {
 }
 
 std::string SoemBackend::describe_al_code(std::uint16_t code) const {
-    // #71/#25: SOEM's human string for an arbitrary (latched) AL code -- no slave read, no I/O.
+    // SOEM's human string for an arbitrary (latched) AL code; no slave read, no I/O.
     return ec_ALstatuscode2string(code);
 }
 
@@ -359,12 +348,10 @@ SlaveIo SoemBackend::slave_io(std::uint16_t slave) noexcept {
 }
 
 void SoemBackend::configure_dc_configdc() {
-    // DC step 1 (PRE-OP): ecx_configdc detects DC-capable slaves, designates the
-    // reference clock, and writes each slave's system-time offset (0x0920) +
-    // propagation delay (0x0928). It MUST run + return TRUE before dcsync0 -- else a
-    // DC-only drive (the A6) refuses with AL 0x0027 "Freerun not supported". SYNC0 is
-    // NOT armed here: the canonical SOEM-author order arms it AFTER SAFE-OP, on a
-    // disciplined clock that has seen synchronized PDO traffic.
+    // ecx_configdc (PRE-OP) detects DC-capable slaves, designates the reference clock, and writes
+    // each slave's system-time offset (0x0920) and propagation delay (0x0928). It must run and
+    // return TRUE, or a DC-only drive (the A6) refuses with AL 0x0027 "Freerun not supported".
+    // SYNC0 is not armed here; arm_dc_sync does that, in PRE-OP.
     const boolean dc_found = ecx_configdc(&impl_->ctx);
     std::cerr << "[dc] ecx_configdc() returned " << (dc_found == TRUE ? "TRUE (DC slaves found)" : "FALSE (NO DC slaves)") << '\n';
     if (dc_found == FALSE) {
@@ -375,16 +362,15 @@ void SoemBackend::configure_dc_configdc() {
 void SoemBackend::arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
     impl_->dc_cycle_ns = cycle_ns;  // remember it so close() disables SYNC0
 
-    // Arm SYNC0 with stock ecx_dcsync0, per ec_sample -- called in PRE-OP, BEFORE
-    // config_map_group. The A6 latches its SM sync-type (SM vs DC) at the PRE-OP->SAFE-OP
-    // transition based on whether SYNC0 is ALREADY armed: arm here and the drive
-    // self-selects DC (0x1C32:01 reads 2) and holds OP; arm only after SAFE-OP and the
-    // drive has already chosen SM-sync -> Er74.1 "no sync signal" ~1s into OP (bench:
-    // team-lead). No hasdc guard: hasdc is not set until config_map_group/configdc, and
-    // ec_sample arms unconditionally here (ecx_dcsync0 writes the ESC SYNC0 registers
-    // directly via configadr). The ~50ms-watchdog worry (CLAUDE.md lesson 5) does not
-    // bite: the arm sits in PRE-OP with the long config_map+configdc before OP, and the
-    // RT loop is pumping PD before SYNC0's first edge (stock 100ms SyncDelay).
+    // Arm SYNC0 with stock ecx_dcsync0, in PRE-OP, before config_map_group. The A6 latches its SM
+    // sync-type (SM vs DC) at the PRE-OP->SAFE-OP transition based on whether SYNC0 is already
+    // armed: arm here and the drive self-selects DC (0x1C32:01 reads 2) and holds OP; arm only
+    // after SAFE-OP and the drive has already chosen SM-sync, then faults Er74.1 "no sync signal"
+    // about 1s into OP. No hasdc guard: hasdc is not set until config_map_group/configdc, and the
+    // arm is unconditional here (ecx_dcsync0 writes the ESC SYNC0 registers directly via
+    // configadr). The ~50ms watchdog does not bite: the arm sits in PRE-OP with the long
+    // config_map+configdc before OP, and the RT loop is pumping PD before SYNC0's first edge
+    // (stock 100ms SyncDelay).
     for (int i = 1; i <= impl_->ctx.slavecount; ++i) {
         ecx_dcsync0(&impl_->ctx, static_cast<std::uint16_t>(i), TRUE, cycle_ns, sync0_shift_ns);
     }
@@ -406,26 +392,22 @@ int SoemBackend::expected_wkc() const noexcept {
 
 void SoemBackend::close() noexcept {
     if (impl_->open) {
-        // Turn SYNC0 OFF before closing if we enabled DC -- otherwise the drive is
-        // left expecting a sync pulse that stops coming, which sync-faults it (A6
-        // Er74) and wedges its CoE mailbox until a control-power cycle. Disabling
-        // SYNC0 first lets the drive fall back cleanly between runs.
+        // Turn SYNC0 off before closing if DC was enabled, otherwise the drive is left expecting
+        // a sync pulse that stops coming, which sync-faults it (A6 Er74) and wedges its CoE
+        // mailbox until a control-power cycle. Disabling SYNC0 first lets the drive fall back
+        // cleanly between runs.
         if (impl_->dc_cycle_ns != 0) {
             for (int i = 1; i <= impl_->ctx.slavecount; ++i) {
                 ecx_dcsync0(&impl_->ctx, static_cast<std::uint16_t>(i), FALSE, 0, 0);
             }
             impl_->dc_cycle_ns = 0;
         }
-        // Walk the drive DOWN to INIT before dropping the master -- the standard EtherCAT
-        // teardown. Leaving it in OP with SYNC0 just disabled + the socket dropped left the
-        // drive's DC subsystem un-re-syncable on the IMMEDIATELY following bring-up (a perfect
-        // odd/even alternation -- a successful run's locked-then-killed DC poisoned the next run;
-        // a failed run that never locked DC did not -- which blocked the energized first move,
-        // 4/4 "OP did not hold"). The INIT transition RESETS the drive's SMs + DC state, so the
-        // next config_init starts from a clean slate regardless of what the SYNC0-disable left.
-        // ec_sample sidesteps this by being killed in OP (the drive falls to INIT on carrier
-        // loss); this is the deterministic equivalent. Best-effort + bounded -- close() is
-        // noexcept and ecx_writestate/ecx_statecheck do not throw.
+        // Walk the drive down to INIT before dropping the master, the standard EtherCAT teardown.
+        // Leaving it in OP with SYNC0 just disabled and the socket dropped left the drive's DC
+        // subsystem un-re-syncable on the immediately following bring-up (a locked-then-killed DC
+        // poisoned the next run). The INIT transition resets the drive's SMs and DC state, so the
+        // next config_init starts from a clean slate. Best-effort and bounded: close() is noexcept
+        // and ecx_writestate/ecx_statecheck do not throw.
         impl_->ctx.slavelist[0].state = EC_STATE_INIT;
         ecx_writestate(&impl_->ctx, 0);
         ecx_statecheck(&impl_->ctx, 0, EC_STATE_INIT, EC_TIMEOUTSTATE);

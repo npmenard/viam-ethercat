@@ -51,9 +51,9 @@ using uint_of_t = typename uint_of<N>::type;
 // ---------------------------------------------------------------------------
 // RT hot-path little-endian helpers (free functions, noexcept, NO bounds check)
 // ---------------------------------------------------------------------------
-// The RT loop calls these on pre-resolved {offset,width} field spans (Phase 4
-// builds that flat table at configure()), so they must not throw and must not
-// bounds-check. PRECONDITION: field.size() == sizeof(T).
+// The RT loop calls these on pre-resolved {offset,width} field spans (configure()
+// builds that flat table), so they must not throw and must not bounds-check.
+// Precondition: field.size() == sizeof(T).
 
 template <PdoScalar T>
 T load_le(std::span<const std::byte> field) noexcept {

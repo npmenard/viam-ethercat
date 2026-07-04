@@ -51,9 +51,9 @@ const char* to_string(RunnerPhase p) noexcept {
 // --- CycleContext ----------------------------------------------------------
 
 void CycleContext::request_stop() noexcept {
-    // Legal from inside step()/hooks (the RT error channel) AND harmless if the
-    // control cached the ctx -- it only latches an atomic. Routed through core_ (the
-    // RT-shared state the thread itself lives in), reachable for the whole RT lifetime.
+    // Legal from inside step()/hooks (the RT error channel) and harmless if the control
+    // cached the ctx, since it only latches an atomic. Routed through core_ (the RT-shared
+    // state the thread lives in), reachable for the whole RT lifetime.
     core_->latch_reason(StopReason::Requested);
     core_->stop_flag_.store(true, std::memory_order_release);
 }
@@ -69,17 +69,15 @@ bool CycleContext::fault() const noexcept {
 }
 
 void CycleContext::check_live() const noexcept {
-    // Debug-only (#47): a control that touches the ctx outside its dispatch
-    // window gets a loud, immediate failure in debug builds. In release this compiles
-    // to nothing -- and per the owned-data design (inputs_/outputs_ are by-value, not
-    // spans into live buffers) the worst case there is SAFE-STALE: a valid object with
-    // last-cycle data, never a dangling/in-flight read. There is no release-mode
-    // counter (the old contract_violations was dropped: owned data makes the escape
-    // harmless rather than merely counted).
+    // Debug-only: a control that touches the ctx outside its dispatch window gets a loud,
+    // immediate failure in debug builds. In release this compiles to nothing, and per the
+    // owned-data design (inputs_/outputs_ are by-value, not spans into live buffers) the
+    // worst case there is safe-stale: a valid object with last-cycle data, never a dangling
+    // or in-flight read.
     assert(live_ && "CycleContext used outside its dispatch window (#47 valid on the RT thread, during dispatch only)");
 }
 
-// --- RtCore (the RT-thread-shared cyclic state; #52) ---------------
+// --- RtCore (the RT-thread-shared cyclic state) ---------------
 
 void RtCore::request_stop() noexcept {
     latch_reason(StopReason::Requested);
@@ -97,9 +95,9 @@ Runner::Runner(Master& master, RunnerConfig cfg) noexcept : master_(master) {
     if (cfg.teardown_cycles == 0) {
         cfg.teardown_cycles = 1;  // documented floor
     }
-    // The RT state is heap-held from construction so its address is STABLE for the
-    // thread to capture and so a wedge can LEAK it intact (#52). OOM here terminates
-    // (noexcept) -- a Runner you cannot allocate is unrecoverable regardless.
+    // The RT state is heap-held from construction so its address is stable for the thread to
+    // capture and so a wedge can leak it intact. OOM here terminates (noexcept); a Runner you
+    // cannot allocate is unrecoverable regardless.
     rt_core_ = std::make_unique<RtCore>(master, cfg);
 }
 
@@ -130,9 +128,9 @@ void Runner::start() {
     if (rt_core_->controls_.empty()) {
         throw Error("Runner::start: no controls attached");
     }
-    // NON-RT hooks first -- the ONLY throwing phase. A throw here aborts start()
-    // cleanly: nothing locked, no thread, no rt_active bracket, master untouched.
-    // on_configured gets the RESTRICTED ConfigContext (§3a), never a raw Master&.
+    // Non-RT hooks first, the only throwing phase. A throw here aborts start() cleanly:
+    // nothing locked, no thread, no rt_active bracket, master untouched. on_configured gets
+    // the restricted ConfigContext, never a raw Master&.
     for (RtCore::Attached& a : rt_core_->controls_) {
         ConfigContext cfg{master_, a.slave_id};
         a.control->on_configured(cfg);
@@ -140,8 +138,8 @@ void Runner::start() {
     realtime::lock_current();
     started_.store(true, std::memory_order_release);
     rt_core_->phase_.store(RunnerPhase::BringingUp, std::memory_order_relaxed);
-    // The thread captures the RtCore* (NOT `this`) -- so it never reaches a Runner
-    // member, and a leaked RtCore (#52 wedge) carries everything the thread needs.
+    // The thread captures the RtCore*, not `this`, so it never reaches a Runner member, and
+    // a leaked RtCore (on a wedge) carries everything the thread needs.
     rt_core_->thread_ = std::jthread([core = rt_core_.get()](const std::stop_token& st) { core->rt_body(st); });
 }
 
@@ -154,13 +152,13 @@ void Runner::stop() noexcept {
         return;  // never started (or a failed start): nothing to tear down
     }
     RtCore& core = *rt_core_;
-    // PRIVATE: only ~Runner + run() reach here, both owner-thread -- so this
-    // never runs on the RT thread and the old self-join guard is gone by construction.
+    // Only ~Runner and run() reach here, both on the owner thread, so this never runs on the
+    // RT thread.
     core.request_stop();  // latch Requested (first-cause) + set the flag
 
-    // BOUNDED wait (H1): wait for the RT loop to finish its stopping window and
-    // mark Stopped, up to a derived/configured ceiling. A non-wedged teardown reaches
-    // Stopped well inside it; a WEDGED step() never does.
+    // Bounded wait: wait for the RT loop to finish its stopping window and mark Stopped, up
+    // to a derived or configured ceiling. A non-wedged teardown reaches Stopped well inside
+    // it; a wedged step() never does.
     std::chrono::nanoseconds bound = core.cfg_.stop_join_timeout;
     if (bound <= std::chrono::nanoseconds::zero()) {
         const std::uint64_t period_ns = 1'000'000'000ULL / master_.loop_rate_hz();
@@ -170,20 +168,15 @@ void Runner::stop() noexcept {
     const auto deadline = std::chrono::steady_clock::now() + bound;
     while (core.phase_.load(std::memory_order_acquire) != RunnerPhase::Stopped) {
         if (std::chrono::steady_clock::now() >= deadline) {
-            // WEDGED -> FAIL-STOP (#52). The RT thread is stuck INSIDE control->step() and
-            // will never return; it holds the ctx (Runner-internal, leakable) AND the
-            // EXTERNALLY-owned control (a reference from attach() -- NOT ours to leak). If
-            // we returned, the orderly dtor chain (~ServoController -> ~Runner -> destroy
-            // the control) would free state the abandoned thread is actively using ->
-            // use-after-free, possibly heap-corrupting the host process. There is no safe
-            // way to reclaim a thread parked in foreign code, and we cannot keep the
-            // consumer's control alive past its owner. So we do NOT tear down: abort the
-            // process. The drive is already SAFE (PD gapped upstream of the wedge -> the SM
-            // watchdog de-energizes ~50ms); the supervisor (viam-server) restarts the
-            // module. Deterministic fail-stop beats undefined behavior; this is a
-            // genuinely unrecoverable RT fault. (H1 LIVENESS is still met -- the operator
-            // is not stuck: the process restarts -- and no rogue thread corrupts a
-            // torn-down heap.)
+            // Wedged, so fail-stop. The RT thread is stuck inside control->step() and will
+            // never return; it holds the ctx (Runner-internal, leakable) and the
+            // externally-owned control (a reference from attach(), not ours to leak). If this
+            // returned, the orderly dtor chain would free state the abandoned thread is still
+            // using, a use-after-free that could corrupt the host process heap. A thread
+            // parked in foreign code cannot be reclaimed, and the consumer's control cannot be
+            // kept alive past its owner, so abort the process instead of tearing down. The
+            // drive is already safe (process data gapped upstream of the wedge, so the SM
+            // watchdog de-energizes it in about 50 ms); the supervisor restarts the module.
             (void)std::fprintf(stderr,
                                "[ethercat] Runner::stop: RT loop WEDGED -- step() did not return within the bounded "
                                "teardown ceiling. The RT thread is parked inside a control's step() and cannot be "
@@ -199,7 +192,7 @@ void Runner::stop() noexcept {
     if (core.thread_.joinable()) {
         core.thread_.join();
     }
-    master_.close();  // the proven INIT teardown (idempotent at the backend)
+    master_.close();  // the INIT teardown (idempotent at the backend)
 }
 
 void Runner::run() {
@@ -217,36 +210,34 @@ void RtCore::dispatch(Attached& a, std::uint64_t cycle, std::int64_t dc, bool st
     const std::span<const std::byte> in = master_.input_image(a.slave_id);
     const std::span<std::byte> out = master_.outputs(a.slave_id);
 
-    // COPY-IN (#47): refresh the ctx's OWNED input from this cycle's latched
-    // feedback. Applies to EVERY ctx-touching hook -- incl. sync_faulted() during
-    // bring-up, which loads FaultCode and must see the refreshed input.
+    // Copy-in: refresh the ctx's owned input from this cycle's latched feedback. Applies to
+    // every ctx-touching hook, including sync_faulted() during bring-up, which loads
+    // FaultCode and must see the refreshed input.
     ctx.input_size_ = in.size();
     std::memcpy(ctx.inputs_.data(), in.data(), in.size());
-    // SEED the OWNED output from the live command image, so a field the hook does NOT
-    // store carries its current wire value over (exactly the old direct-span semantic;
-    // a read-only hook then copies back a no-op). Owned buffers also persist across
-    // cycles, but seeding makes a read-only or partial-write hook behavior-identical to
-    // the earlier direct span that wrote through to the live image.
+    // Seed the owned output from the live command image so a field the hook does not store
+    // carries its current wire value over. This makes a read-only or partial-write hook
+    // behave as if it wrote directly through to the live image.
     ctx.output_size_ = out.size();
     std::memcpy(ctx.outputs_.data(), out.data(), out.size());
 
     ctx.cycle_ = cycle;
     ctx.dc_time_ = dc;
     ctx.stopping_ = stopping;
-    ctx.live_ = true;  // the dispatch window (#47): ctx is legal ONLY in here
+    ctx.live_ = true;  // the dispatch window: ctx is legal only in here
     fn(ctx);
     ctx.live_ = false;
 
-    // COPY-OUT: the owned output goes to the wire; it ships with the NEXT process().
-    // A store made through an escaped (stale) handle after this point lands in the
-    // owned buffer only and never reaches here -> never reaches the wire.
+    // Copy-out: the owned output goes to the wire and ships with the next process(). A store
+    // made through an escaped (stale) handle after this point lands in the owned buffer only
+    // and never reaches here, so it never reaches the wire.
     std::memcpy(out.data(), ctx.outputs_.data(), out.size());
 }
 
 void RtCore::rt_body(const std::stop_token& st) noexcept {
     (void)st;
-    // realtime setup (mlockall/mallopt/prefault/SCHED_FIFO). require_realtime
-    // semantics preserved: SCHED failure + require -> latched abort, no bring-up.
+    // realtime setup (mlockall/mallopt/prefault/SCHED_FIFO). If SCHED setup fails and
+    // require_realtime is set, latch an abort and skip bring-up.
     if (!realtime::setup(cfg_.rt_priority) && cfg_.require_realtime) {
         latch_reason(StopReason::RtSetupFailed);
         for (Attached& a : controls_) {
@@ -258,22 +249,20 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
 
     const bool dc = master_.dc_enabled();
     const std::uint64_t period_ns = 1'000'000'000ULL / master_.loop_rate_hz();
-    // THE one pacer (#47 §4): a Runner local -- structurally untouchable by
-    // consumers; carried gapless across bring-up -> steady -> the stopping window.
-    // Strategy selection is the INPUT: pace(dc ? dc_time : 0).
-    realtime::DcPacer pacer(period_ns);  // mid-cycle phase target (the #40 default)
+    // The single pacer: a Runner local, untouchable by consumers, carried gapless across
+    // bring-up, steady, and the stopping window. The regime is selected by the input:
+    // pace(dc ? dc_time : 0).
+    realtime::DcPacer pacer(period_ns);  // mid-cycle phase target (the default)
 
-    // --- BRING-UP (inlined here so this pacer is THE pacer, #19: the standalone
-    // realtime::run_to_operational pump is gone): pace + bringup_step(OR over the
-    // controls' sync_faulted), bounded by
-    // bringup_timeout. EXACTLY ONE OP request per start() -- bringup_step owns the
-    // single request; every abort path below exits WITHOUT re-entering bring-up
-    // (the no-hammer invariant; restart = the consumer's call via a fresh Runner).
+    // --- BRING-UP: pace plus bringup_step (OR-ing the controls' sync_faulted), bounded by
+    // bringup_timeout. Exactly one OP request per start(): bringup_step owns the single
+    // request, and every abort path below exits without re-entering bring-up. A restart is
+    // the consumer's call via a fresh Runner.
     const std::uint64_t give_up_at = realtime::monotonic_ns() + static_cast<std::uint64_t>(cfg_.bringup_timeout.count()) * 1'000'000ULL;
     bool operational = false;
     while (!stop_flag_.load(std::memory_order_acquire)) {
         bool any_sync_fault = false;
-        bool all_present = true;                                    // #71/#25: every control's drive feedback must look alive to confirm OP
+        bool all_present = true;                                    // every control's drive feedback must look alive to confirm OP
         const std::int64_t bring_dct = dc ? master_.dc_time() : 0;  // ctx contract: 0 when DC off
         for (Attached& a : controls_) {
             dispatch(a, 0, bring_dct, false, [&](CycleContext& ctx) {
@@ -294,9 +283,9 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
         }
     }
     if (!operational) {
-        // Aborted bring-up or a stop request before OP. No stopping window: the drive
-        // was never enabled, so there is no consumer disable-policy to give time to
-        // (§5b BringingUp rows); stop() runs the close-to-INIT teardown.
+        // Aborted bring-up or a stop request before OP. No stopping window: the drive was
+        // never enabled, so there is no consumer disable policy to give time to; stop() runs
+        // the close-to-INIT teardown.
         if (reason_.load(std::memory_order_relaxed) == StopReason::None) {
             latch_reason(StopReason::Requested);  // stop request during bring-up
         }
@@ -315,21 +304,20 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
         dispatch(a, 0, op_dct, false, [&](CycleContext& ctx) { a.control->on_operational(ctx); });
     }
 
-    // --- STEADY + the stopping window, one loop (#47 §5): process() -> latch ->
-    // step (attach/slave order) -> pace. Stop causes (Master's WKC fault latch |
-    // request_stop | stop()) trigger on_stop(reason) ONCE, then `teardown_cycles`
-    // MORE cycles run with ctx.stopping()==true so the control's disable policy
-    // ships with PD still flowing. A fault DURING the window does NOT cut it short
-    // (settled at the gate): in the partial-fault case the disable may still reach
-    // the drive; in the dead-bus case the cost is <=window of no-reply frames.
+    // --- STEADY plus the stopping window, one loop: process(), latch, step (in attach/slave
+    // order), pace. A stop cause (Master's WKC fault latch, request_stop, or stop()) triggers
+    // on_stop(reason) once, then teardown_cycles more cycles run with ctx.stopping() == true
+    // so the control's disable policy ships with process data still flowing. A fault during
+    // the window does not cut it short: in the partial-fault case the disable may still reach
+    // the drive; in the dead-bus case the cost is at most a window of no-reply frames.
     std::uint64_t cycle = 0;
     bool stopping = false;
     std::uint32_t window_left = 0;
-    // #72 RT-overrun instrument: pace() returns how many WHOLE periods it had to skip to catch up
-    // (0 = healthy). A multi-cycle skip means the SCHED_FIFO RT thread was starved (host contention,
-    // page fault, priority inversion) and PD gapped that long -- exactly the ~26ms stall that gaps
-    // LRW and drops SYNC0 (Er74.1). Surface the first significant one to stderr (the smoking-gun log
-    // line this bug lacked); worst-so-far is tracked for the post-run summary.
+    // RT-overrun instrument: pace() returns how many whole periods it had to skip to catch up
+    // (0 is healthy). A multi-cycle skip means the SCHED_FIFO RT thread was starved (host
+    // contention, page fault, priority inversion) and process data gapped that long, which
+    // gaps LRW and can drop SYNC0 (Er74.1). The first significant one is logged to stderr; the
+    // worst so far is tracked for the post-run summary.
     constexpr std::uint64_t kRtOverrunReportNs = 5'000'000;  // >=5ms starvation is abnormal at any sane rate
     bool rt_overrun_logged = false;
     std::uint32_t rt_overrun_worst = 0;
@@ -340,11 +328,10 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
         const std::int64_t dct = dc ? master_.dc_time() : 0;
         if (!stopping) {
             if (master_.fault()) {
-                latch_reason(StopReason::BusFault);  // steady health = the WKC latch (no AL polling here)
-                // #72: the WKC-latch moment used to print NOTHING to stderr (an operator saw the drive
-                // go dead with no log line -- the same surfacing gap as #71). Emit a ONE-SHOT line
-                // naming the fault. master_.last_error() is lock-free (reads the fault atomics), and this
-                // fires exactly once -- the next cycle takes the stopping path, skipping this block.
+                latch_reason(StopReason::BusFault);  // steady health is the WKC latch (no AL polling here)
+                // Emit a one-shot line naming the fault. master_.last_error() is lock-free (it
+                // reads the fault atomics), and this fires exactly once, since the next cycle
+                // takes the stopping path and skips this block.
                 (void)std::fprintf(stderr, "[ethercat] BUS FAULT -- %s. Entering teardown.\n", master_.last_error().c_str());
                 (void)std::fflush(stderr);
                 stop_flag_.store(true, std::memory_order_release);
@@ -358,8 +345,8 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
                     a.control->on_stop(r);
                 }
             }
-            // #15: no SDO servicing here anymore -- do_command SDOs run directly on the caller's
-            // (non-RT) thread now (SOEM v2 port is thread-safe), so the RT loop never touches the mailbox.
+            // No SDO servicing here: do_command SDOs run on the caller's non-RT thread (the
+            // SOEM v2 port is thread-safe), so the RT loop never touches the mailbox.
         }
         for (Attached& a : controls_) {
             dispatch(a, cycle, dct, stopping, [&](CycleContext& ctx) { a.control->step(ctx); });
@@ -380,18 +367,17 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
         }
         ++cycle;
         if (stopping) {
-            // EVENT-DRIVEN early-out (#47-P3b R1): a control doing a CONTROLLED ramp-stop signals
-            // teardown_complete() once it is de-energized AT REST (ramped vel->0 THEN disabled), so
-            // the teardown ends as soon as it is SAFE -- the common already-stopped case doesn't pay
-            // the full generous window, and a moving stop still ramps fully (complete stays false
-            // until rest). `teardown_cycles` remains the hard CAP so a never-completing control
-            // (e.g. a dead bus that can't reach SwitchOnDisabled) still exits bounded.
+            // Event-driven early-out: a control doing a controlled ramp-stop signals
+            // teardown_complete() once it is de-energized at rest (ramped velocity to 0, then
+            // disabled), so the teardown ends as soon as it is safe. teardown_cycles remains
+            // the hard cap so a never-completing control (e.g. a dead bus that can't reach
+            // SwitchOnDisabled) still exits bounded.
             bool all_torn_down = true;
             for (const Attached& a : controls_) {
                 all_torn_down = all_torn_down && a.control->teardown_complete();
             }
-            // The entering cycle is the window's FIRST stopping cycle: exactly up to
-            // `teardown_cycles` step() dispatches see ctx.stopping()==true (floor 1).
+            // The entering cycle is the window's first stopping cycle: up to teardown_cycles
+            // step() dispatches see ctx.stopping() == true (floor 1).
             --window_left;
             if (all_torn_down || window_left == 0) {
                 break;

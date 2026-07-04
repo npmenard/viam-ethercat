@@ -135,7 +135,7 @@ void SimBackend::map_process_data() {
 
 void SimBackend::request_state(std::uint16_t slave, EcatState target) {
     if (target == EcatState::Op) {
-        ++op_requests_;  // the no-hammer metric (exactly one per start)
+        ++op_requests_;  // exactly one OP request per start
     }
     if (slave == 0) {
         for (auto& s : slaves_) {
@@ -231,9 +231,10 @@ void SimBackend::step_device(Slave& s) noexcept {
             }
             break;
         case St::QuickStopActive:
-            // 0x605A=2 (decel-then-auto-SwitchOnDisabled): the stub has no decel ramp, so it
-            // auto-transitions to SwitchOnDisabled at once -- modelling the real drive's auto-disable
-            // that the policy's status-based teardown exit (#17) depends on. enable_operation re-energizes.
+            // 0x605A=2 (decelerate, then auto-transition to SwitchOnDisabled): the stub has no
+            // decel ramp, so it transitions to SwitchOnDisabled at once, modelling the real
+            // drive's auto-disable that the policy's status-based teardown exit depends on.
+            // enable_operation re-energizes.
             if (enable_op) {
                 s.device_state = St::OperationEnabled;
             } else {
@@ -242,7 +243,7 @@ void SimBackend::step_device(Slave& s) noexcept {
             break;
         case St::FaultReactionActive:
         case St::Fault:
-            break;  // no fault modeling (bench-only)
+            break;  // no fault modeling
     }
 
     // Profile-Position set-point-acknowledge handshake (bit4 -> bit12) + target latch.
@@ -341,7 +342,7 @@ void SimBackend::force_short_wkc(bool on) noexcept {
 
 void SimBackend::arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
     dc_cycle_ns_ = cycle_ns;              // record that the bring-up armed SYNC0 (configured_dc_cycle_ns)
-    dc_sync0_shift_ns_ = sync0_shift_ns;  // record the CyclShift the config threaded through (#32 note 4)
+    dc_sync0_shift_ns_ = sync0_shift_ns;  // record the CyclShift the config threaded through
 }
 
 std::uint32_t SimBackend::configured_dc_cycle_ns() const noexcept {

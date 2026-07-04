@@ -25,9 +25,9 @@ void RxSnapshot::publish(std::span<const std::byte> payload, std::uint16_t worki
     // a test seam left seq at an odd value.
     const std::uint64_t odd = (seq_.load(std::memory_order_relaxed) + 1U) | 1U;
     seq_.store(odd, std::memory_order_relaxed);  // -> odd: write in progress
-    // (F1) LOAD-BEARING: orders the odd marker before the payload writes below.
-    // Must stay a fence -- making the odd store `release` would NOT order it
-    // before the subsequent relaxed payload stores. Do not remove.
+    // (F1) Orders the odd marker before the payload writes below. This must stay a
+    // fence: making the odd store `release` would not order it before the subsequent
+    // relaxed payload stores. Do not remove.
     std::atomic_thread_fence(std::memory_order_release);
 
     // All shared payload/metadata writes go through atomic_ref (relaxed) so there
@@ -61,11 +61,10 @@ PdoSnapshot RxSnapshot::read() const noexcept {
         const std::uint16_t wkc = std::atomic_ref<std::uint16_t>(wkc_).load(std::memory_order_relaxed);
         const std::uint64_t cyc = std::atomic_ref<std::uint64_t>(cycle_).load(std::memory_order_relaxed);
 
-        // (G2) LOAD-BEARING: orders the payload loads above before the seq
-        // re-read below. Must stay a fence -- making the re-read `acquire` would
-        // order the re-read before *later* ops, not the *prior* loads before
-        // itself (wrong direction). Do not remove. The re-read can stay relaxed
-        // precisely because this fence carries the ordering.
+        // (G2) Orders the payload loads above before the seq re-read below. This must
+        // stay a fence: making the re-read `acquire` would order the re-read before
+        // later ops, not the prior loads before itself (the wrong direction). Do not
+        // remove. The re-read can stay relaxed because this fence carries the ordering.
         std::atomic_thread_fence(std::memory_order_acquire);
         const std::uint64_t s1 = seq_.load(std::memory_order_relaxed);
         if (s0 == s1) {
@@ -139,17 +138,17 @@ CommandBatch CommandQueue::drain() noexcept {
                 using T = std::decay_t<decltype(cmd)>;
                 if constexpr (std::is_same_v<T, SetTarget>) {
                     batch.set_target = cmd;         // latest-wins
-                    batch.halt_supersedes = false;  // #70: a motion command AFTER a halt supersedes it
+                    batch.halt_supersedes = false;  // a motion command after a halt supersedes it
                 } else if constexpr (std::is_same_v<T, SetVelocity>) {
                     batch.set_velocity = cmd;       // latest-wins
-                    batch.halt_supersedes = false;  // #70: a motion command AFTER a halt supersedes it
+                    batch.halt_supersedes = false;  // a motion command after a halt supersedes it
                 } else if constexpr (std::is_same_v<T, Enable>) {
                     batch.enable = true;
                 } else if constexpr (std::is_same_v<T, Disable>) {
                     batch.disable = true;
                 } else if constexpr (std::is_same_v<T, Halt>) {
                     batch.halt = true;
-                    batch.halt_supersedes = true;  // #70: a halt AFTER any prior motion -> the sticky halt latches
+                    batch.halt_supersedes = true;  // a halt after any prior motion latches the sticky halt
                 } else if constexpr (std::is_same_v<T, QuickStop>) {
                     batch.quick_stop = true;
                 } else if constexpr (std::is_same_v<T, FaultReset>) {

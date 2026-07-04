@@ -1,14 +1,12 @@
 #pragma once
 
-// SoemBackend -- the REAL EtherCAT backend, the ONLY place SOEM is used. It
-// implements EcatBackend on top of SOEM's reentrant ecx_* API with a per-Master
-// ecx_contextt (no global ec_slave[] state), so a process could host more than
-// one master. SOEM headers are confined to soem_backend.cpp (pimpl), so no SOEM
-// types leak into the rest of the library.
+// SoemBackend -- the real EtherCAT backend, the only place SOEM is used. It implements
+// EcatBackend on top of SOEM's reentrant ecx_* API with a per-Master ecx_contextt (no global
+// ec_slave[] state), so a process could host more than one master. SOEM headers are confined to
+// soem_backend.cpp (pimpl), so no SOEM types leak into the rest of the library.
 //
-// Runtime requires CAP_NET_RAW (raw packet socket) and a dedicated NIC, so this
-// cannot run in CI -- it must only COMPILE + LINK there. The offline path uses
-// SimBackend.
+// Runtime requires CAP_NET_RAW (raw packet socket) and a dedicated NIC, so this cannot run in
+// CI -- there it only compiles and links. The offline path uses SimBackend.
 
 #include <cstddef>
 #include <cstdint>
@@ -34,8 +32,8 @@ class SoemBackend final : public EcatBackend {
     void set_state(std::uint16_t slave, EcatState target) noexcept override;
     void reack_op(std::uint16_t slave) noexcept override;
     EcatState slave_state(std::uint16_t slave) const override;
-    std::uint16_t al_status_code(std::uint16_t slave) const noexcept override;  // #71: cached ESC AL status code
-    std::string describe_al_code(std::uint16_t code) const override;            // #71/#25: SOEM string for a latched code
+    std::uint16_t al_status_code(std::uint16_t slave) const noexcept override;  // cached ESC AL status code
+    std::string describe_al_code(std::uint16_t code) const override;            // SOEM string for a latched code
     void configure_dc_configdc() override;
     void arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) override;
     std::int64_t dc_time() const noexcept override;

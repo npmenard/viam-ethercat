@@ -16,9 +16,8 @@ namespace {
 
 constexpr std::uint16_t kModesOfOp = 0x6060;  // CiA402 modes-of-operation (U8): PP=1, PV=3; SDO-set in PRE-OP
 constexpr long kNsPerSec = 1'000'000'000L;
-// The AWAIT_OP bounds (hold-confirm / nudge-interval / give-up) moved into MasterConfig
-// (#42): they carry A6/ec_sample-derived magnitudes + a wall-time meaning that depends on
-// the loop rate, so they are config (with the same defaults), derived once in the ctor.
+// The AWAIT_OP bounds (hold-confirm, nudge-interval, give-up) live in MasterConfig: they
+// carry a wall-time meaning that depends on the loop rate, and are derived once in the ctor.
 
 std::uint32_t field_key(std::uint16_t index, std::uint8_t sub) noexcept {
     return (static_cast<std::uint32_t>(index) << 8U) | sub;
@@ -39,23 +38,21 @@ Master::Master(MasterConfig config, std::unique_ptr<EcatBackend> backend) : conf
     if (config_.target_loop_rate_hz == 0 || config_.target_loop_rate_hz > 1000) {
         throw Error("Master: target_loop_rate_hz " + std::to_string(config_.target_loop_rate_hz) + " out of range (1..1000)");
     }
-    // Derive the AWAIT_OP bounds ONCE from config (#42) -- no per-cycle math/clamping on
-    // the bring-up path. The counts clamp 0 -> 1 (a zero hold-confirm would declare OP on
-    // no held evidence; a zero nudge interval would divide by zero). The give-up bound is
-    // configured in WALL TIME and converted at the configured rate, so the ec_sample
-    // patience window is rate-independent (e.g. 30 s at 250 Hz = 7'500 cycles, not the
-    // 2 minutes the old fixed 30'000-cycle constant would have meant).
+    // Derive the AWAIT_OP bounds once from config, so there is no per-cycle math on the
+    // bring-up path. The counts clamp 0 -> 1 (a zero hold-confirm would declare OP on no held
+    // evidence; a zero nudge interval would divide by zero). The give-up bound is configured in
+    // wall time and converted at the configured rate, so the patience window is rate-independent
+    // (e.g. 30 s at 250 Hz = 7'500 cycles).
     op_hold_confirm_cycles_ = std::max(config_.op_hold_confirm_cycles, 1U);
     op_nudge_interval_cycles_ = std::max(config_.op_nudge_interval_cycles, 1U);
     const std::uint64_t await_cycles = (static_cast<std::uint64_t>(config_.op_await_timeout_ms) * config_.target_loop_rate_hz) / 1000ULL;
     op_await_bound_cycles_ = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(await_cycles, 1, UINT32_MAX));
 
-    // #44: validate the loop rate against each slave's declared SYNC0 cycle granularity
-    // UP FRONT -- a non-multiple cycle otherwise surfaces only as a cryptic fault AT OP
-    // ENTRY (the A6 Er74.0 "cycle error"), the worst place to debug a config mistake.
-    // Uses the SAME truncated-cycle arithmetic configure() arms SYNC0 with, so the value
-    // checked is the value the drive sees. Granularity is per-slave config DATA (0 = no
-    // constraint); only meaningful when DC/SYNC0 is in play.
+    // Validate the loop rate against each slave's declared SYNC0 cycle granularity up front. A
+    // non-multiple cycle otherwise surfaces only as a cryptic fault at OP entry (the A6 Er74.0
+    // "cycle error"). Uses the same truncated-cycle arithmetic configure() arms SYNC0 with, so
+    // the value checked is the value the drive sees. Granularity is per-slave config data (0 =
+    // no constraint); only meaningful when DC/SYNC0 is in play.
     if (config_.use_distributed_clocks) {
         const std::uint64_t cycle_ns = static_cast<std::uint64_t>(kNsPerSec) / config_.target_loop_rate_hz;
         for (const SlaveConfig& sc : config_.slaves) {
@@ -63,8 +60,8 @@ Master::Master(MasterConfig config, std::unique_ptr<EcatBackend> backend) : conf
             if (g == 0 || cycle_ns % g == 0) {
                 continue;
             }
-            // Suggest the nearest rates (within the validated 1..1000 Hz range) whose
-            // truncated cycle IS a multiple -- scanned with the same arithmetic as the check.
+            // Suggest the nearest rates (within the validated 1..1000 Hz range) whose truncated
+            // cycle is a multiple, scanned with the same arithmetic as the check.
             const auto rate_ok = [&](std::uint32_t r) { return (static_cast<std::uint64_t>(kNsPerSec) / r) % g == 0; };
             std::uint32_t lower = 0;
             for (std::uint32_t r = config_.target_loop_rate_hz; r >= 1; --r) {
@@ -136,37 +133,33 @@ void Master::configure() {
     backend_->request_state(0, EcatState::PreOp);
 
     for (const SlaveConfig& sc : config_.slaves) {
-        // The STRUCTURAL PDO remap (keeps this in Master -- it's intrinsic to the
-        // init->map sequence, not consumer policy): assign 0x1600/0x1A00 to SM2/SM3
-        // (0x1C12/0x1C13) + write the entry lists. The generic preop/postremap SDO lists
-        // that used to bracket this are GONE -- setup-SDO policy is the consumer's, run
-        // via Master::sdo_write() post-configure while it is the single port owner.
+        // The structural PDO remap (intrinsic to the init->map sequence, not consumer policy):
+        // assign 0x1600/0x1A00 to SM2/SM3 (0x1C12/0x1C13) and write the entry lists. Setup-SDO
+        // policy is the consumer's, run via Master::sdo_write() post-configure while it is the
+        // single port owner.
         //
-        // ETG ORDERING LESSON (preserve for a future named SM-sync hook, DA):
-        // an SM-sync-type write (0x1C32:01 / 0x1C33:01) MUST go AFTER this apply_pdo_map,
-        // not before -- several drives RE-DEFAULT 0x1C32 when the PDO assignment changes,
-        // so a sync-type write done before the assignment is silently clobbered. (The A6
-        // needs none -- it self-selects DC from the PRE-OP SYNC0 arm, #20 -- but the next
-        // drive that needs an explicit sync-type write must place its hook here, post-remap.)
+        // An SM-sync-type write (0x1C32:01 / 0x1C33:01) must go after this apply_pdo_map, not
+        // before: several drives re-default 0x1C32 when the PDO assignment changes, so a
+        // sync-type write done before the assignment is silently clobbered. The A6 needs none
+        // (it self-selects DC from the PRE-OP SYNC0 arm), but a drive that needs an explicit
+        // sync-type write must place its hook here, post-remap.
         apply_pdo_map(*backend_, sc.slave_id, sc.rxpdo, PdoDirection::Rx);
         apply_pdo_map(*backend_, sc.slave_id, sc.txpdo, PdoDirection::Tx);
-        // Set modes-of-operation (0x6060, U8) via SDO -- NOT mapped cyclically. A real
-        // drive left in mode 0 never moves; this is the one drive-mode write per
-        // configure(). PP=1 / PV=3 from the configured default_mode.
+        // Set modes-of-operation (0x6060, U8) via SDO; it is not mapped cyclically. A drive
+        // left in mode 0 never moves. PP=1 / PV=3, from the configured default_mode.
         const std::array<std::byte, 1> mode{static_cast<std::byte>(static_cast<std::uint8_t>(sc.default_mode))};
         backend_->sdo_write(sc.slave_id, kModesOfOp, 0, mode);
     }
 
-    // DC SYNC0 cycle = loop period (A6: must be a 250 us multiple, e.g. 1 ms @ 1 kHz).
+    // DC SYNC0 cycle = loop period (A6: must be a 250 us multiple, e.g. 1 ms at 1 kHz).
     const auto cycle_ns = static_cast<std::uint32_t>(kNsPerSec / static_cast<long>(config_.target_loop_rate_hz));
 
-    // ARM SYNC0 IN PRE-OP, BEFORE config_map_group -- ec_sample's exact order (bench /
-    // CLAUDE.md). The A6 latches its SM sync-type (SM vs DC) at the PRE-OP->SAFE-OP
-    // transition from whether SYNC0 is ALREADY armed: arm here and the drive self-selects
-    // DC (0x1C32:01 reads 2) and holds OP; arm only after SAFE-OP and it has already chosen
-    // SM-sync -> Er74.1 "no sync signal" ~1s into OP. We still NEVER write 0x1C32:01 (that
-    // force was the self-inflicted AL 0x0030); the PRE-OP arm is the whole trigger. Stock
-    // ecx_dcsync0 -- the 100 ms SyncDelay is covered by config_map+configdc + the RT loop
+    // Arm SYNC0 in PRE-OP, before config_map_group. The A6 latches its SM sync-type (SM vs DC)
+    // at the PRE-OP -> SAFE-OP transition from whether SYNC0 is already armed: arm here and the
+    // drive self-selects DC (0x1C32:01 reads 2) and holds OP; arm only after SAFE-OP and it has
+    // already chosen SM-sync, then faults Er74.1 "no sync signal" about 1 s into OP. Never write
+    // 0x1C32:01 by hand (that force causes AL 0x0030); the PRE-OP arm is the whole trigger. With
+    // stock ecx_dcsync0 the 100 ms SyncDelay is covered by config_map, configdc, and the RT loop
     // pumping PD before the first SYNC0 edge.
     if (config_.use_distributed_clocks) {
         backend_->arm_dc_sync(cycle_ns, config_.dc_sync0_shift_ns);
@@ -179,12 +172,11 @@ void Master::configure() {
     for (const SlaveConfig& sc : config_.slaves) {
         const SlaveInfo info = backend_->slave_info(sc.slave_id);
 
-        // Validate the APPLIED (wire) image against the CONFIGURED map. If a real
-        // drive silently rejected part of the remap, map_process_data lays out the
-        // drive's default image while the field table (built from config below)
-        // carries offsets for the expected map -- a store_le into outputs at a
-        // config-derived offset could then run past the wire-sized span (OOB in
-        // the noexcept RT loop). Fail loudly here instead.
+        // Validate the applied (wire) image against the configured map. If a drive silently
+        // rejected part of the remap, map_process_data lays out the drive's default image while
+        // the field table (built from config below) carries offsets for the expected map, so a
+        // store_le into outputs at a config-derived offset could run past the wire-sized span
+        // (out of bounds in the noexcept RT loop). Fail loudly here instead.
         const std::size_t rx_bytes = sc.rxpdo.byte_size();
         const std::size_t tx_bytes = sc.txpdo.byte_size();
         if (info.output_bytes != rx_bytes || info.input_bytes != tx_bytes) {
@@ -202,35 +194,32 @@ void Master::configure() {
         rt.tx_fields = build_field_table(sc.slave_id, sc.txpdo);
     }
 
-    // DC configdc -- AFTER config_map_group (ec_sample order: dcsync0 -> map -> configdc).
-    // Designates the reference clock + writes each slave's system-time offset (0x0920) +
-    // propagation delay (0x0928). The SYNC0 arm already happened in PRE-OP above; we NEVER
-    // write 0x1C32:01 (the drive self-selects DC from the armed SYNC0).
+    // DC configdc, after config_map_group. Designates the reference clock and writes each
+    // slave's system-time offset (0x0920) and propagation delay (0x0928). The SYNC0 arm already
+    // happened in PRE-OP above; never write 0x1C32:01 (the drive self-selects DC from the armed SYNC0).
     if (config_.use_distributed_clocks) {
         backend_->configure_dc_configdc();
-        // NOTE: no mlockall here. Memory locking is an RT-SETUP concern, and
-        // realtime::setup() already does it (mlockall MCL_CURRENT|MCL_FUTURE) when the
-        // Runner's RT thread starts -- which is the only point the SYNC0 PLL cares about
-        // (pacing begins post-start, after configure() returns at SAFE-OP). A second
-        // mlockall here was redundant AND a layering leak: Master is thread-free bus
-        // policy (#31/#47); memory residency belongs to the RT-setup layer. The
-        // CAP_IPC_LOCK / RLIMIT_MEMLOCK errno guidance lives in realtime::setup's log.
+        // No mlockall here: memory locking is an RT-setup concern, and realtime::setup()
+        // already does it (mlockall MCL_CURRENT|MCL_FUTURE) when the Runner's RT thread starts,
+        // which is when the SYNC0 PLL first cares (pacing begins after configure() returns at
+        // SAFE-OP). Master is thread-free bus policy; memory residency belongs to the RT-setup
+        // layer. The CAP_IPC_LOCK / RLIMIT_MEMLOCK guidance lives in realtime::setup's log.
     }
 
-    // Stop at SAFE-OP. SYNC0 is armed (PRE-OP) but its first edge is ~100 ms out (stock
-    // SyncDelay), so the brief PRE-OP->SAFE-OP statecheck (no PD) finishes well before it
-    // -- the RT loop is pumping phase-locked PD before the first pulse. The drive latched
-    // DC sync-type at this transition (SYNC0 already armed).
+    // Stop at SAFE-OP. SYNC0 is armed (PRE-OP) but its first edge is about 100 ms out (stock
+    // SyncDelay), so the brief PRE-OP -> SAFE-OP statecheck (no PD) finishes well before it, and
+    // the RT loop is pumping phase-locked PD before the first pulse. The drive latched its DC
+    // sync-type at this transition, since SYNC0 was already armed.
     backend_->request_state(0, EcatState::SafeOp);
 
-    // NOTE (#39): configure() carries ZERO vendor-object knowledge. The vendor fault-reset
-    // that used to fire here is CONSUMER policy now -- consumers run it themselves via the
-    // public sdo_write() while they are still the single port owner (pre-RT-spawn).
+    // configure() carries no vendor-object knowledge. A vendor fault-reset is consumer policy:
+    // consumers run it themselves via the public sdo_write() while they are still the single
+    // port owner (before the RT thread spawns).
 
     // Hand off to the caller's RT loop at SAFE-OP with SYNC0 already armed. It runs
-    // bringup_step() -- SETTLE (bounded phase-locked PD) -> request OP -> AWAIT_OP (hold
-    // for OP + Er74.1-cleared + WKC) -- until OPERATIONAL, so operational_ stays false
-    // until then. Reset the FSM.
+    // bringup_step() -- settle (bounded phase-locked PD), request OP, await OP (hold for OP,
+    // Er74.1 cleared, and WKC) -- until operational, so operational_ stays false until then.
+    // Reset the FSM.
     dc_enabled_ = config_.use_distributed_clocks;
     bringup_phase_ = BringupPhase::Settle;
     bringup_settle_count_ = 0;
@@ -246,23 +235,21 @@ void Master::configure() {
 }
 
 BringupStatus Master::bringup_step(bool drive_sync_faulted, bool drive_present) noexcept {
-    // The caller owns the cadence (clock_nanosleep + dc_phase_correction on dc_time());
-    // this does the one cyclic exchange + advances the FSM. SYNC0 was already armed in
-    // configure() (PRE-OP, per ec_sample): SETTLE pumps phase-locked PD a bounded settle,
-    // requests OP ONCE, then AWAIT_OP holds for "OP reached + Er74.1 cleared + WKC holds".
+    // The caller owns the cadence (clock_nanosleep + dc_phase_correction on dc_time()); this
+    // does the one cyclic exchange and advances the FSM. SYNC0 was already armed in configure()
+    // (PRE-OP): settle pumps phase-locked PD a bounded settle, requests OP once, then AwaitOp
+    // holds for OP reached, Er74.1 cleared, and WKC holding.
     const int wkc = backend_->exchange();
     last_wkc_.store(wkc, std::memory_order_relaxed);
 
     switch (bringup_phase_) {
         case BringupPhase::Settle: {
-            // Pump phase-locked PD a brief settle so the master's send is disciplined
-            // before OP (ec_sample settles RT PD ~400 ms before requesting OP). We do NOT
-            // gate on Er74.1 here: 0x603F=0x8700 in SAFE-OP is the NORMAL pre-sync state --
-            // the A6 completes SYNC0 alignment only once OP cycling starts, so Er74.1
-            // clears AT OP, not before (ec_sample requests OP with it present and succeeds).
-            // Gating on no-Er74.1 here would block the exact transition that works. Non-DC
-            // backends need no settle (1 cycle). Then make the INITIAL OP request; AwaitOp keeps
-            // re-requesting (reack_op) until it sticks, the way ec_sample waits out the A6.
+            // Pump phase-locked PD a brief settle so the master's send is disciplined before OP.
+            // Do not gate on Er74.1 here: 0x603F=0x8700 in SAFE-OP is the normal pre-sync state,
+            // because the A6 completes SYNC0 alignment only once OP cycling starts, so Er74.1
+            // clears at OP, not before. Gating on no-Er74.1 here would block the exact transition
+            // that works. Non-DC backends need no settle (1 cycle). Then make the initial OP
+            // request; AwaitOp keeps re-requesting (reack_op) until it sticks.
             const std::uint32_t target = dc_enabled_ ? (config_.dc_op_gate_cycles == 0 ? 1U : config_.dc_op_gate_cycles) : 1U;
             if (++bringup_settle_count_ >= target) {
                 backend_->set_state(0, EcatState::Op);  // writestate only; this loop pumps the transition
@@ -273,31 +260,31 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted, bool drive_present) 
             return BringupStatus::Gating;
         }
         case BringupPhase::AwaitOp: {
-            // Pump the gapless transition while WAITING OUT a slow SAFE-OP->OP (the A6 takes
-            // seconds). Success = full WKC AND no Er74.1 held op_hold_confirm_cycles -- i.e. the
-            // drive reached OP, SYNC0 aligned (Er74.1 cleared), and PD is exchanging cleanly.
-            // Every op_nudge_interval_cycles, run ec_sample's SAFE-OP recovery (reack_op): ACK a
-            // SAFE_OP+ERROR / re-request OP from SAFE_OP. This is self-gating -- once the drive is
-            // in OP, reack_op is a no-op -- and PD keeps flowing (no watchdog starve). Only after
-            // the generous wall-time give-up window (op_await_timeout_ms, converted to cycles in
-            // the ctor) without the held-synced state do we give up. Bounds are MasterConfig (#42).
+            // Pump the gapless transition while waiting out a slow SAFE-OP -> OP (the A6 takes
+            // seconds). Success is a full WKC and no Er74.1 held for op_hold_confirm_cycles:
+            // the drive reached OP, SYNC0 aligned (Er74.1 cleared), and PD is exchanging cleanly.
+            // Every op_nudge_interval_cycles, run the SAFE-OP recovery (reack_op): ACK a
+            // SAFE_OP+ERROR and re-request OP from SAFE_OP. This is self-gating (once the drive
+            // is in OP, reack_op is a no-op) and PD keeps flowing, so no watchdog starves. Give
+            // up only after the wall-time window (op_await_timeout_ms, converted to cycles in the
+            // ctor) without the held-synced state.
             ++bringup_await_count_;
-            // #71/#25: latch the last NON-ZERO AL status code across AWAIT so a give-up can name the
-            // cause. Read it BEFORE reack_op(0) below -- reack ACKs the SAFE_OP+ERROR, momentarily
-            // clearing the code, so the value read on the timeout cycle (post-reack) is often 0. This
-            // pre-reack read holds the real cause (e.g. 0x0027 "Freerun not supported").
+            // Latch the last non-zero AL status code across AWAIT so a give-up can name the
+            // cause. Read it before reack_op(0) below: reack ACKs the SAFE_OP+ERROR, momentarily
+            // clearing the code, so the value read on the timeout cycle (post-reack) is often 0.
+            // This pre-reack read holds the real cause (e.g. 0x0027 "Freerun not supported").
             if (const std::uint16_t al = backend_->al_status_code(1); al != 0) {
                 bringup_al_code_ = al;
             }
             if (bringup_await_count_ % op_nudge_interval_cycles_ == 0) {
                 backend_->reack_op(0);
             }
-            // #71/#25: OP is confirmed by a HELD full WKC AND no sync fault AND plausible drive
-            // feedback (drive_present). The last gate is load-bearing: the A6 under free-run gives a
-            // FULL WKC while zombie-PDOing (dead statusword) -- without drive_present, WKC alone would
-            // declare OP on a dead drive and the enable ladder would spin forever. A dead drive keeps
-            // drive_present false through the whole window -> the streak never builds -> AWAIT times
-            // out -> Aborted (and the caller's AL-status diagnostic names AL 0x0027).
+            // OP is confirmed by a held full WKC, no sync fault, and plausible drive feedback
+            // (drive_present). The last gate matters: the A6 under free-run gives a full WKC
+            // while zombie-PDOing (dead statusword), so without drive_present, WKC alone would
+            // declare OP on a dead drive and the enable ladder would spin forever. A dead drive
+            // keeps drive_present false through the whole window, so the streak never builds,
+            // AWAIT times out, and it aborts (and the caller's AL-status diagnostic names AL 0x0027).
             if (wkc == expected_wkc_ && !drive_sync_faulted && drive_present) {
                 ++bringup_op_hold_streak_;
             } else {
@@ -328,17 +315,17 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted, bool drive_present) 
 void Master::process() noexcept {
     const int wkc = backend_->exchange();
     last_wkc_.store(wkc, std::memory_order_relaxed);  // raw, every cycle (diagnostic)
-    // WKC stats (#40 item 4): two relaxed increments per cycle (one conditional). Steady
-    // cycles only -- bringup_step's exchanges are deliberately excluded (partial WKC is
-    // NORMAL pre-OP and would pollute the bad count). Reset in configure().
+    // WKC stats: two relaxed increments per cycle (one conditional). Steady cycles only;
+    // bringup_step's exchanges are excluded, because a partial WKC is normal pre-OP and would
+    // pollute the bad count. Reset in configure().
     total_cycles_.fetch_add(1, std::memory_order_relaxed);
     if (wkc < 0 || wkc < expected_wkc_) {
         bad_cycles_.fetch_add(1, std::memory_order_relaxed);
     }
-    // Post-OP DC settle grace: while it lasts, fully clear the latch state every
-    // cycle, so NOTHING (not even a bad streak during the grace) can carry past the
-    // grace boundary and trip a spurious latch the instant it ends. The DC phase PI
-    // is still pulling into the window; a few partial-processing cycles are benign.
+    // Post-OP DC settle grace: while it lasts, fully clear the latch state every cycle, so no
+    // bad streak during the grace can carry past the grace boundary and trip a spurious latch
+    // the instant it ends. The DC phase PI is still pulling into the window; a few
+    // partial-processing cycles are benign.
     const bool in_grace = settle_remaining_ > 0;
     if (in_grace) {
         --settle_remaining_;
@@ -348,8 +335,8 @@ void Master::process() noexcept {
         if (!in_grace) {
             ++consecutive_wkc_errors_;
             if (consecutive_wkc_errors_ >= config_.max_consecutive_wkc_errors) {
-                // Store the payload (fault_wkc_) first, then publish the flag with a
-                // release store so a reader that acquires fault_==true sees the wkc.
+                // Store the payload (fault_wkc_) first, then publish the flag with a release
+                // store so a reader that acquires fault_ == true sees the wkc.
                 fault_wkc_.store(wkc, std::memory_order_relaxed);
                 fault_.store(true, std::memory_order_release);
                 operational_.store(false, std::memory_order_relaxed);
@@ -449,19 +436,18 @@ FieldLocation Master::resolve_field(const std::map<std::uint32_t, MappedField>& 
     const char* const which = is_tx ? "TxPDO (feedback)" : "RxPDO (command)";
     const auto it = table.find(field_key(index, sub));
     if (it == table.end()) {
-        // NOT-IN-MAP is a MAP-MEMBERSHIP failure -> PdoMappingError ("the map can't satisfy you";
-        // distinct operator fix = "add it to the map"). PdoMappingError spans BOTH apply-time
-        // (apply_pdo_map) and this runtime access of an un-mapped object. A MALFORMED access
-        // (wrong width) throws the base Error below -- deliberately NOT PdoMappingError, so
-        // resolve_rx_optional/resolve_tx_optional don't swallow a wrong-width object as "absent".
+        // Not-in-map is a map-membership failure, so throw PdoMappingError; the operator fixes
+        // it by adding the object to the map. PdoMappingError spans both apply-time
+        // (apply_pdo_map) and this runtime access of an un-mapped object. A wrong-width access
+        // throws the base Error below, not PdoMappingError, so resolve_rx_optional/
+        // resolve_tx_optional do not swallow a wrong-width object as absent.
         throw PdoMappingError("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
                               " is not in the " + which + " map");
     }
-    // #30 §5 width assertion (PROVISIONAL, pending the user's call via team-lead -- built but
-    // trivially removable): the Field's T must match the mapped object's width. Catches a silent
+    // Width assertion: the Field's T must match the mapped object's width. Catches a silent
     // wrong-width access (e.g. an int16 alias against a 32-bit-mapped object would read 2 of 4
-    // bytes in-bounds, no throw). Checked against the INTERNAL table's bit_length (the public
-    // FieldLocation is offset-only post-P2c); build_field_table guarantees bit_length % 8 == 0.
+    // bytes in-bounds, with no throw). Checked against the internal table's bit_length (the
+    // public FieldLocation is offset-only); build_field_table guarantees bit_length % 8 == 0.
     const std::size_t mapped_width = it->second.bit_length / 8U;
     if (mapped_width != want_width) {
         throw Error("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
@@ -472,16 +458,16 @@ FieldLocation Master::resolve_field(const std::map<std::uint32_t, MappedField>& 
 }
 
 void Master::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
-    // #15: the CoE mailbox transfer runs on the CALLER's thread and blocks until it completes. It is
-    // SAFE while the RT PDO loop is running: SOEM v2's port is thread-safe (per-index frame buffers +
-    // PRIO_INHERIT getindex/tx/rx mutexes in nicdrv), and the mailbox SyncManager is distinct from the
-    // PDO SM, so a ONE-SHOT SDO neither corrupts nor -- being one-shot, not a tight poll -- starves the
-    // cyclic LRW. No RT-phase gate, no marshaling through the RT thread (that whole path is gone).
+    // The CoE mailbox transfer runs on the caller's thread and blocks until it completes. It is
+    // safe while the RT PDO loop is running: SOEM v2's port is thread-safe (per-index frame
+    // buffers plus PRIO_INHERIT getindex/tx/rx mutexes in nicdrv), and the mailbox SyncManager
+    // is distinct from the PDO SM, so a one-shot SDO neither corrupts nor (being one-shot, not a
+    // tight poll) starves the cyclic LRW.
     backend_->sdo_write(slave, index, sub, data);
 }
 
 std::size_t Master::sdo_read(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<std::byte> out) {
-    // #15: caller-thread, blocking, RT-concurrent-safe (see sdo_write). Returns bytes read into `out`.
+    // Caller-thread, blocking, RT-concurrent-safe (see sdo_write). Returns bytes read into `out`.
     return backend_->sdo_read(slave, index, sub, out);
 }
 
