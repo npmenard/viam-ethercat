@@ -211,26 +211,6 @@ install(
 # Tools
 #
 
-# ec_scan: standalone EtherCAT bus scanner. Links SOEM directly (no SDK).
-add_executable(ec_scan)
-
-target_sources(ec_scan
-  PRIVATE
-    src/tools/ec_scan.cpp
-)
-
-target_link_libraries(ec_scan
-  PRIVATE
-    soem
-)
-
-viam_apply_wall_werror(ec_scan)
-
-install(
-  TARGETS
-    ec_scan
-)
-
 # slaveinfo: SOEM's own bundled bus-inspection tool, built from the FetchContent
 # source (SOEM's CMake samples are disabled, so we add the target ourselves). It
 # dumps each slave's identity, SM/FMMU config, DC info, and -- with -sdo -- the
