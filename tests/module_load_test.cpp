@@ -46,7 +46,6 @@ using ethercat::PdoEntry;
 using ethercat::SimBackend;
 using ethercat::SimSlaveModel;
 using ethercat::servo::A6ServoDriver;
-using ethercat::servo::ControlMode;
 using ethercat::servo::ServoConfig;
 using ethercat::servo::ServoController;
 using ethercat::servo::ServoMotor;
@@ -150,20 +149,12 @@ TEST("module-load: BOTH models register and their construct/validate functors WO
 TEST("module-load: validate() accepts the sim config and rejects malformed ones with clear text") {
     CHECK(ServoMotor::validate(make_resource_config(load_sim_attrs(), "ok")).empty());
 
-    // Negatives -- Viam surfaces validate() text to the user, so the message must name
-    // the offending field. (a) missing required map, (b) missing required scalar,
-    // (c) a proto TYPE mismatch (control_mode as a number).
-    ProtoStruct no_tx = load_sim_attrs();
-    no_tx.erase("txpdo");
-    CHECK_THROWS_MSG(ServoMotor::validate(make_resource_config(std::move(no_tx), "no-tx")), ConfigError, "txpdo");
-
+    // Negatives -- Viam surfaces validate() text to the user, so the message must name the offending
+    // field. #18: the PDO map + control_mode are NO LONGER config (a fixed driver-defined superset,
+    // always-switchable), so the surviving required datum is the kinematic counts_per_rev.
     ProtoStruct no_cpr = load_sim_attrs();
     no_cpr.erase("counts_per_rev");
     CHECK_THROWS_MSG(ServoMotor::validate(make_resource_config(std::move(no_cpr), "no-cpr")), ConfigError, "counts_per_rev");
-
-    ProtoStruct bad_mode = load_sim_attrs();
-    bad_mode["control_mode"] = ProtoValue(static_cast<double>(1));  // number where a string is required
-    CHECK_THROWS_MSG(ServoMotor::validate(make_resource_config(std::move(bad_mode), "bad-mode")), ConfigError, "control_mode");
 }
 
 TEST("module-load: simulate defaults FALSE -- a config without it routes to real hardware") {
@@ -224,22 +215,21 @@ TEST("module-load: is_moving uses the |delta| completion predicate (go_for moves
     CHECK(!motor.is_moving());  // settled via |target-actual|<=tol, never statusword bit10
 }
 
-TEST("module-load: reconfigure PP -> PV FLIPS the API contract (re-resolves the mode)") {
+TEST("module-load: reconfigure rebuilds the controller; the drive stays always-switchable (#18)") {
     ServoMotor motor{Dependencies{}, make_resource_config(load_sim_attrs(), "recfg-motor")};
     CHECK(wait_until([&] { return status_powered(motor); }, std::chrono::milliseconds(1000)));
-    motor.go_to(1000.0, 1.0, ProtoStruct{});  // PP: go_to is accepted
+    motor.go_to(1000.0, 1.0, ProtoStruct{});  // go_to accepted (never mode-rejected)
     CHECK(std::abs(motor.get_position(ProtoStruct{}) - 1.0) < 0.01);
 
-    // Reconfigure to Profile-Velocity -> stop the old controller, rebuild a fresh
-    // SimBackend-backed one in PV mode (the sim RxPDO maps 0x60FF). The mode must
-    // actually flip: go_to now REJECTS (PP-only) -- proving reconfigure re-resolved
-    // the control mode, not just restarted on the stale resolution.
-    ProtoStruct pv = load_sim_attrs();
-    pv["control_mode"] = ProtoValue(std::string("PV"));
-    motor.reconfigure(Dependencies{}, make_resource_config(std::move(pv), "recfg-motor"));
+    // #18: there is NO control_mode and NO mode-reject -- the drive is ALWAYS switch-capable, so
+    // reconfigure just stops the old controller + rebuilds a fresh one (no mode to re-resolve). After
+    // the rebuild BOTH verbs are accepted: go_to (PP) converges, and set_rpm (PV) is accepted without
+    // a ConfigError (the driver ensures each verb's own mode at runtime).
+    motor.reconfigure(Dependencies{}, make_resource_config(load_sim_attrs(), "recfg-motor"));
     CHECK(wait_until([&] { return status_powered(motor); }, std::chrono::milliseconds(1000)));  // usable after rebuild
-
-    CHECK_THROWS(motor.go_to(1000.0, 2.0, ProtoStruct{}), ConfigError);  // PP-only -> rejected in PV
+    motor.go_to(1000.0, 2.0, ProtoStruct{});                                                    // PP still accepted + converges
+    CHECK(std::abs(motor.get_position(ProtoStruct{}) - 2.0) < 0.01);
+    motor.set_rpm(500.0, ProtoStruct{});  // PV accepted too (always-switchable) -- must NOT throw ConfigError
 }
 
 TEST("module-load: API-after-stop is fail-safe (not powered, last_error doesn't crash)") {
