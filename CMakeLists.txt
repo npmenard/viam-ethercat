@@ -1,4 +1,6 @@
-cmake_minimum_required(VERSION 3.25 FATAL_ERROR)
+# 3.28: FetchContent_Declare(... EXCLUDE_FROM_ALL) in cmake/soem.cmake, and
+# SOEM v2's own cmake_minimum_required is 3.28 -- so this was the real floor already.
+cmake_minimum_required(VERSION 3.28 FATAL_ERROR)
 
 project(
   ethercat
@@ -156,6 +158,13 @@ endif()
 
 enable_testing()
 
+# Umbrella target for every test executable. Tests are EXCLUDE_FROM_ALL so the
+# Conan package build (bin/build.sh), which only needs the module, never
+# compiles them -- and never trips over the host's system protobuf headers
+# shadowing Conan's in test TUs that use protobuf directly. `make test` (and
+# CI) builds this target explicitly before running ctest.
+add_custom_target(build-tests)
+
 
 #
 # The EtherCAT master library
@@ -200,10 +209,15 @@ target_link_libraries(ethercat
 
 viam_apply_wall_werror(ethercat)
 
-install(
-  TARGETS
-    ethercat
-)
+# Install the library only in library-only builds. Module builds feed CPack,
+# and the module.tar.gz must carry just the runtime payload (bin/ + meta.json),
+# not a static lib nobody on the robot can link against.
+if (NOT ETHERCAT_BUILD_MODULE)
+  install(
+    TARGETS
+      ethercat
+  )
+endif()
 
 
 #
@@ -273,6 +287,12 @@ if (ETHERCAT_BUILD_MODULE)
   # NOT in viam_apply_wall_werror -- so genuine enum-constexpr issues in our library
   # TUs still fail. Known boost-mpl issue (boostorg/mpl#69); UR carries the same flag.
   target_compile_options(ethercat-servo PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
+  # gcc 14 (at -O2) reports a known false-positive null-dereference from
+  # boost::asio's scheduler.ipp when its epoll reactor code is inlined into
+  # main.cpp -- the warning escapes system-header suppression because it fires
+  # during inlining. Demote just that warning, GNU-only, module-target-only, so
+  # -Wnull-dereference keeps failing our library TUs everywhere else.
+  target_compile_options(ethercat-servo PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wno-error=null-dereference>)
 
   # DEPLOYMENT runtime story (#TODO-9): statically link libstdc++ + libgcc INTO the
   # shipped module binary. The module is built on noble (gcc-13/14 libstdc++ 13) but
@@ -339,16 +359,19 @@ if (ETHERCAT_BUILD_MODULE)
   # strip is best-effort (a failure leaves a larger-but-working lib, never breaks the package);
   # patchelf stays a hard requirement. Order: strip THEN patchelf (rpath edit is the last write).
   install(CODE [==[
+    set(_ethercat_root "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}")
+    file(GLOB_RECURSE _ethercat_bundled LIST_DIRECTORIES false "${_ethercat_root}/*.so*")
+    # patchelf is only a hard requirement when there ARE bundled shared libs to
+    # stamp. A fully static build (the Conan path: -o:a "*:shared=False" plus
+    # -static-libstdc++) bundles nothing, so it must not demand patchelf.
     find_program(_ethercat_patchelf patchelf)
-    if(NOT _ethercat_patchelf)
+    if(NOT _ethercat_patchelf AND _ethercat_bundled)
       message(FATAL_ERROR "#69: patchelf is required to stamp $ORIGIN into the bundled deps -- install it in the build image")
     endif()
     find_program(_ethercat_strip strip)
-    if(NOT _ethercat_strip)
+    if(NOT _ethercat_strip AND _ethercat_bundled)
       message(WARNING "#16: strip not found -- bundling UNSTRIPPED libs (~181MB of SDK debug info retained). Install binutils to shrink the bundle.")
     endif()
-    set(_ethercat_root "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}")
-    file(GLOB_RECURSE _ethercat_bundled LIST_DIRECTORIES false "${_ethercat_root}/*.so*")
     set(_ethercat_n 0)
     foreach(_so IN LISTS _ethercat_bundled)
       if(NOT IS_SYMLINK "${_so}")
@@ -374,7 +397,7 @@ if (ETHERCAT_BUILD_MODULE)
 
   # Offline validation of the shipped example configs through the real parser +
   # ServoConfig::validate() (JSON -> protobuf::Struct -> ProtoStruct -> parse).
-  add_executable(a6_config_parse_test
+  add_executable(a6_config_parse_test EXCLUDE_FROM_ALL
     tests/a6_config_parse_test.cpp
     src/viam/module/servo_motor.cpp
   )
@@ -393,6 +416,7 @@ if (ETHERCAT_BUILD_MODULE)
   viam_apply_wall_werror(a6_config_parse_test)
   target_compile_options(a6_config_parse_test PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
   add_test(NAME a6_config_parse_test COMMAND a6_config_parse_test)
+  add_dependencies(build-tests a6_config_parse_test)
 
 endif()
 
@@ -404,11 +428,12 @@ endif()
 # library and gets the header-only test harness on its include path.
 
 function(viam_add_test test_name source)
-  add_executable(${test_name} ${source})
+  add_executable(${test_name} EXCLUDE_FROM_ALL ${source})
   target_link_libraries(${test_name} PRIVATE ethercat)
   target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
   viam_apply_wall_werror(${test_name})
   add_test(NAME ${test_name} COMMAND ${test_name})
+  add_dependencies(build-tests ${test_name})
 endfunction()
 
 viam_add_test(pdo_buffer_test tests/pdo_buffer_test.cpp)

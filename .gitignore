@@ -4,6 +4,17 @@ build-tsan/
 install/
 *.tar.gz
 
+# Conan build process (bin/setup.sh + bin/build.sh) working files
+tmp_cpp_sdk/
+protobuf-override.profile
+CMakeUserPresets.json
+conanbuild*.sh
+conanrun*.sh
+deactivate_conan*.sh
+
+# Local architecture-docs site (never committed; served over LAN for the team)
+docs-site/
+
 # Editor / OS cruft
 .vscode/*
 *~

@@ -359,7 +359,7 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
             rt_overrun_logged = true;  // one-shot -- a fault/teardown typically follows within cycles
             (void)std::fprintf(stderr,
                                "[ethercat] RT cycle overrun %.1fms (%u cycles) at cycle %llu -- the SCHED_FIFO RT thread was "
-                               "starved (host contention / page fault / priority inversion); PD gapped, SYNC0 may drop (Er74.1).\n",
+                               "starved (host contention / page fault / priority inversion).\n",
                                static_cast<double>(static_cast<std::uint64_t>(skipped) * period_ns) / 1e6,
                                skipped,
                                static_cast<unsigned long long>(cycle));

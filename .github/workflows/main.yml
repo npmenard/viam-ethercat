@@ -11,23 +11,18 @@ on:
   release:
     types: [published]
 
+# Lean CI, linux/amd64 only for now: every push runs format + lint + build +
+# test inside the project build image. The heavier Conan module build (and the
+# registry publish) only runs for tags, releases, and manual dispatch.
 jobs:
   build-test-lint:
-    name: Build, Test, and Lint (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
+    name: Build, Test, and Lint (amd64)
+    runs-on: ubuntu-latest
     # The container image is built from this repo's Dockerfile and published to
-    # ghcr.io/viam-modules/ethercat:{amd64,arm64}. It ships the clang-19
-    # toolchain, cmake, boost, and a prebuilt viam-cpp-sdk so the module's
+    # ghcr.io/viam-modules/ethercat:amd64. It ships the clang-19 toolchain,
+    # cmake, boost, and a prebuilt viam-cpp-sdk so the module's
     # find_package(viam-cpp-sdk) resolves without a from-source SDK build.
-    container: ghcr.io/viam-modules/ethercat:${{ matrix.arch }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-4cpu-arm
+    container: ghcr.io/viam-modules/ethercat:amd64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,25 +48,15 @@ jobs:
         run: make test
 
   thread-sanitizer:
-    name: ThreadSanitizer (RT boundary, ${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    container: ghcr.io/viam-modules/ethercat:${{ matrix.arch }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # The arm64 leg MUST be a NATIVE arm64 runner (ubuntu-24.04-arm = GitHub's
-        # free native Ampere runner), never qemu. TSan finds data races but NOT
-        # misplaced-fence ORDERING bugs in the seqlock; x86 is TSO and hides
-        # weak-ordering mistakes, and qemu serializes to ~TSO too. So the native
-        # arm64 run is the only authoritative check of the seqlock fence
-        # placement and the TxStaging Dekker (seq_cst) ordering. If a native
-        # arm64 runner is ever unavailable, document it as a known
-        # weak-ordering-coverage gap here -- do NOT substitute an emulated leg.
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
+    name: ThreadSanitizer (RT boundary, amd64)
+    runs-on: ubuntu-latest
+    container: ghcr.io/viam-modules/ethercat:amd64
+    # NOTE: this used to also run on a NATIVE arm64 runner, which is the only
+    # authoritative check of the seqlock fence placement (x86 is TSO and hides
+    # weak-ordering mistakes; qemu serializes to ~TSO too). We only target
+    # linux/amd64 for now, so that leg was dropped -- this is a KNOWN
+    # weak-ordering-coverage gap. If arm64 ever becomes a target again,
+    # restore a native (never emulated) arm64 leg here.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -88,3 +73,92 @@ jobs:
 
       - name: Run TSan tests
         run: ctest --test-dir build-tsan -L tsan --output-on-failure
+
+  build-module:
+    name: Build Module (Conan, linux/amd64)
+    needs: [build-test-lint]
+    # The Conan build compiles boost/grpc/protobuf/the SDK from source, so it
+    # only runs where the artifact is actually needed: tags, releases, and
+    # manual dispatch -- not on every push.
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'release'
+    runs-on: ubuntu-latest
+    container: ubuntu:noble
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt update
+          DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            g++ \
+            git \
+            gnupg \
+            jq \
+            lsb-release \
+            ninja-build \
+            pipx \
+            pkg-config \
+            sudo \
+            wget
+
+      # Install Conan via pipx (not conan-io/setup-conan, for container compatibility)
+      - name: Install Conan
+        run: |
+          pipx install conan
+          pipx ensurepath
+          export PATH="$HOME/.local/bin:${PATH}"
+          conan profile detect
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup C++ SDK
+        run: |
+          export PATH="$HOME/.local/bin:${PATH}"
+          ./bin/setup.sh
+
+      - name: Build module
+        run: |
+          export PATH="$HOME/.local/bin:${PATH}"
+          ./bin/build.sh
+
+      # Attach module.tar.gz to workflow run
+      - name: Attach build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-linux-amd64
+          path: module.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Publish to Viam Module Registry
+    needs: [build-module]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: module-linux-amd64
+
+      - name: Extract meta.json from module archive
+        run: tar -xzf module.tar.gz meta.json
+
+      - name: Upload module to Viam
+        uses: viamrobotics/upload-module@v1
+        with:
+          module-path: module.tar.gz
+          platform: linux/amd64
+          version: ${{ github.ref_name }}
+          key-id: ${{ secrets.VIAM_DEV_API_KEY_ID }}
+          key-value: ${{ secrets.VIAM_DEV_API_KEY }}
+          do-update: ${{ github.event_name == 'release' && !github.event.release.prerelease }}
+          do-upload: ${{ github.event_name == 'release' }}

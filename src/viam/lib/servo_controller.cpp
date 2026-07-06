@@ -319,6 +319,9 @@ void ServoController::reconfigure(ServoConfig config) {
     bump_wake();
     rt_runner_.reset();
     master_.reset();  // safe: Runner (master_'s only cyclic user) is destroyed
+    // A reconfigure IS a full rebuild: consume any pending bus-loss marker so it cannot tear
+    // down the fresh run on the next motion call. A new fault re-latches it as usual.
+    bus_lost_.store(false, std::memory_order_release);
     config_ = std::move(next);
 
     // Restart with the new config (same body as start(), lock already held).
@@ -992,12 +995,75 @@ void ServoController::on_stop(StopReason reason) noexcept {
         // NotOperational) so last_error() names the realtime cause instead of blaming the drive.
         rt_error_.store(RtError::RtSetupFailed, std::memory_order_release);
         degraded_.store(true, std::memory_order_release);
+    } else if (reason == StopReason::BusFault) {
+        // The bus died mid-run (interface down, cable pulled, slave dropped off): mark the loss
+        // RECOVERABLE. The next motion call tears the dead run down and attempts a full rebuild
+        // inline (maybe_recover_bus) -- recovery is API-driven, never a background poll.
+        //
+        // Publish the WKC tier HERE: the steady loop's publish runs before the Runner's fault
+        // check, and once the latch fires every remaining cycle is a stopping-window dispatch --
+        // so without this store last_error() reads EMPTY for the whole outage (HW-caught by the
+        // link-loss test, P3). This is the RT thread, the sole master_ toucher, so the reads are
+        // safe (same as the BringupAborted branch above).
+        state_.fault_wkc.store(master_ != nullptr ? master_->last_wkc() : -1, std::memory_order_relaxed);
+        state_.wkc_faulted.store(true, std::memory_order_release);
+        bus_lost_.store(true, std::memory_order_release);
     }
-    // Requested / BusFault: clean teardown. The steady loop published the bus tier each cycle; parked
-    // waiters are woken by stop()'s notify_all.
+    // Requested: clean teardown; parked waiters are woken by stop()'s notify_all.
+}
+
+// API-driven bus recovery: no background reconnect loop by design (a motor that lost its bus must
+// not re-energize on its own schedule; it re-energizes when an operator/client asks it to move).
+// A motion verb called after a bus loss lands here first: tear down the dead run -- the exited RT
+// thread and the Master holding the stale socket -- then attempt ONE full rebuild (open, configure
+// to SAFE-OP, bring-up to OP) inline in the caller. While the interface is still down the rebuild
+// fails at open() in milliseconds and the call returns a clear error; once the link is back a call
+// rebuilds, then executes its motion normally. The client's retry loop is the reconnect policy;
+// the controller stays alive and queryable (fail-safe reads, last_error) throughout.
+void ServoController::maybe_recover_bus() {
+    if (!bus_lost_.load(std::memory_order_acquire)) {
+        return;
+    }
+    const std::unique_lock<std::shared_mutex> lk(api_mutex_);
+    if (!bus_lost_.load(std::memory_order_acquire)) {
+        return;  // another caller already recovered the bus
+    }
+    // Full teardown before rebuilding: join the exited RT thread, close the stale socket. Same
+    // shape as reconfigure(); the rebuild must start from nothing so open() gets a fresh handle.
+    stopping_.store(true, std::memory_order_release);
+    bump_wake();
+    rt_runner_.reset();
+    master_.reset();
+    // Clear the marker BEFORE the rebuild spawns: a NEW bus fault during or right after bring-up
+    // re-latches it on the RT thread, and clearing afterwards could overwrite that latch.
+    bus_lost_.store(false, std::memory_order_release);
+    try {
+        master_ = std::make_unique<Master>(build_master_config(config_), std::make_unique<SoemBackend>());
+        master_->init();
+        master_->configure();  // -> SAFE-OP
+        bring_up();            // -> OP with bounded retry (gives up by setting degraded_)
+    } catch (const Error& e) {
+        // Rebuild failed outright (typically: the interface is still down). Stay torn down and
+        // recoverable; the next motion call retries.
+        rt_runner_.reset();
+        master_.reset();
+        bus_lost_.store(true, std::memory_order_release);
+        throw Error("bus lost and recovery failed (" + std::string(e.what()) + ") -- will retry on the next motion call");
+    }
+    if (degraded_.load(std::memory_order_acquire)) {
+        // bring_up() exhausted its attempts: the bus enumerates but the drive would not reach OP.
+        // Stay torn down and recoverable rather than parked on a half-alive master.
+        const std::string cause = last_error();
+        rt_runner_.reset();
+        master_.reset();
+        bus_lost_.store(true, std::memory_order_release);
+        throw Error("bus lost and recovery failed (" + cause + ") -- will retry on the next motion call");
+    }
+    (void)std::fprintf(stderr, "[servo] bus recovered -- drive back to OPERATIONAL\n");
 }
 
 void ServoController::set_rpm(double rpm) {
+    maybe_recover_bus();
     const std::shared_lock<std::shared_mutex> lk(api_mutex_);
     if (degraded_.load(std::memory_order_acquire)) {  // §8 Degraded-but-alive: motion APIs throw, never act
         throw Error("set_rpm unavailable: " + (degraded_reason_.empty() ? last_error() : degraded_reason_));
@@ -1094,6 +1160,7 @@ void ServoController::await_move(std::uint32_t generation) {
 }
 
 void ServoController::go_to(double rpm, double position) {
+    maybe_recover_bus();
     std::uint32_t g = 0;
     {
         const std::shared_lock<std::shared_mutex> lk(api_mutex_);
@@ -1118,6 +1185,7 @@ void ServoController::go_to(double rpm, double position) {
 }
 
 void ServoController::go_for(double rpm, double revs) {
+    maybe_recover_bus();
     // Always switch-capable: go_for is always a relative PP move (ensure PP, target = actual + delta).
     // set_rpm remains the PV-jog verb.
     std::uint32_t g = 0;

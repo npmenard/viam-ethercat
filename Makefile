@@ -13,12 +13,10 @@
 	clean \
 	clean-all \
 	docker-amd64 \
-	docker-arm64 \
 	docker-build \
 	docker-upload \
 	docker \
-	docker-amd64-ci \
-	docker-arm64-ci
+	docker-amd64-ci
 
 # Build the Viam module (and pull in viam-cpp-sdk) by default. Set to OFF to
 # build only the library, tools, and pure tests without the SDK:
@@ -50,8 +48,11 @@ build: configure
 install: build
 	DESTDIR=build/install cmake --install build --prefix /
 
+# Test executables are EXCLUDE_FROM_ALL (so the Conan package build skips
+# them); build them explicitly before running ctest.
 test: build
-	CTEST_OUTPUT_ON_FAILURE=1 cmake --build build --target test
+	cmake --build build --target build-tests -- -j4
+	ctest --test-dir build --output-on-failure
 
 package: format-check install
 	cmake --build build --target package
@@ -79,7 +80,7 @@ clean:
 clean-all:
 	git clean -fxd
 
-# Docker
+# Docker (linux/amd64 only for now)
 BUILD_CMD = docker buildx build --pull $(BUILD_PUSH) --force-rm --build-arg MAIN_TAG=$(MAIN_TAG) \
 	--build-arg BASE_TAG=$(BUILD_TAG) --platform linux/$(BUILD_TAG) -f $(BUILD_FILE) -t '$(MAIN_TAG):$(BUILD_TAG)' .
 BUILD_PUSH = --load
@@ -90,28 +91,16 @@ docker-amd64: BUILD_TAG = amd64
 docker-amd64:
 	$(BUILD_CMD)
 
-docker-arm64: MAIN_TAG = ghcr.io/viam-modules/ethercat
-docker-arm64: BUILD_TAG = arm64
-docker-arm64:
-	$(BUILD_CMD)
-
-docker-build: docker-amd64 docker-arm64
+docker-build: docker-amd64
 
 docker-upload:
 	docker push 'ghcr.io/viam-modules/ethercat:amd64'
-	docker push 'ghcr.io/viam-modules/ethercat:arm64'
 
 docker: docker-build docker-upload
 
-# CI targets that automatically push; avoid for local test-first-then-push flows.
+# CI target that automatically pushes; avoid for local test-first-then-push flows.
 docker-amd64-ci: MAIN_TAG = ghcr.io/viam-modules/ethercat
 docker-amd64-ci: BUILD_TAG = amd64
 docker-amd64-ci: BUILD_PUSH = --push
 docker-amd64-ci:
-	$(BUILD_CMD)
-
-docker-arm64-ci: MAIN_TAG = ghcr.io/viam-modules/ethercat
-docker-arm64-ci: BUILD_TAG = arm64
-docker-arm64-ci: BUILD_PUSH = --push
-docker-arm64-ci:
 	$(BUILD_CMD)

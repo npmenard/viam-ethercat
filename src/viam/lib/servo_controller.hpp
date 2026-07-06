@@ -123,6 +123,10 @@ class ServoController : public SlaveControl {
     void reconfigure(ServoConfig config);  // stop() -> rebuild master_ from the factory -> start()
 
     // --- non-RT motor API (shared api_mutex_; go_to/go_for release before park) ---
+    // After a bus loss (NIC down, cable pulled -- StopReason::BusFault), the motion verbs first
+    // attempt an inline full rebuild (maybe_recover_bus): they throw a clear error while the bus
+    // is still gone and succeed again once it is back, so a client retry loop IS the reconnect
+    // policy. No background reconnect thread.
     void set_rpm(double rpm);                 // PV only (rejects in PP)
     void go_for(double rpm, double revs);     // PP: relative move; PV: timed run
     void go_to(double rpm, double position);  // PP only (rejects in PV)
@@ -272,6 +276,10 @@ class ServoController : public SlaveControl {
     // thread is still the single port owner (after Master::configure(), before the RT thread
     // spawns). Best-effort: a failed clear is logged, not fatal. nullopt seam means no-op.
     void run_vendor_fault_reset();
+    // Inline bus recovery, called by the motion verbs BEFORE their shared lock: no-op unless
+    // bus_lost_; otherwise (exclusive lock) tear down the dead run and attempt one full rebuild,
+    // throwing a clear "will retry on the next motion call" Error while the bus stays gone.
+    void maybe_recover_bus();
     bool rt_alive() const noexcept;  // !rt_exited_ && !faulted (event-based, no clock; master_-free)
     void bump_wake() noexcept;       // wake every parked await_move waiter (C++20 atomic notify)
 
@@ -343,6 +351,11 @@ class ServoController : public SlaveControl {
     // stop, and on_stop, and await_move blocks on it (no timeout, no condvar). Both lock-free.
     std::atomic<bool> rt_exited_{false};
     std::atomic<std::uint64_t> wake_seq_{0};
+    // Bus-loss marker (RT-latched by on_stop(StopReason::BusFault), lock-free). While set, the
+    // motion verbs route through maybe_recover_bus() -- teardown of the dead run + one inline
+    // rebuild attempt per call. Cleared before a rebuild spawns (so a NEW bus fault during or
+    // right after the rebuild re-latches it and is never lost) and re-set on a failed attempt.
+    std::atomic<bool> bus_lost_{false};
     // Degraded-but-alive: set when start()/bring-up fails (RT-spawn, on_configured refusal, or
     // drive AL-reject) -- motion APIs throw degraded_reason_, accessors fail-safe, and the process
     // never crashes; reconfigure()/start() clear it on a clean retry. degraded_ (lock-free) gates

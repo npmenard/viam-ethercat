@@ -47,12 +47,18 @@ set(ETHERCAT_SOEM_GIT_TAG "b410bf6ef599d5c85302ea45cae5f55f8e9aa394")
 # it cannot shadow anything that still reads the cache.
 unset(ETHERCAT_SOEM_GIT_TAG CACHE)
 
+# EXCLUDE_FROM_ALL keeps SOEM's own install() rules out of OUR install tree --
+# without it, module.tar.gz grows libsoem.a, the soem/ headers, its cmake
+# configs, AND SOEM's README.md/LICENSE.md at the package root (shadowing
+# ours). The soem target still builds on demand as a dependency of libethercat.
+# (Requires CMake >= 3.28, which SOEM's own cmake_minimum_required demands anyway.)
 FetchContent_Declare(
   soem
   GIT_REPOSITORY https://github.com/OpenEtherCATsociety/SOEM
   GIT_TAG ${ETHERCAT_SOEM_GIT_TAG}
   GIT_SHALLOW FALSE
   SYSTEM
+  EXCLUDE_FROM_ALL
 )
 
 FetchContent_MakeAvailable(soem)
