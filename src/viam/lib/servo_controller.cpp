@@ -28,12 +28,13 @@ constexpr std::uint16_t kProfileVel = 0x6081;   // PP move speed (carries the Go
 constexpr std::uint16_t kModeOfOp = 0x6060;     // runtime mode-of-operation (RxPDO); present means PV->PP hold-switch
 constexpr std::uint16_t kModeDisplay = 0x6061;  // mode display (TxPDO); present means enable-time mode-echo gate
 constexpr std::uint16_t kFaultCode = 0x603F;    // drive error code (TxPDO, optional feedback)
-// The A6's "no-SYNC0" code (0x8700 / Er74.1) is config data (ServoConfig::sync_fault_code),
-// not a constant here, so this generic core carries no vendor value. The bring-up gate reads
-// it from config (nullopt means no detection).
+// A drive's "no-sync" fault code is a device seam (sync_fault_code(), nullopt in this generic
+// base), not a constant here, so this core carries no vendor value. The bring-up gate reads it
+// through the seam (nullopt means no detection).
 constexpr std::uint16_t kVelActual = 0x606C;  // velocity actual value (TxPDO, optional feedback)
 // Controlled-stop watchdog headroom: the teardown window and velocity budget reserve this much
-// time below the full window so the ramp finishes before close() (A6 sync watchdog ~50ms).
+// time below the full window so the ramp finishes before close() (a slave's sync/SM watchdog is
+// typically a few tens of ms).
 constexpr double kStopWindowMarginS = 0.05;
 // Driver-owned mode-switch bounds (cycles; internal constants, no config knob -- the switch is a
 // bounded hold, never a de-energize deadline). kModeSwitchStopCycles: max cycles to ramp the current
@@ -43,7 +44,8 @@ constexpr std::uint32_t kModeSwitchStopCycles = 1000;
 constexpr std::uint32_t kModeSwitchSettleCycles = 200;
 // Bring-up retry: attempt OP up to this many times, clearing drive errors and rebuilding the master
 // (INIT bounce) between attempts. Bounded, because a persistent fault must give up rather than hammer
-// (a repeated Er74 OP-entry can wedge the A6). kBringupWaitCap is a defensive backstop above the
+// (repeated failed OP entries wedge some drives' EtherCAT interface until a power cycle).
+// kBringupWaitCap is a defensive backstop above the
 // Runner's own bring-up bound (120s), so the async-outcome poll never hangs if a signal is missed.
 constexpr unsigned kMaxBringupAttempts = 5;
 constexpr std::chrono::milliseconds kBringupWaitCap{130'000};
@@ -114,7 +116,7 @@ std::string rt_unavailable_message(int priority) {
 
 // The device fault-reset seam (vendor_fault_reset_sdo()) run once pre-RT-spawn, while this thread
 // is still the single port owner (after Master::configure(), before the RT thread spawns). The
-// vendor datum (A6: 0x2031:01 = 1) is carried by the subclass, never config. Best-effort: a failed
+// vendor datum is carried by the device subclass, never config. Best-effort: a failed
 // clear is logged, not fatal, and the bring-up gate still guards OP entry.
 void ServoController::run_vendor_fault_reset() {
     const std::optional<SdoWrite> reset = vendor_fault_reset_sdo();
@@ -223,7 +225,7 @@ void ServoController::spawn_runner() {
     RunnerConfig rc;
     rc.rt_priority = config_.rt_priority;
     rc.require_realtime = config_.require_realtime;
-    // The Er74 OP-entry gate (bringup_step -> Aborted) decides a failed bring-up, not this wall
+    // The sync-fault OP-entry gate (bringup_step -> Aborted) decides a failed bring-up, not this wall
     // bound; keep it well above Master's own op-await window (the pump backstop).
     rc.bringup_timeout = std::chrono::milliseconds(120'000);
     // Teardown window: for a controlled quick-stop (quick_stop_decel>0) size it to the controlled-stop
@@ -247,7 +249,7 @@ void ServoController::spawn_runner() {
 // (run_vendor_fault_reset). A failed attempt -- bring-up aborted by intermittent enumeration,
 // mailbox-not-ready, or a transient sync miss -- is recovered by a full master rebuild (INIT bounce,
 // PRE-OP settle, DC re-arm), requesting OP exactly once per attempt rather than an OP re-request
-// hammer that would wedge the A6. After kMaxBringupAttempts the drive stays Degraded with the AL/fault
+// hammer (which wedges some drives). After kMaxBringupAttempts the drive stays Degraded with the AL/fault
 // surfaced by on_stop. The caller holds the exclusive api_mutex_ and has already built and configured
 // master_ (SAFE-OP) for the first attempt.
 void ServoController::bring_up() {
@@ -358,7 +360,7 @@ void ServoController::resolve_fields() {
     f_fault_code_ = txpdo_has(kFaultCode) ? master_->tx_field(s, kFaultCode, 0) : FieldLocation{};
     f_velocity_actual_ = txpdo_has(kVelActual) ? master_->tx_field(s, kVelActual, 0) : FieldLocation{};
     // Enable-ladder mode fields: 0x6060 (write, seed the mode through the ladder) is present only in a
-    // PDO-mapped-0x6060 map; 0x6061 (read, the mode-echo gate) is present in the A6 production map. Both
+    // PDO-mapped-0x6060 map; 0x6061 (read, the mode-echo gate) is present in the fixed superset map. Both
     // optional, so !mapped() makes the respective enable-ladder step inert.
     f_mode_wr_ = rxpdo_has(kModeOfOp) ? master_->rx_field(s, kModeOfOp, 0) : FieldLocation{};
     f_mode_disp_ = txpdo_has(kModeDisplay) ? master_->tx_field(s, kModeDisplay, 0) : FieldLocation{};
@@ -451,7 +453,7 @@ bool ServoController::position_stable(std::int32_t actual) noexcept {
     // real motion widens the range, so it reads not stable. A not-yet-full window is not stable
     // (still settling). O(N), N ~ 20ms of cycles. N (~20ms) and the tolerance (0.5deg) jointly set
     // two floors: (1) noise-immunity -- the drive's position jitter over the window must stay below
-    // the tolerance (true for the A6: sub-count dither << 182 counts), else at-rest would read
+    // the tolerance (encoder dither is normally orders of magnitude below it), else at-rest would read
     // "moving"; (2) min-detectable velocity ~ tolerance/(N*cycle) ~ 182/(20ms) ~ 9100 c/s ~ 4 rpm, so
     // a creep slower than that reads "stopped". That is intended for a servo (reached is still guarded
     // by |actual-target| <= tolerance, so a slow move far from target is not false-reached). Widen N
@@ -553,8 +555,9 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // Order-preserving: the sticky halt latches (and the PV->PP hold arms) only when the halt is the
         // latest stop-relevant command in this batch. If a motion command was issued after the halt in the
         // same drain (Stop() then GoTo() coalesced), that move supersedes the halt, so halted_ stays clear
-        // (already set false above) and the move runs, instead of being wedged under Halt (cw 0x011F, which
-        // the A6 never acks). A halt in its own batch has halt_supersedes == true (the common case).
+        // (already set false above) and the move runs, instead of being parked under Halt (cw 0x011F,
+        // whose bit-4 edge drives never ack). A halt in its own batch has halt_supersedes == true (the
+        // common case).
         if (batch.halt_supersedes) {
             halted_ = true;  // sticky: stays asserted across cycles until a new motion command
             // On a switch-capable PV map, hold position via PP (below). The driver mode-switch brings
@@ -618,7 +621,7 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         }
         // Mode-echo gate, in the module's own ladder: once the drive is SwitchedOn the commanded mode
         // should be adopted (SDO-set at configure, or PDO-seeded above), so require 0x6061 == commanded
-        // before energizing to OperationEnabled. A mismatch (the A6 silently ignored the mode) latches
+        // before energizing to OperationEnabled. A mismatch (the drive silently ignored the mode) latches
         // Failed, de-energizes, and sets RtError::ModeMismatch (last_error), sticky so there is no
         // ReadyToSwitchOn <-> SwitchedOn oscillation. Inert when 0x6061 is not mapped. Mirrors the
         // policy's gate, which the module never reaches (it delegates to the policy only post-OperationEnabled).
@@ -779,9 +782,9 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
 
     // Reach and rest signals. position_stable must be called once per cycle (it advances the ring),
     // so evaluate it unconditionally; its verdict feeds at_rest_ (the mode-switch stop-first gate) and
-    // the A6 reach heuristic. The move-complete predicate is a driver seam (reached_target): the
-    // generic base trusts statusword bit 10; A6ServoDriver overrides to the position-stability
-    // heuristic because the A6 ties bit 10 high. velocity_threshold>0 stays an optional PV is-moving gate.
+    // the reach heuristic. The move-complete predicate is a driver seam (reached_target): the
+    // generic base trusts statusword bit 10; a device subclass overrides to the position-stability
+    // heuristic for drives that tie bit 10 high. velocity_threshold>0 stays an optional PV is-moving gate.
     const bool pos_stable = position_stable(actual);
     at_rest_ = pos_stable;  // the driver's rest verdict, read (1-cycle stale) by run_mode_switch's stop-first gate
     const bool pos_near_target = std::abs(actual - target_counts_) <= config_.position_tolerance_counts;
@@ -802,7 +805,7 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
         bump_wake();
     }
 
-    // Per-tier fault publish. last_error() composes every active tier, so a both-true Er74 (drive
+    // Per-tier fault publish. last_error() composes every active tier, so a both-true sync-loss (drive
     // 0x603F plus bus WKC -> 0) reports root cause and symptom. In each tier the payload is
     // relaxed-stored before the flag is release-stored, so a master_-free reader never sees a true
     // flag with a stale payload (cross-tier skew is benign: fault state is quasi-static once latched).
@@ -866,7 +869,7 @@ void ServoController::on_operational(CycleContext& ctx) noexcept {
 
 bool ServoController::drive_present(const CycleContext& ctx) const noexcept {
     // OP-confirm gate: a live drive populates a non-zero statusword; a drive that zombie-PDOs (a
-    // DC-only A6 requested into OP under free-run -- AL 0x0027, dead TxPDO) leaves it 0x0. Gating
+    // DC-only drive requested into OP under free-run -- AL 0x0027, dead TxPDO) leaves it 0x0. Gating
     // OP-confirm on this makes bring-up give up (BringupAborted, with the AL-status diagnostic) instead
     // of reaching OP on a full-WKC-but-dead drive and spinning the enable ladder forever.
     return ctx.load<cia402::Statusword::type>(f_statusword_) != 0;
@@ -954,7 +957,7 @@ void ServoController::on_stop(StopReason reason) noexcept {
     bump_wake();
     if (reason == StopReason::BringupAborted) {
         // Bring-up gave up, with two independent possible causes, both surfaced: (1) the DC-sync
-        // gate -- 0x603F == the configured no-sync code (Er74.1) held, the SYNC0-didn't-take case;
+        // gate -- 0x603F == the configured no-sync code held, the SYNC0-didn't-take case;
         // (2) the ESC AL status code -- the drive refused an AL transition, e.g. AL 0x0027 "Freerun
         // not supported" when a DC-only drive is requested into OP without SYNC0
         // (use_distributed_clocks=false).
@@ -1297,15 +1300,15 @@ double ServoController::rated_current_amps() const noexcept {
 
 std::string ServoController::fault_description(std::uint16_t /*code*/) const {
     // The generic base has no device gloss, so it returns empty and last_error() shows just the bare
-    // hex (never wrong, just less descriptive). A device subclass (A6ServoDriver) overrides this to
-    // name its codes (0x8700 -> "Er74.1 / no SYNC0"). Cold path.
+    // hex (never wrong, just less descriptive). A device subclass overrides this to name its
+    // vendor codes. Cold path.
     return {};
 }
 
 std::string ServoController::last_error() const {
     // Cold but lock-free and master_-free (symmetric with is_powered/is_moving): read the three
     // published tier flags (acquire) and their payloads, composing every active tier so a both-true
-    // Er74 reports root cause and symptom. (fault_description reads config_, taking the shared lock,
+    // sync-loss reports root cause and symptom. (fault_description reads config_, taking the shared lock,
     // which is fine on this non-RT path.)
     std::string out;
     const auto append = [&out](const std::string& s) {

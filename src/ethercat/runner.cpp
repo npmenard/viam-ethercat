@@ -314,10 +314,7 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
     bool stopping = false;
     std::uint32_t window_left = 0;
     // RT-overrun instrument: pace() returns how many whole periods it had to skip to catch up
-    // (0 is healthy). A multi-cycle skip means the SCHED_FIFO RT thread was starved (host
-    // contention, page fault, priority inversion) and process data gapped that long, which
-    // gaps LRW and can drop SYNC0 (Er74.1). The first significant one is logged to stderr; the
-    // worst so far is tracked for the post-run summary.
+    // (0 is healthy).
     constexpr std::uint64_t kRtOverrunReportNs = 5'000'000;  // >=5ms starvation is abnormal at any sane rate
     bool rt_overrun_logged = false;
     std::uint32_t rt_overrun_worst = 0;

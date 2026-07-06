@@ -7,8 +7,8 @@
 // published ControllerState atomics. The behaviors the library leaves to the driver live here:
 //   (a) fault-reset rising-edge re-arm (Cia402Fsm::step returns the level),
 //   (b) staleness -> fail-safe is_powered()/is_moving(),
-//   (c) is-moving/reached: the generic base trusts statusword bit 10; A6ServoDriver overrides
-//       reached_target() with a position-stability heuristic because the A6 ties bit 10 high,
+//   (c) is-moving/reached: the generic base trusts statusword bit 10; a device subclass
+//       overrides reached_target() for drives that tie bit 10 permanently high,
 //   (d) the runtime mode-switch orchestration (run_mode_switch), and
 //   (e) the std::variant lifecycle FSM.
 //
@@ -66,7 +66,7 @@ struct ControllerState {
     std::atomic<bool> faulted{false};  // drive/bus only: master_->fault() || status.fault() (move errors are the controller tier, not here)
     std::atomic<std::int32_t> fault_wkc{0};     // WKC at a live bus fault (payload; published before the wkc_faulted release)
     std::atomic<std::int32_t> expected_wkc{0};  // constant after start(); for last_error() (lock-free, master_-free)
-    // Per-tier fault liveness: last_error() composes every active tier, so a both-true Er74
+    // Per-tier fault liveness: last_error() composes every active tier, so a both-true sync-loss
     // (drive 0x603F plus bus WKC -> 0) reports root cause and symptom without masking either. In
     // each (flag, payload) pair the payload is relaxed-stored before the flag is release-stored
     // (RT, sole writer); cross-tier skew is benign.
@@ -107,13 +107,14 @@ class ServoController : public SlaveControl {
     // start() succeeding means the RT thread is launched and scheduled, not that the drive is
     // operational or powered. The DC bring-up must be gapless, so OP is reached inside the RT
     // loop (configure() stops at SAFE-OP; it cannot reach OP without gapping the process-data
-    // handoff, which would fault Er74), and start() cannot block until OP. It throws synchronously
+    // handoff, which would sync-fault the drive), and start() cannot block until OP. It throws synchronously
     // only on what it can guarantee up front: that the RT loop can run (realtime setup plus
     // require_realtime), via the started-promise. The DC bring-up outcome is observed asynchronously:
     //   - reached OP: is_operational() / is_powered() become true;
-    //   - aborted: Er74.1 (no SYNC0) in the gate, so the RT loop surfaces the drive tier and
+    //   - aborted: the no-sync fault held in the gate, so the RT loop surfaces the drive tier and
     //              RtError::NotOperational via last_error() and exits without auto-retry (repeated
-    //              Er74 OP-entry wedges the A6); recovery is an explicit reconfigure() or restart.
+    //              failed OP entries wedge some drives); recovery is an explicit reconfigure() or
+    //              restart.
     // A command issued before OP and enabled degrades gracefully: await_move() blocks until the RT
     // loop exits or the drive faults, rather than acting on a non-operational drive.
     void start();
@@ -177,30 +178,30 @@ class ServoController : public SlaveControl {
 
    protected:
     // --- Device seams. The base is the generic CiA402 servo driver; a device subclass
-    // (A6ServoDriver) overrides these to add its vendor specifics. All three are consulted only
+    // overrides these to add its vendor specifics. All three are consulted only
     // outside the constructor (start()/reconfigure()/RT loop), so a subclass override dispatches
     // normally (no virtual-during-construction trap). ---
     //
     // Vendor fault-reset SDO, run once pre-RT-spawn (single port owner). nullopt (base) means no
-    // vendor reset: the standard CiA402 controlword bit-7 in-loop path is the only reset. The A6's
-    // reset is a vendor SDO write of 1 to 0x2031:01, not bit 7.
+    // vendor reset: the standard CiA402 controlword bit-7 in-loop path is the only reset.
+    // Workaround seam for drives whose faults clear only through a proprietary SDO, not bit 7.
     virtual std::optional<ethercat::SdoWrite> vendor_fault_reset_sdo() const {
         return std::nullopt;
     }
     // The drive's "SYNC0 not yet established" 0x603F code, fed to the DC bring-up gate and the
     // on_stop diagnostic. nullopt (base) means no sync-fault detection (the gate signal is always
-    // false). The A6's is 0x8700 (Er74.1 "no SYNC0").
+    // false).
     virtual std::optional<std::uint16_t> sync_fault_code() const noexcept {
         return std::nullopt;
     }
     // 0x603F code to human label for last_error() (cold path). Empty (base) means bare hex, so the
-    // line is never wrong, just less descriptive. The A6 glosses its 0x8700 as "Er74.1 / no SYNC0".
+    // line is never wrong, just less descriptive; a subclass glosses its vendor codes.
     virtual std::string fault_description(std::uint16_t code) const;
     // Move-complete seam (the driver owns is-moving/reached, not the policy). Given this cycle's
     // "actual is within tolerance of target", "the shaft is position-stable", and the statusword,
     // decide whether a PP move has reached. The generic base trusts the drive's statusword bit 10
-    // (target-reached); A6ServoDriver overrides to `pos_near_target && pos_stable` because the A6
-    // ties bit 10 permanently high. RT-only (publish_state); position_stable() has already advanced
+    // (target-reached); a device subclass overrides to `pos_near_target && pos_stable` for drives
+    // that tie bit 10 permanently high. RT-only (publish_state); position_stable() has already advanced
     // its ring this cycle, so an override composes the two booleans and must not call
     // position_stable() again.
     virtual bool reached_target(bool pos_near_target, bool pos_stable, Status status) noexcept {
@@ -209,7 +210,7 @@ class ServoController : public SlaveControl {
         return status.target_reached();
     }
     // Noise-robust "shaft is still" heuristic: stable once the last N cycles' position range is
-    // within position_tolerance_counts. Protected so the A6 reach override can compose it. Advances
+    // within position_tolerance_counts. Protected so a subclass reach override can compose it. Advances
     // a ring, so call exactly once per cycle (publish_state does).
     bool position_stable(std::int32_t actual) noexcept;
 
@@ -299,7 +300,7 @@ class ServoController : public SlaveControl {
     // OperationEnabled, so it must itself (a) seed 0x6060 = commanded mode through the ladder when
     // 0x6060 is RxPDO-mapped (else a PDO-following drive enables in mode 0), and (b) enforce the
     // mode-echo gate when 0x6061 is TxPDO-mapped (refuse OperationEnabled if 0x6061 != commanded;
-    // the A6 production map does map 0x6061). Both !mapped() means the respective step is inert.
+    // the fixed superset map does map 0x6061). Both !mapped() means the respective step is inert.
     FieldLocation f_mode_wr_;    // 0x6060 mode-of-operation (RxPDO write); !mapped() means SDO-set only
     FieldLocation f_mode_disp_;  // 0x6061 mode-display (TxPDO read); !mapped() means no mode-echo gate
     // Enable-time mode-echo gate state (RT-only). Sticky once resolved so the drive does not
@@ -313,7 +314,7 @@ class ServoController : public SlaveControl {
     FieldLocation f_fault_code_;       // 0x603F U16 drive error code (last_error gloss)
     FieldLocation f_velocity_actual_;  // 0x606C S32 velocity-actual (wire velocity; else estimate)
 
-    // The generic CiA402 motion policy (shared with a6_validate's A6Control). The module's
+    // The generic CiA402 motion policy (shared with the bench validation tool). The module's
     // Operational healthy-path (enable-hold, PP handshake, PV stream, Halt) delegates here; the
     // wrapper keeps the two-tier fault, fault-reset machine, completion generations, the driver
     // mode-switch, and is-moving/reached. Constructed with just the quick-stop decel value.
@@ -380,7 +381,7 @@ class ServoController : public SlaveControl {
     std::vector<std::int32_t> pos_hist_;
     std::size_t pos_hist_idx_ = 0;
     std::uint32_t pos_hist_filled_ = 0;  // entries written so far (window not "full" until == pos_hist_.size())
-    // (position_stable() is declared protected above so the A6 reach override can compose it.)
+    // (position_stable() is declared protected above so a subclass reach override can compose it.)
     // The Cia402 mode to command this cycle: the fixed config mode (PP/PV) or, for a switchable
     // config, the current switch_intent_. RT-only (reads switch_intent_).
     Cia402Mode commanded_cia402_mode() const noexcept;

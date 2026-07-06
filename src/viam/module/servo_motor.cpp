@@ -85,7 +85,7 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     c.require_realtime = opt_attr<bool>(attrs, "require_realtime").value_or(true);
     c.rt_priority = static_cast<int>(opt_num(attrs, "rt_priority", 80.0));
     c.use_distributed_clocks = opt_attr<bool>(attrs, "use_distributed_clocks").value_or(false);
-    // Optional drive datum: the SYNC0 cycle granularity the drive accepts (A6: 250000 ns). When set,
+    // Optional drive datum: the SYNC0 cycle granularity the drive accepts (e.g. 250000 ns). When set,
     // the Master validates loop rate vs granularity at config time (clear text) instead of the drive
     // rejecting the cycle cryptically at OP entry.
     c.sync_cycle_granularity_ns = static_cast<std::uint32_t>(opt_num(attrs, "sync_cycle_granularity_ns", 0.0));

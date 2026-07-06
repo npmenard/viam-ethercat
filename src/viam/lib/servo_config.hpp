@@ -40,9 +40,9 @@ struct ServoConfig {
 
     // --- motor limits ---
     double max_motor_speed_rpm = 0.0;       // >= 0; the speed clamp
-    double motor_rated_current_amps = 0.0;  // > 0 (A6 datum; do_command's per-mille current readback)
+    double motor_rated_current_amps = 0.0;  // > 0 (nameplate datum; scales per-mille current readbacks)
     double gear_ratio = 1.0;                // motor revs per output rev; != 0
-    double counts_per_rev = 0.0;            // encoder counts per motor rev; > 0 (A6 = 131072)
+    double counts_per_rev = 0.0;            // encoder counts per motor rev; > 0 (e.g. 2^17 = 131072)
 
     // do_command SDO reads target the fixed standard CiA402 objects (0x6079/0x6078/0x6502) in the
     // module handler (see servo_motor.cpp read_std_sdo).
@@ -57,20 +57,20 @@ struct ServoConfig {
     bool require_realtime = true;              // hard-fail if RT scheduling unavailable
     int rt_priority = 80;                      // SCHED_FIFO priority, 1..99
     // op_await_timeout_ms is not a config knob; MasterConfig's fixed 30s default applies.
-    // Enable Distributed-Clock SYNC0. Required by drives that support only DC sync (the A6-EC faults
-    // out of OP -- Er74.1 "no sync signal", WKC -> 0 -- without it). The SYNC0 cycle =
-    // 1e9 / target_loop_rate_hz; that period must be a value the drive accepts (A6: an integer
-    // multiple of 250 us, so use 1000/500/250 Hz).
+    // Enable Distributed-Clock SYNC0. Required by drives that support only DC sync (a DC-only
+    // drive refuses free-run OP, or sync-faults out of OP with WKC -> 0). The SYNC0 cycle =
+    // 1e9 / target_loop_rate_hz; that period must be a value the drive accepts (some drives allow
+    // only integer multiples of a base tick -- see sync_cycle_granularity_ns).
     bool use_distributed_clocks = false;
-    // Optional SYNC0 cycle granularity the drive accepts, in ns (config data; A6: 250000). When set
-    // (and DC is on), the Master validates the loop rate against it at config time with clear text
-    // and nearest valid rates, instead of the drive rejecting the cycle cryptically at OP entry (A6
-    // Er74.0). 0 = none.
+    // Optional SYNC0 cycle granularity the drive accepts, in ns (config data; e.g. 250000 for a
+    // 250 us base tick). When set (and DC is on), the Master validates the loop rate against it at
+    // config time with clear text and nearest valid rates, instead of the drive rejecting the
+    // cycle cryptically at OP entry. 0 = none.
     std::uint32_t sync_cycle_granularity_ns = 0;
     // The drive "no-sync" 0x603F code, the vendor fault-reset SDO, and the 0x603F->label gloss are
-    // not config data. They are device knowledge, carried by a ServoController subclass
-    // (A6ServoDriver) via its overridable seams. The generic base drives standard CiA402 only. PDO
-    // map, limits, and kinematics stay per-machine config below.
+    // not config data. They are device knowledge, carried by a ServoController subclass via its
+    // overridable seams. The generic base drives standard CiA402 only. PDO map, limits, and
+    // kinematics stay per-machine config below.
 
     // --- health / boundary ---
     int max_consecutive_wkc_errors = 5;       // WKC latch threshold (passed to Master)

@@ -1,29 +1,5 @@
 #pragma once
 
-// EcatBackend is the seam that isolates SOEM. ONLY soem_backend.cpp includes
-// <soem/ethercat.h>; no SOEM types (ec_slavet, ecx_contextt, the global
-// ec_slave[]) appear here, so the master library's public API stays clean and
-// -Werror/-clang-tidy happy.
-//
-// Layering:
-//   Master (generic policy: config validation, PDO-remap sub-protocol via SDO,
-//           flat {offset,width} field table, WKC threshold, PdoCache refresh)
-//     -> EcatBackend (low-level bus ops, SOEM-shaped but SOEM-free types)
-//          -> SoemBackend  (real: reentrant ecx_* on a per-Master ecx_contextt)
-//
-// The backend deals in RAW BYTES only (SDO payloads, process-data images). All
-// typing / little-endian encoding / CiA402 policy lives above it.
-//
-// ORIENTATION (do not transpose): names are from the MASTER's perspective, like
-// SOEM's ec_slave[].outputs/.inputs --
-//   outputs(slave) = the RxPDO COMMAND image (master -> slave: controlword,
-//                    target, ...), WRITABLE by the RT loop.
-//   inputs(slave)  = the TxPDO FEEDBACK image (slave -> master: statusword,
-//                    actual, ...), READ-ONLY.
-// This is the INVERSE of PdoCache, whose "inputs" are the feedback snapshot the
-// non-RT side reads. So: Master publishes backend.inputs(slave) into
-// PdoCache::publish_inputs; the RT loop writes commands into backend.outputs().
-
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -50,7 +26,7 @@ struct SlaveInfo {
     std::uint16_t position = 0;  // 1-based ring position (SOEM convention)
     std::uint32_t vendor_id = 0;
     std::uint32_t product_code = 0;
-    std::uint32_t revision = 0;  // EEPROM revision (0x1018:3) -- library-sourced identity
+    std::uint32_t revision = 0;
     std::string name;
     std::size_t input_bytes = 0;   // TxPDO feedback image size (slave -> master)
     std::size_t output_bytes = 0;  // RxPDO command image size (master -> slave)
@@ -109,8 +85,8 @@ class EcatBackend {
     // The ESC AL status code for a slave (1-based): the standard EtherCAT reason a drive refused
     // an AL state transition (e.g. 0x0027 "Freerun not supported", 0x0030 "Invalid DC sync
     // config", 0x001B "SM watchdog"). Cached from the last state check (no port I/O), so it is
-    // safe to read at a bring-up give-up. 0 means no error. Default 0 (the sim overrides to model
-    // a refusal); describe_al_code() below turns the code into text.
+    // safe to read at a bring-up give-up. 0 means no error. Default 0; describe_al_code() below
+    // turns the code into text.
     virtual std::uint16_t al_status_code(std::uint16_t slave) const noexcept {
         (void)slave;
         return 0;
@@ -136,27 +112,20 @@ class EcatBackend {
 
     // SAFE-OP -> OP recovery nudge for the OP-await wait: refresh AL state and, per slave
     // (0 = all), ACK a SAFE_OP+ERROR (write SAFE_OP+ACK) or re-request OP from a plain SAFE_OP
-    // (write OP). The A6's SAFE-OP -> OP can take many seconds; it is waited out with PD flowing
-    // and these repeated nudges, not a single request. Writes the AL-control register only, so
-    // the caller's loop keeps pumping process data and PD never gaps. Default no-op (sim /
-    // free-run drives reach OP from the single set_state).
+    // (write OP). Workaround for drives whose SAFE-OP -> OP takes many seconds: the transition
+    // is waited out with PD flowing and these repeated nudges, not a single request. Writes the
+    // AL-control register only, so the caller's loop keeps pumping process data and PD never
+    // gaps. Default no-op (free-run drives reach OP from the single set_state).
     virtual void reack_op(std::uint16_t slave) noexcept {
         (void)slave;
     }
 
     // ecx_configdc: detect DC-capable slaves, designate the reference clock, and write each
     // slave's system-time offset (0x0920) and propagation delay (0x0928). Offsets only; SYNC0 is
-    // not armed here (arm_dc_sync does that). Default no-op (sim / free-run drives).
+    // not armed here (arm_dc_sync does that). Default no-op (free-run drives).
     virtual void configure_dc_configdc() {}
 
-    // Arm the ESC SYNC-out unit via stock `ecx_dcsync0`. Called in PRE-OP, before
-    // config_map_group: the A6 latches its DC sync-type at the PRE-OP -> SAFE-OP transition from
-    // whether SYNC0 is already armed, so arming here is what makes it self-select DC. The first
-    // edge is about 100 ms out (stock SyncDelay), covered by config_map, configdc, and the RT
-    // loop pumping PD before that edge, so SYNC0 is never armed into a process-data gap.
-    // `cycle_ns` must be valid for the drive (A6: multiple of 250000 ns). `sync0_shift_ns` is the
-    // SYNC0 pulse phase offset (ecx_dcsync0 CyclShift): the edge fires `sync0_shift_ns` after the
-    // DC base time. Default no-op (sim / free-run drives).
+    // Arm the ESC SYNC-out unit via `ecx_dcsync0`.
     virtual void arm_dc_sync(std::uint32_t cycle_ns, std::int32_t sync0_shift_ns) {
         (void)cycle_ns;
         (void)sync0_shift_ns;

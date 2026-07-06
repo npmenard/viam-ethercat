@@ -70,9 +70,8 @@ struct Status {
         return bit(11);
     }
 
-    // bit 10 "target reached". The A6-EC ties bit 10 permanently high, so it cannot
-    // signal move-completion there; use position deviation (following_error / bit 13)
-    // or actual-vs-target instead. Exposed for conformant drives.
+    // bit 10 "target reached". Some drives tie bit 10 permanently high and cannot
+    // signal move-completion there;
     bool target_reached() const noexcept {
         return bit(10);
     }

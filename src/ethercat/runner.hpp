@@ -292,10 +292,11 @@ class SlaveControl {
         return false;
     }
     // RT, every bring-up cycle: does the drive's feedback look alive? An OP-confirm gate for
-    // bringup_step, beyond the working counter. A DC-only A6 requested into OP under free-run
-    // does not visibly refuse: it sits at SAFE-OP (AL 0x0027) yet contributes a full working
-    // counter while its statusword stays 0x0 and its inputs read dead, so a WKC-only check
-    // wrongly declares OP and the enable ladder spins forever. Defaults to true (WKC only); a
+    // bringup_step, beyond the working counter -- a workaround for drives that do not visibly
+    // refuse a bad OP request: refused into OP (e.g. a DC-only drive asked to free-run) they
+    // sit at SAFE-OP (AL 0x0027) yet contribute a full working counter while their statusword
+    // stays 0x0 and their inputs read dead, so a WKC-only check wrongly declares OP and the
+    // enable ladder spins forever. Defaults to true (WKC only); a
     // device-aware control implements it (e.g. statusword != 0). A control that returns false
     // through the whole OP-await window makes bring-up give up (BringupAborted, and the
     // AL-status diagnostic names AL 0x0027) instead of enabling a dead drive.

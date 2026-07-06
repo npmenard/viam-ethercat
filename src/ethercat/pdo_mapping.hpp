@@ -3,9 +3,9 @@
 // PDO mapping config data + the SDO sub-protocol that applies it to a slave.
 //
 // The driver supplies the map (the library never parses manufacturer defaults).
-// CiA402 / A6 detail: the configurable PDO map is writable ONLY in PRE-OP and is
-// NOT stored in EEPROM, so Master::configure() re-applies it on every power-on
-// via apply_pdo_map() -- this must not be skipped.
+// CiA402 detail: the configurable PDO map is writable ONLY in PRE-OP and on many
+// drives is NOT stored in EEPROM, so Master::configure() re-applies it on every
+// power-on via apply_pdo_map() -- this must not be skipped.
 
 #include <cstddef>
 #include <cstdint>
@@ -64,7 +64,7 @@ struct PdoMap {
 // length must match the object's CoE data type or the drive aborts. Consumer-issued: setup-SDO
 // policy belongs to the consumer, which issues its writes via Master::sdo_write() while it is
 // the single port owner (post-configure, pre-RT). Used as a data carrier for the consumer's
-// vendor fault-reset (ServoConfig::vendor_fault_reset, A6 0x2031:01). Whether a write is
+// vendor fault-reset (drives with a proprietary fault-clear object). Whether a write is
 // best-effort or mandatory is the consumer's call at the call site, not a flag here.
 struct SdoWrite {
     std::uint16_t index = 0;
@@ -72,24 +72,13 @@ struct SdoWrite {
     std::vector<std::byte> data;
 };
 
-// Per-slave configuration (config DATA; the A6 specifics live here, never in
-// generic code).
+// Per-slave configuration (config DATA; device specifics arrive here as values,
+// never as branches in generic code).
 struct SlaveConfig {
     std::uint16_t slave_id = 1;  // 1-based ring position
     PdoMap rxpdo;                // outputs -> SM2 0x1C12 (assign-index derived)
     PdoMap txpdo;                // inputs  -> SM3 0x1C13 (assign-index derived)
     Cia402Mode default_mode = Cia402Mode::ProfilePosition;
-    // The structural remap SDOs (0x1C12/0x1C13 assign, 0x1600/0x1A00 entries) run in
-    // configure() as part of the init->map sequence. Other setup SDOs are consumer policy: the
-    // consumer issues them via Master::sdo_write() while still the single port owner
-    // (post-configure, pre-RT-spawn).
-    //
-    // Optional SYNC0 cycle granularity this slave accepts, in ns. Some drives accept only SYNC0
-    // cycles that are an integer multiple of a base tick -- the A6 requires a 250 us multiple
-    // and otherwise faults at OP entry (Er74.0 "cycle error"). Declare it here (config data) and
-    // the Master ctor validates the configured loop rate against it up front, with clear text
-    // and nearest valid rates. 0 means no constraint declared. Only meaningful with
-    // use_distributed_clocks.
     std::uint32_t sync_cycle_granularity_ns = 0;
 };
 
@@ -103,9 +92,10 @@ struct MasterConfig {
     // config_map_group, so the drive self-selects DC sync-type from the armed SYNC0). The RT
     // loop then pumps phase-locked PD a bounded settle and requests OP once.
     //   Settle: cycles of phase-locked PD to run before requesting OP, so the master's send
-    //   cadence is disciplined onto SYNC0 first. This is not gated on Er74.1: 0x603F=0x8700 in
-    //   SAFE-OP is the normal pre-sync state and clears at OP, so the gate is a fixed settle, not
-    //   a no-Er74.1 wait. Only applied when DC is on (non-DC needs no settle). 0 becomes 1.
+    //   cadence is disciplined onto SYNC0 first. This is not gated on the drive's no-sync fault:
+    //   reporting it in SAFE-OP is the normal pre-sync state and it clears at OP, so the gate is
+    //   a fixed settle, not a fault-free wait. Only applied when DC is on (non-DC needs no
+    //   settle). 0 becomes 1.
     std::uint32_t dc_op_gate_cycles = 400;
     // Post-OP grace: suppress the consecutive-WKC-error fault latch for this many cycles after
     // reaching OP, so a residual DC phase transient settles without tripping the latch (the
@@ -123,8 +113,8 @@ struct MasterConfig {
     // good cycle.
     std::uint32_t max_consecutive_wkc_errors = 5;
     // --- AWAIT_OP bounds (bringup_step's OP-await phase) ---
-    // The A6's SAFE-OP -> OP is slow (wire-measured over 11 s, up to about 24 s) and reaches OP
-    // by waiting it out with PD flowing and periodic SAFE-OP recovery nudges. These are
+    // Workaround for drives with a slow SAFE-OP -> OP (tens of seconds on some hardware),
+    // reached by waiting it out with PD flowing and periodic SAFE-OP recovery nudges. These are
     // give-up/confirm bounds with early exit: a conformant drive confirms OP in about
     // op_hold_confirm_cycles, so fast drives are unaffected; tune them for other slow drives or
     // non-default loop rates.

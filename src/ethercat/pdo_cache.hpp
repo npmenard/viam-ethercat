@@ -30,9 +30,10 @@
 
 namespace ethercat {
 
-// Upper bound on a single PDO image (Rx or Tx) in bytes. The A6-EC freely
-// mappable RPDO is <= 40 B; 512 leaves generous headroom for other EtherCAT
-// slaves while keeping snapshots trivially copyable and cheap to pass by value.
+// Upper bound on a single PDO image (Rx or Tx) in bytes. A typical CiA402
+// freely-mapped PDO is a few tens of bytes; 512 leaves generous headroom for
+// other EtherCAT slaves while keeping snapshots trivially copyable and cheap
+// to pass by value.
 inline constexpr std::size_t kMaxPdoBytes = 512;
 
 // ----------------------------------------------------------------------------

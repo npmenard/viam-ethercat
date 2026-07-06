@@ -7,9 +7,6 @@
 // backend-agnostic: the EcatBackend (SoemBackend in production) is injected
 // as std::unique_ptr<EcatBackend>.
 //
-// RT boundary: process() runs on the RT thread and is noexcept/exception-free
-// (a bus fault is LATCHED into an atomic flag, never thrown). Everything else
-// runs non-RT at init/configure/shutdown and may throw with clear text.
 
 #include <atomic>
 #include <chrono>
@@ -72,13 +69,14 @@ struct WkcStats {
 
 // Status of the DC bring-up state machine (Master::bringup_step). The caller drives one step
 // per cyclic exchange until it sees Operational (switch to the steady loop) or Aborted
-// (surface the fault; do not immediately re-enter bring-up, because repeated Er74 OP-entry
-// wedges the A6).
+// (surface the fault; do not immediately re-enter bring-up -- a workaround for drives whose
+// EtherCAT interface locks up under repeated failed OP requests, recoverable only by a
+// control-power cycle).
 enum class BringupStatus : std::uint8_t {
-    Gating,       // SYNC0 armed in configure(); pumping phase-locked PD a bounded settle before requesting OP
-    AwaitingOp,   // OP requested once; awaiting "OP reached + Er74.1 cleared + WKC holds"
-    Operational,  // all slaves OPERATIONAL, synced (WKC holding) -- bring-up complete
-    Aborted,      // OP did not take within the await window (WKC won't hold / Er74.1 didn't clear) -- no re-request
+    Gating,
+    AwaitingOp,
+    Operational,
+    Aborted,
 };
 
 class Master {
@@ -100,15 +98,14 @@ class Master {
 
     // PRE-OP, apply the PDO remap per slave, map the process image, size the PdoCaches and
     // build the flat field tables, arm SYNC0 in PRE-OP (DC), run configdc (DC), then go to
-    // SAFE-OP. Re-applies the map every call (the A6 map is not in EEPROM). Throws
-    // Error/PdoMappingError naming the offending slave.
+    // SAFE-OP. Re-applies the map every call (a remapped PDO assignment is volatile on many
+    // drives, not persisted in EEPROM). Throws Error/PdoMappingError naming the offending slave.
     //
     // configure() stops at SAFE-OP: it arms SYNC0 (in PRE-OP, before config_map_group) but
     // does not request OP. The caller's single cyclic loop runs the bring-up to OP via
     // bringup_step(), so a DC drive sees continuous process data through SAFE-OP -> OP with
-    // no frame gap. Arming SYNC0 in PRE-OP is what makes the A6 self-select DC at the
-    // PRE-OP -> SAFE-OP transition. Any vendor fault-reset SDO is the caller's to run
-    // afterward, while it is still the single port owner (before the RT thread spawns).
+    // no frame gap. Arming SYNC0 in PRE-OP is what makes drives that latch their sync-type at
+    // the PRE-OP -> SAFE-OP transition self-select DC.
     void configure();
 
     // One cyclic step of the DC bring-up state machine, called from the caller's RT loop after
@@ -117,17 +114,19 @@ class Master {
     // await OP (hold for OP + sync), operational, returning the new status. The caller owns the
     // cadence: it does the clock_nanosleep deadline and dc_phase_correction(dc_time(), ...)
     // around this call, so PD stays phase-locked and gapless. `drive_sync_faulted` is the
-    // caller's read of the drive's Er74.1 no-sync fault (0x603F == 0x8700) from the previous
+    // caller's read of the drive's no-sync fault (its device fault code) from the previous
     // step's feedback image; passing it in keeps Master free of CiA402 semantics. Never throws.
     // On Operational the caller switches to its steady loop; on Aborted it must surface the
-    // fault and not immediately re-enter bring-up (repeated Er74 OP-entry wedges the A6).
+    // fault and not immediately re-enter bring-up (a workaround for drives whose EtherCAT
+    // interface locks up under repeated failed OP requests).
     //
     // `drive_present` is a caller read of whether the drive's feedback looks alive (e.g.
-    // statusword != 0). It is an OP-confirm gate beyond the working counter: a DC-only A6 under
-    // free-run passes the WKC gate (full WKC) while zombie-PDOing (dead statusword), so WKC
-    // alone wrongly declares OP; requiring drive_present makes bring-up give up (BringupAborted)
-    // on a dead drive instead. Defaults to true (WKC only) so single-signal callers and tests
-    // are unaffected; the Runner passes the AND of the controls' drive_present().
+    // statusword != 0). It is an OP-confirm gate beyond the working counter -- a workaround for
+    // drives that pass the WKC gate (full WKC) while their PDO data is dead (statusword 0x0)
+    // after a refused OP request, where WKC alone would wrongly declare OP; requiring
+    // drive_present makes bring-up give up (BringupAborted) on a dead drive instead. Defaults
+    // to true (WKC only) so single-signal callers and tests are unaffected; the Runner passes
+    // the AND of the controls' drive_present().
     BringupStatus bringup_step(bool drive_sync_faulted, bool drive_present = true) noexcept;
 
     void close() noexcept;
@@ -325,14 +324,14 @@ class Master {
 
     // Internal phases of the bring-up state machine (bringup_step). SYNC0 is armed in
     // configure() (PRE-OP). Settle pumps phase-locked PD a bounded settle -- it is not gated on
-    // Er74.1, which is the normal pre-sync state in SAFE-OP and clears at OP -- then requests OP
-    // once, and AwaitOp holds for OP reached, Er74.1 cleared, and WKC holding, or aborts (no
-    // re-request) if that does not happen within a window.
+    // the drive's no-sync fault, which is the normal pre-sync state in SAFE-OP and clears only
+    // at OP -- then requests OP once, and AwaitOp holds for OP reached, sync fault cleared, and
+    // WKC holding, or aborts (no re-request) if that does not happen within a window.
     enum class BringupPhase : std::uint8_t { Settle, AwaitOp, Done, Aborted };
     BringupPhase bringup_phase_ = BringupPhase::Settle;  // RT-only
     std::uint32_t bringup_settle_count_ = 0;             // RT-only: settle cycles elapsed before requesting OP
     std::uint32_t bringup_await_count_ = 0;              // RT-only: AWAIT_OP cycles since requesting OP
-    std::uint32_t bringup_op_hold_streak_ = 0;           // RT-only: consecutive (full-WKC && !Er74.1) cycles at OP
+    std::uint32_t bringup_op_hold_streak_ = 0;           // RT-only: consecutive (full-WKC && !sync-faulted) cycles at OP
     std::uint16_t bringup_al_code_ = 0;                  // RT-written: last non-zero AL status code seen during AWAIT_OP
     // AWAIT_OP bounds derived once from MasterConfig in the ctor: pre-clamped cycle counts the
     // bring-up FSM compares against (the counts clamp 0 -> 1; the give-up bound is

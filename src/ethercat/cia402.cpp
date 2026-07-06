@@ -120,9 +120,9 @@ std::uint16_t Cia402Fsm::step(Status current, Cia402State goal) const noexcept {
 
         case Cia402State::SwitchedOn:
             if (state == Cia402State::SwitchOnDisabled) {
-                return ControlWord::shutdown();  // climb one rung toward SwitchedOn
+                return ControlWord::shutdown();
             }
-            return ControlWord::switch_on();  // from ReadyToSwitchOn up, or drop from OperationEnabled
+            return ControlWord::switch_on();
 
         case Cia402State::NotReadyToSwitchOn:
         case Cia402State::OperationEnabled:
@@ -136,8 +136,6 @@ std::uint16_t Cia402Fsm::step(Status current, Cia402State goal) const noexcept {
                     return ControlWord::shutdown();  // -> ReadyToSwitchOn
                 case Cia402State::ReadyToSwitchOn:
                     return ControlWord::switch_on();  // -> SwitchedOn
-                // SwitchedOn advances to OperationEnabled; OperationEnabled holds; and
-                // QuickStopActive resumes (DS402 transition 16) -- all the same level.
                 case Cia402State::SwitchedOn:
                 case Cia402State::OperationEnabled:
                 case Cia402State::QuickStopActive:
