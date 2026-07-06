@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 #include "ethercat/cia402.hpp"
@@ -62,12 +63,12 @@ class Cia402Policy {
         cw_loc_ = cfg.resolve_rx<cia402::ControlWord>();
         sw_loc_ = cfg.resolve_tx<cia402::Statusword>();
 
-        target_loc_ = cfg.resolve_rx_optional<cia402::TargetPosition>();
-        pv_loc_ = cfg.resolve_rx_optional<cia402::ProfileVelocity>();
-        tv_loc_ = cfg.resolve_rx_optional<cia402::TargetVelocity>();
-        mode_wr_loc_ = cfg.resolve_rx_optional<cia402::ModeOfOperation>();  // 0x6060 RxPDO; absent -> mode is SDO-set only
-        fc_loc_ = cfg.resolve_tx_optional<cia402::FaultCode>();
-        mode_loc_ = cfg.resolve_tx_optional<cia402::ModeDisplay>();
+        target_loc_ = cfg.try_resolve_rx<cia402::TargetPosition>();
+        pv_loc_ = cfg.try_resolve_rx<cia402::ProfileVelocity>();
+        tv_loc_ = cfg.try_resolve_rx<cia402::TargetVelocity>();
+        mode_wr_loc_ = cfg.try_resolve_rx<cia402::ModeOfOperation>();  // 0x6060 RxPDO; nullopt -> mode is SDO-set only
+        fc_loc_ = cfg.try_resolve_tx<cia402::FaultCode>();
+        mode_loc_ = cfg.try_resolve_tx<cia402::ModeDisplay>();
 
         std::uint32_t echoed = 0;
         if (needs_quick_stop) {
@@ -110,8 +111,8 @@ class Cia402Policy {
     // (CiA402 bit 8, controlword 0x0F).
     std::uint16_t step(CycleContext& ctx, const PolicyCommand& cmd) noexcept {
         const Status status{ctx.load<cia402::Statusword::type>(sw_loc_)};
-        state_.fault_code = fc_loc_.mapped() ? ctx.load<cia402::FaultCode::type>(fc_loc_) : std::uint16_t{0};
-        state_.current_mode = mode_loc_.mapped() ? ctx.load<cia402::ModeDisplay::type>(mode_loc_) : std::int8_t{0};
+        state_.fault_code = fc_loc_ ? ctx.load<cia402::FaultCode::type>(*fc_loc_) : std::uint16_t{0};
+        state_.current_mode = mode_loc_ ? ctx.load<cia402::ModeDisplay::type>(*mode_loc_) : std::int8_t{0};
         state_.handshake_timed_out = false;  // re-armed each step; set only on the cycle the handshake times out
 
         // Count consecutive cycles the written controlword had Halt (bit 8) clear, off last_cw_
@@ -140,8 +141,8 @@ class Cia402Policy {
             if (!announced_op_ || status.fault() || status.switch_on_disabled()) {
                 qcw = ControlWord::disable_voltage();  // never energized, faulted, or already at rest: go straight off
             }
-            if (tv_loc_.mapped()) {
-                ctx.store<cia402::TargetVelocity::type>(tv_loc_, 0);
+            if (tv_loc_) {
+                ctx.store<cia402::TargetVelocity::type>(*tv_loc_, 0);
             }
             ctx.store<cia402::ControlWord::type>(cw_loc_, qcw);
             return qcw;
@@ -155,8 +156,8 @@ class Cia402Policy {
         // written only after OperationEnabled it reads 0 through the ladder and the gate sees
         // 0x6061 != the commanded mode and stops. Seed it every cycle; the wrapper owns mode-switch
         // orchestration and picks cmd.mode.
-        if (mode_wr_loc_.mapped()) {
-            ctx.store<cia402::ModeOfOperation::type>(mode_wr_loc_, static_cast<std::int8_t>(cmd.mode));
+        if (mode_wr_loc_) {
+            ctx.store<cia402::ModeOfOperation::type>(*mode_wr_loc_, static_cast<std::int8_t>(cmd.mode));
         }
 
         // Mode-echo check: before climbing to OperationEnabled, at SwitchedOn require 0x6061 ==
@@ -209,13 +210,13 @@ class Cia402Policy {
    private:
     std::uint16_t drive_operational_(CycleContext& ctx, const PolicyCommand& cmd, Status status) noexcept {
         std::uint16_t base = ControlWord::enable_operation();  // 0x0F
-        if (mode_wr_loc_.mapped()) {
-            ctx.store<cia402::ModeOfOperation::type>(mode_wr_loc_, static_cast<std::int8_t>(cmd.mode));
+        if (mode_wr_loc_) {
+            ctx.store<cia402::ModeOfOperation::type>(*mode_wr_loc_, static_cast<std::int8_t>(cmd.mode));
         }
         if (cmd.mode == Cia402Mode::ProfileVelocity) {
             // PV: stream target velocity. Halt asserts the drive's own Halt ramp (bit8).
-            if (tv_loc_.mapped()) {
-                ctx.store<cia402::TargetVelocity::type>(tv_loc_, cmd.target_velocity);
+            if (tv_loc_) {
+                ctx.store<cia402::TargetVelocity::type>(*tv_loc_, cmd.target_velocity);
             }
             if (cmd.halt) {
                 base = ControlWord::with_halt(base, true);
@@ -223,11 +224,11 @@ class Cia402Policy {
             return base;
         }
         // ProfilePosition absolute move-to.
-        if (target_loc_.mapped()) {
-            ctx.store<cia402::TargetPosition::type>(target_loc_, cmd.target_counts);
+        if (target_loc_) {
+            ctx.store<cia402::TargetPosition::type>(*target_loc_, cmd.target_counts);
         }
-        if (pv_loc_.mapped()) {
-            ctx.store<cia402::ProfileVelocity::type>(pv_loc_, cmd.profile_velocity);  // 0x6081 move speed (optional)
+        if (pv_loc_) {
+            ctx.store<cia402::ProfileVelocity::type>(*pv_loc_, cmd.profile_velocity);  // 0x6081 move speed (optional)
         }
 
         // Four-phase CiA402 new-set-point handshake (WriteTarget -> AwaitAck -> ClearBit4 ->
@@ -316,8 +317,9 @@ class Cia402Policy {
     // any written Halt. Gates the bit-4 raise so a halt-release and bit-4 edge never coincide on the wire.
     std::uint32_t halt_clear_cycles_ = kSetpointHaltSettleCycles;
 
-    FieldLocation cw_loc_, target_loc_, pv_loc_, tv_loc_, mode_wr_loc_;
-    FieldLocation sw_loc_, fc_loc_, mode_loc_;
+    FieldLocation cw_loc_, sw_loc_;                                            // required fields (throwing resolve)
+    std::optional<FieldLocation> target_loc_, pv_loc_, tv_loc_, mode_wr_loc_;  // optional RxPDO command fields
+    std::optional<FieldLocation> fc_loc_, mode_loc_;                           // optional TxPDO feedback fields
 
     const std::uint32_t quick_stop_decel_;  // 0x6085 write value (0 = quick-stop not configured)
     const std::int16_t quick_stop_option_;  // 0x605A asserted value

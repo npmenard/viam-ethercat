@@ -34,7 +34,7 @@ class Error : public std::runtime_error {
 //     rejected, or the requested map is invalid for the slave); or
 //   - a runtime PDO access referenced an object not in the applied map
 //     (resolve_rx / resolve_tx), which the operator fixes by adding it to the map.
-// resolve_rx_optional/resolve_tx_optional catch this specifically to treat a
+// try_resolve_rx/try_resolve_tx catch this specifically to treat a
 // not-in-map object as absent; a wrong-width access throws the base Error instead,
 // since that is a malformed access rather than an absent one. A generic non-mapping
 // SDO abort is SdoError.

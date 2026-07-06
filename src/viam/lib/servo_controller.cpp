@@ -19,19 +19,9 @@ namespace ethercat::servo {
 
 namespace {
 
-constexpr std::uint16_t kCtrlword = 0x6040;
-constexpr std::uint16_t kStatusword = 0x6041;
-constexpr std::uint16_t kTargetPos = 0x607A;
-constexpr std::uint16_t kActualPos = 0x6064;
-constexpr std::uint16_t kTargetVel = 0x60FF;
-constexpr std::uint16_t kProfileVel = 0x6081;   // PP move speed (carries the GoTo/GoFor rpm); optional in the map
-constexpr std::uint16_t kModeOfOp = 0x6060;     // runtime mode-of-operation (RxPDO); present means PV->PP hold-switch
-constexpr std::uint16_t kModeDisplay = 0x6061;  // mode display (TxPDO); present means enable-time mode-echo gate
-constexpr std::uint16_t kFaultCode = 0x603F;    // drive error code (TxPDO, optional feedback)
 // A drive's "no-sync" fault code is a device seam (sync_fault_code(), nullopt in this generic
 // base), not a constant here, so this core carries no vendor value. The bring-up gate reads it
 // through the seam (nullopt means no detection).
-constexpr std::uint16_t kVelActual = 0x606C;  // velocity actual value (TxPDO, optional feedback)
 // Controlled-stop watchdog headroom: the teardown window and velocity budget reserve this much
 // time below the full window so the ramp finishes before close() (a slave's sync/SM watchdog is
 // typically a few tens of ms).
@@ -338,32 +328,27 @@ void ServoController::reconfigure(ServoConfig config) {
 
 void ServoController::resolve_fields() {
     // Resolve each RT field once here (non-RT, at start) to a cached offset; the RT loop then
-    // reads/writes at the cached byte_offset with literal widths, with no per-cycle resolve, throw,
-    // or map-walk. rx_field/tx_field return an offset-only FieldLocation; an absent optional field
-    // caches a default FieldLocation{} (!mapped()).
+    // reads/writes at the cached byte_offset with no per-cycle resolve, throw, or map-walk. All
+    // resolves go through the TYPED API: a missing required object is a loud configure error, a
+    // missing optional one is nullopt, and every hit is width-checked against the Field's type.
     const std::uint16_t s = config_.slave_id;
-    f_ctrlword_ = master_->rx_field(s, kCtrlword, 0);
-    f_statusword_ = master_->tx_field(s, kStatusword, 0);
-    f_actual_ = master_->tx_field(s, kActualPos, 0);
-    // Resolve whichever command objects the map carries: PP {0x607A,0x6081}, PV {0x60FF}, switchable
-    // all. Map-driven (rxpdo_has) so all three control modes work; an absent object caches !mapped()
-    // (the policy guards every write on mapped()).
-    f_target_ = rxpdo_has(kTargetPos) ? master_->rx_field(s, kTargetPos, 0) : FieldLocation{};
-    f_profile_velocity_ = rxpdo_has(kProfileVel) ? master_->rx_field(s, kProfileVel, 0) : FieldLocation{};
-    f_velocity_ = rxpdo_has(kTargetVel) ? master_->rx_field(s, kTargetVel, 0) : FieldLocation{};
-    // A PV motion-hold locks position (not just zero velocity) by switching to PP-at-current-counts.
-    // Available when the fixed superset maps 0x6060 and 0x607A. The runtime halt handler further gates
-    // on the current intent being PV (a PP halt already holds in PP, no switch).
-    pv_hold_capable_ = rxpdo_has(kModeOfOp) && rxpdo_has(kTargetPos);
-    // Optional TxPDO feedback, both modes. !mapped() means not in the map, so the RT loop falls back
+    f_ctrlword_ = master_->resolve_rx<cia402::ControlWord>(s);
+    f_statusword_ = master_->resolve_tx<cia402::Statusword>(s);
+    f_actual_ = master_->resolve_tx<cia402::PositionActual>(s);
+    // The PP/PV command objects (0x607A/0x6081/0x60FF) are the policy's to resolve and write.
+    // Optional TxPDO feedback, both modes. nullopt means not in the map, so the RT loop falls back
     // (velocity estimate) or omits the tier (fault code).
-    f_fault_code_ = txpdo_has(kFaultCode) ? master_->tx_field(s, kFaultCode, 0) : FieldLocation{};
-    f_velocity_actual_ = txpdo_has(kVelActual) ? master_->tx_field(s, kVelActual, 0) : FieldLocation{};
+    f_fault_code_ = master_->try_resolve_tx<cia402::FaultCode>(s);
+    f_velocity_actual_ = master_->try_resolve_tx<cia402::VelocityActual>(s);
     // Enable-ladder mode fields: 0x6060 (write, seed the mode through the ladder) is present only in a
     // PDO-mapped-0x6060 map; 0x6061 (read, the mode-echo gate) is present in the fixed superset map. Both
-    // optional, so !mapped() makes the respective enable-ladder step inert.
-    f_mode_wr_ = rxpdo_has(kModeOfOp) ? master_->rx_field(s, kModeOfOp, 0) : FieldLocation{};
-    f_mode_disp_ = txpdo_has(kModeDisplay) ? master_->tx_field(s, kModeDisplay, 0) : FieldLocation{};
+    // optional, so nullopt makes the respective enable-ladder step inert.
+    f_mode_wr_ = master_->try_resolve_rx<cia402::ModeOfOperation>(s);
+    f_mode_disp_ = master_->try_resolve_tx<cia402::ModeDisplay>(s);
+    // A PV motion-hold locks position (not just zero velocity) by switching to PP-at-current-counts.
+    // Available when the map carries 0x6060 and 0x607A. The runtime halt handler further gates
+    // on the current intent being PV (a PP halt already holds in PP, no switch).
+    pv_hold_capable_ = f_mode_wr_.has_value() && master_->try_resolve_rx<cia402::TargetPosition>(s).has_value();
 
     // Size the position-stability window to ~20 ms at the loop rate (>= 3 cycles), reset it.
     // Pre-allocated here (non-RT, pre-spawn) so the RT loop never allocates. Re-sized on each start/reconfigure.
@@ -384,28 +369,6 @@ void ServoController::resolve_fields() {
                            "controlled ramp-stop.\n",
                            static_cast<unsigned>(s));
     }
-}
-
-bool ServoController::rxpdo_has(std::uint16_t index) const noexcept {
-    for (const auto& [pdo, entries] : config_.rxpdo.entries) {
-        for (const PdoEntry& e : entries) {
-            if (e.index == index) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-bool ServoController::txpdo_has(std::uint16_t index) const noexcept {
-    for (const auto& [pdo, entries] : config_.txpdo.entries) {
-        for (const PdoEntry& e : entries) {
-            if (e.index == index) {
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 bool ServoController::rt_alive() const noexcept {
@@ -490,7 +453,7 @@ Cia402Mode ServoController::commanded_cia402_mode() const noexcept {
 // is handled by step_lifecycle's Fault branch, not here.
 std::uint16_t ServoController::run_mode_switch(CycleContext& ctx, std::int32_t actual, Cia402Mode want) noexcept {
     const std::int8_t want_i8 = static_cast<std::int8_t>(want);
-    const std::int8_t confirmed = ctx.load<cia402::ModeDisplay::type>(f_mode_disp_);  // 0x6061 echo THIS cycle
+    const std::int8_t confirmed = ctx.load<cia402::ModeDisplay::type>(*f_mode_disp_);  // 0x6061 echo THIS cycle (caller guards mapped)
     PolicyCommand pcmd;
     pcmd.enable = true;
     pcmd.halt = false;
@@ -614,10 +577,10 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // Seed 0x6060 = commanded mode through the enable ladder. The module's own enable FSM (not the
         // policy, which is stepped only post-OperationEnabled) drives the ladder, so it must write the
         // mode itself, else on a PDO-mapped-0x6060 map the drive follows the PDO (=0) and enables in mode
-        // 0. Inert when 0x6060 is SDO-set only: f_mode_wr_ !mapped().
-        if (f_mode_wr_.mapped()) {
+        // 0. Inert when 0x6060 is SDO-set only: f_mode_wr_ is nullopt.
+        if (f_mode_wr_) {
             ctx.store<cia402::ModeOfOperation::type>(
-                f_mode_wr_, static_cast<std::int8_t>(commanded_cia402_mode()));  // switchable: the current mode intent
+                *f_mode_wr_, static_cast<std::int8_t>(commanded_cia402_mode()));  // switchable: the current mode intent
         }
         // Mode-echo gate, in the module's own ladder: once the drive is SwitchedOn the commanded mode
         // should be adopted (SDO-set at configure, or PDO-seeded above), so require 0x6061 == commanded
@@ -625,10 +588,9 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // Failed, de-energizes, and sets RtError::ModeMismatch (last_error), sticky so there is no
         // ReadyToSwitchOn <-> SwitchedOn oscillation. Inert when 0x6061 is not mapped. Mirrors the
         // policy's gate, which the module never reaches (it delegates to the policy only post-OperationEnabled).
-        if (mode_gate_ == ModeGate::Pending && f_mode_disp_.mapped() &&
-            (dev == Cia402State::SwitchedOn || dev == Cia402State::OperationEnabled)) {
+        if (mode_gate_ == ModeGate::Pending && f_mode_disp_ && (dev == Cia402State::SwitchedOn || dev == Cia402State::OperationEnabled)) {
             const auto want = static_cast<std::int8_t>(commanded_cia402_mode());  // gate on the commanded (intent) mode
-            const auto echo = ctx.load<cia402::ModeDisplay::type>(f_mode_disp_);
+            const auto echo = ctx.load<cia402::ModeDisplay::type>(*f_mode_disp_);
             if (echo == want) {
                 mode_gate_ = ModeGate::Passed;
             } else {
@@ -663,9 +625,9 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // command the new mode via the policy, await the echo) instead of the motion body. Only when
         // 0x6060 (write) and 0x6061 (echo) are both mapped; else the mode is fixed and this never triggers.
         const Cia402Mode want = pv_hold_as_pp_ ? Cia402Mode::ProfilePosition : commanded_cia402_mode();
-        if (f_mode_wr_.mapped() && f_mode_disp_.mapped()) {
+        if (f_mode_wr_ && f_mode_disp_) {
             const std::int8_t want_i8 = static_cast<std::int8_t>(want);
-            const std::int8_t confirmed = ctx.load<cia402::ModeDisplay::type>(f_mode_disp_);  // 0x6061 echo this cycle
+            const std::int8_t confirmed = ctx.load<cia402::ModeDisplay::type>(*f_mode_disp_);  // 0x6061 echo this cycle
             if (switch_phase_ == SwitchPhase::None && confirmed != 0 && confirmed != want_i8) {
                 switch_phase_ = SwitchPhase::Stopping;
                 switch_cycles_ = 0;
@@ -817,7 +779,7 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
     // Drive tier: live-read 0x603F from this cycle's owned snapshot every faulted cycle (not
     // edge-captured) so a code the drive latches a frame or two after it sets bit 3 is still picked
     // up ("code pending" collapses to the rare hard-drop race only).
-    const std::uint16_t drive_code = f_fault_code_.mapped() ? ctx.load<std::uint16_t>(f_fault_code_) : 0;
+    const std::uint16_t drive_code = f_fault_code_ ? ctx.load<std::uint16_t>(*f_fault_code_) : 0;
     state_.drive_fault_code.store(drive_code, std::memory_order_relaxed);
     state_.drive_faulted.store(status.fault(), std::memory_order_release);
     // Controller tier: the published mirror of the latch (tracks abort, clears on fault_reset).
@@ -879,7 +841,7 @@ bool ServoController::sync_faulted(const CycleContext& ctx) const noexcept {
     // The bring-up gate: drive-sync-faulted = mapped 0x603F == the configured no-sync code; nullopt
     // (none declared) means always false. Stash the read code for on_stop's bring-up-abort diagnostic
     // (sync_faulted and on_stop both run on the RT thread).
-    const std::uint16_t code = f_fault_code_.mapped() ? ctx.load<std::uint16_t>(f_fault_code_) : 0;
+    const std::uint16_t code = f_fault_code_ ? ctx.load<std::uint16_t>(*f_fault_code_) : 0;
     last_sync_code_ = code;
     const std::optional<std::uint16_t> no_sync = sync_fault_code();  // device seam (base nullopt)
     return no_sync.has_value() && code == *no_sync;
@@ -894,9 +856,8 @@ void ServoController::step(CycleContext& ctx) noexcept {
         const Status sstatus{ctx.load<std::uint16_t>(f_statusword_)};
         const std::int32_t sactual = ctx.load<std::int32_t>(f_actual_);
         const std::int32_t svel =
-            f_velocity_actual_.mapped()
-                ? ctx.load<std::int32_t>(f_velocity_actual_)
-                : static_cast<std::int32_t>(static_cast<std::int64_t>(sactual - prev_actual_) * config_.target_loop_rate_hz);
+            f_velocity_actual_ ? ctx.load<std::int32_t>(*f_velocity_actual_)
+                               : static_cast<std::int32_t>(static_cast<std::int64_t>(sactual - prev_actual_) * config_.target_loop_rate_hz);
         prev_actual_ = sactual;
         // Two-level stop: when quick-stop is configured (quick_stop_decel>0), delegate to the policy's
         // controlled quick-stop (ramp via 0x6085, auto SwitchOnDisabled, then disable-voltage backstop
@@ -935,9 +896,8 @@ void ServoController::step(CycleContext& ctx) noexcept {
     // Velocity from the wire (0x606C) when mapped, else the instantaneous estimate
     // (actual-delta * loop rate). One branch; identical fallback when unmapped.
     const std::int32_t velocity =
-        f_velocity_actual_.mapped()
-            ? ctx.load<std::int32_t>(f_velocity_actual_)
-            : static_cast<std::int32_t>(static_cast<std::int64_t>(actual - prev_actual_) * config_.target_loop_rate_hz);
+        f_velocity_actual_ ? ctx.load<std::int32_t>(*f_velocity_actual_)
+                           : static_cast<std::int32_t>(static_cast<std::int64_t>(actual - prev_actual_) * config_.target_loop_rate_hz);
     prev_actual_ = actual;
 
     const std::uint16_t cw = step_lifecycle(ctx, status, batch, actual);

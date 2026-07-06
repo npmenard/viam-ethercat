@@ -31,6 +31,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <span>
 #include <string>
@@ -269,10 +270,8 @@ class ServoController : public SlaveControl {
     // Reset per-run state and construct, attach, and start the one-shot Runner; on a start-time
     // failure go Degraded-but-alive, never rethrowing past here. Shared by start()/reconfigure().
     void spawn_runner();
-    void reset_run_state();                              // zero the per-run atomics + RT-only working state
-    void resolve_fields();                               // cache controlword/status/target/actual/velocity FieldLocations
-    bool rxpdo_has(std::uint16_t index) const noexcept;  // is `index` mapped in the RxPDO? (optional-field probe)
-    bool txpdo_has(std::uint16_t index) const noexcept;  // is `index` mapped in the TxPDO? (optional feedback probe)
+    void reset_run_state();  // zero the per-run atomics + RT-only working state
+    void resolve_fields();   // cache controlword/status/target/actual/velocity FieldLocations
     // Run the device fault-reset seam (vendor_fault_reset_sdo()) once pre-RT-spawn, while this
     // thread is still the single port owner (after Master::configure(), before the RT thread
     // spawns). Best-effort: a failed clear is logged, not fatal. nullopt seam means no-op.
@@ -286,23 +285,20 @@ class ServoController : public SlaveControl {
 
     ServoConfig config_;
 
-    // Resolved once at start(); indexed by the RT loop without a map find. Every RxPDO field the
-    // drive consumes must be written by the RT loop each cycle (or SDO-set at configure):
-    // controlword, target position/velocity, and profile velocity here. A mapped-but-unwritten
-    // command field makes the drive use its default (silent wrong behavior on hardware).
+    // Resolved once at start(); indexed by the RT loop without a map find. Required fields are
+    // plain FieldLocation (throwing resolve at start); optional fields are
+    // std::optional<FieldLocation> (nullopt = not in the map; guard the per-cycle load/store).
+    // The policy owns writing the PP/PV command fields (target/velocity/profile velocity).
     FieldLocation f_ctrlword_;
     FieldLocation f_statusword_;
-    FieldLocation f_target_;
     FieldLocation f_actual_;
-    FieldLocation f_velocity_;
-    FieldLocation f_profile_velocity_;  // 0x6081 PP move speed; !mapped() if not in the map (optional)
     // Enable-ladder mode fields (optional). The module's own enable FSM (not the policy) climbs to
     // OperationEnabled, so it must itself (a) seed 0x6060 = commanded mode through the ladder when
     // 0x6060 is RxPDO-mapped (else a PDO-following drive enables in mode 0), and (b) enforce the
     // mode-echo gate when 0x6061 is TxPDO-mapped (refuse OperationEnabled if 0x6061 != commanded;
-    // the fixed superset map does map 0x6061). Both !mapped() means the respective step is inert.
-    FieldLocation f_mode_wr_;    // 0x6060 mode-of-operation (RxPDO write); !mapped() means SDO-set only
-    FieldLocation f_mode_disp_;  // 0x6061 mode-display (TxPDO read); !mapped() means no mode-echo gate
+    // the fixed superset map does map 0x6061). Both nullopt means the respective step is inert.
+    std::optional<FieldLocation> f_mode_wr_;    // 0x6060 mode-of-operation (RxPDO write); nullopt means SDO-set only
+    std::optional<FieldLocation> f_mode_disp_;  // 0x6061 mode-display (TxPDO read); nullopt means no mode-echo gate
     // Enable-time mode-echo gate state (RT-only). Sticky once resolved so the drive does not
     // oscillate ReadyToSwitchOn <-> SwitchedOn: Pending until the drive is SwitchedOn with 0x6061
     // mapped, then Passed (0x6061 == commanded, allow OperationEnabled) or Failed (mismatch, latch
@@ -310,9 +306,9 @@ class ServoController : public SlaveControl {
     // bring-up or fault-recovery re-checks.
     enum class ModeGate : std::uint8_t { Pending, Passed, Failed };
     ModeGate mode_gate_ = ModeGate::Pending;
-    // TxPDO feedback fields, both optional (!mapped() means not in the map):
-    FieldLocation f_fault_code_;       // 0x603F U16 drive error code (last_error gloss)
-    FieldLocation f_velocity_actual_;  // 0x606C S32 velocity-actual (wire velocity; else estimate)
+    // TxPDO feedback fields, both optional (nullopt means not in the map):
+    std::optional<FieldLocation> f_fault_code_;       // 0x603F U16 drive error code (last_error gloss)
+    std::optional<FieldLocation> f_velocity_actual_;  // 0x606C S32 velocity-actual (wire velocity; else estimate)
 
     // The generic CiA402 motion policy (shared with the bench validation tool). The module's
     // Operational healthy-path (enable-hold, PP handshake, PV stream, Halt) delegates here; the

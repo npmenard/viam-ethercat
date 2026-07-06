@@ -218,17 +218,17 @@ class ConfigContext {
     FieldLocation resolve_tx() const {
         return master_.resolve_tx<F>(slave_id_);
     }
-    // Optional resolve: returns an unmapped FieldLocation (mapped() == false) when the object
-    // is absent from the map instead of throwing, since a consumer maps some fields only in
-    // some modes. A mapped-but-wrong-width object still throws. Guard the per-cycle
-    // load/store on mapped().
+    // Optional resolve: returns nullopt when the object is absent from the map instead of
+    // throwing, since a consumer maps some fields only in some modes. A mapped-but-wrong-width
+    // object still throws. Store the std::optional and guard the per-cycle load/store on it
+    // (deref with *loc -- never .value(), which can throw, on the RT path).
     template <class F>
-    FieldLocation resolve_rx_optional() const {
-        return master_.resolve_rx_optional<F>(slave_id_);
+    std::optional<FieldLocation> try_resolve_rx() const {
+        return master_.try_resolve_rx<F>(slave_id_);
     }
     template <class F>
-    FieldLocation resolve_tx_optional() const {
-        return master_.resolve_tx_optional<F>(slave_id_);
+    std::optional<FieldLocation> try_resolve_tx() const {
+        return master_.try_resolve_tx<F>(slave_id_);
     }
     // One-time SDOs while the consumer is the single port owner (pre-RT), e.g. a regime
     // readback or a vendor fault-reset. Post-spawn, via a stashed handle, Master's rt_active

@@ -15,6 +15,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -32,16 +33,10 @@ namespace ethercat {
 // store_le free functions below), so the location carries no width. The per-object mapped
 // width (bit_length) lives in the Master's internal field table (Master::MappedField),
 // where resolve_field's configure-time assert verifies sizeof(F::type)*8 == bit_length.
-// `present` distinguishes a resolved location from a default-constructed "not mapped"
-// sentinel (the optional-feedback fields); mapped() reads it.
+// A FieldLocation is ALWAYS a valid resolved location (only the resolvers construct one);
+// "maybe absent" is expressed as std::optional<FieldLocation> (try_resolve_rx/try_resolve_tx).
 struct FieldLocation {
     std::size_t byte_offset = 0;
-    bool present = false;  // false for a default-constructed (unmapped) sentinel
-    // True once resolved by Master::resolve_rx/resolve_tx / rx_field / tx_field.
-    // Optional fields cache a default FieldLocation{} when absent -> mapped()==false.
-    [[nodiscard]] constexpr bool mapped() const noexcept {
-        return present;
-    }
 };
 
 // RT cached-offset accessors: read/write sizeof(T) little-endian at a resolved FieldLocation
@@ -251,24 +246,24 @@ class Master {
         return resolve_field(runtime_for(slave).tx_fields, F::index, F::sub, sizeof(typename F::type), slave, /*is_tx=*/true);
     }
     // Optional resolve, for a field a consumer maps only in some modes (0x60FF is absent in a
-    // PP-only map, 0x607A in a PV-only map). Returns an unmapped FieldLocation (mapped() ==
-    // false) when the object is not in the map instead of throwing; the caller guards its
-    // per-cycle load/store on mapped(). A mapped-but-wrong-width object still throws Error.
-    // Configure-time only.
+    // PP-only map, 0x607A in a PV-only map). Returns nullopt when the object is not in the map
+    // instead of throwing; the caller stores the std::optional and guards its per-cycle
+    // load/store on it (deref with *loc -- never .value(), which can throw, on the RT path).
+    // A mapped-but-wrong-width object still throws Error. Configure-time only.
     template <class F>
-    FieldLocation resolve_rx_optional(std::uint16_t slave) const {
+    std::optional<FieldLocation> try_resolve_rx(std::uint16_t slave) const {
         try {
             return resolve_rx<F>(slave);
         } catch (const PdoMappingError&) {
-            return FieldLocation{};
+            return std::nullopt;
         }
     }
     template <class F>
-    FieldLocation resolve_tx_optional(std::uint16_t slave) const {
+    std::optional<FieldLocation> try_resolve_tx(std::uint16_t slave) const {
         try {
             return resolve_tx<F>(slave);
         } catch (const PdoMappingError&) {
-            return FieldLocation{};
+            return std::nullopt;
         }
     }
 

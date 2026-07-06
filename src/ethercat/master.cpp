@@ -161,7 +161,7 @@ void Master::configure() {
                                   " B / TxPDO " + std::to_string(info.input_bytes) + " B != configured " + std::to_string(rx_bytes) +
                                   " / " + std::to_string(tx_bytes) + " B (remap did not take)");
         }
-        .slaves_.emplace_back(sc.slave_id, info.input_bytes);
+        slaves_.emplace_back(sc.slave_id, info.input_bytes);
         SlaveRuntime& rt = slaves_.back();
         rt.io = backend_->slave_io(sc.slave_id);
         rt.rx_fields = build_field_table(sc.slave_id, sc.rxpdo);
@@ -338,7 +338,7 @@ FieldLocation Master::rx_field(std::uint16_t slave, std::uint16_t index, std::ui
     if (it == rt.rx_fields.end()) {
         throw PdoMappingError("slave " + std::to_string(slave) + ": object not in the RxPDO (command) map");
     }
-    return FieldLocation{it->second.byte_offset, /*present=*/true};
+    return FieldLocation{it->second.byte_offset};
 }
 
 FieldLocation Master::tx_field(std::uint16_t slave, std::uint16_t index, std::uint8_t sub) const {
@@ -347,7 +347,7 @@ FieldLocation Master::tx_field(std::uint16_t slave, std::uint16_t index, std::ui
     if (it == rt.tx_fields.end()) {
         throw PdoMappingError("slave " + std::to_string(slave) + ": object not in the TxPDO (feedback) map");
     }
-    return FieldLocation{it->second.byte_offset, /*present=*/true};
+    return FieldLocation{it->second.byte_offset};
 }
 
 FieldLocation Master::resolve_field(const std::map<std::uint32_t, MappedField>& table,
@@ -362,8 +362,8 @@ FieldLocation Master::resolve_field(const std::map<std::uint32_t, MappedField>& 
         // Not-in-map is a map-membership failure, so throw PdoMappingError; the operator fixes
         // it by adding the object to the map. PdoMappingError spans both apply-time
         // (apply_pdo_map) and this runtime access of an un-mapped object. A wrong-width access
-        // throws the base Error below, not PdoMappingError, so resolve_rx_optional/
-        // resolve_tx_optional do not swallow a wrong-width object as absent.
+        // throws the base Error below, not PdoMappingError, so try_resolve_rx/try_resolve_tx
+        // do not swallow a wrong-width object as absent.
         throw PdoMappingError("slave " + std::to_string(slave) + ": object " + std::to_string(index) + ":" + std::to_string(sub) +
                               " is not in the " + which + " map");
     }
@@ -377,7 +377,7 @@ FieldLocation Master::resolve_field(const std::map<std::uint32_t, MappedField>& 
                     " width mismatch -- the Field type is " + std::to_string(want_width) + " byte(s) but the object is mapped " +
                     std::to_string(mapped_width) + " byte(s)");
     }
-    return FieldLocation{it->second.byte_offset, /*present=*/true};
+    return FieldLocation{it->second.byte_offset};
 }
 
 void Master::sdo_write(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, std::span<const std::byte> data) {
