@@ -238,24 +238,6 @@ if(DEFINED soem_SOURCE_DIR AND EXISTS "${soem_SOURCE_DIR}/test/linux/slaveinfo/s
   target_link_libraries(slaveinfo PRIVATE soem)
 endif()
 
-# a6_validate: hardware bring-up validation against a real drive. src/tools is
-# bench material kept UNTRACKED (on-disk only); gate on existence so this machine
-# builds it while a fresh clone configures cleanly without it.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/a6_validate.cpp)
-  add_executable(a6_validate)
-
-  target_sources(a6_validate
-    PRIVATE
-      src/tools/a6_validate.cpp
-  )
-
-  target_link_libraries(a6_validate
-    PRIVATE
-      ethercat
-  )
-
-  viam_apply_wall_werror(a6_validate)
-endif()
 
 
 #
@@ -398,31 +380,7 @@ if (ETHERCAT_BUILD_MODULE)
     message(STATUS "#69/#16: stamped $ORIGIN RUNPATH into (and stripped) ${_ethercat_n} bundled lib file(s) under ${_ethercat_root}")
   ]==])
 
-  # Offline validation of the example configs through the real parser +
-  # ServoConfig::validate() (JSON -> protobuf::Struct -> ProtoStruct -> parse).
-  # etc/ and this test are bench material kept UNTRACKED (on-disk only).
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/a6_config_parse_test.cpp AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-hardware.example.json)
-  add_executable(a6_config_parse_test EXCLUDE_FROM_ALL
-    tests/a6_config_parse_test.cpp
-    src/viam/module/servo_motor.cpp
-  )
-  target_link_libraries(a6_config_parse_test
-    PRIVATE
-      ethercat
-      viam-cpp-sdk::viamapi
-      viam-cpp-sdk::viamsdk
-  )
-  target_compile_definitions(a6_config_parse_test PRIVATE
-    BOOST_DLL_USE_STD_FS
-    "A6_HW_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-hardware.example.json\""
-    "A6_MINIMAL_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-minimal.example.json\""
-  )
-  target_include_directories(a6_config_parse_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  viam_apply_wall_werror(a6_config_parse_test)
-  target_compile_options(a6_config_parse_test PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
-  add_test(NAME a6_config_parse_test COMMAND a6_config_parse_test)
-  add_dependencies(build-tests a6_config_parse_test)
-  endif()
+  
 
 endif()
 
@@ -450,13 +408,7 @@ viam_add_test(conversion_test tests/conversion_test.cpp)
 viam_add_test(dc_sync_test tests/dc_sync_test.cpp)
 viam_add_test(realtime_test tests/realtime_test.cpp)
 viam_add_test(rt_preflight_test tests/rt_preflight_test.cpp)
-# Bench-tool tests (depend on the untracked src/tools headers); build when present.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/sine_move_test.cpp)
-  viam_add_test(sine_move_test tests/sine_move_test.cpp)
-endif()
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/a6_control_test.cpp)
-  viam_add_test(a6_control_test tests/a6_control_test.cpp)
-endif()
+
 viam_add_test(servo_config_test tests/servo_config_test.cpp)
 
 # ThreadSanitizer build of the RT-boundary test. Compiles the pdo_cache TU
