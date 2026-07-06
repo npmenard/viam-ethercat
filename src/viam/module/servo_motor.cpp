@@ -19,7 +19,6 @@
 #include "ethercat/cia402.hpp"
 #include "ethercat/errors.hpp"
 #include "ethercat/pdo_mapping.hpp"
-#include "ethercat/sim_backend.hpp"
 #include "viam/lib/a6_servo_driver.hpp"
 #include "viam/lib/servo_config.hpp"
 
@@ -102,82 +101,13 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs) {
     return c;
 }
 
-bool wants_simulation(const ProtoStruct& attrs, const ServoConfig& sc) {
-    if (opt_attr<bool>(attrs, "simulate").value_or(false)) {
-        return true;
-    }
-    return sc.ifname == "sim";
-}
-
-// Derive an in-memory SimSlaveModel from the configured PDO offsets, so the module can load and
-// run in a Viam robot config with no hardware.
-SimSlaveModel sim_model_from_config(const ServoConfig& sc_in) {
-    // The sim reads the driver's fixed superset map (config carries no map). Materialize it on a copy
-    // so the SimSlaveModel offsets match what the Master will remap. It models a Profile-Position
-    // drive; the sim smoke path does go_to.
-    ServoConfig sc = sc_in;
-    sc.set_fixed_pdo_map();
-    SimSlaveModel m;
-    m.mode = Cia402Mode::ProfilePosition;
-
-    std::size_t off = 0;
-    for (const std::uint16_t pidx : sc.rxpdo.pdo_indices) {
-        for (const PdoEntry& e : sc.rxpdo.entries.at(pidx)) {
-            if (e.index == 0x6040) {
-                m.ctrlword_off = off;
-            } else if (e.index == 0x6060) {
-                m.mode_of_op_off = static_cast<std::int32_t>(off);
-            } else if (e.index == 0x607A) {
-                m.target_off = off;
-            } else if (e.index == 0x60FF) {
-                m.velocity_off = static_cast<std::int32_t>(off);
-            }
-            off += e.bit_length / 8U;
-        }
-    }
-    m.output_bytes = off;
-
-    off = 0;
-    for (const std::uint16_t pidx : sc.txpdo.pdo_indices) {
-        for (const PdoEntry& e : sc.txpdo.entries.at(pidx)) {
-            if (e.index == 0x6041) {
-                m.statusword_off = off;
-            } else if (e.index == 0x6061) {
-                m.mode_display_off = static_cast<std::int32_t>(off);
-            } else if (e.index == 0x6064) {
-                m.actual_off = off;
-            } else if (e.index == 0x606C) {
-                m.velocity_actual_off = static_cast<std::int32_t>(off);
-            }
-            off += e.bit_length / 8U;
-        }
-    }
-    m.input_bytes = off;
-
-    // Counts advanced per cycle at max speed, so a simulated move actually converges.
-    const double per_cycle =
-        sc.counts_per_rev * std::abs(sc.gear_ratio) * (sc.max_motor_speed_rpm / 60.0) / static_cast<double>(sc.target_loop_rate_hz);
-    m.counts_per_step = std::max<std::int32_t>(1, static_cast<std::int32_t>(per_cycle));
-    return m;
-}
-
-ServoController::BackendFactory sim_factory_from_config(const ServoConfig& sc) {
-    const SimSlaveModel model = sim_model_from_config(sc);
-    return [model] { return std::unique_ptr<EcatBackend>(std::make_unique<SimBackend>(std::vector<SimSlaveModel>{model})); };
-}
-
 // Build the controller for a model. `Controller` is the generic ServoController (viam:ethercat:servo)
 // or the A6ServoDriver subclass (viam:ethercat:a6-servo); both share the same config parser and ctors
 // (A6 inherits them) and differ only in the three device seams. Returns a base-typed unique_ptr so
 // ServoMotor stays subclass-agnostic (reconfigure() rebuilds the master in place, preserving the type).
 template <class Controller>
 std::unique_ptr<ServoController> build_controller(const ResourceConfig& cfg) {
-    const ProtoStruct& attrs = cfg.attributes();
-    ServoConfig sc = config_from_attrs(attrs);
-    if (wants_simulation(attrs, sc)) {
-        return std::make_unique<Controller>(std::move(sc), sim_factory_from_config(sc));
-    }
-    return std::make_unique<Controller>(std::move(sc));  // SoemBackend (real hardware)
+    return std::make_unique<Controller>(config_from_attrs(cfg.attributes()));
 }
 
 bool command_flag(const ProtoStruct& command, const char* key) {

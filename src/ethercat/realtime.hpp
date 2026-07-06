@@ -55,6 +55,13 @@ bool setup(int priority = kDefaultRtPriority, std::size_t prefault_bytes = kDefa
 // allocations do not EAGAIN. Best-effort.
 void lock_current() noexcept;
 
+// Preflight probe: can this process obtain SCHED_FIFO at `priority`? Tries
+// pthread_setschedparam on a short-lived scratch thread, so unlike setup() it has NO process-wide
+// side effects (no mlockall, no mallopt) and never leaves the calling thread realtime. Use it to
+// fail fast with a clear error BEFORE opening the bus on hosts without realtime scheduling
+// (needs CAP_SYS_NICE or an adequate RLIMIT_RTPRIO -- most stock desktops/servers have neither).
+bool sched_fifo_available(int priority) noexcept;
+
 // DC SYNC0 phase-locked cyclic pacer. Owns the absolute clock_nanosleep deadline (`next`) and
 // the PI integral accumulator; one pace() per cyclic iteration sleeps to the next
 // phase-corrected deadline. Single-thread (the RT loop); no atomics.

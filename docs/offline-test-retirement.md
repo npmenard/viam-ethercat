@@ -1,5 +1,9 @@
 # Offline test retirement (#17 item 12 — sim-fidelity demotion)
 
+> **2026-07-04: SUPERSEDED — the SimBackend stub itself is now REMOVED** (simulation
+> deleted 100%; the sim-backed offline suites went with it). This document remains as
+> the audit trail for which HW checks own each retired behavior.
+
 The offline `SimBackend` was a drive-fidelity simulator (statusword ladder, PP
 set-point-ack, quick-stop deceleration ramp, fault-inject/clear FSM, mode-echo,
 mode-switch latency, encoder noise). It is now a **loopback STUB** — a pipe, not a

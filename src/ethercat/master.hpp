@@ -4,7 +4,7 @@
 //
 // Owns the bus lifecycle (init/configure/process/close), the per-power-on PDO
 // remap, the flat {offset,width} field tables, and one PdoCache per slave. It is
-// backend-agnostic: a SoemBackend in production, a SimBackend in tests, injected
+// backend-agnostic: the EcatBackend (SoemBackend in production) is injected
 // as std::unique_ptr<EcatBackend>.
 //
 // RT boundary: process() runs on the RT thread and is noexcept/exception-free

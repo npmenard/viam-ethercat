@@ -104,6 +104,48 @@ TEST("disable and quick-stop goals") {
     CHECK_EQ(fsm.step(sw(0x0007), Cia402State::OperationEnabled), ControlWord::enable_operation());
 }
 
+TEST("ill-formed statusword decodes to Fault (never report operational on garbage)") {
+    // Patterns matching no DS402 state row must land on the defensive Fault fall-through.
+    CHECK_EQ(sw(0x0001).decode(), Cia402State::Fault);  // ready bit alone: no row
+    CHECK_EQ(sw(0x0003).decode(), Cia402State::Fault);  // ready+switched-on without bit5/bit6 context
+    CHECK_EQ(sw(0x004F).decode(), Cia402State::Fault);  // contradictory: fault bits + switch-on-disabled
+}
+
+TEST("enable ladder waits out NotReadyToSwitchOn with voltage disabled") {
+    // The drive owns the NotReady->SwitchOnDisabled transition; the master must not push.
+    const Cia402Fsm fsm;
+    CHECK_EQ(fsm.step(sw(0x0000), Cia402State::OperationEnabled), ControlWord::disable_voltage());
+}
+
+TEST("goal SwitchedOn: climb from below, drop from above, hold at goal") {
+    const Cia402Fsm fsm;
+    // Below: SwitchOnDisabled climbs one rung (shutdown), ReadyToSwitchOn switches on.
+    CHECK_EQ(fsm.step(sw(0x0040), Cia402State::SwitchedOn), ControlWord::shutdown());
+    CHECK_EQ(fsm.step(sw(0x0021), Cia402State::SwitchedOn), ControlWord::switch_on());
+    // At goal: hold the switch_on level (no further climb).
+    CHECK_EQ(fsm.step(sw(0x0023), Cia402State::SwitchedOn), ControlWord::switch_on());
+    // Above: OperationEnabled drops one rung back to SwitchedOn (de-energize the stage).
+    CHECK_EQ(fsm.step(sw(0x0027), Cia402State::SwitchedOn), ControlWord::switch_on());
+}
+
+TEST("goal ReadyToSwitchOn is one shutdown from any active state") {
+    const Cia402Fsm fsm;
+    CHECK_EQ(fsm.step(sw(0x0040), Cia402State::ReadyToSwitchOn), ControlWord::shutdown());
+    CHECK_EQ(fsm.step(sw(0x0023), Cia402State::ReadyToSwitchOn), ControlWord::shutdown());
+    CHECK_EQ(fsm.step(sw(0x0027), Cia402State::ReadyToSwitchOn), ControlWord::shutdown());
+}
+
+TEST("fault handling has priority over every goal") {
+    const Cia402Fsm fsm;
+    // In Fault, the reset level wins no matter what the caller asks for.
+    CHECK_EQ(fsm.step(sw(0x0008), Cia402State::SwitchOnDisabled), ControlWord::fault_reset());
+    CHECK_EQ(fsm.step(sw(0x0008), Cia402State::QuickStopActive), ControlWord::fault_reset());
+    CHECK_EQ(fsm.step(sw(0x0008), Cia402State::SwitchedOn), ControlWord::fault_reset());
+    // FaultReactionActive: wait it out with voltage disabled, whatever the goal.
+    CHECK_EQ(fsm.step(sw(0x000F), Cia402State::SwitchOnDisabled), ControlWord::disable_voltage());
+    CHECK_EQ(fsm.step(sw(0x000F), Cia402State::QuickStopActive), ControlWord::disable_voltage());
+}
+
 TEST("mode and state names round-trip to strings") {
     CHECK(std::string("OperationEnabled") == ethercat::to_string(Cia402State::OperationEnabled));
     CHECK(std::string("Fault") == ethercat::to_string(Cia402State::Fault));

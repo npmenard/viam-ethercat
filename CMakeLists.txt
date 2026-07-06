@@ -173,7 +173,6 @@ target_sources(ethercat
     src/ethercat/cia402.cpp
     src/ethercat/pdo_cache.cpp
     src/ethercat/backend.cpp
-    src/ethercat/sim_backend.cpp
     src/ethercat/pdo_mapping.cpp
     src/ethercat/master.cpp
     src/ethercat/realtime.cpp
@@ -373,24 +372,6 @@ if (ETHERCAT_BUILD_MODULE)
     message(STATUS "#69/#16: stamped $ORIGIN RUNPATH into (and stripped) ${_ethercat_n} bundled lib file(s) under ${_ethercat_root}")
   ]==])
 
-  # Module smoke test: drives a ServoMotor over a SimBackend-backed controller.
-  # Lives here (not viam_add_test) because it needs the Viam SDK link.
-  add_executable(servo_motor_test
-    tests/servo_motor_test.cpp
-    src/viam/module/servo_motor.cpp
-  )
-  target_link_libraries(servo_motor_test
-    PRIVATE
-      ethercat
-      viam-cpp-sdk::viamapi
-      viam-cpp-sdk::viamsdk
-  )
-  target_compile_definitions(servo_motor_test PRIVATE BOOST_DLL_USE_STD_FS)
-  target_include_directories(servo_motor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  viam_apply_wall_werror(servo_motor_test)
-  target_compile_options(servo_motor_test PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
-  add_test(NAME servo_motor_test COMMAND servo_motor_test)
-
   # Offline validation of the shipped example configs through the real parser +
   # ServoConfig::validate() (JSON -> protobuf::Struct -> ProtoStruct -> parse).
   add_executable(a6_config_parse_test
@@ -406,7 +387,6 @@ if (ETHERCAT_BUILD_MODULE)
   target_compile_definitions(a6_config_parse_test PRIVATE
     BOOST_DLL_USE_STD_FS
     "A6_HW_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-hardware.example.json\""
-    "A6_SIM_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-servo.example.json\""
     "A6_MINIMAL_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-minimal.example.json\""
   )
   target_include_directories(a6_config_parse_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -414,28 +394,6 @@ if (ETHERCAT_BUILD_MODULE)
   target_compile_options(a6_config_parse_test PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
   add_test(NAME a6_config_parse_test COMMAND a6_config_parse_test)
 
-  # Module-LOAD smoke (#12): the full SDK boundary -- registration + validate +
-  # the config-driven production ctor (ServoMotor{deps, ResourceConfig} -> SimBackend)
-  # + the Motor API + Reconfigure + clean shutdown -- offline. Proves the module
-  # loads + runs the gRPC-resource lifecycle without a real viam-server.
-  add_executable(module_load_test
-    tests/module_load_test.cpp
-    src/viam/module/servo_motor.cpp
-  )
-  target_link_libraries(module_load_test
-    PRIVATE
-      ethercat
-      viam-cpp-sdk::viamapi
-      viam-cpp-sdk::viamsdk
-  )
-  target_compile_definitions(module_load_test PRIVATE
-    BOOST_DLL_USE_STD_FS
-    "A6_SIM_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-servo.example.json\""
-  )
-  target_include_directories(module_load_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  viam_apply_wall_werror(module_load_test)
-  target_compile_options(module_load_test PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
-  add_test(NAME module_load_test COMMAND module_load_test)
 endif()
 
 
@@ -456,18 +414,14 @@ endfunction()
 viam_add_test(pdo_buffer_test tests/pdo_buffer_test.cpp)
 viam_add_test(cia402_test tests/cia402_test.cpp)
 viam_add_test(pdo_cache_test tests/pdo_cache_test.cpp)
-viam_add_test(pdo_mapping_test tests/pdo_mapping_test.cpp)
-viam_add_test(master_test tests/master_test.cpp)
 viam_add_test(soem_backend_test tests/soem_backend_test.cpp)
 viam_add_test(conversion_test tests/conversion_test.cpp)
 viam_add_test(dc_sync_test tests/dc_sync_test.cpp)
 viam_add_test(realtime_test tests/realtime_test.cpp)
-viam_add_test(runner_test tests/runner_test.cpp)
+viam_add_test(rt_preflight_test tests/rt_preflight_test.cpp)
 viam_add_test(sine_move_test tests/sine_move_test.cpp)
 viam_add_test(a6_control_test tests/a6_control_test.cpp)
 viam_add_test(servo_config_test tests/servo_config_test.cpp)
-viam_add_test(controller_offline_test tests/controller_offline_test.cpp)
-viam_add_test(teardown_under_load_test tests/teardown_under_load_test.cpp)
 
 # ThreadSanitizer build of the RT-boundary test. Compiles the pdo_cache TU
 # directly (with -fsanitize=thread) so the seqlock / lock-free handoff code is
@@ -482,13 +436,11 @@ if (ETHERCAT_SANITIZE_THREAD AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
                  "seqlock fences are load-bearing). Configure with clang to build it.")
 endif()
 if (ETHERCAT_SANITIZE_THREAD AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  # #50: the TSan lane MUST be an NDEBUG config. Several concurrency tests are gated
-  # `#ifdef NDEBUG` (e.g. runner_test #47.10: the escaped-ctx + stop()-from-RT paths,
-  # which in a debug build would trip check_live's assert instead of running). Under a
-  # Debug build those tests compile to a `CHECK(true)` STUB -- so the very races they
-  # exist to catch (and which TSan would flag, e.g. the Runner self-join-guard rt_tid_
-  # access, #49) go UN-SANITIZED while the lane still reports green. Fail loud: require
-  # a build type whose flags carry -DNDEBUG.
+  # #50: the TSan lane MUST be an NDEBUG config. Concurrency tests may be gated
+  # `#ifdef NDEBUG` (paths that in a debug build would trip an assert instead of
+  # running); under a Debug build such tests compile to a `CHECK(true)` STUB, so
+  # the races they exist to catch go UN-SANITIZED while the lane reports green.
+  # Fail loud: require a build type whose flags carry -DNDEBUG.
   if (NOT CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
     message(FATAL_ERROR
         "ETHERCAT_SANITIZE_THREAD requires an NDEBUG build type (got "
@@ -516,146 +468,6 @@ if (ETHERCAT_SANITIZE_THREAD AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   viam_apply_wall_werror(pdo_cache_test_tsan)
   add_test(NAME pdo_cache_test_tsan COMMAND pdo_cache_test_tsan)
   set_tests_properties(pdo_cache_test_tsan PROPERTIES LABELS "tsan")
-
-  # ThreadSanitizer build of the ServoController teardown-under-load test. The
-  # whole RT/non-RT controller stack is compiled directly with -fsanitize=thread
-  # (linking the un-instrumented libethercat would leave the teardown/atomics
-  # code uninstrumented). SOEM is referenced (the production SoemBackend ctor)
-  # but never executed -- the test injects a SimBackend factory.
-  add_executable(teardown_under_load_test_tsan
-    tests/teardown_under_load_test.cpp
-    src/ethercat/cia402.cpp
-    src/ethercat/pdo_cache.cpp
-    src/ethercat/pdo_mapping.cpp
-    src/ethercat/backend.cpp
-    src/ethercat/sim_backend.cpp
-    src/ethercat/soem_backend.cpp
-    src/ethercat/master.cpp
-    src/ethercat/runner.cpp  # #54 P3a: ServoController drives the library Runner (~Runner) -- required to link
-    src/ethercat/realtime.cpp
-    src/viam/lib/motion_profile.cpp
-    src/viam/lib/servo_config.cpp
-    src/viam/lib/servo_controller.cpp
-  )
-  target_include_directories(teardown_under_load_test_tsan
-    PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/src
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests
-  )
-  target_link_libraries(teardown_under_load_test_tsan
-    PRIVATE
-      soem
-      Threads::Threads
-      Boost::headers
-  )
-  target_compile_options(teardown_under_load_test_tsan PRIVATE -fsanitize=thread -O1 -g)
-  target_link_options(teardown_under_load_test_tsan PRIVATE -fsanitize=thread)
-  viam_apply_wall_werror(teardown_under_load_test_tsan)
-  add_test(NAME teardown_under_load_test_tsan COMMAND teardown_under_load_test_tsan)
-  set_tests_properties(teardown_under_load_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
-
-  # ThreadSanitizer build of the offline controller tests. The #16 fault tests toggle
-  # SimBackend hooks (inject_fault / set_fault_code / force_short_wkc) from the test
-  # thread WHILE the RT loop reads them -- TSan proves those hook fields are race-free
-  # (they are atomic) and that the whole RT/non-RT fault-publish path is clean.
-  add_executable(controller_offline_test_tsan
-    tests/controller_offline_test.cpp
-    src/ethercat/cia402.cpp
-    src/ethercat/pdo_cache.cpp
-    src/ethercat/pdo_mapping.cpp
-    src/ethercat/backend.cpp
-    src/ethercat/sim_backend.cpp
-    src/ethercat/soem_backend.cpp
-    src/ethercat/master.cpp
-    src/ethercat/realtime.cpp
-    src/ethercat/runner.cpp  # #54 P3a: ServoController now drives the library Runner
-    src/viam/lib/motion_profile.cpp
-    src/viam/lib/servo_config.cpp
-    src/viam/lib/servo_controller.cpp
-  )
-  target_include_directories(controller_offline_test_tsan
-    PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/src
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests
-  )
-  target_link_libraries(controller_offline_test_tsan
-    PRIVATE
-      soem
-      Threads::Threads
-      Boost::headers
-  )
-  target_compile_options(controller_offline_test_tsan PRIVATE -fsanitize=thread -O1 -g)
-  target_link_options(controller_offline_test_tsan PRIVATE -fsanitize=thread)
-  viam_apply_wall_werror(controller_offline_test_tsan)
-  add_test(NAME controller_offline_test_tsan COMMAND controller_offline_test_tsan)
-  set_tests_properties(controller_offline_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
-
-  # ThreadSanitizer build of the Master tests. The #22 marshaled steady-state SDO wake (N1) is a
-  # real cross-thread handoff -- a non-RT waiter blocked in sdo_read_deferred woken by
-  # set_rt_active(false) via the sdo_mtx_/sdo_cv_ + sdo_pending_ atomic. Compile the Master + sim
-  # stack directly under -fsanitize=thread so that handoff (and every threaded Master test) is
-  # instrumented, not merely covered by-argument. SOEM referenced (SoemBackend ctor), never executed.
-  add_executable(master_test_tsan
-    tests/master_test.cpp
-    src/ethercat/cia402.cpp
-    src/ethercat/pdo_cache.cpp
-    src/ethercat/pdo_mapping.cpp
-    src/ethercat/backend.cpp
-    src/ethercat/sim_backend.cpp
-    src/ethercat/soem_backend.cpp
-    src/ethercat/master.cpp
-  )
-  target_include_directories(master_test_tsan
-    PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/src
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests
-  )
-  target_link_libraries(master_test_tsan
-    PRIVATE
-      soem
-      Threads::Threads
-      Boost::headers
-  )
-  target_compile_options(master_test_tsan PRIVATE -fsanitize=thread -O1 -g)
-  target_link_options(master_test_tsan PRIVATE -fsanitize=thread)
-  viam_apply_wall_werror(master_test_tsan)
-  add_test(NAME master_test_tsan COMMAND master_test_tsan)
-  set_tests_properties(master_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
-
-  # ThreadSanitizer build of the #47 Runner tests. The Runner spawns the RT thread
-  # while the test thread calls status()/stop()/request_stop()/contract_violations()
-  # concurrently (run()'s phase polling, test 3's start+sleep+stop, test 10's
-  # deliberate cross-thread misbehavior) -- the whole Runner + Master + sim stack is
-  # compiled directly under -fsanitize=thread so the spawn/join/atomics handoff and
-  # the #47 violation counter are instrumented. SOEM referenced, never executed.
-  add_executable(runner_test_tsan
-    tests/runner_test.cpp
-    src/ethercat/cia402.cpp
-    src/ethercat/pdo_cache.cpp
-    src/ethercat/pdo_mapping.cpp
-    src/ethercat/backend.cpp
-    src/ethercat/sim_backend.cpp
-    src/ethercat/soem_backend.cpp
-    src/ethercat/master.cpp
-    src/ethercat/realtime.cpp
-    src/ethercat/runner.cpp
-  )
-  target_include_directories(runner_test_tsan
-    PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/src
-      ${CMAKE_CURRENT_SOURCE_DIR}/tests
-  )
-  target_link_libraries(runner_test_tsan
-    PRIVATE
-      soem
-      Threads::Threads
-      Boost::headers
-  )
-  target_compile_options(runner_test_tsan PRIVATE -fsanitize=thread -O1 -g)
-  target_link_options(runner_test_tsan PRIVATE -fsanitize=thread)
-  viam_apply_wall_werror(runner_test_tsan)
-  add_test(NAME runner_test_tsan COMMAND runner_test_tsan)
-  set_tests_properties(runner_test_tsan PROPERTIES LABELS "tsan" TIMEOUT 300)
 endif()
 
 

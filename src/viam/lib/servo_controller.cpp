@@ -100,8 +100,17 @@ MasterConfig build_master_config(const ServoConfig& c) {
 
 }  // namespace
 
-ServoController::ServoController(ServoConfig config)
-    : ServoController(std::move(config), [] { return std::unique_ptr<EcatBackend>(std::make_unique<SoemBackend>()); }) {}
+std::string rt_unavailable_message(int priority) {
+    return "realtime scheduling is not available on this machine: the module could not enable "
+           "SCHED_FIFO (realtime priority " +
+           std::to_string(priority) +
+           ") for its EtherCAT cycle thread. EtherCAT servo control needs a steady 1 kHz cycle, so the "
+           "host must allow realtime scheduling. To fix: run viam-server as root, or grant it realtime "
+           "permission (systemd: LimitRTPRIO=99 in the viam-server unit; or an rtprio entry in "
+           "/etc/security/limits.d). A PREEMPT_RT Linux kernel is strongly recommended for reliable "
+           "motion. To evaluate WITHOUT realtime (development only -- motion timing is not guaranteed "
+           "and the drive may fault), set \"require_realtime\": false in this motor's attributes.";
+}
 
 // The device fault-reset seam (vendor_fault_reset_sdo()) run once pre-RT-spawn, while this thread
 // is still the single port owner (after Master::configure(), before the RT thread spawns). The
@@ -124,19 +133,14 @@ void ServoController::run_vendor_fault_reset() {
     }
 }
 
-ServoController::ServoController(ServoConfig config, BackendFactory backend_factory)
+ServoController::ServoController(ServoConfig config)
     : config_(validated(std::move(config))),
-      backend_factory_(std::move(backend_factory)),
       // The policy carries only the two quick-stop values: the 0x6085 decel from config (0 makes
       // configure() skip the quick-stop SDO setup, so stop coasts) and the 0x605A option, asserted
       // to be 2 (decelerate, then auto-transition to SwitchOnDisabled). is-moving/reached and the
       // mode-switch are the driver's.
       policy_(config_.quick_stop_decel, 2),
-      commands_(config_.command_queue_capacity) {
-    if (!backend_factory_) {
-        throw Error("ServoController: null backend factory");
-    }
-}
+      commands_(config_.command_queue_capacity) {}
 
 ServoController::~ServoController() {
     stop();
@@ -145,13 +149,23 @@ ServoController::~ServoController() {
 void ServoController::start() {
     const std::unique_lock<std::shared_mutex> lk(api_mutex_);
 
+    // Realtime preflight, BEFORE any bus I/O: probe whether this process can obtain SCHED_FIFO at
+    // the configured priority. Most hosts a Viam module lands on are NOT set up for realtime, and
+    // the failure must be a clear, actionable config error at load -- not a misleading "drive not
+    // operational" minutes later after the NIC was opened and bring-up ran. The probe runs on a
+    // scratch thread (no process-wide side effects); the RT thread's realtime::setup() remains the
+    // authoritative backstop (privileges could change between the probe and the spawn).
+    if (config_.require_realtime && !realtime::sched_fifo_available(config_.rt_priority)) {
+        throw Error(rt_unavailable_message(config_.rt_priority));
+    }
+
     // configure() reaches SAFE-OP and does no memory lock (residency is RT-setup's job, not
     // thread-free bus policy). The RT thread then runs the DC bring-up prelude (settle, request OP,
     // await OP) to Operational; realtime::setup() does the full MCL_CURRENT|MCL_FUTURE in-thread,
     // post-spawn. An in-thread, post-spawn MCL_FUTURE never sees this thread's later jthread stack
     // alloc, and nothing cyclic runs before that in-thread lock, so no SYNC0-critical page-fault
     // window opens.
-    master_ = std::make_unique<Master>(build_master_config(config_), backend_factory_());
+    master_ = std::make_unique<Master>(build_master_config(config_), std::make_unique<SoemBackend>());
     master_->init();
     master_->configure();  // -> SAFE-OP (may throw Error; the SDK retries)
     bring_up();            // resolve, clear errors, and reach OP, with bounded retry
@@ -259,7 +273,7 @@ void ServoController::bring_up() {
         // and master, then rebuild (INIT bounce, PRE-OP settle, DC re-arm). Requests OP once next attempt.
         rt_runner_.reset();
         master_.reset();
-        master_ = std::make_unique<Master>(build_master_config(config_), backend_factory_());
+        master_ = std::make_unique<Master>(build_master_config(config_), std::make_unique<SoemBackend>());
         master_->init();
         master_->configure();  // -> SAFE-OP
     }
@@ -308,7 +322,10 @@ void ServoController::reconfigure(ServoConfig config) {
     config_ = std::move(next);
 
     // Restart with the new config (same body as start(), lock already held).
-    master_ = std::make_unique<Master>(build_master_config(config_), backend_factory_());
+    if (config_.require_realtime && !realtime::sched_fifo_available(config_.rt_priority)) {
+        throw Error(rt_unavailable_message(config_.rt_priority));
+    }
+    master_ = std::make_unique<Master>(build_master_config(config_), std::make_unique<SoemBackend>());
     master_->init();
     master_->configure();
     bring_up();  // resolve, clear errors, and reach OP, with bounded retry
@@ -969,8 +986,11 @@ void ServoController::on_stop(StopReason reason) noexcept {
                                ? " -- freerun not supported; this drive requires use_distributed_clocks=true"
                                : "");
     } else if (reason == StopReason::RtSetupFailed) {
-        // Realtime scheduling unavailable and require_realtime -> Degraded-but-alive.
-        rt_error_.store(RtError::NotOperational, std::memory_order_release);
+        // Realtime scheduling unavailable and require_realtime -> Degraded-but-alive. Backstop only:
+        // start()/reconfigure() preflight this and throw before any bus I/O; reaching here means the
+        // privileges changed between the probe and the RT-thread spawn. RtSetupFailed (not
+        // NotOperational) so last_error() names the realtime cause instead of blaming the drive.
+        rt_error_.store(RtError::RtSetupFailed, std::memory_order_release);
         degraded_.store(true, std::memory_order_release);
     }
     // Requested / BusFault: clean teardown. The steady loop published the bus tier each cycle; parked
@@ -1271,6 +1291,9 @@ std::string ServoController::last_error() const {
             break;
         case RtError::ModeMismatch:
             append("drive mode-of-operation (0x6061) did not match the commanded mode -- refused to energize");
+            break;
+        case RtError::RtSetupFailed:
+            append(rt_unavailable_message(config_.rt_priority));
             break;
         case RtError::None:
             break;

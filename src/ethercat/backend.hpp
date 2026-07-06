@@ -2,15 +2,14 @@
 
 // EcatBackend is the seam that isolates SOEM. ONLY soem_backend.cpp includes
 // <soem/ethercat.h>; no SOEM types (ec_slavet, ecx_contextt, the global
-// ec_slave[]) appear here, so the master library's public API stays clean,
-// -Werror/-clang-tidy happy, and SimBackend is a drop-in for offline tests.
+// ec_slave[]) appear here, so the master library's public API stays clean and
+// -Werror/-clang-tidy happy.
 //
 // Layering:
 //   Master (generic policy: config validation, PDO-remap sub-protocol via SDO,
 //           flat {offset,width} field table, WKC threshold, PdoCache refresh)
 //     -> EcatBackend (low-level bus ops, SOEM-shaped but SOEM-free types)
 //          -> SoemBackend  (real: reentrant ecx_* on a per-Master ecx_contextt)
-//          -> SimBackend   (in-memory drive: echo a PDO map + toy CiA402)
 //
 // The backend deals in RAW BYTES only (SDO payloads, process-data images). All
 // typing / little-endian encoding / CiA402 policy lives above it.

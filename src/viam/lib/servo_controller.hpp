@@ -1,8 +1,8 @@
 #pragma once
 
 //
-// ServoController owns the real-time loop for one servo. It is SDK-free (src/viam/lib) so it is
-// unit-testable on a SimBackend with no Viam SDK and no hardware. It owns the EtherCAT Master,
+// ServoController owns the real-time loop for one servo. It is SDK-free (src/viam/lib), separate
+// from the Viam module glue. It owns the EtherCAT Master,
 // the CommandQueue, the RT thread, the resolved field offsets, the lifecycle FSM, and the
 // published ControllerState atomics. The behaviors the library leaves to the driver live here:
 //   (a) fault-reset rising-edge re-arm (Cia402Fsm::step returns the level),
@@ -48,6 +48,13 @@
 
 namespace ethercat::servo {
 
+// The user-facing "this host has no realtime scheduling" explanation: what failed (SCHED_FIFO at
+// `priority`), why the module needs it, and how to fix it (viam-server realtime permission /
+// PREEMPT_RT kernel / require_realtime=false opt-out for development). Thrown by
+// start()/reconfigure() on a non-realtime host and composed into last_error() by the RT-thread
+// backstop, so the same clear text reaches the Viam UI on every path.
+std::string rt_unavailable_message(int priority);
+
 // RT-published state read by the non-RT motor API. Every field is atomic; the RT loop is the
 // sole writer. The non-RT side derives is_powered/is_moving/position/completion from these,
 // never from master_.
@@ -81,13 +88,9 @@ struct ControllerState {
 // ~Runner joins before the Master and state tear down).
 class ServoController : public SlaveControl {
    public:
-    using BackendFactory = std::function<std::unique_ptr<EcatBackend>()>;
-
-    // Production: backend factory = a SoemBackend maker (so reconfigure() can
-    // build a fresh backend). Validates config (no I/O); throws Error.
+    // Validates config (no I/O); throws Error. start()/reconfigure() build the
+    // SoemBackend-backed Master.
     explicit ServoController(ServoConfig config);
-    // Test/DI: inject a backend factory (SimBackend maker in offline tests).
-    ServoController(ServoConfig config, BackendFactory backend_factory);
 
     ServoController(const ServoController&) = delete;
     ServoController& operator=(const ServoController&) = delete;
@@ -95,10 +98,11 @@ class ServoController : public SlaveControl {
     ServoController& operator=(ServoController&&) = delete;
     ~ServoController();  // stop()
 
-    // Non-RT lifecycle (exclusive api_mutex_). start() builds, inits, and configures the Master
-    // to SAFE-OP (may throw Error), resolves field offsets once, and spawns the RT thread; the
-    // promise/future handshake makes start() throw if the RT thread cannot get SCHED_FIFO with
-    // require_realtime.
+    // Non-RT lifecycle (exclusive api_mutex_). start() first preflights the realtime requirement
+    // (require_realtime: can this process obtain SCHED_FIFO?) and throws rt_unavailable_message()
+    // BEFORE any bus I/O -- on a non-realtime host the user sees the actionable config error at
+    // load, not a drive error later. It then builds, inits, and configures the Master to SAFE-OP
+    // (may throw Error), resolves field offsets once, and spawns the RT thread.
     //
     // start() succeeding means the RT thread is launched and scheduled, not that the drive is
     // operational or powered. The DC bring-up must be gapless, so OP is reached inside the RT
@@ -230,6 +234,7 @@ class ServoController : public SlaveControl {
         MotorStopped,   // an in-flight move cancelled by stop()/halt(); the waiter throws
         MotorDisabled,  // an in-flight move cancelled by disable() (operator de-energize); the waiter throws
         ModeMismatch,   // 0x6061 != commanded mode at SwitchedOn; refuse to energize
+        RtSetupFailed,  // SCHED_FIFO denied on the RT thread (backstop; start() preflights and throws first)
     };
 
     // --- SlaveControl hooks (RT; the Runner owns the thread, pacing, bring-up, and teardown) ---
@@ -271,14 +276,11 @@ class ServoController : public SlaveControl {
     void bump_wake() noexcept;       // wake every parked await_move waiter (C++20 atomic notify)
 
     ServoConfig config_;
-    BackendFactory backend_factory_;
 
     // Resolved once at start(); indexed by the RT loop without a map find. Every RxPDO field the
     // drive consumes must be written by the RT loop each cycle (or SDO-set at configure):
     // controlword, target position/velocity, and profile velocity here. A mapped-but-unwritten
-    // command field makes the drive use its default (silent wrong behavior on hardware). The
-    // SimBackend consumes each field's wire value, so a missing write fails an offline test, not
-    // just the bench.
+    // command field makes the drive use its default (silent wrong behavior on hardware).
     FieldLocation f_ctrlword_;
     FieldLocation f_statusword_;
     FieldLocation f_target_;

@@ -52,10 +52,11 @@ class ServoMotor final : public Motor, public Reconfigurable {
     static std::vector<std::string> validate(const ResourceConfig& cfg);
 
     // Production constructor: parse cfg -> ServoConfig -> build + start a
-    // ServoController (SoemBackend, or a SimBackend when `simulate`/ifname=="sim").
+    // SoemBackend-backed ServoController.
     ServoMotor(const Dependencies& deps, const ResourceConfig& cfg);
 
-    // Test seam: inject an already-built controller (e.g. SimBackend-backed). Starts it.
+    // Inject an already-built controller (the registration path builds the model-specific
+    // subclass first). Starts it.
     ServoMotor(std::string name, std::unique_ptr<ServoController> controller);
 
     ~ServoMotor() override;

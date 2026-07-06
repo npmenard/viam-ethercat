@@ -70,14 +70,6 @@ TEST("a6-hardware.example.json parses through the real parser + validate()") {
     CHECK(c.txpdo.entries.empty());
 }
 
-TEST("a6-servo.example.json: sim config parses + validates") {
-    const ProtoStruct attrs = load_attributes(A6_SIM_CONFIG_PATH);
-    const ServoConfig c = parse_servo_config(attrs);
-    CHECK(c.counts_per_rev == 131072.0);
-    CHECK(c.max_motor_speed_rpm == 3000.0);
-    CHECK(!c.require_realtime);  // sim config runs SCHED_OTHER
-}
-
 TEST("a6-minimal.example.json: only required fields + A6 hw bits -> parses + validates") {
     // The minimal-path proof: the shipped minimal config carries NO PDO map and NO move-complete
     // tolerances -- it parses, validate() passes, and the A6 hardware bits ride in the config.

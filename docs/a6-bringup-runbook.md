@@ -23,7 +23,7 @@ The drive enables through the CiA402 ladder, a PV jog and a PP move both work, r
 ```
 make module.tar.gz        # CPack TGZ -> module.tar.gz (bin/ethercat-servo + meta.json)
 ```
-Install it as a local module in your robot config (point the robot at the unpacked entrypoint, or upload the tarball). Confirm it loads in **sim** first (`"simulate": true` / `"interface": "sim"`) — that's the Phase-6 offline gate and proves the module + config parse before hardware is involved.
+Install it as a local module in your robot config (point the robot at the unpacked entrypoint, or upload the tarball). (The simulation mode this step used to reference is REMOVED — the module always drives real hardware; config parsing is covered offline by `a6_config_parse_test`.)
 
 **1.2 Grant capabilities** to whatever process will exec the module (per `docs/deployment-capabilities.md`):
 - `CAP_NET_RAW` (+ `CAP_NET_ADMIN`) — SOEM's raw socket; without it `ec_init`/NIC open fails.
@@ -58,7 +58,7 @@ ec_scan: found 1 EtherCAT slave(s) on 'enp3s0':
 
 ## 3. Configure the module against the real drive
 
-**3.1 Swap SimBackend → SoemBackend.** In the component config, set `"interface"` to the **real NIC name** (e.g. `"enp3s0"`) and **remove `"simulate"` / don't use `"sim"`**. That alone flips the backend factory from SimBackend to SoemBackend (`interface != "sim" && !simulate` → real). Use the **hardware profile `etc/a6-hardware.example.json`** (#14, the unified PP+PV map below) as the base; `etc/a6-servo.example.json` is the sim quickstart.
+**3.1 Point at the real NIC.** In the component config, set `"interface"` to the **real NIC name** (e.g. `"enp3s0"`). (SimBackend and the `"simulate"`/`"sim"` switches are REMOVED — the module always drives real hardware.) Use the **hardware profile `etc/a6-hardware.example.json`** (#14, the unified PP+PV map below) as the base.
 
 **3.2 The A6 `SlaveConfig` is CONFIG DATA** (never hardcoded; cpp-expert's `etc/a6-hardware.example.json` (#14) encodes this same map in decimal, since JSON has no hex). Authoritative map, verified against the A6 manual §10 (object dictionary + PDO config). Mapping-word format: each entry packs as `index<<16 | subindex<<8 | length_bits` (length byte `08`=8b, `10`=16b, `20`=32b) — e.g. `6040:00`/16b → `0x60400010`; entries pack byte-aligned in map order, little-endian on the wire (our cursor handles LE).
 

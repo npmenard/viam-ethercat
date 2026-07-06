@@ -50,10 +50,9 @@ _Single-mode PP/PV ships on the 1a path; `switchable` must not ship on offline-g
 ---
 
 ## 2. Hardening / coverage (low-priority, non-blocking)
-- **#66 — make the 500-count velocity backstop offline-gatable.** Extend SimBackend
-  `report_noise` to also jitter `0x606C` (velocity), not just position, so the `0→500`
-  quick-stop backstop regression can be caught offline. Its real-HW verification is folded
-  into 1b above; this is the offline complement.
+- **#66 — OBSOLETE (2026-07-04): SimBackend was removed entirely** (simulation is gone;
+  drive behavior is verified HW-first on the bench). The `0→500` quick-stop backstop is
+  covered by the real-HW verification folded into 1b above.
 - **#65 — pin the module build to the noble container.** The host keeps dropping
   `pkg-config`/`libgrpc++-dev`/`libprotobuf-dev`; the module only reliably builds in
   `ethercat-noble-gate:amd64`. Make a container-only build target so no one depends on

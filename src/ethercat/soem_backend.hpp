@@ -6,7 +6,7 @@
 // soem_backend.cpp (pimpl), so no SOEM types leak into the rest of the library.
 //
 // Runtime requires CAP_NET_RAW (raw packet socket) and a dedicated NIC, so this cannot run in
-// CI -- there it only compiles and links. The offline path uses SimBackend.
+// CI -- there it only compiles and links.
 
 #include <cstddef>
 #include <cstdint>

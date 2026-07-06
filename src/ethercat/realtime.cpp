@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 namespace ethercat::realtime {
 
@@ -69,6 +70,24 @@ bool setup(int priority, std::size_t prefault_bytes) noexcept {
 void lock_current() noexcept {
     // NOLINTNEXTLINE(concurrency-mt-unsafe)
     (void)mlockall(MCL_CURRENT);  // best-effort: resident before the RT thread spawns
+}
+
+bool sched_fifo_available(int priority) noexcept {
+    // Probe on a scratch thread: the SCHED_FIFO policy dies with the thread, so the caller is
+    // never left realtime and there are no process-wide side effects. pthread_create failure
+    // (resource exhaustion) reports "unavailable", which errs on the loud side.
+    bool ok = false;
+    try {
+        std::thread probe([&ok, priority]() noexcept {
+            sched_param param{};
+            param.sched_priority = priority;
+            ok = pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == 0;
+        });
+        probe.join();
+    } catch (...) {
+        ok = false;
+    }
+    return ok;
 }
 
 }  // namespace ethercat::realtime
