@@ -15,7 +15,6 @@
 
 #include <viam/sdk/common/proto_value.hpp>
 
-#include "ethercat/backend.hpp"
 #include "ethercat/cia402.hpp"
 #include "ethercat/errors.hpp"
 #include "ethercat/pdo_mapping.hpp"

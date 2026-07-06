@@ -155,7 +155,7 @@ void ServoController::start() {
     // post-spawn. An in-thread, post-spawn MCL_FUTURE never sees this thread's later jthread stack
     // alloc, and nothing cyclic runs before that in-thread lock, so no SYNC0-critical page-fault
     // window opens.
-    master_ = std::make_unique<Master>(build_master_config(config_), std::make_unique<SoemBackend>());
+    master_ = std::make_unique<Master>(build_master_config(config_));
     master_->init();
     master_->configure();  // -> SAFE-OP (may throw Error; the SDK retries)
     bring_up();            // resolve, clear errors, and reach OP, with bounded retry
@@ -263,7 +263,7 @@ void ServoController::bring_up() {
         // and master, then rebuild (INIT bounce, PRE-OP settle, DC re-arm). Requests OP once next attempt.
         rt_runner_.reset();
         master_.reset();
-        master_ = std::make_unique<Master>(build_master_config(config_), std::make_unique<SoemBackend>());
+        master_ = std::make_unique<Master>(build_master_config(config_));
         master_->init();
         master_->configure();  // -> SAFE-OP
     }
@@ -318,7 +318,7 @@ void ServoController::reconfigure(ServoConfig config) {
     if (config_.require_realtime && !realtime::sched_fifo_available(config_.rt_priority)) {
         throw Error(rt_unavailable_message(config_.rt_priority));
     }
-    master_ = std::make_unique<Master>(build_master_config(config_), std::make_unique<SoemBackend>());
+    master_ = std::make_unique<Master>(build_master_config(config_));
     master_->init();
     master_->configure();
     bring_up();  // resolve, clear errors, and reach OP, with bounded retry
@@ -931,7 +931,7 @@ void ServoController::on_stop(StopReason reason) noexcept {
         if (al == 0 && master_ != nullptr) {
             al = master_->al_status_code(config_.slave_id);
         }
-        const std::string al_msg = master_ != nullptr ? master_->describe_al_code(al) : std::string{};
+        const std::string al_msg = Master::describe_al_code(al);  // static: no live master needed
         state_.bringup_al_code.store(al, std::memory_order_relaxed);
         const std::optional<std::uint16_t> no_sync = sync_fault_code();  // device seam (base nullopt)
         const bool sync_fault = no_sync.has_value() && last_sync_code_ != 0 && last_sync_code_ == *no_sync;
@@ -999,7 +999,7 @@ void ServoController::maybe_recover_bus() {
     // re-latches it on the RT thread, and clearing afterwards could overwrite that latch.
     bus_lost_.store(false, std::memory_order_release);
     try {
-        master_ = std::make_unique<Master>(build_master_config(config_), std::make_unique<SoemBackend>());
+        master_ = std::make_unique<Master>(build_master_config(config_));
         master_->init();
         master_->configure();  // -> SAFE-OP
         bring_up();            // -> OP with bounded retry (gives up by setting degraded_)

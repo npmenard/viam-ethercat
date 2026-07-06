@@ -14,8 +14,8 @@
 #include <string>
 #include <vector>
 
-#include "ethercat/backend.hpp"
 #include "ethercat/cia402.hpp"
+#include "ethercat/soem_backend.hpp"
 
 namespace ethercat {
 
@@ -141,6 +141,6 @@ struct MasterConfig {
 //       assignment count (assign_index:00 := M)
 // Throws PdoMappingError (clear text) if the map references a PDO with no entry
 // list or has too many entries/PDOs for the 1-byte counts.
-void apply_pdo_map(EcatBackend& backend, std::uint16_t slave, const PdoMap& map, PdoDirection dir);
+void apply_pdo_map(SoemBackend& backend, std::uint16_t slave, const PdoMap& map, PdoDirection dir);
 
 }  // namespace ethercat

@@ -5,7 +5,6 @@
 
 #include <cstddef>
 
-#include "ethercat/backend.hpp"
 #include "ethercat/soem_backend.hpp"
 #include "test_harness.hpp"
 

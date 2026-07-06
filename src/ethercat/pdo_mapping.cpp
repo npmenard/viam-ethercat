@@ -17,7 +17,7 @@ namespace {
 // re-tag it as PdoMappingError here, the one place the mapping context makes that name correct.
 // A transport or bounds base Error propagates unchanged (it is not a mapping rejection).
 template <PdoScalar T>
-void sdo_write_scalar(EcatBackend& backend, std::uint16_t slave, std::uint16_t index, std::uint8_t sub, T value) {
+void sdo_write_scalar(SoemBackend& backend, std::uint16_t slave, std::uint16_t index, std::uint8_t sub, T value) {
     std::array<std::byte, sizeof(T)> buf{};
     store_le<T>(buf, value);
     try {
@@ -42,7 +42,7 @@ std::size_t PdoMap::byte_size() const {
     return bits / 8;
 }
 
-void apply_pdo_map(EcatBackend& backend, std::uint16_t slave, const PdoMap& map, PdoDirection dir) {
+void apply_pdo_map(SoemBackend& backend, std::uint16_t slave, const PdoMap& map, PdoDirection dir) {
     const std::uint16_t assign_index = map.assign_index(dir);  // derived from direction (or override)
     // (a) Disable the SM PDO assignment (count := 0) so the entries are writable.
     sdo_write_scalar<std::uint8_t>(backend, slave, assign_index, 0x00, 0);

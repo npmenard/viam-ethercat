@@ -39,7 +39,6 @@
 #include <variant>
 #include <vector>
 
-#include "ethercat/backend.hpp"
 #include "ethercat/cia402.hpp"
 #include "ethercat/cia402_sequencer.hpp"
 #include "ethercat/master.hpp"

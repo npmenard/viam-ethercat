@@ -13,6 +13,22 @@
 
 namespace ethercat {
 
+const char* to_string(EcatState state) noexcept {
+    switch (state) {
+        case EcatState::None:
+            return "None";
+        case EcatState::Init:
+            return "Init";
+        case EcatState::PreOp:
+            return "PreOp";
+        case EcatState::SafeOp:
+            return "SafeOp";
+        case EcatState::Op:
+            return "Op";
+    }
+    return "Unknown";
+}
+
 namespace {
 
 // EcatState <-> SOEM AL-state value.
@@ -334,7 +350,7 @@ std::uint16_t SoemBackend::al_status_code(std::uint16_t slave) const noexcept {
     return impl_->ctx.slavelist[slave].ALstatuscode;
 }
 
-std::string SoemBackend::describe_al_code(std::uint16_t code) const {
+std::string SoemBackend::describe_al_code(std::uint16_t code) {
     // SOEM's human string for an arbitrary (latched) AL code; no slave read, no I/O.
     return ec_ALstatuscode2string(code);
 }

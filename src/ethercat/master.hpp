@@ -1,11 +1,11 @@
 #pragma once
 
-// Master -- the generic EtherCAT master policy layer over an EcatBackend.
+// Master -- the generic EtherCAT master policy layer over the SoemBackend.
 //
 // Owns the bus lifecycle (init/configure/process/close), the per-power-on PDO
 // remap, the flat {offset,width} field tables, and one PdoCache per slave. It is
-// backend-agnostic: the EcatBackend (SoemBackend in production) is injected
-// as std::unique_ptr<EcatBackend>.
+// SOEM-free by construction: the SoemBackend's pimpl confines every SOEM type
+// to soem_backend.cpp, and Master constructs and owns the backend itself.
 //
 
 #include <atomic>
@@ -19,12 +19,12 @@
 #include <span>
 #include <string>
 
-#include "ethercat/backend.hpp"
 #include "ethercat/errors.hpp"
 #include "ethercat/field.hpp"
 #include "ethercat/pdo_buffer.hpp"
 #include "ethercat/pdo_cache.hpp"
 #include "ethercat/pdo_mapping.hpp"
+#include "ethercat/soem_backend.hpp"
 
 namespace ethercat {
 
@@ -77,7 +77,7 @@ enum class BringupStatus : std::uint8_t {
 class Master {
    public:
     // Validates config (no I/O). Throws Error on a bad config.
-    Master(MasterConfig config, std::unique_ptr<EcatBackend> backend);
+    explicit Master(MasterConfig config);
 
     Master(const Master&) = delete;
     Master& operator=(const Master&) = delete;
@@ -171,8 +171,8 @@ class Master {
     // Human-readable text for an AL status code (delegates to the backend / SOEM's
     // ec_ALstatuscode2string), so a consumer can describe the latched bringup_al_code(). Non-RT
     // (allocates); call it at the give-up, off the RT path.
-    std::string describe_al_code(std::uint16_t code) const {
-        return backend_->describe_al_code(code);
+    static std::string describe_al_code(std::uint16_t code) {
+        return SoemBackend::describe_al_code(code);
     }
     bool all_operational() const noexcept {
         return operational_.load(std::memory_order_relaxed);
@@ -337,7 +337,7 @@ class Master {
     bool dc_enabled_ = false;  // set in configure(): is SYNC0 in play? (gates the post-OP settle grace)
 
     MasterConfig config_;
-    std::unique_ptr<EcatBackend> backend_;
+    std::unique_ptr<SoemBackend> backend_;
     std::deque<SlaveRuntime> slaves_;
 
     int expected_wkc_ = 0;

@@ -181,7 +181,6 @@ target_sources(ethercat
   PRIVATE
     src/ethercat/cia402.cpp
     src/ethercat/pdo_cache.cpp
-    src/ethercat/backend.cpp
     src/ethercat/pdo_mapping.cpp
     src/ethercat/master.cpp
     src/ethercat/realtime.cpp

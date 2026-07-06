@@ -23,7 +23,7 @@ std::uint32_t field_key(std::uint16_t index, std::uint8_t sub) noexcept {
 
 }  // namespace
 
-Master::Master(MasterConfig config, std::unique_ptr<EcatBackend> backend) : config_(std::move(config)), backend_(std::move(backend)) {
+Master::Master(MasterConfig config) : config_(std::move(config)), backend_(std::make_unique<SoemBackend>()) {
     if (!backend_) {
         throw Error("Master: null backend");
     }
