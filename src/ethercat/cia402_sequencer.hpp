@@ -1,19 +1,19 @@
 #pragma once
 
-// Generic, device-agnostic CiA402 motion policy
+// Generic, device-agnostic CiA402 motion sequencer
 //
 // Scope:
-//  * The policy works in pure counts and is unit-agnostic The policy owns only
+//  * The sequencer works in pure counts and is unit-agnostic The sequencer owns only
 //    the CiA402 sequencing: enable ladder, mode-echo, the four-phase new-set-point
 //    handshake (WriteTarget -> AwaitAck -> ClearBit4 -> AwaitAckClear), and quick-stop. Runtime mode switching is also the driver's job;
-//    the policy is a per-mode executor that writes 0x6060 = cmd.mode plus that mode's command objects every cycle and never decides to
+//    the sequencer is a per-mode executor that writes 0x6060 = cmd.mode plus that mode's command objects every cycle and never decides to
 //    switch.
 //  * The only device-specific values are the two quick-stop settings (0x6085 decel, 0x605A
 //    option), passed to the constructor. Standard CiA402 object indices and controlword/
 //    statusword bit semantics live here. A Halt intent holds position (CiA402 bit 8);
 //    ctx.stopping()/on_stop() de-energize via quick-stop.
 //
-// The policy operates on a CycleContext (the library RT boundary) plus typed cia402::Field aliases.
+// The sequencer operates on a CycleContext (the library RT boundary) plus typed cia402::Field aliases.
 
 #include <cstddef>
 #include <cstdint>
@@ -28,7 +28,7 @@
 
 namespace ethercat {
 
-struct PolicyCommand {
+struct SequencerCommand {
     Cia402Mode mode = Cia402Mode::ProfilePosition;  // 0x6060 mode
     std::int32_t target_counts = 0;                 // PP absolute target (counts)
     std::uint32_t profile_velocity = 0;             // PP move speed (counts/s)
@@ -38,7 +38,7 @@ struct PolicyCommand {
     bool new_setpoint = false;
 };
 
-struct PolicyState {
+struct SequencerState {
     std::int8_t current_mode = 0;  // 0x6061 echo (confirmed device mode)
     std::uint16_t fault_code = 0;  // raw 0x603F device error code
     bool mode_mismatch = false;
@@ -46,13 +46,13 @@ struct PolicyState {
     bool handshake_timed_out = false;
 };
 
-class Cia402Policy {
+class Cia402Sequencer {
    public:
     // The two device-specific values: the quick-stop deceleration written to 0x6085
     // (counts/s^2; 0 means quick-stop is not configured and configure() skips the SDO setup)
     // and the 0x605A option the drive is asserted to already hold (2 = decelerate, then
     // auto-transition to SwitchOnDisabled).
-    explicit Cia402Policy(std::uint32_t quick_stop_decel, std::int16_t quick_stop_option = 2) noexcept
+    explicit Cia402Sequencer(std::uint32_t quick_stop_decel, std::int16_t quick_stop_option = 2) noexcept
         : quick_stop_decel_(quick_stop_decel), quick_stop_option_(quick_stop_option) {}
 
     // Non-RT, called before the RT thread spawns; may throw Error (which aborts Runner start,
@@ -79,7 +79,7 @@ class Cia402Policy {
             const std::size_t n = cfg.sdo_read(kQuickStopOption, 0, qso);
             const std::int16_t qs_opt = n >= 2 ? load_le<std::int16_t>(qso) : std::int16_t{-1};
             if (qs_opt != quick_stop_option_) {
-                throw Error("Cia402Policy: 0x605A (quick-stop option) = " + std::to_string(qs_opt) + ", require == " +
+                throw Error("Cia402Sequencer: 0x605A (quick-stop option) = " + std::to_string(qs_opt) + ", require == " +
                             std::to_string(quick_stop_option_) + " (decel on 0x6085 -> auto SwitchOnDisabled). Refusing to energize.");
             }
             // Write 0x6085 (quick-stop decel), then read it back and use the read-back value downstream.
@@ -88,7 +88,7 @@ class Cia402Policy {
             const std::size_t m = cfg.sdo_read(kQuickStopDecel, 0, qd);
             echoed = m >= 4 ? load_le<std::uint32_t>(qd) : 0U;
             if (echoed == 0U) {
-                throw Error("Cia402Policy: 0x6085 (quick-stop decel) readback = 0/absent after write. Refusing to energize.");
+                throw Error("Cia402Sequencer: 0x6085 (quick-stop decel) readback = 0/absent after write. Refusing to energize.");
             }
         }
         qs_decel_echoed_ = echoed;
@@ -101,7 +101,7 @@ class Cia402Policy {
     int bit4_edges() const noexcept {
         return bit4_edges_;
     }
-    const PolicyState& state() const noexcept {
+    const SequencerState& state() const noexcept {
         return state_;
     }
 
@@ -109,7 +109,7 @@ class Cia402Policy {
     // controlword and the mode's command objects, and updates state_. Returns the controlword
     // written. ctx.stopping() de-energizes via quick-stop; a Halt intent holds position
     // (CiA402 bit 8, controlword 0x0F).
-    std::uint16_t step(CycleContext& ctx, const PolicyCommand& cmd) noexcept {
+    std::uint16_t step(CycleContext& ctx, const SequencerCommand& cmd) noexcept {
         const Status status{ctx.load<cia402::Statusword::type>(sw_loc_)};
         state_.fault_code = fc_loc_ ? ctx.load<cia402::FaultCode::type>(*fc_loc_) : std::uint16_t{0};
         state_.current_mode = mode_loc_ ? ctx.load<cia402::ModeDisplay::type>(*mode_loc_) : std::int8_t{0};
@@ -190,13 +190,13 @@ class Cia402Policy {
 
     void on_stop(StopReason /*reason*/) noexcept {}
 
-    // Reset the per-run RT sequencing state (published state, handshake, latches) so the policy
+    // Reset the per-run RT sequencing state (published state, handshake, latches) so the sequencer
     // can be reused across a wrapper stop/restart. Leaves the resolved FieldLocations and
     // qs_decel_echoed_ intact; configure() owns those and re-runs before the next RT phase.
     // Only a persistent wrapper needs this (the module's ServoController, across reconfigure);
-    // a one-shot consumer just builds a fresh policy per run.
+    // a one-shot consumer just builds a fresh sequencer per run.
     void reset() noexcept {
-        state_ = PolicyState{};
+        state_ = SequencerState{};
         handshake_ = Handshake::Idle;
         handshake_cycles_remaining_ = 0;
         last_cw_ = 0;
@@ -208,7 +208,7 @@ class Cia402Policy {
     }
 
    private:
-    std::uint16_t drive_operational_(CycleContext& ctx, const PolicyCommand& cmd, Status status) noexcept {
+    std::uint16_t drive_operational_(CycleContext& ctx, const SequencerCommand& cmd, Status status) noexcept {
         std::uint16_t base = ControlWord::enable_operation();  // 0x0F
         if (mode_wr_loc_) {
             ctx.store<cia402::ModeOfOperation::type>(*mode_wr_loc_, static_cast<std::int8_t>(cmd.mode));
@@ -284,7 +284,7 @@ class Cia402Policy {
         return base;
     }
 
-    // Standard CiA402 object indices used by the policy.
+    // Standard CiA402 object indices used by the sequencer.
     static constexpr std::uint16_t kQuickStopDecel = 0x6085;
     static constexpr std::uint16_t kQuickStopOption = 0x605A;
     // Quick-stop controlword: enable_operation() with bit 2 (quick-stop) cleared = 0x0B.
@@ -309,7 +309,7 @@ class Cia402Policy {
     enum class Handshake : std::uint8_t { Idle, WriteTarget, AwaitAck, ClearBit4, AwaitAckClear };
 
     Cia402Fsm fsm_;
-    PolicyState state_;
+    SequencerState state_;
     Handshake handshake_ = Handshake::Idle;
     std::uint32_t handshake_cycles_remaining_ = 0;
     // Consecutive recent cycles the written controlword had Halt (bit 8) clear, capped at

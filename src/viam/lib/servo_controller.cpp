@@ -127,11 +127,11 @@ void ServoController::run_vendor_fault_reset() {
 
 ServoController::ServoController(ServoConfig config)
     : config_(validated(std::move(config))),
-      // The policy carries only the two quick-stop values: the 0x6085 decel from config (0 makes
+      // The sequencer carries only the two quick-stop values: the 0x6085 decel from config (0 makes
       // configure() skip the quick-stop SDO setup, so stop coasts) and the 0x605A option, asserted
       // to be 2 (decelerate, then auto-transition to SwitchOnDisabled). is-moving/reached and the
       // mode-switch are the driver's.
-      policy_(config_.quick_stop_decel, 2),
+      sequencer_(config_.quick_stop_decel, 2),
       commands_(config_.command_queue_capacity) {}
 
 ServoController::~ServoController() {
@@ -179,7 +179,7 @@ void ServoController::reset_run_state() {
     state_.expected_wkc.store(master_->expected_wkc(), std::memory_order_relaxed);  // constant; read lock-free by last_error()
     lifecycle_ = Init{};
     last_cw_ = 0;
-    policy_.reset();  // clear the shared policy's per-run sequencing state (handshake/latches) for reuse
+    sequencer_.reset();  // clear the shared sequencer's per-run sequencing state (handshake/latches) for reuse
     prev_actual_ = 0;
     first_cycle_ = true;
     halted_ = false;
@@ -335,7 +335,7 @@ void ServoController::resolve_fields() {
     f_ctrlword_ = master_->resolve_rx<cia402::ControlWord>(s);
     f_statusword_ = master_->resolve_tx<cia402::Statusword>(s);
     f_actual_ = master_->resolve_tx<cia402::PositionActual>(s);
-    // The PP/PV command objects (0x607A/0x6081/0x60FF) are the policy's to resolve and write.
+    // The PP/PV command objects (0x607A/0x6081/0x60FF) are the sequencer's to resolve and write.
     // Optional TxPDO feedback, both modes. nullopt means not in the map, so the RT loop falls back
     // (velocity estimate) or omits the tier (fault code).
     f_fault_code_ = master_->try_resolve_tx<cia402::FaultCode>(s);
@@ -447,27 +447,27 @@ Cia402Mode ServoController::commanded_cia402_mode() const noexcept {
 
 // Driver-owned runtime mode-switch. Holds energized (cw 0x0F) throughout: "no motion" during a switch
 // is not a de-energize. Stopping: ramp the current mode to rest (driver rest detection, at_rest_) then
-// advance. Settling: command the target mode via the policy (which writes 0x6060 = cmd.mode) plus a
-// safe seed, and confirm the 0x6061 echo. The hold token is constant through the switch so the policy's
+// advance. Settling: command the target mode via the sequencer (which writes 0x6060 = cmd.mode) plus a
+// safe seed, and confirm the 0x6061 echo. The hold token is constant through the switch so the sequencer's
 // handshake settles to Idle (a clean cw=0x0F hold, no re-armed bit 4). A drive fault during the window
 // is handled by step_lifecycle's Fault branch, not here.
 std::uint16_t ServoController::run_mode_switch(CycleContext& ctx, std::int32_t actual, Cia402Mode want) noexcept {
     const std::int8_t want_i8 = static_cast<std::int8_t>(want);
     const std::int8_t confirmed = ctx.load<cia402::ModeDisplay::type>(*f_mode_disp_);  // 0x6061 echo THIS cycle (caller guards mapped)
-    PolicyCommand pcmd;
+    SequencerCommand pcmd;
     pcmd.enable = true;
     pcmd.halt = false;
     pcmd.profile_velocity = profile_vel_;
     pcmd.target_counts = actual;  // PP hold at the current position (no lunge)
     pcmd.target_velocity = 0;     // PV ramp to 0
-    pcmd.new_setpoint = false;    // hold: never arm the handshake during a switch (the policy settles to Idle)
+    pcmd.new_setpoint = false;    // hold: never arm the handshake during a switch (the sequencer settles to Idle)
 
     if (switch_phase_ == SwitchPhase::Stopping) {
         // Command the current confirmed mode so the drive stays in its present control loop while it ramps
         // to rest (don't write the new 0x6060 until the motor has stopped, to avoid an in-motion switch).
         pcmd.mode = (confirmed == static_cast<std::int8_t>(Cia402Mode::ProfileVelocity)) ? Cia402Mode::ProfileVelocity
                                                                                          : Cia402Mode::ProfilePosition;
-        const std::uint16_t cw = policy_.step(ctx, pcmd);
+        const std::uint16_t cw = sequencer_.step(ctx, pcmd);
         if (at_rest_) {  // driver rest detection (last publish_state's verdict)
             switch_phase_ = SwitchPhase::Settling;
             switch_cycles_ = 0;
@@ -476,9 +476,9 @@ std::uint16_t ServoController::run_mode_switch(CycleContext& ctx, std::int32_t a
         }
         return cw;
     }
-    // Settling: command the target mode plus a safe seed (the policy writes 0x6060 = want); confirm the echo.
+    // Settling: command the target mode plus a safe seed (the sequencer writes 0x6060 = want); confirm the echo.
     pcmd.mode = want;
-    const std::uint16_t cw = policy_.step(ctx, pcmd);
+    const std::uint16_t cw = sequencer_.step(ctx, pcmd);
     if (confirmed == want_i8) {  // confirmed: next cycle runs the target mode's motion body
         switch_phase_ = SwitchPhase::None;
     } else if (++switch_cycles_ >= kModeSwitchSettleCycles) {
@@ -524,7 +524,7 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         if (batch.halt_supersedes) {
             halted_ = true;  // sticky: stays asserted across cycles until a new motion command
             // On a switch-capable PV map, hold position via PP (below). The driver mode-switch brings
-            // PV->PP; then pending_new_setpoint_ arms the policy's PP handshake once for the hold target,
+            // PV->PP; then pending_new_setpoint_ arms the sequencer's PP handshake once for the hold target,
             // which latches the live actual at rest (post stop-first ramp) so there is no lunge. Not
             // switch-capable means pv_hold_as_pp_ stays false and the interim bit-8 zero-velocity hold
             // applies. Only when the drive is currently in PV (a PP-intent halt already holds in PP, no
@@ -550,7 +550,7 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             target_counts_ = t.relative ? static_cast<std::int32_t>(actual + t.counts) : t.counts;
             profile_vel_ = t.profile_velocity;
             latched_ctrl_error_ = RtError::None;  // a fresh move starts with a clean diagnostic slate
-            pending_new_setpoint_ = true;         // arm the policy's PP handshake for this new target (consumed post-switch)
+            pending_new_setpoint_ = true;         // arm the sequencer's PP handshake for this new target (consumed post-switch)
             state_.active_generation.store(t.generation, std::memory_order_release);
         }
     }
@@ -575,7 +575,7 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             return ControlWord::disable_voltage();  // latch the fault; reset is explicit (Faulted handles it)
         }
         // Seed 0x6060 = commanded mode through the enable ladder. The module's own enable FSM (not the
-        // policy, which is stepped only post-OperationEnabled) drives the ladder, so it must write the
+        // sequencer, which is stepped only post-OperationEnabled) drives the ladder, so it must write the
         // mode itself, else on a PDO-mapped-0x6060 map the drive follows the PDO (=0) and enables in mode
         // 0. Inert when 0x6060 is SDO-set only: f_mode_wr_ is nullopt.
         if (f_mode_wr_) {
@@ -587,7 +587,7 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // before energizing to OperationEnabled. A mismatch (the drive silently ignored the mode) latches
         // Failed, de-energizes, and sets RtError::ModeMismatch (last_error), sticky so there is no
         // ReadyToSwitchOn <-> SwitchedOn oscillation. Inert when 0x6061 is not mapped. Mirrors the
-        // policy's gate, which the module never reaches (it delegates to the policy only post-OperationEnabled).
+        // sequencer's gate, which the module never reaches (it delegates to the sequencer only post-OperationEnabled).
         if (mode_gate_ == ModeGate::Pending && f_mode_disp_ && (dev == Cia402State::SwitchedOn || dev == Cia402State::OperationEnabled)) {
             const auto want = static_cast<std::int8_t>(commanded_cia402_mode());  // gate on the commanded (intent) mode
             const auto echo = ctx.load<cia402::ModeDisplay::type>(*f_mode_disp_);
@@ -622,7 +622,7 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         // Driver-owned runtime mode-switch. The intent's Cia402 mode is PP for a positioned move (or a
         // PV->PP motion-hold), PV for set_rpm. If the drive's confirmed 0x6061 differs, or a switch is
         // already mid-sequence, the wrapper orchestrates the switch (hold energized, bring to rest,
-        // command the new mode via the policy, await the echo) instead of the motion body. Only when
+        // command the new mode via the sequencer, await the echo) instead of the motion body. Only when
         // 0x6060 (write) and 0x6061 (echo) are both mapped; else the mode is fixed and this never triggers.
         const Cia402Mode want = pv_hold_as_pp_ ? Cia402Mode::ProfilePosition : commanded_cia402_mode();
         if (f_mode_wr_ && f_mode_disp_) {
@@ -638,12 +638,12 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         }
 
         // No switch in flight: delegate the Operational healthy-path (enable-hold, PP new-set-point
-        // handshake, 0x6081 move-speed or PV 0x60FF stream, Halt) to the shared generic policy. The
+        // handshake, 0x6081 move-speed or PV 0x60FF stream, Halt) to the shared generic sequencer. The
         // wrapper keeps completion generations, the two-tier fault, the fault-reset machine, and
-        // is-moving/reached. pending_new_setpoint_ arms the policy's handshake on the cycle a new target
-        // is adopted. The policy writes the controlword and command objects into ctx and returns the cw;
+        // is-moving/reached. pending_new_setpoint_ arms the sequencer's handshake on the cycle a new target
+        // is adopted. The sequencer writes the controlword and command objects into ctx and returns the cw;
         // publish_state below reads its handshake-idle for the completion gate.
-        PolicyCommand pcmd;
+        SequencerCommand pcmd;
         if (pv_hold_as_pp_) {
             // PV motion-hold as PP-at-current-counts. The switch above brought PV->PP (position loop
             // active); command PP with target = the position latched at the halt so the drive's position
@@ -664,12 +664,12 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             pcmd.enable = true;
             pcmd.halt = halted_;
         }
-        pcmd.new_setpoint = pending_new_setpoint_;  // arm the policy's handshake on the cycle a new target is adopted
+        pcmd.new_setpoint = pending_new_setpoint_;  // arm the sequencer's handshake on the cycle a new target is adopted
         pending_new_setpoint_ = false;              // consume (a switch defers this -- run_mode_switch returns before here)
-        const std::uint16_t cw = policy_.step(ctx, pcmd);
-        // The four-phase handshake's ack (or ack-clear) timeout is the policy's per-cycle signal; the
+        const std::uint16_t cw = sequencer_.step(ctx, pcmd);
+        // The four-phase handshake's ack (or ack-clear) timeout is the sequencer's per-cycle signal; the
         // wrapper owns the disposition and aborts the in-flight move (latch and wake the waiter).
-        if (policy_.state().handshake_timed_out && !pv_hold_as_pp_) {
+        if (sequencer_.state().handshake_timed_out && !pv_hold_as_pp_) {
             abort_active_move(RtError::HandshakeTimeout);
         }
         return cw;
@@ -762,7 +762,7 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
     // PP generation protocol: completion (PP-only via move_active). There is no no-progress watchdog;
     // a stuck move parks in await_move until the client stops it, the drive faults, or the RT loop
     // exits (client-owned cancellation, consistent with the no-timeout wait).
-    if (powered && move_active && at_target && policy_.state().handshake_idle) {
+    if (powered && move_active && at_target && sequencer_.state().handshake_idle) {
         state_.completed_generation.store(g, std::memory_order_release);  // publish before the wake
         bump_wake();
     }
@@ -800,16 +800,16 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
 
 // --- SlaveControl hooks: the RT body split across the Runner's lifecycle. The Runner owns
 // realtime setup, the DC bring-up pump, the single DcPacer, pacing, the steady cadence, the
-// stopping window, and master.close(). What remains here is policy.
+// stopping window, and master.close(). What remains here is driver policy.
 
 void ServoController::on_configured(ConfigContext& cfg) {
-    // Resolve the policy's typed fields and run its quick-stop SDO setup here (non-RT, pre-spawn,
+    // Resolve the sequencer's typed fields and run its quick-stop SDO setup here (non-RT, pre-spawn,
     // single port owner -- the one hook that may throw; a throw aborts start() cleanly and goes
     // Degraded). The module's own f_* offsets and vendor reset still resolve in start()/reconfigure();
-    // this adds the policy's resolution (same Master, same SAFE-OP phase). needs_quick_stop is gated on
+    // this adds the sequencer's resolution (same Master, same SAFE-OP phase). needs_quick_stop is gated on
     // a configured 0x6085 (quick_stop_decel > 0); the echoed value backs the velocity-window guard. A
     // mismatched 0x605A or absent 0x6085 throws.
-    const std::uint32_t echoed = policy_.configure(cfg, /*needs_quick_stop=*/config_.quick_stop_decel > 0);
+    const std::uint32_t echoed = sequencer_.configure(cfg, /*needs_quick_stop=*/config_.quick_stop_decel > 0);
     qs_decel_echoed_.store(echoed, std::memory_order_release);
     // Derive the velocity guard budget from the teardown window (a single source of truth, so the
     // window and the budget cannot disagree): the max velocity the echoed 0x6085 decel can ramp to 0
@@ -859,16 +859,16 @@ void ServoController::step(CycleContext& ctx) noexcept {
             f_velocity_actual_ ? ctx.load<std::int32_t>(*f_velocity_actual_)
                                : static_cast<std::int32_t>(static_cast<std::int64_t>(sactual - prev_actual_) * config_.target_loop_rate_hz);
         prev_actual_ = sactual;
-        // Two-level stop: when quick-stop is configured (quick_stop_decel>0), delegate to the policy's
+        // Two-level stop: when quick-stop is configured (quick_stop_decel>0), delegate to the sequencer's
         // controlled quick-stop (ramp via 0x6085, auto SwitchOnDisabled, then disable-voltage backstop
         // once |vel| is sub-threshold for the debounce). Opt-out (no decel): a straight disable-voltage
-        // coast. Both are defined safe stops; the controlled one is opt-in. The policy's step() takes
+        // coast. Both are defined safe stops; the controlled one is opt-in. The sequencer's step() takes
         // its ctx.stopping() branch and writes the cw.
         if (config_.quick_stop_decel > 0) {
-            PolicyCommand scmd;
+            SequencerCommand scmd;
             scmd.mode = commanded_cia402_mode();
-            scmd.enable = false;            // stopping is not a motion intent; the policy's stopping branch owns the cw
-            (void)policy_.step(ctx, scmd);  // writes cw (kQuickStopCw / disable backstop) into ctx
+            scmd.enable = false;               // stopping is not a motion intent; the sequencer's stopping branch owns the cw
+            (void)sequencer_.step(ctx, scmd);  // writes cw (kQuickStopCw / disable backstop) into ctx
         } else {
             ctx.store<std::uint16_t>(f_ctrlword_, ControlWord::disable_voltage());
         }

@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "ethercat/cia402.hpp"
-#include "ethercat/cia402_policy.hpp"  // #47-P3b: the generic policy this control now wraps for PP/PV
+#include "ethercat/cia402_sequencer.hpp"  // #47-P3b: the generic sequencer this control now wraps for PP/PV
 #include "ethercat/errors.hpp"
 #include "ethercat/master.hpp"
 #include "ethercat/pdo_buffer.hpp"
@@ -133,10 +133,10 @@ struct Telemetry {
 class A6Control final : public SlaveControl {
    public:
     // `mode` is the commanded 0x6060 (the CLI mode); its int8 value is what 0x6061 must echo before
-    // enabling. build_a6_config() sets the same mode at configure. The policy carries only the two
+    // enabling. build_a6_config() sets the same mode at configure. The sequencer carries only the two
     // quick-stop values.
     A6Control(const Options& opt, Telemetry& tel, Cia402Mode mode) noexcept
-        : opt_(opt), tel_(tel), policy_(kQuickStopDecelDefault, kQuickStopOptionRequired) {
+        : opt_(opt), tel_(tel), sequencer_(kQuickStopDecelDefault, kQuickStopOptionRequired) {
         goal_ = opt_.enable ? Cia402State::OperationEnabled : Cia402State::ReadyToSwitchOn;
         profile_vel_ = static_cast<std::uint32_t>(opt_.move_rpm / 60.0 * kCountsPerRev);
         commanded_mode_disp_ = static_cast<std::int8_t>(mode);  // 0x6061 echo target (PP=1, PV=3, CSP=8)
@@ -158,12 +158,12 @@ class A6Control final : public SlaveControl {
         mode_loc_ = cfg.resolve_tx<cia402::ModeDisplay>();
         tv_loc_ = cfg.resolve_rx<cia402::TargetVelocity>();  // PV target (also over-mapped in PP/CSP, inert)
 
-        // The generic policy owns the PV configure-time refusals (0x605A assert, 0x6085
+        // The generic sequencer owns the PV configure-time refusals (0x605A assert, 0x6085
         // write/readback-echo) and resolves its own field handles from the same cfg. The velocity
         // guard stays a wrapper concern (it needs the commanded velocity and the window). All
         // fail-closed: a throw aborts start().
-        if (uses_policy_()) {
-            const std::uint32_t echoed = policy_.configure(cfg, /*needs_quick_stop=*/opt_.move_vel);
+        if (uses_sequencer_()) {
+            const std::uint32_t echoed = sequencer_.configure(cfg, /*needs_quick_stop=*/opt_.move_vel);
             if (opt_.move_vel) {
                 const double window_s = static_cast<double>(kPvTeardownCycles) / static_cast<double>(kLoopHz);
                 const double vel_max = static_cast<double>(echoed) * (window_s - kVelGuardMarginS);
@@ -215,8 +215,8 @@ class A6Control final : public SlaveControl {
     // (ship with the next exchange, one cycle of latency: an output written this cycle rides the next
     // exchange()).
     void step(CycleContext& ctx) noexcept override {
-        if (uses_policy_()) {  // --move-pos / --move-vel are driven by the generic policy
-            step_policy_(ctx);
+        if (uses_sequencer_()) {  // --move-pos / --move-vel are driven by the generic sequencer
+            step_sequencer_(ctx);
             return;
         }
         const Status status{ctx.load<cia402::Statusword::type>(sw_loc_)};
@@ -325,7 +325,7 @@ class A6Control final : public SlaveControl {
             }
         }
 
-        // --- The CiA402 branch tree (policy only).
+        // --- The CiA402 branch tree (sequencer only).
         std::uint16_t cw = fsm_.step(status, goal_);
         if (faulted) {
             // Generic CiA402 bit-7 fault-reset edge (the A6's real reset is the vendor 0x2031:01 SDO,
@@ -445,29 +445,29 @@ class A6Control final : public SlaveControl {
 
     // --- read-after-stop accessors (offline tests; the join is the happens-before edge) ---
     bool move_done() const noexcept {
-        return uses_policy_() ? policy_reached_ : move_done_;
+        return uses_sequencer_() ? sequencer_reached_ : move_done_;
     }
     bool mode_refused() const noexcept {
-        return uses_policy_() ? policy_.state().mode_mismatch : mode_refused_;
+        return uses_sequencer_() ? sequencer_.state().mode_mismatch : mode_refused_;
     }
     int bit4_edges() const noexcept {
-        return uses_policy_() ? policy_.bit4_edges() : bit4_edges_;
+        return uses_sequencer_() ? sequencer_.bit4_edges() : bit4_edges_;
     }
     std::uint32_t qs_decel_echoed() const noexcept {
-        return uses_policy_() ? policy_.qs_decel_echoed() : qs_decel_echoed_;
+        return uses_sequencer_() ? sequencer_.qs_decel_echoed() : qs_decel_echoed_;
     }
 
    private:
-    // Drive the generic policy for --move-pos (PP absolute) and --move-vel (PV). The wrapper builds
-    // the per-cycle Command from the CLI opts, hands it to the policy, publishes telemetry from the
-    // policy's outputs and the ctx feedback, and ends a completed move-to. The policy owns the CiA402
+    // Drive the generic sequencer for --move-pos (PP absolute) and --move-vel (PV). The wrapper builds
+    // the per-cycle Command from the CLI opts, hands it to the sequencer, publishes telemetry from the
+    // sequencer's outputs and the ctx feedback, and ends a completed move-to. The sequencer owns the CiA402
     // sequencing (enable ladder, mode-echo, bit-4 handshake, quick-stop). This tool keeps its own
     // CSP-sine, PP-relative, and plain-hold paths.
-    void step_policy_(CycleContext& ctx) noexcept {
-        // The policy is a per-mode executor; the bench drives one fixed mode per run (--move-pos PP or
+    void step_sequencer_(CycleContext& ctx) noexcept {
+        // The sequencer is a per-mode executor; the bench drives one fixed mode per run (--move-pos PP or
         // --move-vel PV). Runtime mode-switch orchestration is the Viam driver's job (ServoController),
         // not this tool.
-        PolicyCommand cmd;
+        SequencerCommand cmd;
         cmd.mode = opt_.move_vel ? Cia402Mode::ProfileVelocity : Cia402Mode::ProfilePosition;
         cmd.enable = opt_.enable;
         cmd.target_counts = opt_.pos_target;
@@ -475,9 +475,9 @@ class A6Control final : public SlaveControl {
         cmd.target_velocity = opt_.pv_vel_cps;
         cmd.new_setpoint = opt_.move_pos && arm_setpoint_;  // arm the PP handshake once for the single bench move
         arm_setpoint_ = false;
-        const std::uint16_t cw = policy_.step(ctx, cmd);
+        const std::uint16_t cw = sequencer_.step(ctx, cmd);
 
-        // Bench feedback (the same the policy read this cycle).
+        // Bench feedback (the same the sequencer read this cycle).
         const Status status{ctx.load<cia402::Statusword::type>(sw_loc_)};
         const std::int32_t pos = ctx.load<cia402::PositionActual::type>(pos_loc_);
         const std::int32_t vel = ctx.load<cia402::VelocityActual::type>(vel_loc_);
@@ -485,7 +485,7 @@ class A6Control final : public SlaveControl {
 
         // This tool owns reached: |pos-target| <= tol and velocity ~0 (debounced; never bit 10, the A6
         // ties it high). Latch once, then let a move-to finish (request_stop); continuous PV runs until Ctrl-C.
-        if (opt_.move_pos && !policy_reached_) {
+        if (opt_.move_pos && !sequencer_reached_) {
             const bool pos_ok = std::abs(pos - opt_.pos_target) <= opt_.pos_tol;
             if (std::abs(vel) < kZeroVelThresh) {
                 ++zerovel_cycles_;
@@ -493,12 +493,12 @@ class A6Control final : public SlaveControl {
                 zerovel_cycles_ = 0;
             }
             if (pos_ok && zerovel_cycles_ >= kZeroVelDebounce) {
-                policy_reached_ = true;
+                sequencer_reached_ = true;
                 std::cout << "[B] move-pos reached: pos=" << pos << " target=" << opt_.pos_target << " (|d|<=" << opt_.pos_tol
                           << " counts, vel~0)\n";
             }
         }
-        if (opt_.move_pos && policy_reached_ && ctx.cycle() % 500 == 0) {
+        if (opt_.move_pos && sequencer_reached_ && ctx.cycle() % 500 == 0) {
             ctx.request_stop();
         }
         if (status.operation_enabled() && !announced_op_) {
@@ -528,15 +528,15 @@ class A6Control final : public SlaveControl {
         tel_.bad_wkc.store(ctx.wkc().bad_cycles, std::memory_order_relaxed);
     }
 
-    // --move-pos / --move-vel run through the generic policy; the CSP-sine (--move-sine), PP-relative
+    // --move-pos / --move-vel run through the generic sequencer; the CSP-sine (--move-sine), PP-relative
     // (--move-pp), and plain-hold paths stay as this tool's own code.
-    bool uses_policy_() const noexcept {
+    bool uses_sequencer_() const noexcept {
         return opt_.move_pos || opt_.move_vel;
     }
 
     const Options& opt_;
     Telemetry& tel_;
-    Cia402Policy policy_;
+    Cia402Sequencer sequencer_;
     Cia402Fsm fsm_;
     Cia402State goal_ = Cia402State::ReadyToSwitchOn;
     std::uint32_t profile_vel_ = 0;
@@ -550,13 +550,13 @@ class A6Control final : public SlaveControl {
     std::uint32_t pp_profile_vel_ = 0;     // 0x6081 for --move-pos
     std::uint32_t qs_decel_echoed_ = 0;    // 0x6085 readback (downstream math uses this)
 
-    // RT-thread-only policy state (single-threaded by construction)
+    // RT-thread-only sequencer state (single-threaded by construction)
     std::uint16_t last_cw_ = 0;
     bool announced_op_ = false;
     bool setpoint_latched_ = false;
     bool move_done_ = false;
-    bool arm_setpoint_ = true;     // arm the policy's PP handshake once (the single bench move)
-    bool policy_reached_ = false;  // the tool owns reached (|d|<=tol && vel~0), not the policy
+    bool arm_setpoint_ = true;        // arm the sequencer's PP handshake once (the single bench move)
+    bool sequencer_reached_ = false;  // the tool owns reached (|d|<=tol && vel~0), not the sequencer
     bool was_faulted_ = false;
     bool hold_captured_ = false;
     bool safety_abort_ = false;
