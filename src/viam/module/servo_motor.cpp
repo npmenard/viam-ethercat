@@ -175,7 +175,9 @@ ServoConfig parse_servo_config(const ProtoStruct& attributes) {
 }
 
 const ModelFamily& ServoMotor::model_family() {
-    static const auto family = ModelFamily{"viam", "ethercat"};
+    // TEST ONLY (registry dry run): family namespace matches the personal test org so the
+    // registry-delivered module binds configured models. REVERT to "viam" with meta.json.in.
+    static const auto family = ModelFamily{"dcec8531-c6bb-41ee-b1b0-35f9767830a6", "ethercat"};
     return family;
 }
 
