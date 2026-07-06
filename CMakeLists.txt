@@ -290,119 +290,15 @@ if (ETHERCAT_BUILD_MODULE)
   # is ever preferred. NOTE: applies to GNU/Clang; both honor these flags.
   target_link_options(ethercat-servo PRIVATE -static-libstdc++ -static-libgcc)
 
+  # Install just the module binary. The RELEASE artifact is the Conan build
+  # (bin/build.sh, CI build-module): fully static apart from glibc, so there are
+  # no shared-library dependencies to bundle or post-process. A tarball from a
+  # local FetchContent build links the SDK dynamically and is dev-only.
   install(
     TARGETS
       ethercat-servo
-    RUNTIME_DEPENDENCY_SET ethercat_servo_deps
   )
 
-  # #37 Finding B(a): SELF-BUNDLE the module's shared-library dependencies (viam-cpp-sdk +
-  # gRPC/absl/protobuf/re2/... -- ~250 .so) into the package's lib/ so module.tar.gz is PORTABLE:
-  # it loads on any host (whatever viam-server env the user runs) via ethercat-servo's own RUNPATH
-  # ($ORIGIN/../lib), with NO Viam-SDK/gRPC install required on the target. This is what a registry
-  # deploy needs (and replaces the manual .so copy used to prove the sim RDK smoke).
-  # EXCLUDE the base glibc/loader set (those MUST come from the target host's own glibc, which is
-  # backward-compatible); libstdc++/libgcc are already static-linked (-static-libstdc++/-libgcc above),
-  # so they never appear as deps. Everything else (the SDK/gRPC/absl tree, ssl/crypto/z) is bundled.
-  install(
-    RUNTIME_DEPENDENCY_SET ethercat_servo_deps
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    PRE_EXCLUDE_REGEXES
-      "^ld-linux.*"      "^libc\\.so.*"       "^libm\\.so.*"        "^libdl\\.so.*"
-      "^libpthread\\.so.*" "^librt\\.so.*"     "^libgcc_s\\.so.*"    "^libstdc\\+\\+\\.so.*"
-      "^libresolv\\.so.*"  "^libnsl\\.so.*"    "^libanl\\.so.*"      "^libutil\\.so.*"
-    POST_EXCLUDE_REGEXES
-      "^/lib/ld-linux" "^/lib64/ld-linux"
-      "/libc\\.so"     "/libm\\.so"           "/libpthread\\.so"    "/libdl\\.so"
-      "/librt\\.so"    "/libgcc_s\\.so"       "/libstdc\\+\\+\\.so"
-  )
-
-  # #69 RUNPATH IS NOT TRANSITIVE: the RUNTIME_DEPENDENCY_SET above copies the third-party .so
-  # files (viam-cpp-sdk + gRPC/absl/protobuf/re2/...) into lib/ VERBATIM -- each keeps its OWN
-  # build/system RUNPATH. So when the loader resolves a BUNDLED lib's own NEEDED entries (e.g. an
-  # absl lib -> libabsl_raw_hash_set, libupb -> absl), it uses that lib's RUNPATH, which points at
-  # system paths only -- NOT the sibling libs sitting right next to it in lib/. The exe's
-  # $ORIGIN/../lib RUNPATH is NOT inherited by the libs it pulls in. On a clean host with no system
-  # gRPC/absl this is a loader failure (a prior bundle "worked" only by accident, when the exe
-  # directly NEEDed every lib -- a flat SDK-vendored dep tree; it broke once the build image gained
-  # system gRPC/absl, which links a transitive-NEEDED universe).
-  #
-  # Make the bundle DETERMINISTICALLY self-resolving: stamp $ORIGIN into the RUNPATH of every
-  # bundled REAL .so at install time, so each finds its siblings in the same lib/ dir regardless of
-  # the host. Runs under BOTH `cmake --install` (DESTDIR) AND `cpack` (staging prefix) via
-  # $ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}. Symlinks are skipped (patchelf the real files only).
-  # patchelf is a build-image dep (see Dockerfile).
-  #
-  # #16 STRIP the bundled libs in the SAME pass. The viam-cpp-sdk is built RelWithDebInfo, so its two
-  # libs (libviamsdk ~110MB, libviamapi ~110MB) ship UNSTRIPPED -- ~181MB of debug info that is dead
-  # weight in a DEPLOY bundle (they dominate the ~254MB lib/). `strip --strip-unneeded` keeps the
-  # dynamic symbol table (the .so stays loadable) and drops .symtab/.debug -> the bundle falls to
-  # ~73MB. This is a PACKAGING step, NOT a build-type change: RelWithDebInfo stays for LOCAL debugging
-  # (the un-installed build tree keeps full symbols); only the packaged/bundled copies are stripped.
-  # strip is best-effort (a failure leaves a larger-but-working lib, never breaks the package);
-  # patchelf stays a hard requirement. Order: strip THEN patchelf (rpath edit is the last write).
-  install(CODE [==[
-    set(_ethercat_root "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}")
-    file(GLOB_RECURSE _ethercat_bundled LIST_DIRECTORIES false "${_ethercat_root}/*.so*")
-    # patchelf is only a hard requirement when there ARE bundled shared libs to
-    # stamp. A fully static build (the Conan path: -o:a "*:shared=False" plus
-    # -static-libstdc++) bundles nothing, so it must not demand patchelf.
-    find_program(_ethercat_patchelf patchelf)
-    if(NOT _ethercat_patchelf AND _ethercat_bundled)
-      message(FATAL_ERROR "#69: patchelf is required to stamp $ORIGIN into the bundled deps -- install it in the build image")
-    endif()
-    find_program(_ethercat_strip strip)
-    if(NOT _ethercat_strip AND _ethercat_bundled)
-      message(WARNING "#16: strip not found -- bundling UNSTRIPPED libs (~181MB of SDK debug info retained). Install binutils to shrink the bundle.")
-    endif()
-    set(_ethercat_n 0)
-    foreach(_so IN LISTS _ethercat_bundled)
-      if(NOT IS_SYMLINK "${_so}")
-        if(_ethercat_strip)
-          execute_process(
-            COMMAND "${_ethercat_strip}" --strip-unneeded "${_so}"
-            RESULT_VARIABLE _ethercat_strip_rc)
-          if(NOT _ethercat_strip_rc EQUAL 0)
-            message(WARNING "#16: strip --strip-unneeded failed on ${_so} (continuing; lib is unstripped but valid)")
-          endif()
-        endif()
-        execute_process(
-          COMMAND "${_ethercat_patchelf}" --set-rpath "$ORIGIN" "${_so}"
-          RESULT_VARIABLE _ethercat_rc)
-        if(NOT _ethercat_rc EQUAL 0)
-          message(FATAL_ERROR "#69: patchelf --set-rpath failed on ${_so}")
-        endif()
-        math(EXPR _ethercat_n "${_ethercat_n}+1")
-      endif()
-    endforeach()
-    message(STATUS "#69/#16: stamped $ORIGIN RUNPATH into (and stripped) ${_ethercat_n} bundled lib file(s) under ${_ethercat_root}")
-  ]==])
-
-  # Offline validation of the example configs through the real parser +
-  # ServoConfig::validate() (JSON -> protobuf::Struct -> ProtoStruct -> parse).
-  # etc/ and this test are bench material kept UNTRACKED (on-disk only).
-  if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/a6_config_parse_test.cpp AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-hardware.example.json)
-  add_executable(a6_config_parse_test EXCLUDE_FROM_ALL
-    tests/a6_config_parse_test.cpp
-    src/viam/module/servo_motor.cpp
-  )
-  target_link_libraries(a6_config_parse_test
-    PRIVATE
-      ethercat
-      viam-cpp-sdk::viamapi
-      viam-cpp-sdk::viamsdk
-  )
-  target_compile_definitions(a6_config_parse_test PRIVATE
-    BOOST_DLL_USE_STD_FS
-    "A6_HW_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-hardware.example.json\""
-    "A6_MINIMAL_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/etc/a6-minimal.example.json\""
-  )
-  target_include_directories(a6_config_parse_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-  viam_apply_wall_werror(a6_config_parse_test)
-  target_compile_options(a6_config_parse_test PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
-  add_test(NAME a6_config_parse_test COMMAND a6_config_parse_test)
-  add_dependencies(build-tests a6_config_parse_test)
-  endif()
 
 endif()
 
@@ -433,9 +329,6 @@ viam_add_test(rt_preflight_test tests/rt_preflight_test.cpp)
 # Bench-tool tests (depend on the untracked src/tools headers); build when present.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/sine_move_test.cpp)
   viam_add_test(sine_move_test tests/sine_move_test.cpp)
-endif()
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/a6_control_test.cpp)
-  viam_add_test(a6_control_test tests/a6_control_test.cpp)
 endif()
 viam_add_test(servo_config_test tests/servo_config_test.cpp)
 
