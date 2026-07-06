@@ -137,7 +137,9 @@ jobs:
           pipx install conan
           pipx ensurepath
           export PATH="$HOME/.local/bin:${PATH}"
-          conan profile detect
+          # --force: self-hosted runners persist ~/.conan2 between runs (a plus:
+          # the dependency cache survives), so a plain detect errors on rerun.
+          conan profile detect --force
 
       - name: Checkout
         uses: actions/checkout@v4
