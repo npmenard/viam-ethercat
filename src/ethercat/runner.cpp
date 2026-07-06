@@ -68,6 +68,7 @@ bool CycleContext::fault() const noexcept {
     return core_->master_.fault();
 }
 
+// NOLINTNEXTLINE(readability-convert-member-functions-to-static) -- assert-only body, empty in NDEBUG
 void CycleContext::check_live() const noexcept {
     // Debug-only: a control that touches the ctx outside its dispatch window gets a loud,
     // immediate failure in debug builds. In release this compiles to nothing, and per the
@@ -258,7 +259,7 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
     // bringup_timeout. Exactly one OP request per start(): bringup_step owns the single
     // request, and every abort path below exits without re-entering bring-up. A restart is
     // the consumer's call via a fresh Runner.
-    const std::uint64_t give_up_at = realtime::monotonic_ns() + static_cast<std::uint64_t>(cfg_.bringup_timeout.count()) * 1'000'000ULL;
+    const std::uint64_t give_up_at = realtime::monotonic_ns() + (static_cast<std::uint64_t>(cfg_.bringup_timeout.count()) * 1'000'000ULL);
     bool operational = false;
     while (!stop_flag_.load(std::memory_order_acquire)) {
         bool any_sync_fault = false;
@@ -349,9 +350,7 @@ void RtCore::rt_body(const std::stop_token& st) noexcept {
             dispatch(a, cycle, dct, stopping, [&](CycleContext& ctx) { a.control->step(ctx); });
         }
         const std::uint32_t skipped = pacer.pace(dct);
-        if (skipped > rt_overrun_worst) {
-            rt_overrun_worst = skipped;
-        }
+        rt_overrun_worst = std::max(skipped, rt_overrun_worst);
         if (static_cast<std::uint64_t>(skipped) * period_ns >= kRtOverrunReportNs && !rt_overrun_logged) {
             rt_overrun_logged = true;  // one-shot -- a fault/teardown typically follows within cycles
             (void)std::fprintf(stderr,

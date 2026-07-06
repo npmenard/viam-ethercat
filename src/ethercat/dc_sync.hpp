@@ -36,7 +36,11 @@ inline long dc_phase_correction(std::int64_t dc_time,
     if (delta > cycle_ns / 2) {
         delta -= cycle_ns;  // shortest signed distance to the target phase
     }
-    integral += (delta > 0) ? 1 : (delta < 0 ? -1 : 0);
+    if (delta > 0) {
+        ++integral;
+    } else if (delta < 0) {
+        --integral;
+    }
     // Anti-windup: bound the integral to the correction range (in its own units).
     const std::int64_t integral_limit = max_correction_ns * 20;
     if (integral > integral_limit) {

@@ -194,7 +194,10 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted, bool drive_present) 
 
     switch (bringup_phase_) {
         case BringupPhase::Settle: {
-            const std::uint32_t target = dc_enabled_ ? (config_.dc_op_gate_cycles == 0 ? 1U : config_.dc_op_gate_cycles) : 1U;
+            std::uint32_t target = 1U;
+            if (dc_enabled_ && config_.dc_op_gate_cycles != 0) {
+                target = config_.dc_op_gate_cycles;
+            }
             if (++bringup_settle_count_ >= target) {
                 backend_->set_state(0, EcatState::Op);  // writestate only; this loop pumps the transition
                 bringup_await_count_ = 0;
@@ -355,7 +358,7 @@ FieldLocation Master::resolve_field(const std::map<std::uint32_t, MappedField>& 
                                     std::uint8_t sub,
                                     std::size_t want_width,
                                     std::uint16_t slave,
-                                    bool is_tx) const {
+                                    bool is_tx) {
     const char* const which = is_tx ? "TxPDO (feedback)" : "RxPDO (command)";
     const auto it = table.find(field_key(index, sub));
     if (it == table.end()) {

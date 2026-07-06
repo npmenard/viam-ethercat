@@ -12,6 +12,7 @@
 // RT-safety: setup() and lock_current() are non-RT prelude, called once before the loop.
 // DcPacer::pace() and step() are noexcept and allocation-free, safe on the cyclic path.
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -24,7 +25,7 @@ namespace ethercat {
 
 namespace realtime {
 
-inline constexpr std::size_t kDefaultPrefaultBytes = 512U * 1024U;  // 512 KiB of stack
+inline constexpr std::size_t kDefaultPrefaultBytes = std::size_t{512} * 1024;  // 512 KiB of stack
 inline constexpr int kDefaultRtPriority = 80;
 inline constexpr std::uint64_t kNsPerSec = 1'000'000'000ULL;
 
@@ -102,10 +103,7 @@ class DcPacer {
     // keep the absolute deadline from moving backwards.
     void advance(std::int64_t dc_time_ns) noexcept {
         const long corr = dc_phase_correction(dc_time_ns, static_cast<std::int64_t>(period_ns_), integral_, shift_ns_);
-        long delta = static_cast<long>(period_ns_) + corr;
-        if (delta < 1) {
-            delta = 1;
-        }
+        const long delta = std::max<long>(static_cast<long>(period_ns_) + corr, 1);
         next_ += static_cast<std::uint64_t>(delta);
     }
 

@@ -96,7 +96,7 @@ class EcatBackend {
     // SoemBackend overrides with SOEM's ec_ALstatuscode2string. Non-RT.
     virtual std::string describe_al_code(std::uint16_t code) const {
         char b[16];
-        std::snprintf(b, sizeof b, "0x%04X", code);
+        (void)std::snprintf(b, sizeof b, "0x%04X", code);
         return b;
     }
     // Request `slave` (0 = all) to `target`: writes the state request only; does not pump

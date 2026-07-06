@@ -147,11 +147,14 @@ std::size_t SoemBackend::open(std::string_view ifname) {
         if (ecx_mbxempty(&impl_->ctx, slave, kMbxEmptyTimeoutUs) <= 0) {
             ecx_readstate(&impl_->ctx);
             const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
-            std::string detail = " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
-                                 " ALstatuscode=" + hex(static_cast<std::uint32_t>(al)) + " (" + ec_ALstatuscode2string(al) + ")]";
+            const std::string detail = " [slave " + std::to_string(i) +
+                                       " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
+                                       " ALstatuscode=" + hex(static_cast<std::uint32_t>(al)) + " (" + ec_ALstatuscode2string(al) + ")]";
             ecx_close(&impl_->ctx);
-            throw Error("slave " + std::to_string(i) + " CoE mailbox-out (SM0) not writable within ~10s after PRE-OP on '" + name +
-                        "' -- mbxsend would not transmit" + detail);
+            std::string msg = "slave " + std::to_string(i);
+            msg += " CoE mailbox-out (SM0) not writable within ~10s after PRE-OP on '" + name + "' -- mbxsend would not transmit";
+            msg += detail;
+            throw Error(msg);
         }
         // (2) Handler warm-up: now that SM0 is writable, the read actually goes out.
         constexpr int kWarmupTries = 300;
@@ -175,11 +178,14 @@ std::size_t SoemBackend::open(std::string_view ifname) {
         if (warm_wkc <= 0) {
             ecx_readstate(&impl_->ctx);
             const std::uint16_t al = impl_->ctx.slavelist[i].ALstatuscode;
-            std::string detail = " [slave " + std::to_string(i) + " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
-                                 " ALstatuscode=" + hex(static_cast<std::uint32_t>(al)) + " (" + ec_ALstatuscode2string(al) + ")]";
+            const std::string detail = " [slave " + std::to_string(i) +
+                                       " state=" + to_string(from_soem_state(impl_->ctx.slavelist[i].state)) +
+                                       " ALstatuscode=" + hex(static_cast<std::uint32_t>(al)) + " (" + ec_ALstatuscode2string(al) + ")]";
             ecx_close(&impl_->ctx);
-            throw Error("slave " + std::to_string(i) +
-                        " CoE handler did not answer a warm-up SDO read (0x1018:01) within ~15s after PRE-OP on '" + name + "'" + detail);
+            std::string msg = "slave " + std::to_string(i);
+            msg += " CoE handler did not answer a warm-up SDO read (0x1018:01) within ~15s after PRE-OP on '" + name + "'";
+            msg += detail;
+            throw Error(msg);
         }
     }
 

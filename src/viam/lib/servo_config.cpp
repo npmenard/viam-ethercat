@@ -21,9 +21,17 @@ void ServoConfig::set_fixed_pdo_map() {
     // The one fixed driver-defined superset (standard CiA402 objects only). Always switch-capable
     // (0x6060 mapped) so any API call can ensure PP or PV at runtime. Unconditional: no per-mode
     // choice and no user override; overwrites whatever was there.
-    constexpr std::uint16_t kCtrl = 0x6040, kMode = 0x6060, kTargetPos = 0x607A, kProfileVel = 0x6081, kTargetVel = 0x60FF;
-    constexpr std::uint16_t kFault = 0x603F, kStatus = 0x6041, kModeDisp = 0x6061, kActualPos = 0x6064, kVelAct = 0x606C,
-                            kTorqueAct = 0x6077;
+    constexpr std::uint16_t kCtrl = 0x6040;
+    constexpr std::uint16_t kMode = 0x6060;
+    constexpr std::uint16_t kTargetPos = 0x607A;
+    constexpr std::uint16_t kProfileVel = 0x6081;
+    constexpr std::uint16_t kTargetVel = 0x60FF;
+    constexpr std::uint16_t kFault = 0x603F;
+    constexpr std::uint16_t kStatus = 0x6041;
+    constexpr std::uint16_t kModeDisp = 0x6061;
+    constexpr std::uint16_t kActualPos = 0x6064;
+    constexpr std::uint16_t kVelAct = 0x606C;
+    constexpr std::uint16_t kTorqueAct = 0x6077;
     const auto E = [](std::uint16_t index, std::uint8_t bits) { return ethercat::PdoEntry{index, 0, bits}; };
 
     rxpdo.pdo_indices = {0x1600};

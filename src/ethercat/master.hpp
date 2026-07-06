@@ -310,12 +310,12 @@ class Master {
     // PdoMappingError if it is not mapped or Error if its mapped bit_length/8 != want_width (the
     // templated callers pass sizeof(F::type) so the width-vs-T check happens at resolve).
     // Returns an offset-only FieldLocation.
-    FieldLocation resolve_field(const std::map<std::uint32_t, MappedField>& table,
-                                std::uint16_t index,
-                                std::uint8_t sub,
-                                std::size_t want_width,
-                                std::uint16_t slave,
-                                bool is_tx) const;
+    static FieldLocation resolve_field(const std::map<std::uint32_t, MappedField>& table,
+                                       std::uint16_t index,
+                                       std::uint8_t sub,
+                                       std::size_t want_width,
+                                       std::uint16_t slave,
+                                       bool is_tx);
 
     // Internal phases of the bring-up state machine (bringup_step). SYNC0 is armed in
     // configure() (PRE-OP). Settle pumps phase-locked PD a bounded settle -- it is not gated on

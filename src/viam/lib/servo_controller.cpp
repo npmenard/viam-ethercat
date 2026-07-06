@@ -54,10 +54,8 @@ ServoConfig validated(ServoConfig config) {
     // exact-match predicate never completes under encoder noise. velocity_threshold stays an optional
     // override: > 0 is a velocity gate; 0 is the position-delta method (the default).
     if (config.position_tolerance_counts <= 0) {
-        config.position_tolerance_counts = static_cast<std::int32_t>(config.counts_per_rev / 720.0 + 0.5);
-        if (config.position_tolerance_counts < 1) {
-            config.position_tolerance_counts = 1;  // floor for a tiny-count encoder
-        }
+        const auto half_degree = static_cast<std::int32_t>(std::lround(config.counts_per_rev / 720.0));
+        config.position_tolerance_counts = std::max(half_degree, 1);  // floor of 1 for a tiny-count encoder
     }
     return config;
 }
