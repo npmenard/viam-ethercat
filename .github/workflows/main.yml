@@ -15,6 +15,21 @@ on:
 # test inside the project build image. The heavier Conan module build (and the
 # registry publish) only runs for tags, releases, and manual dispatch.
 jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/viam-ethercat:amd64
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Format
+        run: make format-check
+
   build-test-lint:
     name: Build, Test, and Lint (amd64)
     runs-on: ubuntu-latest
@@ -36,9 +51,6 @@ jobs:
 
       - name: Configure
         run: make configure
-
-      - name: Format
-        run: make format-check
 
       - name: Clang-check
         run: make run-clang-check
