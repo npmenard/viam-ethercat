@@ -1,0 +1,20 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "viam:ethercat",
+  "visibility": "public",
+  "url": "https://github.com/viam-modules/viam-ethercat",
+  "description": "C++ module for generic EtherCAT CiA402 servo drives",
+  "models": [
+    {
+      "api": "rdk:component:motor",
+      "model": "viam:ethercat:servo",
+      "markdown_link": "README.md#configuration-and-usage"
+    },
+    {
+      "api": "rdk:component:motor",
+      "model": "viam:ethercat:a6-servo",
+      "markdown_link": "README.md#configuration-and-usage"
+    }
+  ],
+  "entrypoint": "@CMAKE_INSTALL_BINDIR@/ethercat-servo"
+}

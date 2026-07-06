@@ -1,0 +1,146 @@
+#pragma once
+
+// PDO mapping config data + the SDO sub-protocol that applies it to a slave.
+//
+// The driver supplies the map (the library never parses manufacturer defaults).
+// CiA402 detail: the configurable PDO map is writable ONLY in PRE-OP and on many
+// drives is NOT stored in EEPROM, so Master::configure() re-applies it on every
+// power-on via apply_pdo_map() -- this must not be skipped.
+
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "ethercat/cia402.hpp"
+#include "ethercat/soem_backend.hpp"
+
+namespace ethercat {
+
+// One entry of a PDO map: an object (index:subindex) of `bit_length` bits.
+// A padding/gap entry uses index 0x0000 (advances the offset, no named object).
+struct PdoEntry {
+    std::uint16_t index = 0;
+    std::uint8_t subindex = 0;
+    std::uint8_t bit_length = 0;
+};
+
+// PDO direction = which SyncManager carries it. Fixed by the EtherCAT/CiA402
+// standard: outputs (master->slave, RxPDO) go through SM2, inputs (slave->master,
+// TxPDO) through SM3 -- so the SM PDO-assignment objects are fixed too.
+enum class PdoDirection : std::uint8_t { Rx, Tx };
+
+// The SM PDO-assignment object index for a direction: RxPDO -> SM2 0x1C12,
+// TxPDO -> SM3 0x1C13. Universal for CiA402 servos -- the library derives it; the
+// user does not supply it.
+constexpr std::uint16_t sm_assign_index(PdoDirection dir) noexcept {
+    return dir == PdoDirection::Rx ? 0x1C12 : 0x1C13;
+}
+
+// A Sync-Manager PDO assignment: which PDO(s) (e.g. 0x1600) are assigned to the SM, and the
+// entry list of each (keyed by PDO index). The assign-index is derived from the map's
+// direction; the user names only the PDO(s) and entries. assign_index_override covers a
+// non-standard SM layout; no CiA402 servo should need it.
+struct PdoMap {
+    // 0 = derive from direction (the usual case). Set non-zero only for a non-standard SM
+    // layout; then this index is used verbatim, ignoring direction.
+    std::uint16_t assign_index_override = 0;
+    std::vector<std::uint16_t> pdo_indices;
+    std::map<std::uint16_t, std::vector<PdoEntry>> entries;
+
+    // Effective SM assign-index: the override if set, else derived from direction.
+    std::uint16_t assign_index(PdoDirection dir) const noexcept {
+        return assign_index_override != 0 ? assign_index_override : sm_assign_index(dir);
+    }
+
+    // Total mapped size in bytes (sum of all entry bit lengths / 8). Throws
+    // PdoMappingError if the bit total is not byte-aligned.
+    std::size_t byte_size() const;
+};
+
+// A raw SDO write descriptor: {object index:subindex, little-endian value bytes}. `data`'s
+// length must match the object's CoE data type or the drive aborts. Consumer-issued: setup-SDO
+// policy belongs to the consumer, which issues its writes via Master::sdo_write() while it is
+// the single port owner (post-configure, pre-RT). Used as a data carrier for the consumer's
+// vendor fault-reset (drives with a proprietary fault-clear object). Whether a write is
+// best-effort or mandatory is the consumer's call at the call site, not a flag here.
+struct SdoWrite {
+    std::uint16_t index = 0;
+    std::uint8_t subindex = 0;
+    std::vector<std::byte> data;
+};
+
+// Per-slave configuration (config DATA; device specifics arrive here as values,
+// never as branches in generic code).
+struct SlaveConfig {
+    std::uint16_t slave_id = 1;  // 1-based ring position
+    PdoMap rxpdo;                // outputs -> SM2 0x1C12 (assign-index derived)
+    PdoMap txpdo;                // inputs  -> SM3 0x1C13 (assign-index derived)
+    Cia402Mode default_mode = Cia402Mode::ProfilePosition;
+    std::uint32_t sync_cycle_granularity_ns = 0;
+};
+
+// Master-level configuration.
+struct MasterConfig {
+    std::string ifname;
+    std::uint32_t target_loop_rate_hz = 1000;
+    std::vector<SlaveConfig> slaves;
+    bool use_distributed_clocks = false;
+    // DC bring-up: SYNC0 is armed in PRE-OP inside configure() (stock ecx_dcsync0, before
+    // config_map_group, so the drive self-selects DC sync-type from the armed SYNC0). The RT
+    // loop then pumps phase-locked PD a bounded settle and requests OP once.
+    //   Settle: cycles of phase-locked PD to run before requesting OP, so the master's send
+    //   cadence is disciplined onto SYNC0 first. This is not gated on the drive's no-sync fault:
+    //   reporting it in SAFE-OP is the normal pre-sync state and it clears at OP, so the gate is
+    //   a fixed settle, not a fault-free wait. Only applied when DC is on (non-DC needs no
+    //   settle). 0 becomes 1.
+    std::uint32_t dc_op_gate_cycles = 400;
+    // Post-OP grace: suppress the consecutive-WKC-error fault latch for this many cycles after
+    // reaching OP, so a residual DC phase transient settles without tripping the latch (the
+    // phase PI needs hundreds of cycles to fully lock; the latch fires in about 5). 0 = latch
+    // immediately.
+    std::uint32_t dc_settle_cycles = 0;
+    // SYNC0 pulse CyclShift (ns) passed to ecx_dcsync0: the SYNC0 edge fires this long after the
+    // DC base time. This sets both the ecx_dcsync0 CyclShift and the master's phase-lock target,
+    // so the master's send and the drive's SYNC0 hold a fixed relationship. The phase-lock target
+    // is derived as cycle/2 from the SYNC0 edge (mid-cycle margin; locking on the edge leaves no
+    // room for jitter). 0 = SYNC0 on the DC base.
+    std::int32_t dc_sync0_shift_ns = 0;
+    // Latch a bus fault only after this many CONSECUTIVE short/abnormal WKC
+    // cycles (a single transient bad cycle should not hard-fault). Reset on any
+    // good cycle.
+    std::uint32_t max_consecutive_wkc_errors = 5;
+    // --- AWAIT_OP bounds (bringup_step's OP-await phase) ---
+    // Workaround for drives with a slow SAFE-OP -> OP (tens of seconds on some hardware),
+    // reached by waiting it out with PD flowing and periodic SAFE-OP recovery nudges. These are
+    // give-up/confirm bounds with early exit: a conformant drive confirms OP in about
+    // op_hold_confirm_cycles, so fast drives are unaffected; tune them for other slow drives or
+    // non-default loop rates.
+    //
+    // Declare Operational only after this many consecutive (full-WKC && !sync-faulted) cycles, to
+    // filter a transient good cycle. 0 becomes 1.
+    std::uint32_t op_hold_confirm_cycles = 5;
+    // While awaiting OP, run the backend's reack_op() (SAFE-OP recovery: ACK SAFE_OP+ERROR,
+    // re-request OP; self-gating no-op once in OP) every this many cycles. 0 becomes 1.
+    std::uint32_t op_nudge_interval_cycles = 10;
+    // Give up (Aborted) after this much wall time awaiting OP. Converted to a cycle bound against
+    // target_loop_rate_hz in the Master ctor, so the give-up patience is rate-independent. Floor
+    // of 1 cycle.
+    std::uint32_t op_await_timeout_ms = 30'000;
+};
+
+// Apply a PDO map to a slave via the CoE SDO sub-protocol. The slave MUST be in
+// PRE-OP. Ordering is load-bearing (a non-zero count rejects entry writes):
+//   (a) zero the SM assignment count   (assign_index:00 := 0)
+//   (b) for each PDO: zero its entry count (pdo:00 := 0)
+//   (c) for each PDO: write each entry (pdo:NN := (index<<16)|(sub<<8)|bitlen)
+//   (d) for each PDO: set its entry count (pdo:00 := N)
+//   (e) assign the PDO(s) to the SM (assign_index:01.. := pdo) and set the
+//       assignment count (assign_index:00 := M)
+// Throws PdoMappingError (clear text) if the map references a PDO with no entry
+// list or has too many entries/PDOs for the 1-byte counts.
+void apply_pdo_map(SoemBackend& backend, std::uint16_t slave, const PdoMap& map, PdoDirection dir);
+
+}  // namespace ethercat

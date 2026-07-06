@@ -1,0 +1,191 @@
+name: EtherCAT CI Pipeline
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    branches: ['main']
+  push:
+    branches:
+      - '**'
+  release:
+    types: [published]
+
+# Lean CI, linux/amd64 only for now: every push runs format + lint + build +
+# test inside the project build image. The heavier Conan module build (and the
+# registry publish) only runs for tags, releases, and manual dispatch.
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/viam-ethercat:amd64
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Format
+        run: make format-check
+
+  build-test-lint:
+    name: Build, Test, and Lint (amd64)
+    runs-on: ubuntu-latest
+    # The container image is built from this repo's Dockerfile (see docker.yml) and
+    # published to the repo owner's ghcr, so forks are self-sufficient: dispatch
+    # docker.yml once to build the image, then this job uses it. It ships the
+    # clang-19 toolchain, cmake, boost, and a prebuilt viam-cpp-sdk so the module's
+    # find_package(viam-cpp-sdk) resolves without a from-source SDK build.
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/viam-ethercat:amd64
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure
+        run: make configure
+
+      - name: Clang-check
+        run: make run-clang-check
+
+      - name: Clang-tidy
+        run: make run-clang-tidy-parallel
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
+
+  thread-sanitizer:
+    name: ThreadSanitizer (RT boundary, amd64)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/viam-ethercat:amd64
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    # NOTE: this used to also run on a NATIVE arm64 runner, which is the only
+    # authoritative check of the seqlock fence placement (x86 is TSO and hides
+    # weak-ordering mistakes; qemu serializes to ~TSO too). We only target
+    # linux/amd64 for now, so that leg was dropped -- this is a KNOWN
+    # weak-ordering-coverage gap. If arm64 ever becomes a target again,
+    # restore a native (never emulated) arm64 leg here.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Build the RT-boundary tests under ThreadSanitizer. The seqlock +
+      # lock-free TxPDO handoff must be race-free with ZERO suppressions.
+      # The TSan lane is CLANG-ONLY (gcc rejects atomic_thread_fence under
+      # -fsanitize=thread; the seqlock fences are load-bearing) -- pin clang-19
+      # explicitly, else CMake configures with the container's default gcc and
+      # silently skips the tsan targets.
+      - name: Configure (TSan)
+        run: cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DETHERCAT_BUILD_MODULE=OFF -DETHERCAT_SANITIZE_THREAD=ON
+
+      - name: Build (TSan)
+        run: cmake --build build-tsan --target pdo_cache_test_tsan -- -j4
+
+      - name: Run TSan tests
+        run: ctest --test-dir build-tsan -L tsan --output-on-failure
+
+  build-module:
+    name: Build Module (Conan, linux/amd64)
+    needs: [build-test-lint]
+    # The Conan build compiles boost/grpc/protobuf/the SDK from source, so it
+    # only runs where the artifact is actually needed: tags, releases, and
+    # manual dispatch -- not on every push.
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'release'
+    runs-on: ubuntu-latest
+    container: ubuntu:noble
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt update
+          DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            g++ \
+            git \
+            gnupg \
+            jq \
+            lsb-release \
+            ninja-build \
+            pipx \
+            pkg-config \
+            sudo \
+            wget
+
+      # Install Conan via pipx (not conan-io/setup-conan, for container compatibility)
+      - name: Install Conan
+        run: |
+          pipx install conan
+          pipx ensurepath
+          export PATH="$HOME/.local/bin:${PATH}"
+          # --force: self-hosted runners persist ~/.conan2 between runs (a plus:
+          # the dependency cache survives), so a plain detect errors on rerun.
+          conan profile detect --force
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup C++ SDK
+        run: |
+          export PATH="$HOME/.local/bin:${PATH}"
+          ./bin/setup.sh
+
+      - name: Build module
+        run: |
+          export PATH="$HOME/.local/bin:${PATH}"
+          ./bin/build.sh
+
+      # Attach module.tar.gz to workflow run
+      - name: Attach build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-linux-amd64
+          path: module.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Publish to Viam Module Registry
+    needs: [build-module]
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: module-linux-amd64
+
+      - name: Extract meta.json from module archive
+        run: tar -xzf module.tar.gz meta.json
+
+      - name: Upload module to Viam
+        uses: viamrobotics/upload-module@v1
+        with:
+          module-path: module.tar.gz
+          platform: linux/amd64
+          version: ${{ github.ref_name }}
+          key-id: ${{ secrets.VIAM_DEV_API_KEY_ID }}
+          key-value: ${{ secrets.VIAM_DEV_API_KEY }}
+          do-update: ${{ github.event_name == 'release' && !github.event.release.prerelease }}
+          do-upload: ${{ github.event_name == 'release' }}

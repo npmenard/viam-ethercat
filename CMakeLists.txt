@@ -1,0 +1,401 @@
+# 3.28: FetchContent_Declare(... EXCLUDE_FROM_ALL) in cmake/soem.cmake, and
+# SOEM v2's own cmake_minimum_required is 3.28 -- so this was the real floor already.
+cmake_minimum_required(VERSION 3.28 FATAL_ERROR)
+
+project(
+  ethercat
+  DESCRIPTION "SOEM-based EtherCAT master library + generic servo Viam motor module"
+  HOMEPAGE_URL https://github.com/viam-modules/viam-ethercat
+  LANGUAGES C CXX
+)
+
+#
+# Options
+#
+
+# Build with -Wall / -Werror (and friends) on our own targets.
+option(VIAM_USE_WALL_WERROR "Build with -Wall and -Werror flags" ON)
+
+# Build the Viam motor module (servo_motor + main.cpp). This pulls in the
+# viam-cpp-sdk. Turn OFF to build only the SOEM-based library, tools, and the
+# pure unit tests without the SDK dependency (useful for early phases / CI of
+# the library in isolation). Default ON so the full module always builds.
+option(ETHERCAT_BUILD_MODULE "Build the Viam motor module (requires viam-cpp-sdk)" ON)
+
+# When ON, additionally build the RT-boundary tests under ThreadSanitizer as
+# separate targets, registered with the ctest label "tsan". These must pass with
+# ZERO suppressions. The source for these tests is compiled directly (with TSan)
+# rather than linked from libethercat, so the seqlock / lock-free code under test
+# is itself instrumented.
+option(ETHERCAT_SANITIZE_THREAD "Also build RT-boundary tests under ThreadSanitizer (ctest label 'tsan')" OFF)
+
+# Function to apply strict warning flags to one of OUR targets. SOEM and the
+# viam-cpp-sdk are pulled in as SYSTEM dependencies, so their warnings never
+# reach this.
+function(viam_apply_wall_werror target_name)
+  if (NOT VIAM_USE_WALL_WERROR)
+    return()
+  endif()
+
+  set(GNULIKE_COMPILERS "Clang" "AppleClang" "GNU")
+  if (CMAKE_CXX_COMPILER_ID IN_LIST GNULIKE_COMPILERS)
+    target_compile_options(${target_name} PRIVATE
+      -Wall
+      -Werror
+      -Wextra
+      -pedantic
+      -Wconversion
+      -Wdouble-promotion
+      -Wnull-dereference
+      -Wunused
+    )
+  elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    target_compile_options(${target_name} PRIVATE /W4 /WX)
+  else()
+    message(FATAL_ERROR "VIAM_USE_WALL_WERROR is set, but not known how to enable for compiler ID ${CMAKE_CXX_COMPILER_ID}")
+  endif()
+endfunction()
+
+
+# If no build type is selected, build optimized but retain debug info. This is
+# the right build type for packaging and release.
+if (NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE "RelWithDebInfo")
+endif()
+
+
+# Enforce the C++ standard, and disable extensions.
+if (NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 20)
+endif()
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Minimum-toolchain floor (#TODO-9): GCC 13. GCC 13 (2023) ships in all current LTS
+# distros; the build image is ubuntu:noble (24.04, default g++-13/14). The floor buys
+# a complete C++20 stdlib -- libstdc++ 13 has <format> (libstdc++ 12 does NOT) and
+# <expected> (libstdc++ 12+), so it unblocks std::format adoption (#TODO-5) and lets
+# the ethercat::Expected shim retire to std::expected (#51). clang builds inherit the
+# newest installed libstdc++, so the clang lanes get the same stdlib. Fail loud on an
+# older GCC so a stale toolchain surfaces here, not as a cryptic missing-<format> error.
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
+  message(FATAL_ERROR
+      "GCC ${CMAKE_CXX_COMPILER_VERSION} is below the project floor (GCC 13, #TODO-9). "
+      "GCC 13's libstdc++ is required for complete C++20 (<format>/<expected>). "
+      "Use g++-13+ (ubuntu:noble ships it) or build with clang-16+ against libstdc++ 13.")
+endif()
+
+
+# Produce a compilation database for clang-tidy / editors.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+
+# Produce GNU-style install variables, and default the install prefix to be
+# local to the build. Override with -DCMAKE_INSTALL_PREFIX=... if installing
+# elsewhere.
+if (CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install" CACHE PATH "..." FORCE)
+endif()
+include(GNUInstallDirs)
+
+# Configure runtime paths for relocatable installs.
+set(CMAKE_BUILD_WITH_INSTALL_RPATH false)
+set(CMAKE_BUILD_RPATH_USE_ORIGIN true)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH true)
+set(CMAKE_SKIP_BUILD_RPATH false)
+
+list(FIND CMAKE_PLATFORM_IMPLICIT_LINK_DIRECTORIES "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}" isSystemDir)
+if("${isSystemDir}" STREQUAL "-1")
+  file(RELATIVE_PATH BINTOPREFIXRELPATH ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR} ${CMAKE_INSTALL_PREFIX})
+  file(RELATIVE_PATH PREFIXTOLIBRELPATH ${CMAKE_INSTALL_PREFIX} ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR})
+
+  if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    list(PREPEND CMAKE_INSTALL_RPATH "@loader_path/${BINTOPREFIXRELPATH}/${PREFIXTOLIBRELPATH}")
+  else()
+    list(PREPEND CMAKE_INSTALL_RPATH "$ORIGIN/${BINTOPREFIXRELPATH}/${PREFIXTOLIBRELPATH}")
+  endif()
+endif()
+
+
+#
+# Dependencies
+#
+
+include(FetchContent)
+
+# SOEM: all specifics (tag, target name, include wiring) live in this file.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/soem.cmake)
+
+# Everything needs threads; prefer -pthread if available.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
+# Boost headers (header-only usage for now: asio, etc.).
+find_package(Boost CONFIG REQUIRED
+  COMPONENTS
+    headers
+)
+
+# The Viam C++ SDK is only needed by the module. Pull it in exactly the way
+# universal-robots does (SYSTEM + PATCH_COMMAND to drop the static protobuf
+# gens + find_package fallback), but gated behind ETHERCAT_BUILD_MODULE so the
+# library + pure tests can build without it.
+if (ETHERCAT_BUILD_MODULE)
+  FetchContent_Declare(
+    viam-cpp-sdk
+    GIT_REPOSITORY https://github.com/viamrobotics/viam-cpp-sdk
+    GIT_TAG releases/v0.31.0 # Keep in sync with Dockerfile
+    GIT_SHALLOW TRUE
+    SYSTEM
+    # Without this patch command, using this as a SYSTEM package results in
+    # failed compilation due to the statically included protobuf gens getting
+    # in the wrong order. Just delete them, we don't need them.
+    PATCH_COMMAND find ./src/viam/api -name "*.pb.h" -type f -exec rm {} +
+    FIND_PACKAGE_ARGS 0.31.0 CONFIG COMPONENTS viamsdk
+  )
+  FetchContent_MakeAvailable(viam-cpp-sdk)
+endif()
+
+enable_testing()
+
+# Umbrella target for every test executable. Tests are EXCLUDE_FROM_ALL so the
+# Conan package build (bin/build.sh), which only needs the module, never
+# compiles them -- and never trips over the host's system protobuf headers
+# shadowing Conan's in test TUs that use protobuf directly. `make test` (and
+# CI) builds this target explicitly before running ctest.
+add_custom_target(build-tests)
+
+
+#
+# The EtherCAT master library
+#
+# SOEM-only, no Viam types. Public headers must not include SOEM headers
+# (only the SOEM backend TU will, in a later phase). For now this is a small
+# placeholder so the project configures and builds; later phases add the real
+# sources (master, pdo_*, cia402, backends, ...).
+#
+
+add_library(ethercat)
+
+target_sources(ethercat
+  PRIVATE
+    src/ethercat/cia402.cpp
+    src/ethercat/pdo_cache.cpp
+    src/ethercat/pdo_mapping.cpp
+    src/ethercat/master.cpp
+    src/ethercat/realtime.cpp
+    src/ethercat/runner.cpp
+    src/ethercat/soem_backend.cpp
+    src/viam/lib/motion_profile.cpp
+    src/viam/lib/servo_config.cpp
+    src/viam/lib/servo_controller.cpp
+)
+
+target_include_directories(ethercat
+  PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(ethercat
+  PUBLIC
+    Threads::Threads
+    Boost::headers
+  PRIVATE
+    # SOEM is an implementation detail of the library; it must not leak into
+    # public headers. Linked here so the wiring is in place for later phases.
+    soem
+)
+
+viam_apply_wall_werror(ethercat)
+
+# Install the library only in library-only builds. Module builds feed CPack,
+# and the module.tar.gz must carry just the runtime payload (bin/ + meta.json),
+# not a static lib nobody on the robot can link against.
+if (NOT ETHERCAT_BUILD_MODULE)
+  install(
+    TARGETS
+      ethercat
+  )
+endif()
+
+
+#
+# Tools
+#
+
+# slaveinfo: SOEM's own bundled bus-inspection tool, built from the FetchContent
+# source (SOEM's CMake samples are disabled, so we add the target ourselves). It
+# dumps each slave's identity, SM/FMMU config, DC info, and -- with -sdo -- the
+# full CoE object dictionary (e.g. the whole 0x1C32/0x1C33 sync-manager sub-tree:
+# sync type, cycle time, supported types). Authoritative drive-side DC/SM config
+# for A6 bring-up, straight off the hardware. NOT our code, so NO -Wall -Werror.
+#   sudo ./slaveinfo <ifname>          # identity + SM + DC summary
+#   sudo ./slaveinfo <ifname> -map     # PDO mapping (per CoE + per SII) + SM sizes
+#   sudo ./slaveinfo <ifname> -sdo     # full CoE OD incl 0x1C32/0x1C33 sub-tree
+if(DEFINED soem_SOURCE_DIR AND EXISTS "${soem_SOURCE_DIR}/test/linux/slaveinfo/slaveinfo.c")
+  add_executable(slaveinfo "${soem_SOURCE_DIR}/test/linux/slaveinfo/slaveinfo.c")
+  target_link_libraries(slaveinfo PRIVATE soem)
+endif()
+
+#
+# The Viam motor module (servo)
+#
+
+if (ETHERCAT_BUILD_MODULE)
+  add_executable(ethercat-servo)
+
+  target_sources(ethercat-servo
+    PRIVATE
+      src/viam/module/main.cpp
+      src/viam/module/servo_motor.cpp
+  )
+
+  # Tell boost::dll to use std::filesystem rather than boost::filesystem.
+  target_compile_definitions(ethercat-servo
+    PRIVATE
+      BOOST_DLL_USE_STD_FS
+  )
+
+  target_link_libraries(ethercat-servo
+    PRIVATE
+      ethercat
+      viam-cpp-sdk::viamapi # Proxy for gRPC
+      viam-cpp-sdk::viamsdk
+  )
+
+  viam_apply_wall_werror(ethercat-servo)
+  # The Viam SDK's logging header (boost::log -> boost::mpl) trips clang-19's
+  # -Wenum-constexpr-conversion. Suppress it ONLY on the SDK-linked module targets,
+  # NOT in viam_apply_wall_werror -- so genuine enum-constexpr issues in our library
+  # TUs still fail. Known boost-mpl issue (boostorg/mpl#69); UR carries the same flag.
+  target_compile_options(ethercat-servo PRIVATE $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-enum-constexpr-conversion>)
+  # gcc 14 (at -O2) reports a known false-positive null-dereference from
+  # boost::asio's scheduler.ipp when its epoll reactor code is inlined into
+  # main.cpp -- the warning escapes system-header suppression because it fires
+  # during inlining. Demote just that warning, GNU-only, module-target-only, so
+  # -Wnull-dereference keeps failing our library TUs everywhere else.
+  target_compile_options(ethercat-servo PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wno-error=null-dereference>)
+
+  # DEPLOYMENT runtime story (#TODO-9): statically link libstdc++ + libgcc INTO the
+  # shipped module binary. The module is built on noble (gcc-13/14 libstdc++ 13) but
+  # deployed to robots whose system libstdc++ may be OLDER -- libstdc++ is forward- but
+  # NOT backward-compatible, so a binary referencing libstdc++ 13 symbols (the
+  # GLIBCXX_3.4.32 that <format> pulls, once #TODO-5 lands) would fail to load on a
+  # gcc-11/12 robot with a missing-symbol error. Static-linking makes the module self-
+  # contained: it carries its own libstdc++/libgcc and runs regardless of the target's
+  # stdlib. ONLY the shipped executable gets this (library/tests run in-image). libc
+  # stays dynamic (glibc IS backward-compatible + must match the host). This is the
+  # spec's "settle the deployment story" decision; reversible if a thin-runtime target
+  # is ever preferred. NOTE: applies to GNU/Clang; both honor these flags.
+  target_link_options(ethercat-servo PRIVATE -static-libstdc++ -static-libgcc)
+
+  # Install just the module binary. The RELEASE artifact is the Conan build
+  # (bin/build.sh, CI build-module): fully static apart from glibc, so there are
+  # no shared-library dependencies to bundle or post-process. A tarball from a
+  # local FetchContent build links the SDK dynamically and is dev-only.
+  install(
+    TARGETS
+      ethercat-servo
+  )
+
+
+endif()
+
+
+#
+# Tests
+#
+# One executable per test file, registered with ctest. Each links the ethercat
+# library and gets the header-only test harness on its include path.
+
+function(viam_add_test test_name source)
+  add_executable(${test_name} EXCLUDE_FROM_ALL ${source})
+  target_link_libraries(${test_name} PRIVATE ethercat)
+  target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  viam_apply_wall_werror(${test_name})
+  add_test(NAME ${test_name} COMMAND ${test_name})
+  add_dependencies(build-tests ${test_name})
+endfunction()
+
+viam_add_test(pdo_buffer_test tests/pdo_buffer_test.cpp)
+viam_add_test(cia402_test tests/cia402_test.cpp)
+viam_add_test(pdo_cache_test tests/pdo_cache_test.cpp)
+viam_add_test(soem_backend_test tests/soem_backend_test.cpp)
+viam_add_test(conversion_test tests/conversion_test.cpp)
+viam_add_test(dc_sync_test tests/dc_sync_test.cpp)
+viam_add_test(realtime_test tests/realtime_test.cpp)
+viam_add_test(rt_preflight_test tests/rt_preflight_test.cpp)
+# Bench-tool tests (depend on the untracked src/tools headers); build when present.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/sine_move_test.cpp)
+  viam_add_test(sine_move_test tests/sine_move_test.cpp)
+endif()
+viam_add_test(servo_config_test tests/servo_config_test.cpp)
+
+# ThreadSanitizer build of the RT-boundary test. Compiles the pdo_cache TU
+# directly (with -fsanitize=thread) so the seqlock / lock-free handoff code is
+# instrumented, rather than linking the un-instrumented libethercat.
+# #40 item 6: the TSan lane is CLANG-ONLY by policy -- gcc-14 cannot build it
+# (`atomic_thread_fence not supported with -fsanitize=thread` -Werror=tsan, hit in
+# pdo_cache.cpp's LOAD-BEARING seqlock fences, which must not be weakened). Gate it
+# so nobody burns an hour rediscovering that.
+if (ETHERCAT_SANITIZE_THREAD AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  message(STATUS "ETHERCAT_SANITIZE_THREAD: skipped -- the TSan lane requires clang "
+                 "(gcc rejects atomic_thread_fence under -fsanitize=thread; the pdo_cache "
+                 "seqlock fences are load-bearing). Configure with clang to build it.")
+endif()
+if (ETHERCAT_SANITIZE_THREAD AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  # #50: the TSan lane MUST be an NDEBUG config. Concurrency tests may be gated
+  # `#ifdef NDEBUG` (paths that in a debug build would trip an assert instead of
+  # running); under a Debug build such tests compile to a `CHECK(true)` STUB, so
+  # the races they exist to catch go UN-SANITIZED while the lane reports green.
+  # Fail loud: require a build type whose flags carry -DNDEBUG.
+  if (NOT CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+    message(FATAL_ERROR
+        "ETHERCAT_SANITIZE_THREAD requires an NDEBUG build type (got "
+        "CMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}'). NDEBUG-gated concurrency tests "
+        "(#ifdef NDEBUG) silently stub out otherwise, so the TSan lane would run green "
+        "without sanitizing the paths it exists for. Re-configure with "
+        "-DCMAKE_BUILD_TYPE=RelWithDebInfo (keeps -g for symbolized races + defines NDEBUG).")
+  endif()
+  add_executable(pdo_cache_test_tsan
+    tests/pdo_cache_test.cpp
+    src/ethercat/pdo_cache.cpp
+  )
+  target_include_directories(pdo_cache_test_tsan
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests
+  )
+  target_link_libraries(pdo_cache_test_tsan
+    PRIVATE
+      Threads::Threads
+      Boost::headers
+  )
+  target_compile_options(pdo_cache_test_tsan PRIVATE -fsanitize=thread -O1 -g)
+  target_link_options(pdo_cache_test_tsan PRIVATE -fsanitize=thread)
+  viam_apply_wall_werror(pdo_cache_test_tsan)
+  add_test(NAME pdo_cache_test_tsan COMMAND pdo_cache_test_tsan)
+  set_tests_properties(pdo_cache_test_tsan PROPERTIES LABELS "tsan")
+endif()
+
+
+#
+# Installation and packaging
+#
+
+configure_file(
+  meta.json.in
+  ${CMAKE_CURRENT_BINARY_DIR}/meta.json
+  @ONLY
+)
+
+install(
+  FILES ${CMAKE_CURRENT_BINARY_DIR}/meta.json
+  DESTINATION .
+)
+
+set(CPACK_PACKAGE_NAME "viam-ethercat")
+set(CPACK_PACKAGE_FILE_NAME "module")
+set(CPACK_GENERATOR "TGZ")
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY 0)
+include(CPack)
