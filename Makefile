@@ -24,7 +24,7 @@
 ETHERCAT_BUILD_MODULE ?= ON
 
 # Our source lives under these trees. clang-format / clang-tidy operate on them.
-SOURCE_FILES := $(shell find src/ethercat src/viam src/tools -type f \( -name '*.cpp' -o -name '*.hpp' \))
+SOURCE_FILES := $(shell find src/ethercat src/viam src/tools -type f \( -name '*.cpp' -o -name '*.hpp' \) 2>/dev/null)
 CPP_FILES := $(filter %.cpp,$(SOURCE_FILES))
 
 default: package

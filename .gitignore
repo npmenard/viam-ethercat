@@ -33,3 +33,18 @@ reference-src/
 build-hw/
 .venv*/
 __pycache__/
+
+# Bench/internal material kept on disk but deliberately UNTRACKED (2026-07-06):
+# docs, plans, bench tools + their tests, example configs, vendor manuals.
+# CMakeLists gates the dependent targets on file existence, so this machine
+# builds everything while a fresh clone builds the library + module + pure tests.
+/docs/
+/plan.md
+/tools/
+/scripts/
+/a6-manuals/
+/src/tools/
+/etc/
+/tests/a6_control_test.cpp
+/tests/sine_move_test.cpp
+/tests/a6_config_parse_test.cpp
