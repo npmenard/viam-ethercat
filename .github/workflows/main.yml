@@ -165,26 +165,15 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  publish:
-    name: Publish to Viam Module Registry
-    needs: [build-module]
-    if: github.event_name == 'release'
-    runs-on: self-hosted
-    env:
-      # download-artifact@v4 targets Node 20; runner 2.335 force-runs it on Node 24,
-      # where its Azure blob download fails after retries. Run it on Node 20 until
-      # the action ships Node 24 support.
-      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
-    steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: module-linux-amd64
-
+      # Publish straight from this job: the tarball is already on this runner's
+      # disk, so no artifact download round-trip (which proved flaky on the
+      # self-hosted runner regardless of the action's Node version).
       - name: Extract meta.json from module archive
+        if: github.event_name == 'release'
         run: tar -xzf module.tar.gz meta.json
 
       - name: Upload module to Viam
+        if: github.event_name == 'release'
         uses: viamrobotics/upload-module@v1
         with:
           module-path: module.tar.gz
@@ -194,3 +183,4 @@ jobs:
           key-value: ${{ secrets.VIAM_DEV_API_KEY }}
           do-update: ${{ github.event_name == 'release' && !github.event.release.prerelease }}
           do-upload: ${{ github.event_name == 'release' }}
+
