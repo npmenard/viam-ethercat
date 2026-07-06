@@ -8,7 +8,7 @@ class ethercat(ConanFile):
     name = "viam-ethercat"
 
     license = "Apache-2.0"
-    url = "https://github.com/viam-modules/ethercat"
+    url = "https://github.com/viam-modules/viam-ethercat"
     package_type = "application"
     settings = "os", "compiler", "build_type", "arch"
 

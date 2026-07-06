@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.28 FATAL_ERROR)
 project(
   ethercat
   DESCRIPTION "SOEM-based EtherCAT master library + generic servo Viam motor module"
-  HOMEPAGE_URL https://github.com/viam-modules/ethercat
+  HOMEPAGE_URL https://github.com/viam-modules/viam-ethercat
   LANGUAGES C CXX
 )
 

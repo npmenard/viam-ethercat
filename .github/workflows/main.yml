@@ -18,11 +18,16 @@ jobs:
   build-test-lint:
     name: Build, Test, and Lint (amd64)
     runs-on: ubuntu-latest
-    # The container image is built from this repo's Dockerfile and published to
-    # ghcr.io/viam-modules/ethercat:amd64. It ships the clang-19 toolchain,
-    # cmake, boost, and a prebuilt viam-cpp-sdk so the module's
+    # The container image is built from this repo's Dockerfile (see docker.yml) and
+    # published to the repo owner's ghcr, so forks are self-sufficient: dispatch
+    # docker.yml once to build the image, then this job uses it. It ships the
+    # clang-19 toolchain, cmake, boost, and a prebuilt viam-cpp-sdk so the module's
     # find_package(viam-cpp-sdk) resolves without a from-source SDK build.
-    container: ghcr.io/viam-modules/ethercat:amd64
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/viam-ethercat:amd64
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,7 +55,11 @@ jobs:
   thread-sanitizer:
     name: ThreadSanitizer (RT boundary, amd64)
     runs-on: ubuntu-latest
-    container: ghcr.io/viam-modules/ethercat:amd64
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/viam-ethercat:amd64
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     # NOTE: this used to also run on a NATIVE arm64 runner, which is the only
     # authoritative check of the seqlock fence placement (x86 is TSO and hides
     # weak-ordering mistakes; qemu serializes to ~TSO too). We only target

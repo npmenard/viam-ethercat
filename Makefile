@@ -86,7 +86,7 @@ BUILD_CMD = docker buildx build --pull $(BUILD_PUSH) --force-rm --build-arg MAIN
 BUILD_PUSH = --load
 BUILD_FILE = Dockerfile
 
-docker-amd64: MAIN_TAG = ghcr.io/viam-modules/ethercat
+docker-amd64: MAIN_TAG = ghcr.io/viam-modules/viam-ethercat
 docker-amd64: BUILD_TAG = amd64
 docker-amd64:
 	$(BUILD_CMD)
@@ -94,12 +94,12 @@ docker-amd64:
 docker-build: docker-amd64
 
 docker-upload:
-	docker push 'ghcr.io/viam-modules/ethercat:amd64'
+	docker push 'ghcr.io/viam-modules/viam-ethercat:amd64'
 
 docker: docker-build docker-upload
 
 # CI target that automatically pushes; avoid for local test-first-then-push flows.
-docker-amd64-ci: MAIN_TAG = ghcr.io/viam-modules/ethercat
+docker-amd64-ci: MAIN_TAG = ghcr.io/viam-modules/viam-ethercat
 docker-amd64-ci: BUILD_TAG = amd64
 docker-amd64-ci: BUILD_PUSH = --push
 docker-amd64-ci:
