@@ -17,7 +17,7 @@ on:
 jobs:
   format:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     container:
       image: ghcr.io/${{ github.repository_owner }}/viam-ethercat:amd64
       credentials:
@@ -32,7 +32,7 @@ jobs:
 
   build-test-lint:
     name: Build, Test, and Lint (amd64)
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     # The container image is built from this repo's Dockerfile (see docker.yml) and
     # published to the repo owner's ghcr, so forks are self-sufficient: dispatch
     # docker.yml once to build the image, then this job uses it. It ships the
@@ -66,7 +66,7 @@ jobs:
 
   thread-sanitizer:
     name: ThreadSanitizer (RT boundary, amd64)
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     container:
       image: ghcr.io/${{ github.repository_owner }}/viam-ethercat:amd64
       credentials:
@@ -109,7 +109,7 @@ jobs:
       startsWith(github.ref, 'refs/tags/v') ||
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'release'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     container: ubuntu:noble
     steps:
       - name: Install system dependencies
@@ -167,7 +167,7 @@ jobs:
     name: Publish to Viam Module Registry
     needs: [build-module]
     if: github.event_name == 'release'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
