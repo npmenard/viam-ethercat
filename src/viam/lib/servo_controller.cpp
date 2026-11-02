@@ -183,6 +183,7 @@ void ServoController::reset_run_state() {
     lifecycle_ = Init{};
     state_.homing_state.store(static_cast<std::uint8_t>(HomingState::Idle), std::memory_order_relaxed);
     state_.homed.store(false, std::memory_order_relaxed);  // an incremental reference does not survive a restart
+    state_.home_counts.store(0, std::memory_order_relaxed);
     last_cw_ = 0;
     if (motion_) {
         motion_->reset();  // the mode's per-run RT state (handshake/latches/generator) for reuse
@@ -544,25 +545,6 @@ const char* to_string(HomingFail fail) noexcept {
     return "?";
 }
 
-std::string HomingParams::validate() const {
-    if (!(speed_rpm > 0.0) || !std::isfinite(speed_rpm)) {
-        return "speed must be positive";
-    }
-    if (!(accel_rpm_per_s >= 0.0) || !std::isfinite(accel_rpm_per_s)) {
-        return "acceleration must be >= 0";
-    }
-    if (!(offset_revs >= 0.0) || !std::isfinite(offset_revs)) {
-        return "offset must be >= 0 (the direction sets its sign)";
-    }
-    if (torque_percent < 0.0 || torque_percent > 300.0 || !std::isfinite(torque_percent)) {
-        return "torque percent must be within 0..300";
-    }
-    if (!(timeout_s > 0.0) || !std::isfinite(timeout_s)) {
-        return "timeout must be positive";
-    }
-    return {};
-}
-
 const char* ServoController::motion_mode_name() const noexcept {
     const std::shared_lock<std::shared_mutex> lk(api_mutex_);
     return motion_ ? motion_->name() : "unselected";
@@ -738,9 +720,10 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             return ControlWord::with_halt(ControlWord::enable_operation(), true);
         }
         if (status.homing_attained()) {
-            // The drive rezeroed 0x6064 at the offset point, so the software zero must go with it for
-            // position_revs() to read 0 at home.
+            // home() reports this raw count as the axis reference, so the software zero must go with
+            // it: an offset left over from a set_zero would put position_revs() in another frame.
             state_.zero_offset_counts.store(0, std::memory_order_relaxed);
+            state_.home_counts.store(actual, std::memory_order_relaxed);
             state_.homed.store(true, std::memory_order_release);
             finish_homing(HomingFail::None);
             return ControlWord::enable_operation();
@@ -1212,7 +1195,8 @@ void ServoController::await_move(std::uint32_t generation) {
 
 // SDO-write the standard homing objects, then the configured torque object. Non-RT, run before the
 // RT loop is told to start: a refused object fails home() with the drive's abort code.
-void ServoController::write_homing_objects(const HomingParams& p) {
+std::vector<std::byte> ServoController::write_homing_objects() {
+    const ServoConfig::Homing& h = config_.homing;
     const auto write = [this](std::uint16_t index, std::uint8_t sub, auto value) {
         std::array<std::byte, sizeof(value)> raw{};
         store_le<decltype(value)>(raw, value);
@@ -1220,30 +1204,64 @@ void ServoController::write_homing_objects(const HomingParams& p) {
     };
     const double cpr = config_.counts_per_rev;
     const double ratio = config_.gear_ratio;
-    // Resolve the torque object first: a request the config cannot satisfy must fail before any
-    // homing object is written, not halfway through.
+    // Resolve everything the config must supply first: a request it cannot satisfy must fail before
+    // any homing object is written, not halfway through.
+    if (h.method == 0) {
+        throw Error("home: needs the 'homing' config attribute (its 0x6098 method is drive-specific, so it cannot be guessed)");
+    }
     const sdo_codec::TypeInfo* torque_type = nullptr;
-    if (p.torque_percent > 0.0) {
-        if (config_.homing_torque.index == 0) {
-            throw Error("home: torque_percent needs the 'homing_torque_object' config attribute (the object is drive-specific)");
-        }
-        torque_type = sdo_codec::find_type(config_.homing_torque.type);
+    if (h.torque_percent > 0.0) {
+        torque_type = sdo_codec::find_type(h.torque.type);
         if (torque_type == nullptr) {
-            throw Error("home: unknown homing_torque_object type '" + config_.homing_torque.type + "'");
+            throw Error("home: unknown homing torque object type '" + h.torque.type + "'");
         }
     }
-    write(0x6098, 0, static_cast<std::int8_t>(p.negative_direction ? -4 : -3));
-    write(0x6099, 1, static_cast<std::uint32_t>(rpm_to_device_velocity(p.speed_rpm, cpr, ratio)));
-    if (p.accel_rpm_per_s > 0.0) {
-        write(0x609A, 0, static_cast<std::uint32_t>(rpm_to_device_velocity(p.accel_rpm_per_s, cpr, ratio)));
+    // Save the torque object before clamping it: on a drive whose only torque limit is the global
+    // one (no homing-scoped object), leaving the clamp in place would cap every later move.
+    std::vector<std::byte> saved;
+    if (torque_type != nullptr) {
+        saved.resize(torque_type->width);
+        saved.resize(sdo_read(h.torque.index, h.torque.sub, saved));
     }
-    // The back-off moves away from the stop, so its sign is the opposite of the approach direction.
-    const std::int32_t offset = revs_to_counts(p.offset_revs, cpr, ratio);
-    write(0x607C, 0, p.negative_direction ? offset : -offset);
+    write(0x6098, 0, h.method);
+    // Prove the drive took the method rather than trusting the download: a drive that range-checks
+    // 0x6098 aborts the write above, but one that ignores an unknown value would otherwise home by
+    // whatever method it kept -- in another direction, into another stop.
+    std::array<std::byte, 4> echo{};  // wider than the INT8 object: a width mismatch is data, not a transport failure
+    const std::size_t read = sdo_read(0x6098, 0, echo);
+    const auto got = static_cast<std::int8_t>(echo[0]);
+    if (read != 1 || got != h.method) {
+        throw Error("home: the drive refused homing method " + std::to_string(h.method) + " (0x6098 reads back " + std::to_string(got) +
+                    " in " + std::to_string(read) + " bytes) -- it does not support it");
+    }
+    write(0x6099, 1, static_cast<std::uint32_t>(rpm_to_device_velocity(h.speed_rpm, cpr, ratio)));
+    if (h.accel_rpm_per_s > 0.0) {
+        write(0x609A, 0, static_cast<std::uint32_t>(rpm_to_device_velocity(h.accel_rpm_per_s, cpr, ratio)));
+    }
     if (torque_type != nullptr) {
         sdo_codec::Input in;
-        in.number = p.torque_percent * config_.homing_torque.units_per_percent;
-        sdo_write(config_.homing_torque.index, config_.homing_torque.sub, torque_type->encode(in));
+        // Round: the product is a unit conversion, and the codec refuses a fraction. A percent that
+        // does not land on an exact multiple of the object's resolution is a rounding question, not
+        // an error.
+        in.number = std::round(h.torque_percent * h.torque.units_per_percent);
+        sdo_write(h.torque.index, h.torque.sub, torque_type->encode(in));
+    }
+    return saved;
+}
+
+// Put the torque object back after the run. Best-effort and never throws: it is cleanup on both the
+// success and the failure path, and a refused restore must not mask the homing result.
+void ServoController::restore_homing_torque(std::span<const std::byte> saved) noexcept {
+    if (saved.empty()) {
+        return;
+    }
+    try {
+        sdo_write(config_.homing.torque.index, config_.homing.torque.sub, saved);
+    } catch (const std::exception& e) {
+        ETHERCAT_LOG_ERROR("servo",
+                           "home: restoring the torque limit {} failed -- the drive is still clamped: {}",
+                           hex(config_.homing.torque.index),
+                           e.what());
     }
 }
 
@@ -1290,10 +1308,7 @@ void ServoController::finish_homing(HomingFail fail) noexcept {
     mode_echo_wait_ = 0;
 }
 
-bool ServoController::home(const HomingParams& params) {
-    if (const std::string err = params.validate(); !err.empty()) {
-        throw Error("home: " + err);
-    }
+bool ServoController::home() {
     maybe_recover_bus();
     std::uint32_t g = 0;
     std::uint32_t timeout_cycles = 0;
@@ -1308,15 +1323,16 @@ bool ServoController::home(const HomingParams& params) {
         if (!state_.powered.load(std::memory_order_acquire)) {
             throw Error("home: the drive is not energized");
         }
-        timeout_cycles = static_cast<std::uint32_t>(params.timeout_s * static_cast<double>(config_.target_loop_rate_hz));
+        timeout_cycles = static_cast<std::uint32_t>(config_.homing.timeout_s * static_cast<double>(config_.target_loop_rate_hz));
         g = next_generation_.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!try_claim_motion_slot(g)) {  // homing owns the single-in-flight slot for the whole run
             throw Error("home: a motion operation is already in progress");
         }
     }
     bool attained = false;
+    std::vector<std::byte> saved_torque;
     try {
-        write_homing_objects(params);
+        saved_torque = write_homing_objects();
         select_drive_mode(Cia402Mode::Homing);
         state_.homing_fail.store(static_cast<std::uint8_t>(HomingFail::None), std::memory_order_relaxed);
         state_.homing_state.store(static_cast<std::uint8_t>(HomingState::Running), std::memory_order_release);
@@ -1334,12 +1350,14 @@ bool ServoController::home(const HomingParams& params) {
         } catch (const std::exception& e) {
             ETHERCAT_LOG_ERROR("servo", "home: restoring the running mode failed: {}", e.what());
         }
+        restore_homing_torque(saved_torque);
         release_motion_slot(g);
         throw;
     }
     // Free the slot before the restore, which can throw on a refused SDO: a home that attained and
     // then failed to restore the mode must not also leave the slot held, refusing every later move.
     release_motion_slot(g);
+    restore_homing_torque(saved_torque);
     select_drive_mode(commanded_cia402_mode());
     ETHERCAT_LOG_INFO("servo", "slave {}: homing {}", config_.slave_id, attained ? "attained" : homing_error());
     return attained;
@@ -1347,6 +1365,15 @@ bool ServoController::home(const HomingParams& params) {
 
 bool ServoController::homed() const noexcept {
     return state_.homed.load(std::memory_order_acquire);
+}
+
+std::int32_t ServoController::home_position_counts() const noexcept {
+    return state_.home_counts.load(std::memory_order_acquire);
+}
+
+double ServoController::home_position_revs() const noexcept {
+    const std::shared_lock<std::shared_mutex> lk(api_mutex_);  // config_ conversion params, as position_revs()
+    return counts_to_revs(home_position_counts(), config_.counts_per_rev, config_.gear_ratio);
 }
 
 HomingState ServoController::homing_state() const noexcept {

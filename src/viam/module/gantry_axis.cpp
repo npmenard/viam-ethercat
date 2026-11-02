@@ -42,19 +42,14 @@ GantryAxis::Attributes GantryAxis::parse(const ResourceConfig& cfg) {
     if (out.mm_per_sec < 0.0) {
         throw Error("config attribute 'gantry_mm_per_sec' must be >= 0");
     }
-    const ProtoValue* const dir = find_attr(a, "home_direction");
+    const ProtoValue* const dir = find_attr(a, "travel_direction");
     if (dir != nullptr) {
         const std::string* const d = dir->get<std::string>();
         if (d == nullptr || (*d != "negative" && *d != "positive")) {
-            throw Error("config attribute 'home_direction' must be \"negative\" or \"positive\"");
+            throw Error("config attribute 'travel_direction' must be \"negative\" or \"positive\"");
         }
-        out.home_negative = *d == "negative";
+        out.travel_positive = *d == "positive";
     }
-    out.home_mm_per_sec = opt_num(a, "home_mm_per_sec", 0.0);
-    out.home_accel_mm_per_sec2 = opt_num(a, "home_accel_mm_per_sec2", 0.0);
-    out.home_torque_percent = opt_num(a, "home_torque_percent", 0.0);
-    out.home_offset_mm = opt_num(a, "home_offset_mm", 0.0);
-    out.home_timeout_s = opt_num(a, "home_timeout_s", 120.0);
     return out;
 }
 
@@ -116,38 +111,8 @@ ProtoStruct GantryAxis::motor_status() const {
     return *status;
 }
 
-// Ask the motor whether its absolute encoder is configured and still holds its reference. The
-// drive objects and the codes that mean "lost" live in the motor's config, so the axis just reads
-// the verdict. Cached once positive; a failure is not an error here, only "no reference yet".
-bool GantryAxis::absolute_reference() {
-    if (abs_reference_) {
-        return true;
-    }
-    ProtoStruct cmd;
-    cmd.emplace("is_abs_enc_valid", ProtoValue(true));
-    try {
-        const ProtoStruct reply = motor_->do_command(cmd);
-        const ProtoStruct* const answer = nested(reply, "is_abs_enc_valid");
-        abs_reference_ = answer != nullptr && flag(*answer, "valid");
-    } catch (const std::exception&) {
-        abs_reference_ = false;
-    }
-    return abs_reference_;
-}
-
-// A bus drop may have taken the drive's control power with it, and an absolute encoder whose
-// battery is flat loses its count while dark. The cached verdict cannot see that, so forget it and
-// ask the drive again once it answers.
-void GantryAxis::note_connection(const ProtoStruct& status) {
-    if (flag(status, "is_disconnected")) {
-        abs_reference_ = false;
-    }
-}
-
-bool GantryAxis::homed() {
-    const ProtoStruct status = motor_status();
-    note_connection(status);
-    return flag(status, "homed") || absolute_reference();
+bool GantryAxis::homed() const {
+    return flag(motor_status(), "homed");
 }
 
 std::vector<double> GantryAxis::get_position(const ProtoStruct& extra) {
@@ -182,36 +147,26 @@ void GantryAxis::move_to_position(const std::vector<movement_coordinate>& coordi
     motor_->go_to(speed / attrs_.mm_per_rev * 60.0, mm_to_revs(c.position_mm), extra);
 }
 
+// The motor owns the procedure, so the axis only asks for it and keeps the answer: the position the
+// drive ended the run at is this axis's zero, whatever back-off the homing method performed.
 bool GantryAxis::home(const ProtoStruct& /*extra*/) {
-    ProtoStruct args;
-    args.emplace("direction", ProtoValue(std::string(attrs_.home_negative ? "negative" : "positive")));
-    args.emplace("speed_rpm", ProtoValue(attrs_.home_mm_per_sec / attrs_.mm_per_rev * 60.0));
-    if (attrs_.home_accel_mm_per_sec2 > 0.0) {
-        args.emplace("acceleration_rpm_per_s", ProtoValue(attrs_.home_accel_mm_per_sec2 / attrs_.mm_per_rev * 60.0));
-    }
-    if (attrs_.home_torque_percent > 0.0) {
-        args.emplace("torque_percent", ProtoValue(attrs_.home_torque_percent));
-    }
-    args.emplace("offset_revolutions", ProtoValue(attrs_.home_offset_mm / attrs_.mm_per_rev));
-    args.emplace("timeout_s", ProtoValue(attrs_.home_timeout_s));
     ProtoStruct cmd;
-    cmd.emplace("home", ProtoValue(std::move(args)));
+    cmd.emplace("home", ProtoValue(true));
     const ProtoStruct reply = motor_->do_command(cmd);
     const ProtoStruct* const home = nested(reply, "home");
-    return home != nullptr && flag(*home, "homed");
+    if (home == nullptr || !flag(*home, "homed")) {
+        return false;
+    }
+    home_revs_ = opt_num(*home, "revolutions", 0.0);
+    return true;
 }
 
 // The axis state in one struct: its own millimetre view plus the motor's, so one call explains
 // both why a move was refused and what the drive is doing.
 ProtoStruct GantryAxis::get_status() {
     ProtoStruct status = motor_status();
-    note_connection(status);
-    const bool reference = absolute_reference();
-    const bool is_homed = flag(status, "homed") || reference;
-    status.insert_or_assign("homed", ProtoValue(is_homed));
-    status.emplace("absolute_reference", ProtoValue(reference));
     status.emplace("length_mm", ProtoValue(attrs_.length_mm));
-    if (is_homed) {
+    if (flag(status, "homed")) {
         status.emplace("position_mm", ProtoValue(revs_to_mm(motor_->get_position({}))));
     }
     return status;

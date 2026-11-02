@@ -31,6 +31,7 @@
 namespace ethercat::servo {
 
 using attrs::find_attr;
+using attrs::nested;
 using attrs::opt_attr;
 using attrs::opt_num;
 using attrs::req_num;
@@ -59,6 +60,24 @@ codec::Input input_of(const ProtoValue& v, const char* key) {
 std::uint32_t small_uint(const ProtoValue& v, const char* key, const char* type) {
     const codec::TypeInfo& t = *codec::find_type(type);
     return static_cast<std::uint32_t>(*t.decode(t.encode(input_of(v, key))).number);
+}
+
+// The {index, sub?, type?} triple every config-named drive object uses (the encoder mode object,
+// the homing torque object). Writes through to the config fields, leaving `sub`/`type` at their
+// defaults when absent. `where` names the attribute in the error text.
+void object_ref(const ProtoStruct& o, const char* where, std::uint16_t& index, std::uint8_t& sub, std::string& type) {
+    const ProtoValue* const i = find_attr(o, "index");
+    if (i == nullptr) {
+        throw Error(std::string("config attribute '") + where + "' needs an 'index'");
+    }
+    index = static_cast<std::uint16_t>(small_uint(*i, "index", "u16"));
+    if (const ProtoValue* const s = find_attr(o, "sub")) {
+        sub = static_cast<std::uint8_t>(small_uint(*s, "sub", "u8"));
+    }
+    type = opt_attr<std::string>(o, "type").value_or(type);
+    if (codec::find_type(type) == nullptr) {
+        throw Error(std::string("config attribute '") + where + ".type' is not a known SDO type: " + type);
+    }
 }
 
 // Upload buffer for a raw read. Every CoE scalar fits in 8 bytes; the rest is headroom for the
@@ -164,24 +183,13 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs, ethercat::servo::MotionM
     // codes mean the retained position is gone. All drive-specific, so all from config.
     if (const ProtoValue* const v = find_attr(attrs, "absolute_encoder")) {
         const ProtoStruct* const o = v->get<ProtoStruct>();
-        const ProtoValue* const index = o ? find_attr(*o, "index") : nullptr;
         const ProtoValue* const equals = o ? find_attr(*o, "equals") : nullptr;
-        if (index == nullptr || equals == nullptr) {
+        const double* const eq = equals == nullptr ? nullptr : equals->get<double>();
+        if (eq == nullptr) {
             throw Error("config attribute 'absolute_encoder' expects {index, sub?, type?, equals, invalid_codes?}");
         }
         ServoConfig::AbsoluteEncoder& enc = c.absolute_encoder;
-        enc.index = static_cast<std::uint16_t>(small_uint(*index, "index", "u16"));
-        if (const ProtoValue* const sub = find_attr(*o, "sub")) {
-            enc.sub = static_cast<std::uint8_t>(small_uint(*sub, "sub", "u8"));
-        }
-        enc.type = opt_attr<std::string>(*o, "type").value_or("u16");
-        if (codec::find_type(enc.type) == nullptr) {
-            throw Error("config attribute 'absolute_encoder.type' is not a known SDO type: " + enc.type);
-        }
-        const double* const eq = equals->get<double>();
-        if (eq == nullptr) {
-            throw Error("config attribute 'absolute_encoder.equals' must be a number");
-        }
+        object_ref(*o, "absolute_encoder", enc.index, enc.sub, enc.type);
         enc.equals = *eq;
         if (const ProtoValue* const codes = find_attr(*o, "invalid_codes")) {
             const std::vector<ProtoValue>* const list = codes->get<std::vector<ProtoValue>>();
@@ -193,22 +201,30 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs, ethercat::servo::MotionM
             }
         }
     }
-    // Object that bounds current during hard-stop homing; drive-specific, so it is named in config.
-    if (const ProtoValue* const v = find_attr(attrs, "homing_torque_object")) {
+    // Everything one homing run needs, in one block: the 0x6098 method is drive-specific (CiA402
+    // leaves the hard-stop methods to the manufacturer) and so is the torque object, which only the
+    // current-sensing methods use. Ranges are checked by ServoConfig::validate().
+    if (const ProtoValue* const v = find_attr(attrs, "homing")) {
         const ProtoStruct* const o = v->get<ProtoStruct>();
-        const ProtoValue* const index = o ? find_attr(*o, "index") : nullptr;
-        if (index == nullptr) {
-            throw Error("config attribute 'homing_torque_object' expects {index, sub?, type?, units_per_percent?}");
+        if (o == nullptr) {
+            throw Error(
+                "config attribute 'homing' expects {method, speed_rpm, acceleration_rpm_per_s?, torque_object?, torque_percent?, "
+                "timeout_s?}");
         }
-        c.homing_torque.index = static_cast<std::uint16_t>(small_uint(*index, "index", "u16"));
-        if (const ProtoValue* const sub = find_attr(*o, "sub")) {
-            c.homing_torque.sub = static_cast<std::uint8_t>(small_uint(*sub, "sub", "u8"));
+        ServoConfig::Homing& h = c.homing;
+        const double method = req_num(*o, "method");
+        if (method < -128.0 || method > 127.0 || method != std::trunc(method) || method == 0.0) {
+            throw Error("config attribute 'homing.method' must be a non-zero 0x6098 method (int8)");
         }
-        c.homing_torque.type = opt_attr<std::string>(*o, "type").value_or("u16");
-        if (ethercat::servo::sdo_codec::find_type(c.homing_torque.type) == nullptr) {
-            throw Error("config attribute 'homing_torque_object.type' is not a known SDO type: " + c.homing_torque.type);
+        h.method = static_cast<std::int8_t>(method);
+        h.speed_rpm = req_num(*o, "speed_rpm");
+        h.accel_rpm_per_s = opt_num(*o, "acceleration_rpm_per_s", 0.0);
+        h.torque_percent = opt_num(*o, "torque_percent", 0.0);
+        h.timeout_s = opt_num(*o, "timeout_s", 120.0);
+        if (const ProtoStruct* const t = nested(*o, "torque_object")) {
+            object_ref(*t, "homing.torque_object", h.torque.index, h.torque.sub, h.torque.type);
+            h.torque.units_per_percent = opt_num(*t, "units_per_percent", 10.0);
         }
-        c.homing_torque.units_per_percent = opt_num(*o, "units_per_percent", 10.0);
     }
     // 0x603F code the drive reports while its emergency-stop input is engaged (e.g. "0xFF3A").
     if (const ProtoValue* const v = find_attr(attrs, "emergency_stop_fault_code")) {
@@ -436,6 +452,58 @@ void ServoMotor::install_logging(viam::sdk::log_level level) {
     ethercat::log::set_sink(log_sink_);
 }
 
+// The `is_abs_enc_valid` reply: is the drive's absolute encoder set to retain position, and has it
+// kept it? The mode object is a drive setting, so it is read once and cached; the lost-reference
+// verdict is the live 0x603F against the configured codes, so it costs nothing to re-check. Never
+// throws: "cannot tell" is `valid: false` with a reason, the same instruction to the caller -- home it.
+ProtoStruct ServoMotor::absolute_encoder_status() {
+    const ServoConfig::AbsoluteEncoder& enc = controller_->absolute_encoder();
+    ProtoStruct out;
+    out.emplace("valid", ProtoValue(false));
+    if (enc.index == 0) {
+        out.emplace("reason", ProtoValue(std::string("no 'absolute_encoder' config attribute on this motor")));
+        return out;
+    }
+    // A bus drop may have taken the drive's control power with it, and an encoder whose battery is
+    // flat loses its count while dark, so the cached mode is forgotten -- and asked again on the
+    // first call after the bus is back, not now, when the drive cannot answer.
+    if (controller_->is_disconnected()) {
+        abs_enc_mode_known_.store(false, std::memory_order_relaxed);
+        out.emplace("reason", ProtoValue(std::string("the bus is disconnected, so the drive cannot be asked")));
+        return out;
+    }
+    std::string reason;
+    double mode = abs_enc_mode_.load(std::memory_order_relaxed);
+    if (!abs_enc_mode_known_.load(std::memory_order_acquire)) {
+        try {
+            std::vector<std::byte> buf(kSdoReadBytes);
+            buf.resize(std::min(controller_->sdo_read(enc.index, enc.sub, buf), buf.size()));
+            mode = codec::find_type(enc.type)->decode(buf).number.value_or(0.0);
+            abs_enc_mode_.store(mode, std::memory_order_relaxed);
+            abs_enc_mode_known_.store(true, std::memory_order_release);
+        } catch (const std::exception& e) {
+            reason = std::string("reading the encoder mode object failed: ") + e.what();
+        }
+    }
+    const bool configured = reason.empty() && mode == enc.equals;
+    const std::uint16_t code = controller_->drive_fault_code();
+    const bool lost = std::find(enc.invalid_codes.begin(), enc.invalid_codes.end(), code) != enc.invalid_codes.end();
+    if (lost) {
+        reason = "the drive reports " + hex4(code) + ", which this config lists as a lost reference";
+    } else if (reason.empty() && !configured) {
+        reason = "the encoder mode object does not read the configured value";
+    }
+    out.insert_or_assign("valid", ProtoValue(configured && !lost));
+    out.emplace("configured", ProtoValue(configured));
+    out.emplace("mode", ProtoValue(mode));
+    out.emplace("fault_code", ProtoValue(hex4(code)));
+    out.emplace("warning", ProtoValue(controller_->drive_warning()));
+    if (!reason.empty()) {
+        out.emplace("reason", ProtoValue(reason));
+    }
+    return out;
+}
+
 // The drive's state in one struct, for the API's get_status and the `status` do_command alike.
 ProtoStruct ServoMotor::get_status() {
     ProtoStruct status;
@@ -448,7 +516,16 @@ ProtoStruct ServoMotor::get_status() {
     status.emplace("emergency_stop", ProtoValue(controller_->emergency_stopped()));
     status.emplace("warning", ProtoValue(controller_->drive_warning()));  // statusword bit 7
     status.emplace("fault_code", ProtoValue(hex4(controller_->drive_fault_code())));
-    status.emplace("homed", ProtoValue(controller_->homed()));
+    // Homed means the axis reference is known: a run succeeded this session, or the configured
+    // absolute encoder kept its count across the restart.
+    const bool ran = controller_->homed();
+    const bool absolute = !ran && attrs::flag(absolute_encoder_status(), "valid");
+    const char* by = "none";
+    if (ran || absolute) {
+        by = ran ? "home_run" : "absolute_encoder";
+    }
+    status.emplace("homed", ProtoValue(ran || absolute));
+    status.emplace("homed_by", ProtoValue(std::string(by)));
     status.emplace("homing", ProtoValue(std::string(to_string(controller_->homing_state()))));
     if (const std::string err = controller_->homing_error(); !err.empty()) {
         status.emplace("homing_error", ProtoValue(err));
@@ -566,63 +643,18 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
     // declared mode object and the live 0x603F. Reported as data (never an exception) so a caller
     // can branch on it: `valid` false with a reason means home the axis.
     if (attrs::flag(command, "is_abs_enc_valid")) {
-        const ServoConfig::AbsoluteEncoder& enc = controller_->absolute_encoder();
-        ProtoStruct reply;
-        if (enc.index == 0) {
-            reply.emplace("valid", ProtoValue(false));
-            reply.emplace("configured", ProtoValue(false));
-            reply.emplace("reason", ProtoValue(std::string("no 'absolute_encoder' config attribute on this motor")));
-        } else {
-            const codec::TypeInfo& type = *codec::find_type(enc.type);
-            bool configured = false;
-            std::string reason;
-            try {
-                std::vector<std::byte> buf(kSdoReadBytes);
-                buf.resize(std::min(controller_->sdo_read(enc.index, enc.sub, buf), buf.size()));
-                const std::optional<double> mode = type.decode(buf).number;
-                configured = mode.has_value() && *mode == enc.equals;
-                reply.emplace("mode", ProtoValue(mode.value_or(0.0)));
-                if (!configured) {
-                    reason = "the encoder mode object does not read the configured value";
-                }
-            } catch (const std::exception& e) {
-                reason = std::string("reading the encoder mode object failed: ") + e.what();
-            }
-            const std::uint16_t code = controller_->drive_fault_code();
-            const bool lost = std::find(enc.invalid_codes.begin(), enc.invalid_codes.end(), code) != enc.invalid_codes.end();
-            if (lost) {
-                reason = "the drive reports " + hex4(code) + ", which this config lists as a lost reference";
-            }
-            reply.emplace("configured", ProtoValue(configured));
-            reply.emplace("fault_code", ProtoValue(hex4(code)));
-            reply.emplace("warning", ProtoValue(controller_->drive_warning()));
-            reply.emplace("valid", ProtoValue(configured && !lost));
-            if (!reason.empty()) {
-                reply.emplace("reason", ProtoValue(reason));
-            }
-        }
-        result.emplace("is_abs_enc_valid", ProtoValue(std::move(reply)));
+        result.emplace("is_abs_enc_valid", ProtoValue(absolute_encoder_status()));
     }
-    // Hard-stop homing (CiA402 mode 6). Blocks for the run and reports the drive's verdict; a homing
-    // failure is a result, not an exception, so a caller can retry with a different threshold.
-    if (const ProtoValue* const rq = find_attr(command, "home")) {
-        const ProtoStruct* const a = rq->get<ProtoStruct>();
-        if (a == nullptr) {
-            throw Error("home expects {direction, speed_rpm, acceleration_rpm_per_s?, offset_revolutions?, torque_percent?, timeout_s?}");
-        }
-        ethercat::servo::HomingParams p;
-        const std::string dir = opt_attr<std::string>(*a, "direction").value_or("negative");
-        if (dir != "negative" && dir != "positive") {
-            throw Error("home: 'direction' must be \"negative\" or \"positive\" (got '" + dir + "')");
-        }
-        p.negative_direction = dir == "negative";
-        p.speed_rpm = req_num(*a, "speed_rpm");
-        p.accel_rpm_per_s = opt_num(*a, "acceleration_rpm_per_s", 0.0);
-        p.offset_revs = opt_num(*a, "offset_revolutions", 0.0);
-        p.torque_percent = opt_num(*a, "torque_percent", 0.0);
-        p.timeout_s = opt_num(*a, "timeout_s", 120.0);
+    // Homing (CiA402 mode 6), every parameter from the motor's `homing` config. Blocks for the run
+    // and reports the drive's verdict; a homing failure is a result, not an exception, so a caller
+    // can retry with a different threshold. `counts` is the axis reference: the actual position at
+    // the moment the drive attained home, with whatever back-off its method performed already in it.
+    if (attrs::flag(command, "home")) {
         ProtoStruct reply;
-        reply.emplace("homed", ProtoValue(controller_->home(p)));
+        const bool homed = controller_->home();
+        reply.emplace("homed", ProtoValue(homed));
+        reply.emplace("counts", ProtoValue(static_cast<double>(controller_->home_position_counts())));
+        reply.emplace("revolutions", ProtoValue(controller_->home_position_revs()));
         if (const std::string err = controller_->homing_error(); !err.empty()) {
             reply.emplace("error", ProtoValue(err));
         }

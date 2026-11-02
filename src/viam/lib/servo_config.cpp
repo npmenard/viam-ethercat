@@ -1,5 +1,6 @@
 #include "viam/lib/servo_config.hpp"
 
+#include <cmath>
 #include <string>
 
 #include "ethercat/errors.hpp"
@@ -76,6 +77,26 @@ void ServoConfig::validate() const {
     }
     if (command_queue_capacity == 0) {
         throw Error("servo config: 'command_queue_capacity' must be > 0");
+    }
+    // The homing block is checked here, not when `home` is called: a drive that would be driven into
+    // a hard stop by a bad number must be refused at load, while nothing is moving.
+    if (homing.method != 0) {
+        if (!(homing.speed_rpm > 0.0)) {
+            throw Error("servo config: 'homing.speed_rpm' must be > 0");
+        }
+        if (!(homing.accel_rpm_per_s >= 0.0)) {
+            throw Error("servo config: 'homing.acceleration_rpm_per_s' must be >= 0");
+        }
+        // Above rated is legitimate (a stop is found by a brief overload); a multiple of it is a typo.
+        if (homing.torque_percent < 0.0 || homing.torque_percent > 300.0 || std::isnan(homing.torque_percent)) {
+            throw Error("servo config: 'homing.torque_percent' must be within 0..300");
+        }
+        if (homing.torque_percent > 0.0 && homing.torque.index == 0) {
+            throw Error("servo config: 'homing.torque_percent' needs 'homing.torque_object' (the object is drive-specific)");
+        }
+        if (!(homing.timeout_s > 0.0)) {
+            throw Error("servo config: 'homing.timeout_s' must be > 0");
+        }
     }
 }
 

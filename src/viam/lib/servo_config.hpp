@@ -83,16 +83,28 @@ struct ServoConfig {
     // skipped and the drive falls back to disable-voltage on stop. >0 = configured and asserted at
     // bring-up. Standard CiA402 tunable; from config, never a hardcoded device value.
     std::uint32_t quick_stop_decel = 0;
-    // Object that bounds motor current during hard-stop homing, and so sets the contact threshold.
-    // No CiA402 object standardises it, so it comes from config: index 0 = not configured (the drive
-    // keeps its own value). `type` is an sdo_codec type name.
-    struct HomingTorqueObject {
-        std::uint16_t index = 0;
-        std::uint8_t sub = 0;
-        std::string type = "u16";
-        double units_per_percent = 10.0;  // object units for one percent of rated current
+    // Everything the drive needs for one homing run. CiA402 standardises the objects but not the
+    // method numbers (the negative ones are reserved for the manufacturer) nor any torque limit, so
+    // the drive-specific values come from config and are refused, not guessed. The torque block is
+    // only for the methods that detect the end by motor current: a limit-switch method (1, 2, 17,
+    // 18, ...) finds a switch wired ahead of time and needs none.
+    struct Homing {
+        std::int8_t method = 0;        // 0x6098; 0 = not configured, so `home` is refused
+        double speed_rpm = 0.0;        // 0x6099:01 approach speed
+        double accel_rpm_per_s = 0.0;  // 0x609A; 0 leaves the drive's value
+        double torque_percent = 0.0;   // contact threshold; 0 = do not clamp
+        double timeout_s = 120.0;      // the run fails if the drive has not attained home by then
+        // Object that bounds motor current during the run. No CiA402 object standardises it, so it
+        // comes from config: index 0 = not configured. `type` is an sdo_codec type name.
+        struct TorqueObject {
+            std::uint16_t index = 0;
+            std::uint8_t sub = 0;
+            std::string type = "u16";
+            double units_per_percent = 10.0;  // object units for one percent of rated current
+        };
+        TorqueObject torque;
     };
-    HomingTorqueObject homing_torque;
+    Homing homing;
     // Optional absolute-encoder declaration. `index/sub/type` name the manufacturer-specific object
     // that holds the encoder mode and `equals` the value meaning "retains position across power
     // cycles"; `invalid_codes` are the 0x603F values that mean the retained position is gone (these

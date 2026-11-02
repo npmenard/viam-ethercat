@@ -9,14 +9,16 @@
 // stop-join-rebuild path runs through the destructor and the next constructor.
 //
 // Concurrency-coverage invariant (load-bearing): ServoMotor must stay a thin pass-through --
-// `controller_` is never reassigned and the wrapper holds no lock or state of its own. So the
-// module layer's entire concurrency surface is the controller's api_mutex_. If a future change
-// reassigns controller_ or adds a wrapper lock, this invariant breaks and module-level
-// concurrency testing becomes required.
+// `controller_` is never reassigned and the wrapper holds no lock. Its only state is the
+// absolute-encoder mode cache, two atomics whose worst race is a repeated SDO read. So the module
+// layer's entire concurrency surface is the controller's api_mutex_. If a future change reassigns
+// controller_ or adds a wrapper lock, this invariant breaks and module-level concurrency testing
+// becomes required.
 //
 // A6 specifics never appear here: the PDO map, counts/rev, gear ratio, etc. are
 // parsed from the Viam resource config into a ServoConfig (config data, not code).
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -86,8 +88,15 @@ class ServoMotor final : public Motor {
    private:
     void install_logging(viam::sdk::log_level level);
 
+    // The `is_abs_enc_valid` reply. `homed` reads `valid` out of it, so there is one implementation.
+    ProtoStruct absolute_encoder_status();
+
     std::shared_ptr<ethercat::log::Sink> log_sink_;  // declared before controller_: outlives the RT thread
     std::unique_ptr<ServoController> controller_;
+    // Cached encoder-mode SDO read (`status` asks on every poll, and a drive setting does not
+    // change). Atomics rather than a lock: the worst a race does is read the object twice.
+    std::atomic<bool> abs_enc_mode_known_{false};
+    std::atomic<double> abs_enc_mode_{0.0};
 };
 
 }  // namespace ethercat::servo

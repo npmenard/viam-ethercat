@@ -26,28 +26,30 @@ Two motor models ship in one module:
 
 ## Configuration and usage
 
-Add a motor component with one of the models above. Attributes:
+Add a motor component with one of the models above.
 
-| Attribute | Required | Default | Meaning |
-|---|---|---|---|
-| `interface` | yes | — | EtherCAT NIC name (e.g. `enp3s0`) |
-| `max_rpm` | yes | — | motor speed clamp (nameplate rated speed) |
-| `counts_per_rev` | yes | — | encoder counts per motor revolution |
-| `motor_rated_current_amps` | yes | — | nameplate rated current |
-| `slave` | no | 1 | 1-based position of the drive on the bus |
-| `control_mode` | no | `csp` (`profile` for `a6-servo`) | `csp`: cyclic synchronous position, master-side trajectory, needs `use_distributed_clocks`; `profile`: PP for `go_to`/`go_for`, PV for `set_rpm`, the drive generates the trajectory |
-| `gear_ratio` | no | 1.0 | motor revolutions per output revolution |
-| `position_tolerance_counts` | no | counts_per_rev/720 | "reached/stopped" stability band |
-| `loop_rate_hz` | no | 1000 | cycle rate (1..1000) |
-| `use_distributed_clocks` | no | false | DC/SYNC0 sync; required by DC-only drives |
-| `sync_cycle_granularity_ns` | no | 0 | drive's SYNC0 cycle granularity; a bad `loop_rate_hz` is then rejected at config time |
-| `require_realtime` | no | true | hard-fail at load without SCHED_FIFO |
-| `rt_priority` | no | 80 | SCHED_FIFO priority (1..99) |
-| `emergency_stop_fault_code` | no | none | 0x603F value the drive reports while its emergency-stop input is engaged (e.g. `"0xFF3A"`); while present, `status` reports `emergency_stop: true`, motion calls fail with "emergency stop engaged", and no automatic fault-reset edges are sent (the `fault_reset` do_command still works, for a drive that latches the stop) |
-| `quick_stop_decel_rpm_per_s` | no | 0 (not configured) | deceleration written to the drive's 0x6085: its quick stop, its E-stop input ramp, and in `profile` mode the module's own `stop()`; in `profile` mode the drive must hold 0x605A = 2 |
-| `absolute_encoder` | no | none | declares the drive object that says the encoder retains position, and the 0x603F codes that mean it lost it: `{"index": "0x2A9C", "sub": 4, "type": "u16", "equals": 2, "invalid_codes": ["0xFF3C", "0xFF3D", "0xFF0F"]}`; read by the `is_abs_enc_valid` verb |
-| `homing_torque_object` | no | none | drive object that bounds motor current during hard-stop homing, e.g. `{"index": "0x2A08", "sub": 0, "type": "u32", "units_per_percent": 10}`; the type and scale are the drive's own (read the object first -- a wrong width is refused); required for the `home` verb's `torque_percent` |
-| `max_acceleration_rpm_per_s` | no | `max_rpm` per second | ramp acceleration of the master-side trajectory in `csp`; ignored in `profile` |
+### Attributes
+
+| Name | Type | Inclusion | Default | Description |
+|------|------|-----------|---------|-------------|
+| `interface` | string | **Required** | — | EtherCAT NIC name (e.g. `enp3s0`). |
+| `max_rpm` | float | **Required** | — | Motor speed clamp (nameplate rated speed). |
+| `counts_per_rev` | float | **Required** | — | Encoder counts per motor revolution. |
+| `motor_rated_current_amps` | float | **Required** | — | Nameplate rated current. |
+| `slave` | int | Optional | `1` | 1-based position of the drive on the bus. |
+| `control_mode` | string | Optional | `csp` (`profile` for `a6-servo`) | `csp`: cyclic synchronous position, master-side trajectory, needs `use_distributed_clocks`. `profile`: PP for `go_to`/`go_for`, PV for `set_rpm`, the drive generates the trajectory. |
+| `gear_ratio` | float | Optional | `1.0` | Motor revolutions per output revolution. |
+| `position_tolerance_counts` | int | Optional | `counts_per_rev`/720 | "Reached/stopped" stability band. |
+| `loop_rate_hz` | int | Optional | `1000` | Cycle rate (1..1000). |
+| `use_distributed_clocks` | bool | Optional | `false` | DC/SYNC0 sync; required by DC-only drives. |
+| `sync_cycle_granularity_ns` | int | Optional | `0` | The drive's SYNC0 cycle granularity; a bad `loop_rate_hz` is then rejected at config time. |
+| `require_realtime` | bool | Optional | `true` | Hard-fail at load without SCHED_FIFO. |
+| `rt_priority` | int | Optional | `80` | SCHED_FIFO priority (1..99). |
+| `max_acceleration_rpm_per_s` | float | Optional | `max_rpm` per second | Ramp acceleration of the master-side trajectory in `csp`; ignored in `profile`. |
+| `quick_stop_decel_rpm_per_s` | float | Optional | `0` (not configured) | Deceleration written to the drive's 0x6085: its quick stop, its E-stop input ramp, and in `profile` mode the module's own `stop()`; in `profile` mode the drive must hold 0x605A = 2. |
+| `emergency_stop_fault_code` | string or int | Optional | none | 0x603F value the drive reports while its emergency-stop input is engaged (e.g. `"0xFF3A"`). While present, `status` reports `emergency_stop: true`, motion calls fail with "emergency stop engaged", and no automatic fault-reset edges are sent (the `fault_reset` do_command still works, for a drive that latches the stop). |
+| `absolute_encoder` | object | Optional | none | Declares the drive object that says the encoder retains position, and the 0x603F codes that mean it lost it: `{"index": "0x2A9C", "sub": 4, "type": "u16", "equals": 2, "invalid_codes": ["0xFF3C", "0xFF3D", "0xFF0F"]}`. Read by the `is_abs_enc_valid` verb and by `homed`. |
+| `homing` | object | Optional | none | Everything one homing run needs; without it `home` is refused. See [Homing](#homing). |
 
 ### Control mode
 
@@ -107,6 +109,42 @@ matter:
 }
 ```
 
+### Homing
+
+One `homing` object holds everything a run needs, so `home` takes no arguments and a dependent
+component (the gantry) configures nothing about it:
+
+```json
+"homing": {
+  "method": -1,
+  "speed_rpm": 20,
+  "acceleration_rpm_per_s": 100,
+  "torque_object": {"index": "0x6072", "sub": 0, "type": "u16", "units_per_percent": 10},
+  "torque_percent": 20,
+  "timeout_s": 120
+}
+```
+
+| Name | Type | Inclusion | Default | Description |
+|------|------|-----------|---------|-------------|
+| `method` | int | **Required** | — | The 0x6098 homing method. CiA402 leaves the negative methods to the manufacturer, so they differ per drive and cannot be defaulted: the A6-EC homes into a hard stop with -1 (reverse) and -2 (forward), an Applied Motion M56S with -4 and -3. The drive is asked for it and the value is read back, so a method it does not support fails the `home` call before anything moves. |
+| `speed_rpm` | float | **Required** | — | Approach speed, written to 0x6099:01. |
+| `acceleration_rpm_per_s` | float | Optional | `0` (the drive's own) | Written to 0x609A. |
+| `torque_object` | object | Optional | none | Drive object that bounds motor current during the run, and so sets the contact threshold for a hard-stop method: `{"index", "sub", "type", "units_per_percent"}`. The type and scale are the drive's own -- read the object first, a wrong width is refused. A limit-switch method (1, 2, 17, 18, …) needs none. |
+| `torque_percent` | float | Optional | `0` (the drive's own) | Contact threshold in percent of rated current; needs `torque_object`. The object is saved before the run and written back after it, so a drive whose only torque limit is the global one is not left clamped. |
+| `timeout_s` | float | Optional | `120` | The run fails if the drive has not attained home by then. |
+
+`{"home": true}` blocks for the run and replies
+`{"homed": true, "counts": 131749, "revolutions": 1.005}`, or `{"homed": false, "error": "..."}`
+when the drive reports a homing error or the run times out. `counts` is the actual position at the
+cycle the drive attained home -- the axis reference, with whatever back-off the method performed
+already in it, so nothing downstream has to model the back-off. `status` carries `homed`,
+`homed_by`, `homing`, the same `home_counts`/`home_revolutions`, and after a failure `homing_error`.
+
+`homed` is true once a run has succeeded, or when the `absolute_encoder` object says the drive kept
+its reference across the restart (`homed_by` says which). The encoder-mode read is cached until the
+bus drops, since a drive that lost control power may have lost a battery-backed count with it.
+
 ### Behavior notes
 
 - `stop()` is a CiA402 Halt: the motor ramps to standstill and **holds position
@@ -126,12 +164,6 @@ matter:
   `valid: false` with a `reason`. Needs the `absolute_encoder` attribute; without it the answer is
   false with that as the reason. The codes it treats as a lost reference are warnings on some drives,
   so they never raise the fault bit and are read from the live 0x603F instead.
-- Hard-stop homing (CiA402 mode 6, methods -4 and -3): `{"home": {"direction": "negative", "speed_rpm": 20,
-  "torque_percent": 20, "offset_revolutions": 0.25, "acceleration_rpm_per_s": 100, "timeout_s": 120}}`. The
-  drive drives into the mechanical stop until motor current reaches the threshold, backs off by the offset
-  and calls that zero; the module clears its software zero with it. The call blocks for the run and replies
-  `{"homed": true}`, or `{"homed": false, "error": "..."}` when the drive reports a homing error or the run
-  times out. `status` carries `homed`, `homing` and, after a failure, `homing_error`.
 - Raw SDO access to manufacturer-specific objects (0x2000-0x5FFF) and 0x1010 (store parameters) for commissioning:
   `{"sdo_read": {"index": "0x2A9C", "sub": 4, "type": "u16"}}`,
   `{"sdo_write": {"index": "0x2A9C", "sub": 4, "type": "u16", "value": 2}}`. Types `u8 i8 u16 i16 u32 i32
@@ -149,34 +181,22 @@ motor through the standard motor API. It depends on the motor component and neve
 itself. It refuses to build if its dependency is not a `viam:ethercat` servo, since it needs this
 module's homing contract.
 
-There are no limit switches. Homing drives into a mechanical hard stop until motor current
-reaches `home_torque_percent`, backs off by `home_offset_mm` and calls that zero, so the axis
-needs a rigid end stop and a threshold tuned at low speed. `get_position` and
-`move_to_position` are refused until `home()` has succeeded.
+Homing belongs to the motor: the axis asks for it and keeps the answer. The position the drive
+ended the run at is 0 mm, whatever back-off the homing method performed, so there is nothing to
+subtract from `length_mm` and nothing about homing to configure here. `get_position` and
+`move_to_position` are refused until the motor reports `homed` -- which is also true when its
+absolute encoder kept the reference across a restart, in which case 0 mm is the drive's retained
+zero and no run is needed.
 
-Zero is the back-off point, not the stop, so `length_mm` is the travel from there and not the raw
-distance between the mechanical ends: with a 500 mm frame and `home_offset_mm` of 2, the usable
-length is 498. Raising `home_offset_mm` without lowering `length_mm` lets a move to `length_mm`
-run into the far end.
+### Attributes
 
-The axis also counts as referenced when the motor answers `is_abs_enc_valid` positively, so a
-drive whose encoder retains position needs no homing run after a restart. The objects and the
-codes behind that answer are declared on the motor, not here; the axis only reads the verdict and
-caches it. The cache is dropped whenever the motor reports the bus went away, since the drive may
-have lost control power and, with it, a battery-backed encoder's count.
-
-| Attribute | Required | Default | Meaning |
-|---|---|---|---|
-| `motor` | yes | — | name of the axis motor (also list it in `depends_on`) |
-| `length_mm` | yes | — | travel length of the axis |
-| `mm_per_rev` | yes | — | linear travel per motor revolution |
-| `gantry_mm_per_sec` | no | 0 | default speed when a move does not give one |
-| `home_direction` | no | `negative` | `negative` homes into the negative stop (method -4), `positive` into the other (-3) |
-| `home_mm_per_sec` | yes | — | approach speed of the homing move |
-| `home_accel_mm_per_sec2` | no | 0 (drive's own) | homing acceleration |
-| `home_torque_percent` | no | 0 (drive's own) | contact threshold, needs `homing_torque_object` on the motor |
-| `home_offset_mm` | no | 0 | back-off from the stop; the axis zero |
-| `home_timeout_s` | no | 120 | the home fails if the drive has not attained it by then |
+| Name | Type | Inclusion | Default | Description |
+|------|------|-----------|---------|-------------|
+| `motor` | string | **Required** | — | Name of the axis motor (also list it in `depends_on`). |
+| `length_mm` | float | **Required** | — | Travel length of the axis, measured from the home reference. |
+| `mm_per_rev` | float | **Required** | — | Linear travel per motor revolution. |
+| `gantry_mm_per_sec` | float | Optional | `0` | Default speed when a move does not give one. |
+| `travel_direction` | string | Optional | `positive` | Which way motor revolutions run as the axis travels away from its home end. Set it to `negative` when homing moves the motor in the positive direction. |
 
 ```json
 {
@@ -188,10 +208,7 @@ have lost control power and, with it, a battery-backed encoder's count.
     "length_mm": 500,
     "mm_per_rev": 40,
     "gantry_mm_per_sec": 50,
-    "home_direction": "negative",
-    "home_mm_per_sec": 5,
-    "home_torque_percent": 20,
-    "home_offset_mm": 2
+    "travel_direction": "positive"
   },
   "depends_on": ["x-motor"]
 }

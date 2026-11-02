@@ -84,6 +84,7 @@ struct ControllerState {
     std::atomic<std::uint8_t> homing_state{0};           // HomingState; set by the RT loop, read by home()
     std::atomic<std::uint8_t> homing_fail{0};            // HomingFail reason when homing_state == Failed
     std::atomic<bool> homed{false};                      // a homing run succeeded in this session
+    std::atomic<std::int32_t> home_counts{0};            // 0x6064 at the cycle the drive attained home
 };
 
 // The drive's homing procedure as seen by the API: idle until the first run, then running while the
@@ -92,18 +93,6 @@ enum class HomingState : std::uint8_t { Idle, Running, Done, Failed };
 enum class HomingFail : std::uint8_t { None, ModeNotAdopted, DriveError, Timeout, Cancelled, DriveFault, NotOperational };
 const char* to_string(HomingState state) noexcept;
 const char* to_string(HomingFail fail) noexcept;
-
-// One hard-stop homing run: CiA402 mode 6 with method -4 (drive into the negative stop) or -3 (the
-// positive one), the drive detecting contact by motor current. User units; the controller converts.
-struct HomingParams {
-    bool negative_direction = true;
-    double speed_rpm = 0.0;        // 0x6099:01 approach speed
-    double accel_rpm_per_s = 0.0;  // 0x609A; 0 leaves the drive's value
-    double offset_revs = 0.0;      // 0x607C back-off magnitude; the sign points away from the stop
-    double torque_percent = 0.0;   // contact threshold; needs a configured homing_torque object
-    double timeout_s = 120.0;      // the run fails if the drive has not attained home by then
-    std::string validate() const;  // "" when usable, else why not
-};
 
 // ServoController is the module's SlaveControl: it owns the RT policy and state, so it
 // implements the Runner's hooks directly. The library Runner owns the RT thread, pacing,
@@ -220,11 +209,17 @@ class ServoController : public SlaveControl {
     // The absolute-encoder declaration from config (index 0 when absent).
     const ServoConfig::AbsoluteEncoder& absolute_encoder() const noexcept;
 
-    // Run the drive's homing procedure and block until it ends. True when the drive attained home;
-    // false when it reported a homing error, timed out, or the run was cancelled (homing_error()
-    // says which). Throws on bad parameters, a refused SDO, or a state that cannot home.
-    bool home(const HomingParams& params);
+    // Run the drive's homing procedure (every parameter from config_.homing) and block until it
+    // ends. True when the drive attained home; false when it reported a homing error, timed out, or
+    // the run was cancelled (homing_error() says which). Throws when the config has no method, when
+    // the drive refuses one of the objects, or from a state that cannot home.
+    bool home();
     bool homed() const noexcept;
+    // The actual position at the cycle the drive attained home: the axis reference a dependent
+    // component measures from, with whatever back-off the method performed already in it. Only
+    // meaningful while homed() (0 before the first run).
+    std::int32_t home_position_counts() const noexcept;
+    double home_position_revs() const noexcept;
     HomingState homing_state() const noexcept;
     std::string homing_error() const;  // "" unless the last run failed
 
@@ -453,7 +448,11 @@ class ServoController : public SlaveControl {
     bool try_claim_motion_slot(std::uint32_t gen) noexcept;
     void release_motion_slot(std::uint32_t gen) noexcept;  // frees the slot if `gen` still owns it
     // Homing helpers. The first three are non-RT (SDO on the caller's thread); finish_homing is RT.
-    void write_homing_objects(const HomingParams& params);
+    // Writes 0x6098/0x6099:01/0x609A and, when a torque percent is configured, the torque object.
+    // Returns that object's previous bytes (empty when none was written) so the caller can put it
+    // back once the run is over.
+    std::vector<std::byte> write_homing_objects();
+    void restore_homing_torque(std::span<const std::byte> saved) noexcept;
     void select_drive_mode(Cia402Mode mode);
     bool await_homing();
     void finish_homing(HomingFail fail) noexcept;

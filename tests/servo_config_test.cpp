@@ -9,10 +9,8 @@
 #include "ethercat/pdo_buffer.hpp"  // store_le, to build raw test bytes
 #include "test_harness.hpp"
 #include "viam/lib/servo_config.hpp"
-#include "viam/lib/servo_controller.hpp"  // HomingParams::validate
 
 using ethercat::Error;
-using ethercat::servo::HomingParams;
 using ethercat::servo::ServoConfig;
 
 namespace {
@@ -109,31 +107,37 @@ TEST("ServoConfig::validate rejects each invalid field with clear text") {
     }
 }
 
-// Homing parameters are validated before any SDO leaves the host, so a bad ask never reaches a
-// drive that would start moving into a hard stop with it.
-TEST("homing params reject what the drive cannot be asked") {
-    HomingParams p;
-    p.speed_rpm = 20.0;
-    CHECK(p.validate().empty());
+// The homing block is validated at config time, so a bad number is refused while nothing is moving
+// rather than on the call that would drive the axis into a hard stop with it.
+TEST("homing config rejects what the drive cannot be asked") {
+    ServoConfig ok = good_config();
+    ok.homing.method = -4;
+    ok.homing.speed_rpm = 20.0;
+    ok.validate();  // must not throw: the torque object is optional (limit-switch methods need none)
     {
-        HomingParams bad = p;
-        bad.speed_rpm = 0.0;
-        CHECK(bad.validate().find("speed") != std::string::npos);
+        ServoConfig c = ok;
+        c.homing.speed_rpm = 0.0;
+        CHECK_THROWS_MSG(c.validate(), Error, "speed_rpm");
     }
     {
-        HomingParams bad = p;
-        bad.offset_revs = -1.0;
-        CHECK(bad.validate().find("offset") != std::string::npos);
+        ServoConfig c = ok;
+        c.homing.torque_percent = 400.0;
+        CHECK_THROWS_MSG(c.validate(), Error, "torque_percent");
     }
     {
-        HomingParams bad = p;
-        bad.torque_percent = 400.0;
-        CHECK(bad.validate().find("torque") != std::string::npos);
+        ServoConfig c = ok;
+        c.homing.torque_percent = 50.0;  // a threshold with no object to write it to
+        CHECK_THROWS_MSG(c.validate(), Error, "torque_object");
     }
     {
-        HomingParams bad = p;
-        bad.timeout_s = 0.0;
-        CHECK(bad.validate().find("timeout") != std::string::npos);
+        ServoConfig c = ok;
+        c.homing.timeout_s = 0.0;
+        CHECK_THROWS_MSG(c.validate(), Error, "timeout_s");
+    }
+    {
+        ServoConfig c = good_config();  // no method: the block is inert, not invalid
+        c.homing.speed_rpm = 0.0;
+        c.validate();
     }
 }
 
