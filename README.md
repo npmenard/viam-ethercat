@@ -164,10 +164,12 @@ bus drops, since a drive that lost control power may have lost a battery-backed 
   `valid: false` with a `reason`. Needs the `absolute_encoder` attribute; without it the answer is
   false with that as the reason. The codes it treats as a lost reference are warnings on some drives,
   so they never raise the fault bit and are read from the live 0x603F instead.
-- Raw SDO access to manufacturer-specific objects (0x2000-0x5FFF) and 0x1010 (store parameters) for commissioning:
-  `{"sdo_read": {"index": "0x2A9C", "sub": 4, "type": "u16"}}`,
-  `{"sdo_write": {"index": "0x2A9C", "sub": 4, "type": "u16", "value": 2}}`. Types `u8 i8 u16 i16 u32 i32
-  string bytes`; values are numbers or `"0x.."` / hex-byte strings. A drive refusal returns
+- Raw SDO access for commissioning: `{"sdo_read": {"index": "0x6085", "sub": 0, "type": "u32"}}`,
+  `{"sdo_write": {"index": "0x2A9C", "sub": 4, "type": "u16", "value": 2}}`. **Reads** reach any
+  object, so a drive-side setting this module does not model can be inspected; **writes** are limited
+  to manufacturer-specific objects (0x2000-0x5FFF) and 0x1010 (store parameters), since the driver
+  owns the standard objects. Types `u8 i8 u16 i16 u32 i32 string bytes`; values are numbers or
+  `"0x.."` / hex-byte strings. A drive refusal returns
   `{"ok": false, "abort_code": "0x06090030", "error": "..."}`; writes are refused while the motor moves.
 - `do_command` verbs: `status`, `fault_reset`, `enable`, `disable`, `home`, `is_abs_enc_valid`,
   `get_motor_voltage`, `get_motor_current_actual_value`,

@@ -281,8 +281,11 @@ std::unique_ptr<ServoController> build_controller(const ResourceConfig& cfg) {
     return std::make_unique<Controller>(config_from_attrs(cfg.attributes(), Controller::kDefaultMotionMode));
 }
 
-// --- raw SDO verbs: manufacturer-specific objects (0x2000-0x5FFF) plus 0x1010 (store parameters);
-// the driver owns the other standard objects.
+// --- raw SDO verbs. Reads reach the whole dictionary: reading an object changes nothing, and a
+// drive-side setting the driver does not model (a stop ramp, an input function) can only be
+// diagnosed by reading it. Writes stay within the manufacturer range (0x2000-0x5FFF) plus 0x1010
+// (store parameters), because the driver owns the standard objects and a write behind its back
+// would fight it.
 SdoRequest parse_sdo_request(const ProtoValue& v, const char* verb, bool with_value) {
     const ProtoStruct* const req = v.get<ProtoStruct>();
     const ProtoValue* const index = req ? find_attr(*req, "index") : nullptr;
@@ -298,10 +301,10 @@ SdoRequest parse_sdo_request(const ProtoValue& v, const char* verb, bool with_va
         r.sub = static_cast<std::uint8_t>(small_uint(*sub, "sub", "u8"));
     }
     r.type = type;
-    if ((r.index < 0x2000 || r.index > 0x5FFF) && r.index != 0x1010) {
-        throw Error(std::string(verb) + ": only manufacturer-specific objects (0x2000-0x5FFF) and 0x1010 are accessible");
-    }
     if (with_value) {
+        if ((r.index < 0x2000 || r.index > 0x5FFF) && r.index != 0x1010) {
+            throw Error(std::string(verb) + ": only manufacturer-specific objects (0x2000-0x5FFF) and 0x1010 are writable");
+        }
         const ProtoValue* const val = find_attr(*req, "value");
         if (val == nullptr) {
             throw Error("sdo_write: 'value' is required");
@@ -693,10 +696,10 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
     }
     if (result.empty()) {
         throw std::runtime_error(
-            "unknown do_command; supported keys (each a bool): describe, fault_reset, enable, disable, status; "
-            "home {direction, speed_rpm, ...}; "
+            "unknown do_command; supported keys (each a bool): describe, fault_reset, enable, disable, status, home, "
+            "is_abs_enc_valid; "
             "get_motor_voltage, get_motor_current_actual_value, get_motor_drive_modes (converted SDO reads); "
-            "sdo_read / sdo_write {index, sub, type, value} (manufacturer-specific objects 0x2000-0x5FFF)");
+            "sdo_read {index, sub, type} (any object) / sdo_write {index, sub, type, value} (0x2000-0x5FFF and 0x1010)");
     }
     return result;
 }
