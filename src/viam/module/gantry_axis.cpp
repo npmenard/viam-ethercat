@@ -1,9 +1,12 @@
 #include "viam/module/gantry_axis.hpp"
 
 #include <cmath>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <utility>
 
+#include <viam/sdk/log/logging.hpp>
 #include <viam/sdk/resource/resource.hpp>
 
 #include "ethercat/errors.hpp"
@@ -16,6 +19,21 @@ using attrs::find_attr;
 using attrs::flag;
 using attrs::nested;
 using attrs::opt_num;
+
+namespace {
+
+// The whole file, unparsed: the RDK builds the frame-system model from it. Only what would otherwise
+// surface as an opaque planner error later is checked here.
+std::vector<unsigned char> read_kinematics_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (!in || bytes.empty()) {
+        throw Error("config attribute 'kinematics_file': '" + path + "' is missing or empty");
+    }
+    return bytes;
+}
+
+}  // namespace
 
 Model GantryAxis::model() {
     return {ServoMotor::model_family(), "gantry"};
@@ -49,6 +67,9 @@ GantryAxis::Attributes GantryAxis::parse(const ResourceConfig& cfg) {
             throw Error("config attribute 'travel_direction' must be \"negative\" or \"positive\"");
         }
         out.travel_positive = *d == "positive";
+    }
+    if (const auto path = attrs::opt_attr<std::string>(a, "kinematics_file")) {
+        out.kinematics = read_kinematics_file(*path);
     }
     return out;
 }
@@ -177,7 +198,16 @@ bool GantryAxis::is_moving() {
 }
 
 void GantryAxis::stop(const ProtoStruct& extra) {
-    motor_->stop(extra);
+    // The motor's own stop is a halt that cannot fail, so the only thing that can throw here is the
+    // RPC to reach it: the motor is gone or going. That is what happens on every shutdown, where the
+    // RDK stops this axis as it removes it and removes the motor in the same sweep. A motor that is
+    // already gone has nothing left to stop (its own close halts the drive), and letting the error
+    // out would fail the whole removal, which the RDK reports as a fatal shutdown.
+    try {
+        motor_->stop(extra);
+    } catch (const std::exception& e) {
+        VIAM_RESOURCE_LOG(warn) << "stop: motor '" << attrs_.motor << "' is unreachable, nothing left to stop (" << e.what() << ")";
+    }
 }
 
 ProtoStruct GantryAxis::do_command(const ProtoStruct& command) {
@@ -191,7 +221,10 @@ std::vector<GeometryConfig> GantryAxis::get_geometries(const ProtoStruct& /*extr
 }
 
 KinematicsData GantryAxis::get_kinematics(const ProtoStruct& /*extra*/) {
-    return KinematicsDataUnspecified{};
+    if (attrs_.kinematics.empty()) {
+        return KinematicsDataUnspecified{};
+    }
+    return KinematicsDataSVA{attrs_.kinematics};
 }
 
 }  // namespace ethercat::servo
