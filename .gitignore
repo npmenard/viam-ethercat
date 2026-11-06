@@ -6,7 +6,6 @@ install/
 
 # Conan build process (bin/setup.sh + bin/build.sh) working files
 tmp_cpp_sdk/
-protobuf-override.profile
 CMakeUserPresets.json
 conanbuild*.sh
 conanrun*.sh
@@ -44,7 +43,9 @@ __pycache__/
 /scripts/
 /a6-manuals/
 /src/tools/
-/etc/
+/etc/*
+# The Conan release profile is tracked; bin/build.sh needs it.
+!/etc/conan/
 /tests/a6_control_test.cpp
 /tests/sine_move_test.cpp
 /tests/a6_config_parse_test.cpp

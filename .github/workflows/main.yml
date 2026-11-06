@@ -12,7 +12,7 @@ on:
     types: [published]
 
 # Lean CI, linux/amd64 only for now: every push runs format + lint + build +
-# test inside the project build image. The heavier Conan module build (and the
+# test inside the project build image. The Conan module build (and the
 # registry publish) only runs for tags, releases, and manual dispatch.
 jobs:
   format:
@@ -102,59 +102,29 @@ jobs:
   build-module:
     name: Build Module (Conan, linux/amd64)
     needs: [build-test-lint]
-    # The Conan build compiles boost/grpc/protobuf/the SDK from source, so it
-    # only runs where the artifact is actually needed: tags, releases, and
-    # manual dispatch -- not on every push.
+    # The release artifact is only needed for tags, releases, and manual
+    # dispatch, so the Conan build is skipped on ordinary pushes.
     if: |
       startsWith(github.ref, 'refs/tags/v') ||
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'release'
     runs-on: ubuntu-latest
-    container: ubuntu:noble
+    # The C++ SDK's conan image ships conan, gcc 13, and a default conan
+    # profile. Pinned to a dated tag so the release toolchain only changes
+    # deliberately; keep etc/conan/linux.profile and the README in sync when
+    # bumping it.
+    container: ghcr.io/viamrobotics/cpp-sdk-conan-ubuntu:noble-2026-11.00
     steps:
-      - name: Install system dependencies
-        run: |
-          apt update
-          DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
-            build-essential \
-            ca-certificates \
-            cmake \
-            curl \
-            g++ \
-            git \
-            gnupg \
-            jq \
-            lsb-release \
-            ninja-build \
-            pipx \
-            pkg-config \
-            sudo \
-            wget
-
-      # Install Conan via pipx (not conan-io/setup-conan, for container compatibility)
-      - name: Install Conan
-        run: |
-          pipx install conan
-          pipx ensurepath
-          export PATH="$HOME/.local/bin:${PATH}"
-          # --force: self-hosted runners persist ~/.conan2 between runs (a plus:
-          # the dependency cache survives), so a plain detect errors on rerun.
-          conan profile detect --force
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Setup C++ SDK
-        run: |
-          export PATH="$HOME/.local/bin:${PATH}"
-          ./bin/setup.sh
+        run: ./bin/setup.sh
 
       - name: Build module
-        run: |
-          export PATH="$HOME/.local/bin:${PATH}"
-          ./bin/build.sh
+        run: ./bin/build.sh
 
       # Attach module.tar.gz to workflow run
       - name: Attach build artifact

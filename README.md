@@ -262,6 +262,25 @@ make test           # offline test suites
 Release packaging (Conan, linux/amd64 — what CI ships):
 
 ```sh
-./bin/setup.sh      # one-time: builds the C++ SDK + dependencies
+./bin/setup.sh      # one-time: exports the C++ SDK recipe, adds the viamconan remote
 ./bin/build.sh      # produces module.tar.gz
 ```
+
+If you have not used conan before, create a default profile with `conan profile detect` first.
+
+`bin/setup.sh` exports the Viam C++ SDK recipe into your conan cache (the SDK is not on conancenter) and adds the `viamconan` remote to your conan configuration. That remote hosts prebuilt binaries of the SDK and its heavy dependencies (gRPC, Protobuf, Boost, Abseil, OpenSSL), so `bin/build.sh` downloads them instead of compiling them, and finishes in a few minutes. Any dependency without a matching prebuilt binary is compiled from source. To skip the remote and build everything from conancenter sources (about an hour the first time), run `VIAM_CONAN_NO_REMOTE=1 ./bin/setup.sh` instead.
+
+`bin/build.sh` only runs on Linux and uses `etc/conan/linux.profile` (gcc 13). The prebuilt binaries are built with gcc 13 on Ubuntu Noble, so to match CI, build inside the C++ SDK's conan image:
+
+```sh
+docker run --rm -it --platform linux/amd64 --volume .:/src -w /src ghcr.io/viamrobotics/cpp-sdk-conan-ubuntu:noble-2026-11.00 bash -c "./bin/setup.sh && ./bin/build.sh"
+```
+
+Prebuilt binaries are only used when the dependency versions exactly match the ones the SDK release was built with; `conan.lock` pins those versions. When bumping `viam-cpp-sdk` in `conanfile.py`, regenerate it inside that image, starting from the `conan.lock` attached to the SDK release on GitHub:
+
+```sh
+gh release download releases/v<version> -R viamrobotics/viam-cpp-sdk -p conan.lock -O sdk.lock
+conan lock create . <the profile and settings from bin/build.sh> --lockfile=sdk.lock --lockfile-partial --lockfile-out=conan.lock
+```
+
+Also update `etc/conan/linux.profile` if the SDK changed the toolchain it publishes with.

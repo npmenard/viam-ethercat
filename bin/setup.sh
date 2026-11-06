@@ -6,8 +6,6 @@
 #
 set -euxo pipefail
 
-conan profile detect || echo "Conan profile already exists"
-
 if [ ! -d "tmp_cpp_sdk/viam-cpp-sdk" ]; then
   # Clone the C++ SDK repo
   mkdir -p tmp_cpp_sdk
@@ -20,35 +18,20 @@ else
 fi
 
 # NOTE: If you change this version, also change it in the `conanfile.py`
-# requirements, the Dockerfile, and the top-level CMakeLists.txt.
-git checkout releases/v0.42.0
+# requirements, conan.lock, the Dockerfile, and the top-level CMakeLists.txt.
+git checkout releases/v0.44.0
 
-# Export the recipe to the cache so we can skip rebuilds gracefully
+# Export the recipe to the cache. The C++ SDK is not on conancenter, so this is
+# what lets bin/build.sh resolve it without the viamconan remote. Exporting from
+# the release tag yields the same recipe revision that conan.lock pins.
 conan export .
 
-# Otherwise, the C++ SDK build ends up creating two copies of proto and then mixes up which one to use.
-cat > protobuf-override.profile << 'EOF'
-include(default)
-[replace_tool_requires]
-protobuf/*: protobuf/<host_version>
-EOF
-
-# Dig out the declared version of the SDK so we can use it for arguments to --requires below.
-VIAM_CPP_SDK_VERSION=$(conan inspect -vquiet . --format=json | jq -r '.version')
-
-# Build the C++ SDK repo
-#
-# We want a static binary, so we turn off shared. Elect for C++20
-# compilation, since it seems some of the dependencies we pick mandate
-# it anyway.
-
-conan install --update \
-      --profile=protobuf-override.profile \
-      --build=missing \
-      --requires=viam-cpp-sdk/${VIAM_CPP_SDK_VERSION} \
-      -s:a build_type=Release \
-      -s:a "&:build_type=RelWithDebInfo" \
-      -s:a compiler.cppstd=20 \
-      -o:a "*:shared=False" \
-      -o:a "&:shared=False" \
-      -o:a "boost/*:without_cobalt=True"
+# By default, add the viamconan remote, which hosts prebuilt binaries of the SDK
+# and its heavy dependencies, so bin/build.sh downloads them instead of spending
+# about an hour compiling them. This changes your global conan configuration.
+# Set VIAM_CONAN_NO_REMOTE=1 to skip it and build everything from conancenter
+# sources instead.
+if [[ "${VIAM_CONAN_NO_REMOTE:-0}" != "1" ]]; then
+  # --index 0 searches viamconan ahead of conancenter.
+  conan remote add viamconan https://viam.jfrog.io/artifactory/api/conan/viamconan --index 0 --force
+fi

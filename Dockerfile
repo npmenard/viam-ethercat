@@ -76,11 +76,11 @@ RUN set -e; \
 RUN mkdir -p /root/opt/src
 
 # Install Viam C++ SDK from source. If you change the version here, change it in
-# the top level CMakeLists.txt (and cmake/soem.cmake's notes) as well.
+# the top level CMakeLists.txt, conanfile.py, conan.lock, and bin/setup.sh as well.
 RUN cd /root/opt/src && \
     git clone https://github.com/viamrobotics/viam-cpp-sdk && \
     cd viam-cpp-sdk && \
-    git checkout releases/v0.42.0 && \
+    git checkout releases/v0.44.0 && \
     cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DVIAMCPPSDK_USE_DYNAMIC_PROTOS=ON \

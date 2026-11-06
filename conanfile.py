@@ -32,9 +32,11 @@ class ethercat(ConanFile):
             self.version = "0.0.0-unknown"
 
     def requirements(self):
-        # NOTE: If you update the `viam-cpp-sdk` dependency here, it should
-        # also be updated in `bin/setup.sh` and the Dockerfile.
-        self.requires("viam-cpp-sdk/[>=0.42.0]")
+        # Prebuilt binaries on viamconan only match the exact dependency versions
+        # the SDK release was built with, which conan.lock pins. If you bump the
+        # SDK here, regenerate conan.lock from that release's lockfile (see README)
+        # and update `bin/setup.sh`, CMakeLists.txt, and the Dockerfile to match.
+        self.requires("viam-cpp-sdk/0.44.0")
         self.requires("boost/[>=1.74.0]")
         # SOEM is NOT a Conan dependency: it is pinned by exact commit SHA and
         # fetched at configure time (see cmake/soem.cmake), so the recipe needs
