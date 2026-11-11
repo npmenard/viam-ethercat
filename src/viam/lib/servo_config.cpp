@@ -86,6 +86,9 @@ void ServoConfig::validate() const {
         if (!(homing.speed_rpm > 0.0)) {
             throw Error("servo config: 'homing.speed_rpm' must be > 0");
         }
+        if (!(homing.zero_speed_rpm >= 0.0)) {
+            throw Error("servo config: 'homing.zero_speed_rpm' must be >= 0");
+        }
         if (!(homing.accel_rpm_per_s >= 0.0)) {
             throw Error("servo config: 'homing.acceleration_rpm_per_s' must be >= 0");
         }

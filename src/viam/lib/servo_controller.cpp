@@ -1271,6 +1271,12 @@ std::vector<std::byte> ServoController::write_homing_objects() {
                     " in " + std::to_string(read) + " bytes) -- it does not support it");
     }
     write(0x6099, 1, static_cast<std::uint32_t>(rpm_to_device_velocity(h.speed_rpm, cpr, ratio)));
+    if (h.zero_speed_rpm > 0.0) {
+        write(0x6099, 2, static_cast<std::uint32_t>(rpm_to_device_velocity(h.zero_speed_rpm, cpr, ratio)));
+    }
+    if (h.offset_counts != 0) {
+        write(0x607C, 0, h.offset_counts);
+    }
     if (h.accel_rpm_per_s > 0.0) {
         write(0x609A, 0, accel_to_device(rpm_to_device_velocity(h.accel_rpm_per_s, cpr, ratio), accel_units_per_cps2()));
     }

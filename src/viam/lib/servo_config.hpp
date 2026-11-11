@@ -92,11 +92,13 @@ struct ServoConfig {
     // only for the methods that detect the end by motor current: a limit-switch method (1, 2, 17,
     // 18, ...) finds a switch wired ahead of time and needs none.
     struct Homing {
-        std::int8_t method = 0;        // 0x6098; 0 = not configured, so `home` is refused
-        double speed_rpm = 0.0;        // 0x6099:01 approach speed
-        double accel_rpm_per_s = 0.0;  // 0x609A; 0 leaves the drive's value
-        double torque_percent = 0.0;   // contact threshold; 0 = do not clamp
-        double timeout_s = 120.0;      // the run fails if the drive has not attained home by then
+        std::int8_t method = 0;          // 0x6098; 0 = not configured, so `home` is refused
+        double speed_rpm = 0.0;          // 0x6099:01 speed while searching for the switch
+        double zero_speed_rpm = 0.0;     // 0x6099:02, index-pulse search speed; 0 leaves the drive's value
+        std::int32_t offset_counts = 0;  // 0x607C home offset in counts; 0 leaves the drive's value
+        double accel_rpm_per_s = 0.0;    // 0x609A; 0 leaves the drive's value
+        double torque_percent = 0.0;     // contact threshold; 0 = do not clamp
+        double timeout_s = 120.0;        // the run fails if the drive has not attained home by then
         // Object that bounds motor current during the run. No CiA402 object standardises it, so it
         // comes from config: index 0 = not configured. `type` is an sdo_codec type name.
         struct TorqueObject {

@@ -209,8 +209,8 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs, ethercat::servo::MotionM
         const ProtoStruct* const o = v->get<ProtoStruct>();
         if (o == nullptr) {
             throw Error(
-                "config attribute 'homing' expects {method, speed_rpm, acceleration_rpm_per_s?, torque_object?, torque_percent?, "
-                "timeout_s?}");
+                "config attribute 'homing' expects {method, speed_rpm, zero_speed_rpm?, offset_counts?, "
+                "acceleration_rpm_per_s?, torque_object?, torque_percent?, timeout_s?}");
         }
         ServoConfig::Homing& h = c.homing;
         const double method = req_num(*o, "method");
@@ -219,6 +219,8 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs, ethercat::servo::MotionM
         }
         h.method = static_cast<std::int8_t>(method);
         h.speed_rpm = req_num(*o, "speed_rpm");
+        h.zero_speed_rpm = opt_num(*o, "zero_speed_rpm", 0.0);
+        h.offset_counts = static_cast<std::int32_t>(opt_num(*o, "offset_counts", 0.0));
         h.accel_rpm_per_s = opt_num(*o, "acceleration_rpm_per_s", 0.0);
         h.torque_percent = opt_num(*o, "torque_percent", 0.0);
         h.timeout_s = opt_num(*o, "timeout_s", 120.0);

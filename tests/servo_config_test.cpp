@@ -135,6 +135,17 @@ TEST("homing config rejects what the drive cannot be asked") {
         CHECK_THROWS_MSG(c.validate(), Error, "timeout_s");
     }
     {
+        ServoConfig c = ok;
+        c.homing.zero_speed_rpm = -1.0;
+        CHECK_THROWS_MSG(c.validate(), Error, "zero_speed_rpm");
+    }
+    {
+        ServoConfig c = ok;  // both two-stage fields are optional
+        c.homing.zero_speed_rpm = 5.0;
+        c.homing.offset_counts = -250000;
+        c.validate();
+    }
+    {
         ServoConfig c = good_config();  // no method: the block is inert, not invalid
         c.homing.speed_rpm = 0.0;
         c.validate();
