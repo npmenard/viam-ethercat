@@ -225,10 +225,15 @@ class ServoController : public SlaveControl {
 
    protected:
     // --- Device seams. The base is the generic CiA402 servo driver; a device subclass
-    // overrides these to add its vendor specifics. All three are consulted only
+    // overrides these to add its vendor specifics. All of them are consulted only
     // outside the constructor (start()/reconfigure()/RT loop), so a subclass override dispatches
     // normally (no virtual-during-construction trap). ---
     //
+    // Vendor configuration, run once pre-RT-spawn from inside the base's own on_configured, so a
+    // subclass cannot skip the base's setup by overriding. May throw to abort start().
+    virtual void configure_device(ConfigContext& cfg) {
+        (void)cfg;
+    }
     // Vendor fault-reset SDO, run once pre-RT-spawn (single port owner). nullopt (base) means no
     // vendor reset: the standard CiA402 controlword bit-7 in-loop path is the only reset.
     // Workaround seam for drives whose faults clear only through a proprietary SDO, not bit 7.

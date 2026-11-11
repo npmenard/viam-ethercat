@@ -192,6 +192,7 @@ target_sources(ethercat
     src/viam/lib/motion_mode.cpp
     src/viam/lib/sdo_codec.cpp
     src/viam/lib/servo_controller.cpp
+    src/viam/lib/yaskawa_servo_driver.cpp
 )
 
 target_include_directories(ethercat

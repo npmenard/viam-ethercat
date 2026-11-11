@@ -16,6 +16,11 @@
       "markdown_link": "README.md#configuration-and-usage"
     },
     {
+      "api": "rdk:component:motor",
+      "model": "viam:ethercat:yaskawa-servo",
+      "markdown_link": "README.md#configuration-and-usage"
+    },
+    {
       "api": "rdk:component:gantry",
       "model": "viam:ethercat:gantry",
       "markdown_link": "README.md#single-axis-gantry"

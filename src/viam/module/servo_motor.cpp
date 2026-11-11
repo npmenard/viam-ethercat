@@ -27,6 +27,7 @@
 #include "viam/lib/a6_servo_driver.hpp"
 #include "viam/lib/sdo_codec.hpp"
 #include "viam/lib/servo_config.hpp"
+#include "viam/lib/yaskawa_servo_driver.hpp"
 
 namespace ethercat::servo {
 
@@ -400,9 +401,13 @@ Model ServoMotor::a6_model() {
     return {model_family(), "a6-servo"};
 }
 
+Model ServoMotor::yaskawa_model() {
+    return {model_family(), "yaskawa-servo"};
+}
+
 std::vector<std::shared_ptr<ModelRegistration>> ServoMotor::create_model_registrations() {
-    // Both models are rdk:component:motor with the same validator (one config parser). They differ
-    // only in the controller subclass the factory builds: the generic base vs the A6ServoDriver seams.
+    // Every model is rdk:component:motor with the same validator (one config parser). They differ
+    // only in the controller subclass the factory builds, and in that subclass's default mode.
     return {
         std::make_shared<ModelRegistration>(
             API::get<Motor>(),
@@ -418,6 +423,13 @@ std::vector<std::shared_ptr<ModelRegistration>> ServoMotor::create_model_registr
                 return std::make_shared<ServoMotor>(cfg.name(), build_controller<A6ServoDriver>(cfg));
             },
             [](const auto& cfg) { return ServoMotor::validate(cfg, A6ServoDriver::kDefaultMotionMode); }),
+        std::make_shared<ModelRegistration>(
+            API::get<Motor>(),
+            yaskawa_model(),  // viam:ethercat:yaskawa-servo -- YaskawaServoDriver subclass
+            [](const auto& /*deps*/, const auto& cfg) {
+                return std::make_shared<ServoMotor>(cfg.name(), build_controller<YaskawaServoDriver>(cfg));
+            },
+            [](const auto& cfg) { return ServoMotor::validate(cfg, YaskawaServoDriver::kDefaultMotionMode); }),
     };
 }
 

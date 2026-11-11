@@ -840,6 +840,7 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
 // stopping window, and master.close(). What remains here is driver policy.
 
 void ServoController::on_configured(ConfigContext& cfg) {
+    configure_device(cfg);  // vendor setup first: the sequencer's SDOs may depend on it
     // Resolve the sequencer's typed fields and run its quick-stop SDO setup here (non-RT, pre-spawn,
     // single port owner -- the one hook that may throw; a throw aborts start() cleanly and goes
     // Degraded). The module's own f_* offsets and vendor reset still resolve in start()/reconfigure();
