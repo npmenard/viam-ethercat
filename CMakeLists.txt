@@ -267,6 +267,13 @@ if (ETHERCAT_BUILD_MODULE)
   target_link_libraries(ethercat-servo PRIVATE ethercat-servo-models)
   viam_apply_wall_werror(ethercat-servo)
 
+  # The version the module reports at startup. Conan passes the recipe version; a plain cmake
+  # build says "dev", which is exactly what it is. Defined here rather than further down because
+  # the target only exists inside this guard -- a -DETHERCAT_BUILD_MODULE=OFF configure (the
+  # sanitizer builds) has no ethercat-servo to attach it to.
+  set(ETHERCAT_MODULE_VERSION "dev" CACHE STRING "version string the module logs at startup")
+  target_compile_definitions(ethercat-servo PRIVATE ETHERCAT_MODULE_VERSION="${ETHERCAT_MODULE_VERSION}")
+
   # DEPLOYMENT runtime story (#TODO-9): statically link libstdc++ + libgcc INTO the
   # shipped module binary. The module is built on noble (gcc-13/14 libstdc++ 13) but
   # deployed to robots whose system libstdc++ may be OLDER -- libstdc++ is forward- but

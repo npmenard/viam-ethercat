@@ -28,6 +28,9 @@ using namespace viam::sdk;
 int main(int argc, char** argv) {
     try {
         const Instance instance;
+        // Which bundle this is, first thing. Without it a deployed module cannot be told from the
+        // one it replaced, and a test run against the wrong binary looks exactly like a failed fix.
+        VIAM_SDK_LOG(info) << "viam-ethercat module version " << ETHERCAT_MODULE_VERSION;
 
         boost::asio::io_context io_context;
         std::thread io_thread([&io_context] {

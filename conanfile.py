@@ -47,6 +47,9 @@ class ethercat(ConanFile):
 
     def generate(self):
         tc = CMakeToolchain(self)
+        # Carry the recipe version into the binary so a running module can say which bundle it is.
+        # The exported sources have no .git, so CMake cannot work it out for itself.
+        tc.cache_variables["ETHERCAT_MODULE_VERSION"] = str(self.version)
         tc.generate()
         CMakeDeps(self).generate()
 
