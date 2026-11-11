@@ -357,6 +357,7 @@ void ServoController::resolve_fields() {
     // optional, so nullopt makes the respective enable-ladder step inert.
     f_mode_wr_ = master_->try_resolve_rx<cia402::ModeOfOperation>(s);
     f_mode_disp_ = master_->try_resolve_tx<cia402::ModeDisplay>(s);
+    resolve_device_fields(*master_, s);  // the subclass's own objects (device seam)
     ETHERCAT_LOG_DEBUG("servo",
                        "slave {}: resolved fields: ctrlword@{} statusword@{} actual@{} fault_code@{} velocity@{} mode_wr@{} mode_disp@{}"
                        " mode {}",
@@ -490,6 +491,11 @@ MotionFeedback ServoController::feedback(CycleContext& ctx, Status status, std::
 }
 
 bool ServoController::estop_engaged() const noexcept {
+    // Two independent reasons to refuse motion: a device inhibit (seam), or the configured 0x603F
+    // emergency-stop code on a faulted drive.
+    if (state_.inhibit.load(std::memory_order_acquire) != static_cast<std::uint8_t>(Inhibit::None)) {
+        return true;
+    }
     return config_.estop_fault_code != 0 && state_.drive_faulted.load(std::memory_order_acquire) &&
            state_.drive_fault_code.load(std::memory_order_relaxed) == config_.estop_fault_code;
 }
@@ -614,6 +620,32 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
     // published state and the run's timeout only counts inside the Homing state.
     if (batch.start_homing.has_value() && !std::holds_alternative<Operational>(lifecycle_)) {
         publish_homing_result(HomingFail::NotOperational);
+    }
+
+    // Device inhibit. Preempts every state but Disabled (a deliberate de-energize stays) and
+    // outranks the fault path: there is nothing to reset while an input holds the drive down, so
+    // fault-reset edges would only hammer it. Shutdown is also step one of the recovery such a stop
+    // needs, since it latches in the drive.
+    const Inhibit inh = inhibit(ctx);
+    state_.inhibit.store(static_cast<std::uint8_t>(inh), std::memory_order_release);
+    const bool stopped = std::holds_alternative<SafetyStop>(lifecycle_) || std::holds_alternative<QuickStopping>(lifecycle_);
+    if (inh != Inhibit::None && !std::holds_alternative<Disabled>(lifecycle_)) {
+        if (!stopped) {
+            abort_active_move(RtError::MotorStopped);  // the in-flight move's waiter throws
+            motion_->reset();                          // no command survives the stop; release re-enables into a hold
+        }
+        if (inh == Inhibit::QuickStop) {
+            lifecycle_ = QuickStopping{};
+            return ControlWord::quick_stop();
+        }
+        lifecycle_ = SafetyStop{};  // an escalation from QuickStop lands here too, already aborted
+        return ControlWord::shutdown();
+    }
+    if (stopped) {
+        // Released. Hand to the enable ladder, which climbs Shutdown -> SwitchOn -> EnableOperation.
+        lifecycle_ = Enabling{};
+        mode_echo_wait_ = 0;
+        return fsm_.step(status, Cia402State::OperationEnabled);
     }
 
     if (std::holds_alternative<Init>(lifecycle_)) {

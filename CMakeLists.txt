@@ -324,6 +324,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/sine_move_test.cpp)
   viam_add_test(sine_move_test tests/sine_move_test.cpp)
 endif()
 viam_add_test(servo_config_test tests/servo_config_test.cpp)
+viam_add_test(safety_inputs_test tests/safety_inputs_test.cpp)
 # Module-level tests need the SDK, so they exist only when the module is built.
 if (ETHERCAT_BUILD_MODULE)
   viam_add_test(gantry_axis_test tests/gantry_axis_test.cpp)

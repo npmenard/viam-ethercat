@@ -35,6 +35,9 @@ struct ServoConfig {
     // The PDO maps are driver-defined per motion_mode (set_fixed_pdo_map()), never user-supplied.
     ethercat::PdoMap rxpdo;  // command map (0x1C12): cw + 0x607A (cyclic) | cw + 0x6060 + 0x607A + 0x6081 + 0x60FF (profile)
     ethercat::PdoMap txpdo;  // feedback map (0x1C13): 0x603F,0x6041,0x6061,0x6064,0x606C,0x6077
+    // Feedback a device model needs beyond the fixed map, appended by set_fixed_pdo_map(). Set by
+    // the model's own builder, not from user config: the map stays driver-defined.
+    std::vector<ethercat::PdoEntry> extra_txpdo;
 
     // --- motor limits ---
     double max_motor_speed_rpm = 0.0;  // >= 0; the speed clamp

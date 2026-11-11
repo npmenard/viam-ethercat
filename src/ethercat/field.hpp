@@ -41,6 +41,9 @@ using PositionActual = Field<0x6064, 0, std::int32_t>;
 using VelocityActual = Field<0x606C, 0, std::int32_t>;
 using ProfileVelocity = Field<0x6081, 0, std::uint32_t>;
 using TargetVelocity = Field<0x60FF, 0, std::int32_t>;
+// Digital inputs. CiA402 fixes only bits 0-2 and leaves 16-31 manufacturer-defined, so what a
+// bit means is a property of the drive, not of this field.
+using DigitalInputs = Field<0x60FD, 0, std::uint32_t>;
 
 }  // namespace cia402
 

@@ -273,6 +273,61 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs, ethercat::servo::MotionM
     return c;
 }
 
+// --- viam:ethercat:yaskawa-servo extras. The drive's 0x60FD safety inputs are its own wiring, so
+// they are parsed here rather than into the shared ServoConfig, and the model's builder adds the
+// 0x60FD TxPDO entry only when an interlock is actually declared (a drive lacking the object would
+// abort the whole mapping).
+SafetyInputs parse_safety_inputs(const ProtoStruct& attrs) {
+    SafetyInputs out;
+    const ProtoValue* const v = find_attr(attrs, "safety_inputs");
+    if (v == nullptr) {
+        return out;
+    }
+    const ProtoStruct* const block = v->get<ProtoStruct>();
+    if (block == nullptr) {
+        throw Error("config attribute 'safety_inputs' expects {stop?: {...}, quick_stop?: {...}}");
+    }
+    const auto read_bits = [](const ProtoStruct& tier, const char* key, std::vector<std::uint8_t>& into) {
+        const ProtoValue* const list_v = find_attr(tier, key);
+        if (list_v == nullptr) {
+            return;
+        }
+        const std::vector<ProtoValue>* const list = list_v->get<std::vector<ProtoValue>>();
+        if (list == nullptr) {
+            throw Error(std::string("config attribute 'safety_inputs.") + key + "' must be a list of bit numbers");
+        }
+        for (const ProtoValue& b : *list) {
+            into.push_back(static_cast<std::uint8_t>(small_uint(b, key, "u8")));
+        }
+    };
+    const auto read_tier = [&](const char* name, SafetyInputs::Tier& tier) {
+        const ProtoValue* const tv = find_attr(*block, name);
+        if (tv == nullptr) {
+            return;
+        }
+        const ProtoStruct* const t = tv->get<ProtoStruct>();
+        if (t == nullptr) {
+            throw Error(std::string("config attribute 'safety_inputs.") + name +
+                        "' expects {require_high_bits?: [...], require_low_bits?: [...]}");
+        }
+        read_bits(*t, "require_high_bits", tier.require_high);
+        read_bits(*t, "require_low_bits", tier.require_low);
+    };
+    read_tier("stop", out.stop);
+    read_tier("quick_stop", out.quick_stop);
+    out.validate();
+    return out;
+}
+
+std::unique_ptr<ServoController> build_yaskawa_controller(const ResourceConfig& cfg) {
+    ServoConfig sc = config_from_attrs(cfg.attributes(), YaskawaServoDriver::kDefaultMotionMode);
+    SafetyInputs safety = parse_safety_inputs(cfg.attributes());
+    if (safety.declared()) {
+        sc.extra_txpdo.push_back(ethercat::PdoEntry{cia402::DigitalInputs::index, cia402::DigitalInputs::sub, 32});
+    }
+    return std::make_unique<YaskawaServoDriver>(std::move(sc), std::move(safety));
+}
+
 // Build the controller for a model. `Controller` is the generic ServoController (viam:ethercat:servo)
 // or the A6ServoDriver subclass (viam:ethercat:a6-servo); both share the same config parser and ctors
 // (A6 inherits them) and differ only in the three device seams. Returns a base-typed unique_ptr so
@@ -426,10 +481,11 @@ std::vector<std::shared_ptr<ModelRegistration>> ServoMotor::create_model_registr
         std::make_shared<ModelRegistration>(
             API::get<Motor>(),
             yaskawa_model(),  // viam:ethercat:yaskawa-servo -- YaskawaServoDriver subclass
-            [](const auto& /*deps*/, const auto& cfg) {
-                return std::make_shared<ServoMotor>(cfg.name(), build_controller<YaskawaServoDriver>(cfg));
-            },
-            [](const auto& cfg) { return ServoMotor::validate(cfg, YaskawaServoDriver::kDefaultMotionMode); }),
+            [](const auto& /*deps*/, const auto& cfg) { return std::make_shared<ServoMotor>(cfg.name(), build_yaskawa_controller(cfg)); },
+            [](const auto& cfg) {
+                (void)parse_safety_inputs(cfg.attributes());  // throws on a bad interlock declaration
+                return ServoMotor::validate(cfg, YaskawaServoDriver::kDefaultMotionMode);
+            }),
     };
 }
 

@@ -84,6 +84,7 @@ struct ControllerState {
     std::atomic<std::uint8_t> homing_state{0};           // HomingState; set by the RT loop, read by home()
     std::atomic<std::uint8_t> homing_fail{0};            // HomingFail reason when homing_state == Failed
     std::atomic<bool> homed{false};                      // a homing run succeeded in this session
+    std::atomic<std::uint8_t> inhibit{0};                // ServoController::Inhibit reported by the device seam
     std::atomic<std::int32_t> home_counts{0};            // 0x6064 at the cycle the drive attained home
 };
 
@@ -235,6 +236,25 @@ class ServoController : public SlaveControl {
         (void)cfg;
     }
     // Units per count/s^2 for 0x6085/0x609A; 1.0 = the drive takes plain counts/s^2. Must be > 0.
+    // How far a device subclass wants motion held off, from feedback only it can interpret (a
+    // manufacturer input bit, a vendor status word). The base owns the response, which is plain
+    // CiA402: Stop holds Shutdown, QuickStop holds the quick-stop command so the drive ramps at
+    // 0x6085 and then drops to SwitchOnDisabled. Consulted every RT cycle, so it must not allocate.
+    enum class Inhibit : std::uint8_t { None, Stop, QuickStop };
+    virtual Inhibit inhibit(const CycleContext& ctx) const noexcept {
+        (void)ctx;
+        return Inhibit::None;
+    }
+    // Resolve a subclass's own PDO fields, once at start()/reconfigure() alongside the base's. The
+    // entries must already be in the map (ServoConfig::extra_txpdo), and a required object the drive
+    // refused should throw here rather than leave the subclass reading a stale offset.
+    virtual void resolve_device_fields(Master& master, std::uint16_t slave) {
+        (void)master;
+        (void)slave;
+    }
+    // What one unit of this drive's acceleration objects (0x6085, 0x609A) is worth, as units per
+    // count/s^2. CiA402 does not fix the unit, so a drive that scales them reports its factor here;
+    // 1.0 (base) means plain counts/s^2.
     virtual double accel_units_per_cps2() const noexcept {
         return 1.0;
     }
@@ -271,10 +291,12 @@ class ServoController : public SlaveControl {
     struct Init {};
     struct Enabling {};  // climb to OperationEnabled once 0x6061 echoes the commanded mode
     struct Operational {};
-    struct Resetting {};  // drive in Fault: present fault-reset edges until it clears, then Enabling
-    struct Homing {};     // the drive runs its own homing procedure; the loop holds the start bit
-    struct Disabled {};   // operator de-energized; leaves on enable
-    using Lifecycle = std::variant<Init, Enabling, Operational, Resetting, Homing, Disabled>;
+    struct Resetting {};      // drive in Fault: present fault-reset edges until it clears, then Enabling
+    struct Homing {};         // the drive runs its own homing procedure; the loop holds the start bit
+    struct Disabled {};       // operator de-energized; leaves on enable
+    struct SafetyStop {};     // a device inhibit holds Shutdown; leaves when the inhibit clears
+    struct QuickStopping {};  // a device inhibit holds quick-stop; the drive ramps at 0x6085
+    using Lifecycle = std::variant<Init, Enabling, Operational, Resetting, Homing, Disabled, SafetyStop, QuickStopping>;
 
     // The mode-specific motion semantics live in motion_; the controller delegates to it.
 

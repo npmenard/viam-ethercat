@@ -37,6 +37,8 @@ void ServoConfig::set_fixed_pdo_map() {
     }
     txpdo.pdo_indices = {0x1A00};
     txpdo.entries[0x1A00] = {E(kFault, 16), E(kStatus, 16), E(kModeDisp, 8), E(kActualPos, 32), E(kVelAct, 32), E(kTorqueAct, 16)};
+    auto& tx = txpdo.entries[0x1A00];
+    tx.insert(tx.end(), extra_txpdo.begin(), extra_txpdo.end());
 }
 
 void ServoConfig::validate() const {

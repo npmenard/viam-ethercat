@@ -1,8 +1,11 @@
 #include "viam/lib/yaskawa_servo_driver.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <ranges>
+#include <string>
 #include <thread>
 
 #include "ethercat/errors.hpp"
@@ -49,7 +52,31 @@ static_assert(in_range(0) && in_range(1) && in_range(2) && in_range(3));
 // clears it when the set is enabled).
 constexpr std::uint16_t kUserParamConfig = 0x2700;
 constexpr auto kConfigPoll = std::chrono::milliseconds(10);
-constexpr int kConfigPolls = 200;  // 2 s; enabling a parameter set is a sub-second operation
+constexpr int kConfigPolls = 200;     // 2 s; enabling a parameter set is a sub-second operation
+constexpr std::uint8_t kMaxBit = 31;  // 0x60FD is 32 bits wide
+
+bool bit_set(std::uint32_t word, std::uint8_t bit) noexcept {
+    return (word & (std::uint32_t{1} << bit)) != 0;
+}
+
+void check_bits(const SafetyInputs::Tier& tier, const char* name) {
+    const auto in_range = [name](const std::vector<std::uint8_t>& bits, const char* level) {
+        for (const std::uint8_t b : bits) {
+            if (b > kMaxBit) {
+                throw Error(std::string("safety_inputs.") + name + ".require_" + level + "_bits: bit " + std::to_string(b) +
+                            " is outside 0x60FD's 0-31");
+            }
+        }
+    };
+    in_range(tier.require_high, "high");
+    in_range(tier.require_low, "low");
+    for (const std::uint8_t b : tier.require_high) {
+        if (std::find(tier.require_low.begin(), tier.require_low.end(), b) != tier.require_low.end()) {
+            throw Error(std::string("safety_inputs.") + name + ": bit " + std::to_string(b) +
+                        " is required both high and low, which can never be satisfied");
+        }
+    }
+}
 
 // Set one subindex, skipping the write when the drive already holds the value: these are
 // EEPROM-backed, so rewriting a correct ratio on every bring-up wears the drive for nothing.
@@ -64,6 +91,39 @@ void correct(ConfigContext& cfg, std::uint16_t index, std::uint8_t sub, std::uin
 }
 
 }  // namespace
+
+void SafetyInputs::validate() const {
+    check_bits(stop, "stop");
+    check_bits(quick_stop, "quick_stop");
+}
+
+bool safety_engaged(const SafetyInputs::Tier& tier, std::uint32_t digital_inputs) noexcept {
+    const auto reads_low = [digital_inputs](std::uint8_t b) { return !bit_set(digital_inputs, b); };
+    const auto reads_high = [digital_inputs](std::uint8_t b) { return bit_set(digital_inputs, b); };
+    return std::ranges::any_of(tier.require_high, reads_low) || std::ranges::any_of(tier.require_low, reads_high);
+}
+
+void YaskawaServoDriver::resolve_device_fields(Master& master, std::uint16_t slave) {
+    f_digital_inputs_ = master.try_resolve_tx<cia402::DigitalInputs>(slave);
+    // A declared interlock the driver cannot read would report the machine safe while it is not.
+    if (safety_.declared() && !f_digital_inputs_) {
+        throw Error(
+            "safety_inputs are declared but 0x60FD (digital inputs) is not in the TxPDO map -- the drive "
+            "did not accept the mapping, so the interlock cannot be read");
+    }
+}
+
+ServoController::Inhibit YaskawaServoDriver::inhibit(const CycleContext& ctx) const noexcept {
+    if (!f_digital_inputs_) {
+        return Inhibit::None;  // undeclared (resolve_device_fields already refused a declared-but-unmapped one)
+    }
+    const auto word = ctx.load<cia402::DigitalInputs::type>(*f_digital_inputs_);
+    // Stop outranks quick-stop: once torque is gone there is nothing left to ramp.
+    if (safety_engaged(safety_.stop, word)) {
+        return Inhibit::Stop;
+    }
+    return safety_engaged(safety_.quick_stop, word) ? Inhibit::QuickStop : Inhibit::None;
+}
 
 void YaskawaServoDriver::configure_device(ConfigContext& cfg) {
     for (const UserUnit& u : kUserUnits) {
