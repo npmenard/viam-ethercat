@@ -554,8 +554,10 @@ const char* ServoController::motion_mode_name() const noexcept {
 // mode's resolve() then selects it on the drive by SDO, so an unsupported mode fails start() with a
 // clear error rather than a drive that never moves.
 void ServoController::select_motion_mode() {
+    // The configured quick-stop rate is counts/s^2; the drive's 0x6085 may not be (device seam).
+    const std::uint32_t qs = accel_to_device(config_.quick_stop_decel, accel_units_per_cps2());
     if (config_.motion_mode == MotionModeKind::Profile) {
-        motion_ = std::make_unique<ProfilePositionMode>(config_.quick_stop_decel, 2);
+        motion_ = std::make_unique<ProfilePositionMode>(qs, 2);
         ETHERCAT_LOG_INFO("servo", "slave {}: control_mode profile (PP for go_to/go_for, PV for set_rpm)", config_.slave_id);
         return;
     }
@@ -564,7 +566,7 @@ void ServoController::select_motion_mode() {
     const double accel_cps2 = static_cast<double>(rpm_to_device_velocity(accel_rpm_s, config_.counts_per_rev, config_.gear_ratio));
     const double vmax_cps =
         static_cast<double>(rpm_to_device_velocity(config_.max_motor_speed_rpm, config_.counts_per_rev, config_.gear_ratio));
-    motion_ = std::make_unique<CyclicPositionMode>(dt, accel_cps2, vmax_cps, config_.quick_stop_decel);
+    motion_ = std::make_unique<CyclicPositionMode>(dt, accel_cps2, vmax_cps, qs);
     ETHERCAT_LOG_INFO("servo",
                       "slave {}: control_mode csp (master-side trapezoid, accel {} counts/s^2, vmax {} counts/s)",
                       config_.slave_id,
@@ -855,7 +857,8 @@ void ServoController::on_configured(ConfigContext& cfg) {
     std::int64_t budget = 0;
     if (echoed > 0) {
         const double window_s = static_cast<double>(teardown_window_cycles()) / static_cast<double>(config_.target_loop_rate_hz);
-        const double b = static_cast<double>(echoed) * std::max(0.0, window_s - kStopWindowMarginS);
+        const double decel_cps2 = static_cast<double>(echoed) / accel_units_per_cps2();
+        const double b = decel_cps2 * std::max(0.0, window_s - kStopWindowMarginS);
         budget = static_cast<std::int64_t>(b);
     }
     vel_budget_cps_.store(budget, std::memory_order_release);
@@ -1237,7 +1240,7 @@ std::vector<std::byte> ServoController::write_homing_objects() {
     }
     write(0x6099, 1, static_cast<std::uint32_t>(rpm_to_device_velocity(h.speed_rpm, cpr, ratio)));
     if (h.accel_rpm_per_s > 0.0) {
-        write(0x609A, 0, static_cast<std::uint32_t>(rpm_to_device_velocity(h.accel_rpm_per_s, cpr, ratio)));
+        write(0x609A, 0, accel_to_device(rpm_to_device_velocity(h.accel_rpm_per_s, cpr, ratio), accel_units_per_cps2()));
     }
     if (torque_type != nullptr) {
         sdo_codec::Input in;

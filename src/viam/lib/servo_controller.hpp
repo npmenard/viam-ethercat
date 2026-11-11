@@ -234,6 +234,10 @@ class ServoController : public SlaveControl {
     virtual void configure_device(ConfigContext& cfg) {
         (void)cfg;
     }
+    // Units per count/s^2 for 0x6085/0x609A; 1.0 = the drive takes plain counts/s^2. Must be > 0.
+    virtual double accel_units_per_cps2() const noexcept {
+        return 1.0;
+    }
     // Vendor fault-reset SDO, run once pre-RT-spawn (single port owner). nullopt (base) means no
     // vendor reset: the standard CiA402 controlword bit-7 in-loop path is the only reset.
     // Workaround seam for drives whose faults clear only through a proprietary SDO, not bit 7.

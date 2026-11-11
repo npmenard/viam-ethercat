@@ -59,4 +59,15 @@ inline double device_velocity_to_rpm(std::int32_t dev, double counts_per_rev, do
     return denom != 0.0 ? static_cast<double>(dev) / denom * 60.0 : 0.0;
 }
 
+// counts/s^2 -> the drive's acceleration units. A non-zero rate never rounds to 0, which every
+// caller reads as "not configured".
+inline std::uint32_t accel_to_device(double cps2, double units_per_cps2) noexcept {
+    if (!(cps2 > 0.0) || !(units_per_cps2 > 0.0)) {
+        return 0;
+    }
+    constexpr double kMaxU32 = 4294967295.0;
+    const double u = std::round(cps2 * units_per_cps2);
+    return static_cast<std::uint32_t>(std::clamp(u, 1.0, kMaxU32));
+}
+
 }  // namespace ethercat

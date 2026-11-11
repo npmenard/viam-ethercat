@@ -1,6 +1,7 @@
 #include <cstdint>
 
 #include "test_harness.hpp"
+#include "ethercat/util.hpp"
 #include "viam/lib/motion_profile.hpp"
 
 namespace mp = ethercat::servo;
@@ -37,6 +38,16 @@ TEST("rpm<->device velocity (counts/s = rpm/60 * counts_per_rev * gear)") {
     CHECK_EQ(mp::rpm_to_device_velocity(60.0, kA6CountsPerRev, 2.0), std::int32_t{262144});  // gear
     CHECK_EQ(mp::device_velocity_to_rpm(131072, kA6CountsPerRev, 1.0), 60.0);
     CHECK_EQ(mp::device_velocity_to_rpm(262144, kA6CountsPerRev, 2.0), 60.0);
+}
+
+TEST("counts/s^2 <-> a drive acceleration unit, and a rate never rounds away") {
+    constexpr double kPerCps2 = 1.0 / 50.0;  // a drive whose unit is 50 counts/s^2
+    CHECK_EQ(ethercat::accel_to_device(1000.0, kPerCps2), std::uint32_t{20});
+    CHECK_EQ(ethercat::accel_to_device(1000.0, 1.0), std::uint32_t{1000});  // a drive taking plain counts/s^2
+    // 0 means "not configured" to every caller, so a configured-but-tiny rate must not become one:
+    // it would silently turn a quick-stop ramp into an uncontrolled coast.
+    CHECK_EQ(ethercat::accel_to_device(1.0, kPerCps2), std::uint32_t{1});
+    CHECK_EQ(ethercat::accel_to_device(0.0, kPerCps2), std::uint32_t{0});  // genuinely unset stays unset
 }
 
 TEST_MAIN()

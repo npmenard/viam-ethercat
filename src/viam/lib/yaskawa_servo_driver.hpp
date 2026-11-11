@@ -32,6 +32,9 @@ class YaskawaServoDriver final : public ServoController {
 
    protected:
     void configure_device(ConfigContext& cfg) override;
+    double accel_units_per_cps2() const noexcept override {
+        return 1.0 / kAccelUnitCps2;
+    }
     std::string fault_description(std::uint16_t code) const override;
 };
 
