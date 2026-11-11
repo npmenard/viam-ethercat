@@ -28,6 +28,8 @@ constexpr int kStoreDisableWaitCycles = 500;  // x2 ms
 // shown a save still unfinished 20 s after the download was answered, so the patience is generous.
 constexpr auto kStorePoll = std::chrono::milliseconds(100);
 constexpr int kStorePolls = 300;  // 30 s
+// Bring-up patience for a recovery attempt. A healthy drive reaches OP in under half a second.
+constexpr std::uint32_t kRecoveryOpAwaitMs = 3000;
 
 // A drive's "no-sync" fault code is a device seam (sync_fault_code(), nullopt in this generic
 // base), not a constant here, so this core carries no vendor value. The bring-up gate reads it
@@ -152,6 +154,7 @@ void ServoController::start() {
     master_->init();
     master_->configure();  // -> SAFE-OP (may throw Error; the SDK retries)
     bring_up();            // resolve, clear errors, and reach OP, with bounded retry
+    recovery_ = std::jthread([this](const std::stop_token& stop) { recovery_loop(stop); });
 }
 
 // One line naming the effective config a run starts from.
@@ -313,6 +316,12 @@ bool ServoController::attempt_bringup() {
 }
 
 void ServoController::stop() noexcept {
+    // Before the lock: a retry in flight holds it, and asking it to finish while holding the lock
+    // ourselves would deadlock. A healthy bus leaves the thread sleeping, so this returns at once.
+    recovery_.request_stop();
+    if (recovery_.joinable()) {
+        recovery_.join();
+    }
     const std::unique_lock<std::shared_mutex> lk(api_mutex_);
     stopping_.store(true, std::memory_order_release);
     bump_wake();  // wake any parked go_to/go_for waiters
@@ -343,7 +352,10 @@ void ServoController::reconfigure(ServoConfig config) {
     master_ = std::make_unique<Master>(build_master_config(config_));
     master_->init();
     master_->configure();
-    bring_up();  // resolve, clear errors, and reach OP, with bounded retry
+    bring_up();                   // resolve, clear errors, and reach OP, with bounded retry
+    if (!recovery_.joinable()) {  // a reconfigure keeps the retry thread it was started with
+        recovery_ = std::jthread([this](const std::stop_token& stop) { recovery_loop(stop); });
+    }
 }
 
 void ServoController::resolve_fields() {
@@ -1132,7 +1144,12 @@ void ServoController::maybe_recover_bus() {
     // re-latches it on the RT thread, and clearing afterwards could overwrite that latch.
     bus_lost_.store(false, std::memory_order_release);
     try {
-        master_ = std::make_unique<Master>(build_master_config(config_));
+        MasterConfig mc = build_master_config(config_);
+        // A fraction of the patience start() gets. There, one attempt is all there is and a human is
+        // reading the error; here another attempt follows in two seconds, so waiting out a drive that
+        // is still powering up buys nothing and delays the attempt that would have worked.
+        mc.op_await_timeout_ms = kRecoveryOpAwaitMs;
+        master_ = std::make_unique<Master>(std::move(mc));
         master_->init();
         master_->configure();  // -> SAFE-OP
         bring_up();            // -> OP with bounded retry (gives up by setting degraded_)
@@ -1142,7 +1159,7 @@ void ServoController::maybe_recover_bus() {
         rt_runner_.reset();
         master_.reset();
         bus_lost_.store(true, std::memory_order_release);
-        throw Error("bus lost and recovery failed (" + std::string(e.what()) + ") -- will retry on the next motion call");
+        throw Error("bus lost and recovery failed (" + std::string(e.what()) + ") -- retrying every 2 s, and on the next motion call");
     }
     if (degraded_.load(std::memory_order_acquire)) {
         // bring_up() exhausted its attempts: the bus enumerates but the drive would not reach OP.
@@ -1151,9 +1168,43 @@ void ServoController::maybe_recover_bus() {
         rt_runner_.reset();
         master_.reset();
         bus_lost_.store(true, std::memory_order_release);
-        throw Error("bus lost and recovery failed (" + cause + ") -- will retry on the next motion call");
+        throw Error("bus lost and recovery failed (" + cause + ") -- retrying every 2 s, and on the next motion call");
     }
     ETHERCAT_LOG_INFO("servo", "slave {}: bus recovered -- drive back to OPERATIONAL", config_.slave_id);
+}
+
+// The same rebuild a motion verb would make, on a timer. A drive whose control power is cycled
+// takes the bus with it, and nothing asks a powered-off axis to move -- so without this the axis
+// stays down after power comes back, until someone commands a move. While the drive is off the
+// attempt fails at enumeration in milliseconds, which is what makes retrying this often cheap.
+void ServoController::recovery_loop(const std::stop_token& stop) {
+    constexpr auto kTick = std::chrono::milliseconds(100);  // so a stop request is honoured promptly
+    constexpr int kTicksPerRetry = 20;                      // retry every 2 s while the bus is gone
+    constexpr int kQuietRetries = 30;                       // then repeat the same reason ~once a minute
+    int failures = 0;
+    while (!stop.stop_requested()) {
+        for (int i = 0; i < kTicksPerRetry && !stop.stop_requested(); ++i) {
+            std::this_thread::sleep_for(kTick);
+        }
+        // Only the stop token ends this loop. stopping_ is a per-run flag that a failed rebuild
+        // leaves set (it is cleared when a run spawns, which is the thing that did not happen), so
+        // testing it here would retire the retry after its first failure -- exactly when the drive
+        // is off and the retry is the point.
+        if (stop.stop_requested() || !bus_lost_.load(std::memory_order_acquire)) {
+            failures = 0;
+            continue;
+        }
+        try {
+            maybe_recover_bus();  // logs the recovery itself
+            failures = 0;
+        } catch (const std::exception& e) {
+            // Expected for as long as the drive is off; say so once, then stay quiet about it.
+            ++failures;
+            if (failures == 1 || failures % kQuietRetries == 0) {
+                ETHERCAT_LOG_WARN("servo", "slave {}: bus still down, retrying every 2 s: {}", config_.slave_id, e.what());
+            }
+        }
+    }
 }
 
 void ServoController::set_rpm(double rpm) {

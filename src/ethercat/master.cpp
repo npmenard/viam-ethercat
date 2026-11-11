@@ -45,6 +45,8 @@ Master::Master(MasterConfig config) : config_(std::move(config)), backend_(std::
     op_nudge_interval_cycles_ = std::max(config_.op_nudge_interval_cycles, 1U);
     const std::uint64_t await_cycles = (static_cast<std::uint64_t>(config_.op_await_timeout_ms) * config_.target_loop_rate_hz) / 1000ULL;
     op_await_bound_cycles_ = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(await_cycles, 1, UINT32_MAX));
+    const std::uint64_t absent_cycles = (static_cast<std::uint64_t>(config_.op_absent_timeout_ms) * config_.target_loop_rate_hz) / 1000ULL;
+    op_absent_bound_cycles_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(absent_cycles, UINT32_MAX));
 
     // Validate the loop rate against each slave's declared SYNC0 cycle granularity up front.
     // Workaround for drives that reject a non-multiple cycle only as a cryptic device fault at
@@ -275,6 +277,27 @@ BringupStatus Master::bringup_step(bool drive_sync_faulted, bool drive_present) 
                 ++bringup_op_hold_streak_;
             } else {
                 bringup_op_hold_streak_ = 0;
+            }
+            // Silence alone does not decide anything: a healthy drive can take seconds to publish
+            // its first process data, and cutting that short turns a slow start into a failed one.
+            // Silence WITH an AL status code does decide it -- the drive has refused something and
+            // is telling us so, and no amount of waiting has ever changed its mind. Give that case
+            // seconds instead of the full patience, so the attempt that can work comes sooner.
+            bringup_absent_count_ = drive_present ? 0 : bringup_absent_count_ + 1;
+            if (op_absent_bound_cycles_ != 0 && bringup_al_code_ != 0 && bringup_absent_count_ >= op_absent_bound_cycles_) {
+                // RT-context log (one-shot; the RT rule in log.hpp)
+                ETHERCAT_LOG_ERROR("bringup",
+                                   "giving up awaiting OP after {} cycles: the drive has sent no process data at all (statusword "
+                                   "still 0) while refusing with an AL status code -- its ESC answers (wkc {}/{}, slave 1 state "
+                                   "{}), so the drive is powered but its application is not running; AL 0x{:04X} ({})",
+                                   bringup_await_count_,
+                                   wkc,
+                                   expected_wkc_,
+                                   to_string(backend_->slave_state(1)),
+                                   bringup_al_code_,
+                                   SoemBackend::describe_al_code(bringup_al_code_));
+                bringup_phase_ = BringupPhase::Aborted;
+                return BringupStatus::Aborted;
             }
             if (bringup_op_hold_streak_ >= op_hold_confirm_cycles_) {
                 // RT-context log (one-shot; the RT rule in log.hpp)

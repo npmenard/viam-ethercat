@@ -128,6 +128,13 @@ struct MasterConfig {
     // target_loop_rate_hz in the Master ctor, so the give-up patience is rate-independent. Floor
     // of 1 cycle.
     std::uint32_t op_await_timeout_ms = 30'000;
+    // The same give-up, far sooner, for a drive that publishes nothing at all WHILE refusing with
+    // an AL status code: a statusword still reading 0 is an application that is not running, its
+    // ESC answers meanwhile so the working counter looks healthy, and the code says the refusal is
+    // deliberate rather than slow. Silence with no AL code keeps the full patience above -- a
+    // healthy drive may take seconds to publish its first process data. Converted to cycles like
+    // op_await_timeout_ms. 0 disables the early give-up.
+    std::uint32_t op_absent_timeout_ms = 2'000;
 };
 
 // Apply a PDO map to a slave via the CoE SDO sub-protocol. The slave MUST be in

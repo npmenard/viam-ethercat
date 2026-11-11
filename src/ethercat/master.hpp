@@ -331,6 +331,7 @@ class Master {
     std::uint32_t bringup_settle_count_ = 0;             // RT-only: settle cycles elapsed before requesting OP
     std::uint32_t bringup_await_count_ = 0;              // RT-only: AWAIT_OP cycles since requesting OP
     std::uint32_t bringup_op_hold_streak_ = 0;           // RT-only: consecutive (full-WKC && !sync-faulted) cycles at OP
+    std::uint32_t bringup_absent_count_ = 0;             // RT-only: consecutive AWAIT_OP cycles with no drive feedback at all
     std::uint16_t bringup_al_code_ = 0;                  // RT-written: last non-zero AL status code seen during AWAIT_OP
     // AWAIT_OP bounds derived once from MasterConfig in the ctor: pre-clamped cycle counts the
     // bring-up FSM compares against (the counts clamp 0 -> 1; the give-up bound is
@@ -338,7 +339,8 @@ class Master {
     std::uint32_t op_hold_confirm_cycles_ = 5;
     std::uint32_t op_nudge_interval_cycles_ = 10;
     std::uint32_t op_await_bound_cycles_ = 30'000;
-    bool dc_enabled_ = false;  // set in configure(): is SYNC0 in play? (gates the post-OP settle grace)
+    std::uint32_t op_absent_bound_cycles_ = 2'000;  // 0 = no early give-up
+    bool dc_enabled_ = false;                       // set in configure(): is SYNC0 in play? (gates the post-OP settle grace)
 
     MasterConfig config_;
     std::unique_ptr<SoemBackend> backend_;

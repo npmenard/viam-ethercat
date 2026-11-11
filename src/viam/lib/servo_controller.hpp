@@ -148,10 +148,12 @@ class ServoController : public SlaveControl {
     void reconfigure(ServoConfig config);  // stop() -> rebuild master_ from the factory -> start()
 
     // --- non-RT motor API (shared api_mutex_; go_to/go_for release before park) ---
-    // After a bus loss (NIC down, cable pulled -- StopReason::BusFault), the motion verbs first
-    // attempt an inline full rebuild (maybe_recover_bus): they throw a clear error while the bus
-    // is still gone and succeed again once it is back, so a client retry loop IS the reconnect
-    // policy. No background reconnect thread.
+    // After a bus loss (NIC down, cable pulled, the drive's control power cycled --
+    // StopReason::BusFault), the motion verbs first attempt an inline full rebuild
+    // (maybe_recover_bus): they throw a clear error while the bus is still gone and succeed again
+    // once it is back. A background timer retries the same rebuild meanwhile, so an axis whose
+    // drive was power-cycled comes back on its own instead of waiting for a motion call that a
+    // powered-off axis never gets.
     void set_rpm(double rpm);                 // PV only (rejects in PP)
     void go_for(double rpm, double revs);     // PP: relative move; PV: timed run
     void go_to(double rpm, double position);  // PP only (rejects in PV)
@@ -386,6 +388,8 @@ class ServoController : public SlaveControl {
     // bus_lost_; otherwise (exclusive lock) tear down the dead run and attempt one full rebuild,
     // throwing a clear "will retry on the next motion call" Error while the bus stays gone.
     void maybe_recover_bus();
+    // Retries maybe_recover_bus() on a timer while the bus is lost. Runs from start() to stop().
+    void recovery_loop(const std::stop_token& stop);
     bool rt_alive() const noexcept;  // !rt_exited_ && !faulted (event-based, no clock; master_-free)
     void bump_wake() noexcept;       // wake every parked await_move waiter (C++20 atomic notify)
 
@@ -431,6 +435,7 @@ class ServoController : public SlaveControl {
     // Non-RT-readable teardown signal (separate from the jthread stop_token): drives the
     // go_to/go_for wait predicate and the accessors' fail-safe.
     std::atomic<bool> stopping_{false};
+    std::jthread recovery_;                          // retries the rebuild while bus_lost_; joined by stop() before the lock
     std::atomic<std::uint32_t> next_generation_{0};  // non-RT: assigns unique move ids
     // Single-in-flight slot: the generation of the active blocking move (go_to/go_for), or 0 for
     // free. A new blocking move claims it via a single CAS that reclaims a slot whose gen is already
