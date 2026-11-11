@@ -66,6 +66,12 @@ class YaskawaServoDriver final : public ServoController {
     void configure_device(ConfigContext& cfg) override;
     void resolve_device_fields(Master& master, std::uint16_t slave) override;
     Inhibit inhibit(const CycleContext& ctx) const noexcept override;
+    // 27E4h, added to the reported position when the drive's parameters are enabled at power-on.
+    // Keeping a datum here rather than in 0x607C is the drive's own recommendation: the home offset
+    // is meant for the machine coordinate system, and this one is the absolute encoder's origin.
+    std::optional<EncoderOriginObject> encoder_origin_object() const noexcept override {
+        return EncoderOriginObject{0x27E4, 0, "i32"};
+    }
     double accel_units_per_cps2() const noexcept override {
         return 1.0 / kAccelUnitCps2;
     }

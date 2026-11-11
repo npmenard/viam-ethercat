@@ -21,6 +21,14 @@ namespace ethercat::servo {
 
 namespace {
 
+// The drive has to reach Switch On Disabled before its parameter store will answer. One cycle of
+// the enable ladder is all it takes; this is a bound, not an expectation.
+constexpr int kStoreDisableWaitCycles = 500;  // x2 ms
+// Waiting out the parameter store. The drive reports it as running by answering 0; the bench has
+// shown a save still unfinished 20 s after the download was answered, so the patience is generous.
+constexpr auto kStorePoll = std::chrono::milliseconds(100);
+constexpr int kStorePolls = 300;  // 30 s
+
 // A drive's "no-sync" fault code is a device seam (sync_fault_code(), nullopt in this generic
 // base), not a constant here, so this core carries no vendor value. The bring-up gate reads it
 // through the seam (nullopt means no detection).
@@ -347,6 +355,14 @@ void ServoController::resolve_fields() {
     f_ctrlword_ = master_->resolve_rx<cia402::ControlWord>(s);
     f_statusword_ = master_->resolve_tx<cia402::Statusword>(s);
     f_actual_ = master_->resolve_tx<cia402::PositionActual>(s);
+    // One cycle of travel cannot exceed the speed ceiling; x8 leaves room for a drive that overshoots
+    // it before its own limits bite, so only a frame re-base clears the bar. Reset the running total:
+    // a bring-up re-reads the drive's position, which is where the encoder frame is established.
+    const double ceiling_cps =
+        std::abs(static_cast<double>(rpm_to_device_velocity(config_.max_motor_speed_rpm, config_.counts_per_rev, config_.gear_ratio)));
+    const double per_cycle = ceiling_cps / static_cast<double>(config_.target_loop_rate_hz);  // validate(): 1..1000
+    rebase_threshold_ = static_cast<std::int64_t>(per_cycle * 8.0) + 1000;
+    frame_rebased_this_session_ = false;
     // The PP/PV command objects (0x607A/0x6081/0x60FF) are the sequencer's to resolve and write.
     // Optional TxPDO feedback, both modes. nullopt means not in the map, so the RT loop falls back
     // (velocity estimate) or omits the tier (fault code).
@@ -660,6 +676,14 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
         if (dev == Cia402State::Fault) {
             return enter_resetting(ctx);
         }
+        // Operator override, as in every other state that can receive one. Without it a disable
+        // issued while the ladder is climbing -- which is exactly where a finished homing run leaves
+        // it -- is dropped, and the drive energizes against the caller's request.
+        if (batch.disable) {
+            lifecycle_ = Disabled{};
+            motion_->reset();  // enable() re-energizes into a hold
+            return ControlWord::disable_voltage();
+        }
         if (f_mode_wr_) {
             ctx.store<cia402::ModeOfOperation::type>(*f_mode_wr_, static_cast<std::int8_t>(commanded_cia402_mode()));
         }
@@ -758,6 +782,16 @@ std::uint16_t ServoController::step_lifecycle(CycleContext& ctx, Status status, 
             // it: an offset left over from a set_zero would put position_revs() in another frame.
             state_.zero_offset_counts.store(0, std::memory_order_relaxed);
             state_.home_counts.store(actual, std::memory_order_relaxed);
+            // The re-base for THIS search has already landed by the time the drive flags attained,
+            // so the total is current: the origin, expressed in the frame the search started from,
+            // is what is reported now less what the frame moved during the search. That frame is
+            // the encoder's plus the offset the drive was holding, which the write then cancels.
+            state_.home_encoder_rel.store(static_cast<std::int64_t>(actual) - frame_rebase_, std::memory_order_relaxed);
+            // Only the first search since bring-up measures against the power-on frame. A later one
+            // measures against whatever this search left behind, and no stored offset describes that
+            // -- deriving from it is how a good datum gets overwritten with a plausible wrong one.
+            state_.home_encoder_rel_valid.store(!frame_rebased_this_session_, std::memory_order_relaxed);
+            frame_rebased_this_session_ = true;
             state_.homed.store(true, std::memory_order_release);
             finish_homing(HomingFail::None);
             return ControlWord::enable_operation();
@@ -812,6 +846,7 @@ void ServoController::publish_state(CycleContext& ctx, Status status, std::int32
 
     const bool powered = status.operation_enabled();
     state_.powered.store(powered, std::memory_order_relaxed);
+    state_.switch_on_disabled.store(status.decode() == Cia402State::SwitchOnDisabled, std::memory_order_relaxed);
 
     const std::uint32_t g = state_.active_generation.load(std::memory_order_relaxed);
     const bool move_active = g != 0 && state_.completed_generation.load(std::memory_order_relaxed) != g &&
@@ -990,6 +1025,9 @@ void ServoController::step(CycleContext& ctx) noexcept {
         }
     }
 
+    // Before the lifecycle: a search's re-base must already be in the total that step reads when the
+    // drive flags home attained.
+    track_frame_rebase(actual, std::holds_alternative<Homing>(lifecycle_));
     const std::uint16_t cw = step_lifecycle(ctx, status, batch, actual);
     ctx.store<std::uint16_t>(f_ctrlword_, cw);
     last_cw_ = cw;
@@ -1259,16 +1297,15 @@ std::vector<std::byte> ServoController::write_homing_objects() {
         saved.resize(torque_type->width);
         saved.resize(sdo_read(h.torque.index, h.torque.sub, saved));
     }
+    // Prove the drive took the method rather than trusting the download: one that ignores an
+    // unknown value would otherwise home by whatever method it kept -- into another stop.
     write(0x6098, 0, h.method);
-    // Prove the drive took the method rather than trusting the download: a drive that range-checks
-    // 0x6098 aborts the write above, but one that ignores an unknown value would otherwise home by
-    // whatever method it kept -- in another direction, into another stop.
     std::array<std::byte, 4> echo{};  // wider than the INT8 object: a width mismatch is data, not a transport failure
     const std::size_t read = sdo_read(0x6098, 0, echo);
-    const auto got = static_cast<std::int8_t>(echo[0]);
-    if (read != 1 || got != h.method) {
-        throw Error("home: the drive refused homing method " + std::to_string(h.method) + " (0x6098 reads back " + std::to_string(got) +
-                    " in " + std::to_string(read) + " bytes) -- it does not support it");
+    if (read != 1 || static_cast<std::int8_t>(echo[0]) != h.method) {
+        throw Error("home: the drive refused homing method " + std::to_string(h.method) + " (0x6098 reads back " +
+                    std::to_string(static_cast<int>(static_cast<std::int8_t>(echo[0]))) + " in " + std::to_string(read) +
+                    " bytes) -- it does not support it");
     }
     write(0x6099, 1, static_cast<std::uint32_t>(rpm_to_device_velocity(h.speed_rpm, cpr, ratio)));
     if (h.zero_speed_rpm > 0.0) {
@@ -1304,6 +1341,31 @@ void ServoController::restore_homing_torque(std::span<const std::byte> saved) no
                            "home: restoring the torque limit {} failed -- the drive is still clamped: {}",
                            hex(config_.homing.torque.index),
                            e.what());
+    }
+}
+
+// A search re-bases what the drive reports: the position jumps by the whole distance to the old
+// origin in one cycle, while the encoder under it does not move. Separate the two by magnitude
+// against the speed ceiling, and total it so the origin can be put in the encoder's frame.
+void ServoController::track_frame_rebase(std::int32_t actual, bool in_homing) noexcept {
+    // Only a search re-bases the frame, so only a search is watched. Outside one, drop the history:
+    // a bring-up's first process-data frames step from zero to the live position, which is not a
+    // re-base and must not be counted as one, and every run must measure from the frame it starts in
+    // rather than from whatever the frame was when the driver came up.
+    if (!in_homing) {
+        have_last_actual_ = false;
+        return;
+    }
+    if (!have_last_actual_) {
+        frame_rebase_ = 0;
+        last_actual_ = actual;
+        have_last_actual_ = true;
+        return;
+    }
+    const std::int64_t delta = static_cast<std::int64_t>(actual) - static_cast<std::int64_t>(last_actual_);
+    last_actual_ = actual;
+    if (delta > rebase_threshold_ || delta < -rebase_threshold_) {
+        frame_rebase_ += delta;  // not travel: the frame moved under us
     }
 }
 
@@ -1350,6 +1412,119 @@ void ServoController::finish_homing(HomingFail fail) noexcept {
     mode_echo_wait_ = 0;
 }
 
+// Store the origin a home found where the drive will find it again after power-on:
+//
+//     new = old - (reported at origin - re-base during the search)
+//
+// The bracketed term is the origin in the ENCODER's frame; the reported frame is re-based by a
+// search, the encoder under it is not. Writing the offset alone leaves it in RAM, so the write is
+// followed by the parameter store.
+ServoController::EncoderZeroWrite ServoController::save_encoder_zero() {
+    const std::optional<EncoderOriginObject> obj = encoder_origin_object();
+    if (!obj) {
+        return EncoderZeroWrite{};  // a generic CiA402 drive has nowhere to keep an origin; nothing to do
+    }
+    const EncoderOriginObject& d = *obj;
+    if (!homed()) {
+        throw Error("save_encoder_zero: the axis is not homed, so there is no origin to keep -- home it first");
+    }
+    // Required, not forced: the store is refused with the servo on, and de-energizing an axis is the
+    // caller's decision to make, not a side effect of asking for the datum to be kept.
+    // Read from the process image the RT loop already publishes every cycle, not by asking the
+    // drive: the store is refused outside Switch On Disabled, and an SDO poll to find that out adds
+    // mailbox traffic exactly when the drive is being asked to change state.
+    if (!state_.switch_on_disabled.load(std::memory_order_acquire)) {
+        throw Error(
+            "save_encoder_zero: the drive must be in Switch On Disabled -- the parameter store is refused in any other state. "
+            "Disable the drive first (the `disable` do_command) and do not move the axis in between");
+    }
+    const sdo_codec::TypeInfo* const type = sdo_codec::find_type(d.type);
+    if (type == nullptr) {
+        throw Error(std::string("save_encoder_zero: unknown origin object type '") + d.type + "'");
+    }
+    std::vector<std::byte> buf(type->width);
+    buf.resize(sdo_read(d.index, d.sub, buf));
+    const std::optional<double> was = type->decode(buf).number;
+    if (!was) {
+        throw Error("save_encoder_zero: the origin object " + hex(d.index) +
+                    " did not read back as a number, so the offset that keeps "
+                    "the origin cannot be derived from it");
+    }
+    if (!state_.home_encoder_rel_valid.load(std::memory_order_acquire)) {
+        throw Error(
+            "save_encoder_zero: the reported position has already been re-based by an earlier homing run this session, so the "
+            "origin cannot be expressed in the encoder's frame. Restart the module (or cycle control power), home once, "
+            "and keep the datum from that run");
+    }
+    const std::int64_t enc_rel = state_.home_encoder_rel.load(std::memory_order_relaxed);
+    const double want = *was - static_cast<double>(enc_rel);
+    // Stored every run, even when the new origin matches the old one. Skipping a store that would
+    // change nothing looked free, but it decides from the derived offset whether the drive is
+    // already right -- and a run that derives the offset wrongly would then also skip the store
+    // that would have corrected it. The store costs milliseconds and the drive energizes again
+    // straight after, so there is nothing to buy.
+    sdo_codec::Input in;
+    in.number = want;
+    sdo_write(d.index, d.sub, type->encode(in));
+    // Read back rather than trust the download: a refused offset reads as homed now and as lost on
+    // the next power-up, which is the failure this exists to prevent.
+    std::vector<std::byte> echo(type->width);
+    echo.resize(sdo_read(d.index, d.sub, echo));
+    const std::optional<double> got = type->decode(echo).number;
+    if (!got || *got != want) {
+        throw Error("save_encoder_zero: the drive did not take the encoder origin written to " + hex(d.index) + " (wrote " +
+                    std::to_string(want) + ", reads back " + (got ? std::to_string(*got) : std::string("non-numeric")) + ")");
+    }
+    store_parameters();
+    ETHERCAT_LOG_INFO("servo",
+                      "slave {}: datum: was {} now {} origin_in_encoder_frame {} object {} -- stored to non-volatile memory; "
+                      "cycle control power, or restart the module, before energizing again",
+                      config_.slave_id,
+                      *was,
+                      want,
+                      enc_rel,
+                      hex(d.index));
+    return EncoderZeroWrite{*was, want, enc_rel};
+}
+
+// CoE 0x1010:01 "save all parameters". The signature guards against storing by mistake: the drive
+// aborts any value but the ASCII "save", so a wrong one is refused rather than silently ignored.
+//
+// The store is ASYNCHRONOUS, and waiting for it is not optional. The object reads 0 for as long as
+// the save is running, so a caller that writes the signature and moves on can take the bus down
+// mid-write -- and then the parameter is in RAM only, which reads back correct and looks like a
+// successful store right up until the next power cycle, when it is gone.
+void ServoController::store_parameters() {
+    constexpr std::uint32_t kSaveSignature = 0x65766173;  // 's','a','v','e' little-endian
+    std::array<std::byte, 4> raw{};
+    store_le<std::uint32_t>(raw, kSaveSignature);
+    const auto started = std::chrono::steady_clock::now();
+    sdo_write(0x1010, 1, raw);
+    // The download is answered when the drive has ACCEPTED the signature, not when the write to
+    // non-volatile memory is done -- CiA 301 has the object read back 0 for exactly as long as the
+    // save is running. Returning on the download instead leaves the parameter in RAM, where it
+    // reads back correct and looks stored right up until the next power cycle, when it is gone.
+    for (int i = 0; i < kStorePolls; ++i) {
+        std::this_thread::sleep_for(kStorePoll);
+        std::array<std::byte, 4> back{};
+        try {
+            sdo_read(0x1010, 1, back);
+        } catch (const Error&) {
+            continue;  // a refused mailbox while the write is in flight is the save running, not a failure
+        }
+        if (load_le<std::uint32_t>(back) != 0) {
+            ETHERCAT_LOG_INFO("servo",
+                              "slave {}: parameter store complete after {} ms",
+                              config_.slave_id,
+                              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+            return;
+        }
+    }
+    throw Error("store_parameters: the drive is still reporting a save in progress (1010h:01 reads 0) after " +
+                std::to_string(kStorePolls * kStorePoll.count()) +
+                " ms -- the parameters are in RAM and will be lost at the next power cycle, so do not cut control power yet");
+}
+
 bool ServoController::home() {
     maybe_recover_bus();
     std::uint32_t g = 0;
@@ -1383,6 +1558,20 @@ bool ServoController::home() {
             (void)commands_.push(Command{StartHoming{g, timeout_cycles}});
         }
         attained = await_homing();
+        if (attained && config_.homing.save_zero_after_home) {
+            disable();  // the store is refused with the servo on
+            for (int i = 0; i < kStoreDisableWaitCycles && !state_.switch_on_disabled.load(std::memory_order_acquire); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            save_encoder_zero();
+            // The store can re-base what the drive reports, and the axis has not moved since the run
+            // attained home -- so whatever it reports now IS the origin, whichever frame the drive
+            // decided to serve. Re-point the home reference at it and energize again: home() took the
+            // drive down for the store, so home() brings it back, and the caller gets a usable axis
+            // instead of a dead one and an instruction to restart.
+            state_.home_counts.store(state_.position_counts.load(std::memory_order_acquire), std::memory_order_relaxed);
+            enable();
+        }
     } catch (...) {
         state_.homing_state.store(static_cast<std::uint8_t>(HomingState::Failed), std::memory_order_release);
         // Restore the running mode whatever happened, so a failed home never leaves the drive in

@@ -62,6 +62,7 @@ struct ControllerState {
     std::atomic<std::int32_t> position_counts{0};  // 0x6064 actual, before zero-offset
     std::atomic<std::int32_t> velocity{0};         // device velocity units
     std::atomic<bool> powered{false};              // OperationEnabled this cycle
+    std::atomic<bool> switch_on_disabled{false};   // statusword bit 6 this cycle (the parameter store's precondition)
     std::atomic<bool> moving{false};               // !move-complete
     std::atomic<std::int8_t> mode_echo{0};         // 0x6061 this cycle (0 when not mapped)
     std::atomic<bool> faulted{false};  // drive/bus only: master_->fault() || status.fault() (move errors are the controller tier, not here)
@@ -86,6 +87,10 @@ struct ControllerState {
     std::atomic<bool> homed{false};                      // a homing run succeeded in this session
     std::atomic<std::uint8_t> inhibit{0};                // ServoController::Inhibit reported by the device seam
     std::atomic<std::int32_t> home_counts{0};            // 0x6064 at the cycle the drive attained home
+    std::atomic<std::int64_t> home_encoder_rel{0};       // the origin in the encoder's frame, at the last home
+    // home_encoder_rel is derived against the bring-up frame, which a search re-bases: true only for
+    // the first search after a bring-up.
+    std::atomic<bool> home_encoder_rel_valid{false};
 };
 
 // The drive's homing procedure as seen by the API: idle until the first run, then running while the
@@ -215,6 +220,30 @@ class ServoController : public SlaveControl {
     // the run was cancelled (homing_error() says which). Throws when the config has no method, when
     // the drive refuses one of the objects, or from a state that cannot home.
     bool home();
+    // The non-volatile object a drive applies to its reported position at power-on. No CiA402
+    // object standardises an encoder origin, so the base has none and only a drive-specific
+    // subclass can name one; without it there is nowhere to keep a datum and persisting refuses.
+    struct EncoderOriginObject {
+        std::uint16_t index;
+        std::uint8_t sub;
+        const char* type;  // an sdo_codec type name
+    };
+    virtual std::optional<EncoderOriginObject> encoder_origin_object() const noexcept {
+        return std::nullopt;
+    }
+    // Keep the datum a home found, so the origin survives a control-power cycle. Called by home()
+    // itself: nothing to configure and nothing to invoke. The drive's conditions are met rather
+    // than passed on -- the store is refused with the servo on, so the drive is de-energized for
+    // it, and it is skipped entirely when the drive already holds the right origin, which is what
+    // keeps re-homing a commissioned axis free. After a store the drive will not energize until
+    // control power is cycled; that is latched as the degraded reason so it reads as an
+    // instruction rather than a failure. Returns what it wrote, for a caller that wants to report.
+    struct EncoderZeroWrite {
+        double was = 0.0;
+        double now = 0.0;
+        std::int64_t origin_in_encoder_frame = 0;
+    };
+    EncoderZeroWrite save_encoder_zero();
     bool homed() const noexcept;
     // The actual position at the cycle the drive attained home: the axis reference a dependent
     // component measures from, with whatever back-off the method performed already in it. Only
@@ -483,6 +512,14 @@ class ServoController : public SlaveControl {
     // Returns that object's previous bytes (empty when none was written) so the caller can put it
     // back once the run is over.
     std::vector<std::byte> write_homing_objects();
+    void store_parameters();
+    // Re-base of the reported position during the search now running; see the definition.
+    void track_frame_rebase(std::int32_t actual, bool in_homing) noexcept;
+    std::int64_t frame_rebase_ = 0;
+    std::int32_t last_actual_ = 0;
+    bool have_last_actual_ = false;
+    std::int64_t rebase_threshold_ = 0;        // counts/cycle; computed from the speed ceiling at resolve
+    bool frame_rebased_this_session_ = false;  // a search has moved the reported frame since bring-up
     void restore_homing_torque(std::span<const std::byte> saved) noexcept;
     void select_drive_mode(Cia402Mode mode);
     bool await_homing();

@@ -99,6 +99,9 @@ struct ServoConfig {
         double accel_rpm_per_s = 0.0;    // 0x609A; 0 leaves the drive's value
         double torque_percent = 0.0;     // contact threshold; 0 = do not clamp
         double timeout_s = 120.0;        // the run fails if the drive has not attained home by then
+        // Save the encoder zero from home() itself. The save_encoder_zero do_command does the same
+        // work for a drive the caller has already disabled.
+        bool save_zero_after_home = true;
         // Object that bounds motor current during the run. No CiA402 object standardises it, so it
         // comes from config: index 0 = not configured. `type` is an sdo_codec type name.
         struct TorqueObject {

@@ -220,6 +220,11 @@ ServoConfig config_from_attrs(const ProtoStruct& attrs, ethercat::servo::MotionM
         h.method = static_cast<std::int8_t>(method);
         h.speed_rpm = req_num(*o, "speed_rpm");
         h.zero_speed_rpm = opt_num(*o, "zero_speed_rpm", 0.0);
+        // Only when present: flag() reads an absent key as false, which would make the default
+        // in ServoConfig unreachable and absent-means-off regardless of what it says.
+        if (find_attr(*o, "save_zero_after_home") != nullptr) {
+            h.save_zero_after_home = attrs::flag(*o, "save_zero_after_home");
+        }
         h.offset_counts = static_cast<std::int32_t>(opt_num(*o, "offset_counts", 0.0));
         h.accel_rpm_per_s = opt_num(*o, "acceleration_rpm_per_s", 0.0);
         h.torque_percent = opt_num(*o, "torque_percent", 0.0);
@@ -733,6 +738,15 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
         }
         result.emplace("home", ProtoValue(std::move(reply)));
     }
+    if (attrs::flag(command, "save_encoder_zero")) {
+        const ServoController::EncoderZeroWrite w = controller_->save_encoder_zero();
+        ProtoStruct reply;
+        reply.emplace("was", ProtoValue(w.was));
+        reply.emplace("now", ProtoValue(w.now));
+        reply.emplace("origin_in_encoder_frame", ProtoValue(static_cast<double>(w.origin_in_encoder_frame)));
+        reply.emplace("next", ProtoValue(std::string("cycle control power, or restart the module, before energizing again")));
+        result.emplace("save_encoder_zero", ProtoValue(std::move(reply)));
+    }
     if (const ProtoValue* const rq = find_attr(command, "sdo_read")) {
         const SdoRequest r = parse_sdo_request(*rq, "sdo_read", false);
         try {
@@ -766,7 +780,7 @@ ProtoStruct ServoMotor::do_command(const ProtoStruct& command) {
     }
     if (result.empty()) {
         throw std::runtime_error(
-            "unknown do_command; supported keys (each a bool): describe, fault_reset, enable, disable, status, home, "
+            "unknown do_command; supported keys (each a bool): describe, fault_reset, enable, disable, status, home, save_encoder_zero, "
             "is_abs_enc_valid; "
             "get_motor_voltage, get_motor_current_actual_value, get_motor_drive_modes (converted SDO reads); "
             "sdo_read {index, sub, type} (any object) / sdo_write {index, sub, type, value} (0x2000-0x5FFF and 0x1010)");
