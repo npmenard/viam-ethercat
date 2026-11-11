@@ -74,24 +74,28 @@ class GantryAxis final : public Gantry {
     double sign() const noexcept {
         return attrs_.travel_positive ? 1.0 : -1.0;
     }
-    // Millimetres are measured from the home reference, so every conversion goes through it.
-    double mm_to_revs(double mm) const noexcept {
-        return home_revs_ + (sign() * mm / attrs_.mm_per_rev);
+    // Millimetres are measured from the home reference, so every conversion goes through it. The
+    // reference is passed in rather than kept: see home_revs().
+    double mm_to_revs(double home_revs, double mm) const noexcept {
+        return home_revs + (sign() * mm / attrs_.mm_per_rev);
     }
-    double revs_to_mm(double revs) const noexcept {
-        return sign() * (revs - home_revs_) * attrs_.mm_per_rev;
+    double revs_to_mm(double home_revs, double revs) const noexcept {
+        return sign() * (revs - home_revs) * attrs_.mm_per_rev;
     }
+    // The motor position this axis calls zero, read out of the motor's status every time it is
+    // needed. Keeping a copy means holding a frame the motor can change without us: homing through
+    // the motor's own do_command moves it, and so does a restart on an absolute encoder, and a
+    // millimetre computed in the stale frame is commanded as if it were in the live one.
     // The motor's `status`, which also proves the dependency is one of ours.
     ProtoStruct motor_status() const;
     // The motor's verdict: a homing run succeeded this session, or its absolute encoder kept the
     // reference across the restart.
     bool homed() const;
 
+    static double home_revs(const ProtoStruct& motor_status);
+
     Attributes attrs_;
     std::shared_ptr<Motor> motor_;
-    // Motor position of this axis's zero, captured from the last home. 0 until then: a drive whose
-    // absolute encoder retained the reference reports position in the frame its last home set.
-    double home_revs_ = 0.0;
 };
 
 }  // namespace ethercat::servo

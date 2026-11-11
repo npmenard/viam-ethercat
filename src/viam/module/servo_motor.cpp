@@ -604,6 +604,10 @@ ProtoStruct ServoMotor::get_status() {
     }
     status.emplace("homed", ProtoValue(ran || absolute));
     status.emplace("homed_by", ProtoValue(std::string(by)));
+    // The motor position this axis calls zero, so a dependent component measures from the drive's
+    // live frame instead of a copy it took once. 0 after a restart on an absolute encoder: the
+    // stored origin is what puts the drive's own zero at the home point.
+    status.emplace("home_revolutions", ProtoValue(controller_->home_position_revs()));
     status.emplace("homing", ProtoValue(std::string(to_string(controller_->homing_state()))));
     if (const std::string err = controller_->homing_error(); !err.empty()) {
         status.emplace("homing_error", ProtoValue(err));

@@ -62,6 +62,10 @@ class FakeMotor final : public Motor {
 
     int stops = 0;
     bool unreachable = false;
+    // The drive's frame, as the motor reports it: the axis's zero and where the shaft is now.
+    double home_revolutions = 0.0;
+    double position_revs = 0.0;
+    double last_go_to_revs = 0.0;
 
     void stop(const ProtoStruct& /*extra*/) override {
         ++stops;
@@ -69,21 +73,30 @@ class FakeMotor final : public Motor {
             throw std::runtime_error("Unavailable: motor is being removed");
         }
     }
-    ProtoStruct do_command(const ProtoStruct& /*command*/) override {
+    ProtoStruct do_command(const ProtoStruct& command) override {
+        ProtoStruct reply;
+        if (command.find("status") != command.end()) {
+            ProtoStruct status;
+            status.emplace("homed", ProtoValue(true));
+            status.emplace("home_revolutions", ProtoValue(home_revolutions));
+            reply.emplace("status", ProtoValue(std::move(status)));
+            return reply;
+        }
         ProtoStruct describe;
         describe.emplace("driver", ProtoValue(std::string("viam:ethercat")));
         describe.emplace("homing", ProtoValue(true));
-        ProtoStruct reply;
-        reply.emplace("describe", ProtoValue(describe));
+        reply.emplace("describe", ProtoValue(std::move(describe)));
         return reply;
     }
     void set_power(double /*power_pct*/, const ProtoStruct& /*extra*/) override {}
     void go_for(double /*rpm*/, double /*revolutions*/, const ProtoStruct& /*extra*/) override {}
-    void go_to(double /*rpm*/, double /*position_revolutions*/, const ProtoStruct& /*extra*/) override {}
+    void go_to(double /*rpm*/, double position_revolutions, const ProtoStruct& /*extra*/) override {
+        last_go_to_revs = position_revolutions;
+    }
     void set_rpm(double /*rpm*/, const ProtoStruct& /*extra*/) override {}
     void reset_zero_position(double /*offset*/, const ProtoStruct& /*extra*/) override {}
     position get_position(const ProtoStruct& /*extra*/) override {
-        return 0.0;
+        return position_revs;
     }
     properties get_properties(const ProtoStruct& /*extra*/) override {
         return {};
@@ -135,6 +148,20 @@ TEST("validate names the motor as the only dependency") {
     const std::vector<std::string> deps = GantryAxis::validate(config());
     CHECK_EQ(deps.size(), std::size_t{1});
     CHECK_EQ(deps[0], std::string("x-motor"));
+}
+
+// The motor changes this frame without telling anyone -- a home through its own do_command, or a
+// restart on an absolute encoder -- so an axis holding a copy commands millimetres in a dead frame.
+TEST("millimetres follow the motor's current zero, not one captured at home()") {
+    const auto motor = std::make_shared<FakeMotor>();
+    GantryAxis axis(deps_with(motor), config());
+
+    motor->home_revolutions = 7.0;  // homed somewhere else, without the axis being asked
+    motor->position_revs = 7.0;
+    CHECK_EQ(axis.get_position({}).front(), 0.0);
+
+    axis.move_to_position({{80.0, 10.0}}, {});  // 80 mm at 40 mm/rev: two revs past that zero
+    CHECK_EQ(motor->last_go_to_revs, 9.0);
 }
 
 TEST("stop forwards to the motor") {

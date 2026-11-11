@@ -136,11 +136,16 @@ bool GantryAxis::homed() const {
     return flag(motor_status(), "homed");
 }
 
+double GantryAxis::home_revs(const ProtoStruct& motor_status) {
+    return opt_num(motor_status, "home_revolutions", 0.0);
+}
+
 std::vector<double> GantryAxis::get_position(const ProtoStruct& extra) {
-    if (!homed()) {
+    const ProtoStruct status = motor_status();
+    if (!flag(status, "homed")) {
         throw Error("gantry: position is unknown until the axis is homed -- call home()");
     }
-    return {revs_to_mm(motor_->get_position(extra))};
+    return {revs_to_mm(home_revs(status), motor_->get_position(extra))};
 }
 
 std::vector<double> GantryAxis::get_lengths(const ProtoStruct& /*extra*/) {
@@ -151,7 +156,8 @@ void GantryAxis::move_to_position(const std::vector<movement_coordinate>& coordi
     if (coordinates.size() != 1) {
         throw Error("gantry: this axis takes exactly one coordinate, got " + std::to_string(coordinates.size()));
     }
-    if (!homed()) {
+    const ProtoStruct status = motor_status();
+    if (!flag(status, "homed")) {
         throw Error("gantry: home the axis before moving it -- call home()");
     }
     const movement_coordinate& c = coordinates.front();
@@ -165,21 +171,18 @@ void GantryAxis::move_to_position(const std::vector<movement_coordinate>& coordi
     }
     // The motor takes a signed revolution target and an unsigned speed; the sign of the target
     // carries the direction, so the speed is a magnitude in rpm.
-    motor_->go_to(speed / attrs_.mm_per_rev * 60.0, mm_to_revs(c.position_mm), extra);
+    motor_->go_to(speed / attrs_.mm_per_rev * 60.0, mm_to_revs(home_revs(status), c.position_mm), extra);
 }
 
-// The motor owns the procedure, so the axis only asks for it and keeps the answer: the position the
-// drive ended the run at is this axis's zero, whatever back-off the homing method performed.
+// The motor owns the procedure, so the axis only asks for it: the position the drive ended the run
+// at is this axis's zero, whatever back-off the homing method performed, and the motor reports it
+// in its status from then on.
 bool GantryAxis::home(const ProtoStruct& /*extra*/) {
     ProtoStruct cmd;
     cmd.emplace("home", ProtoValue(true));
     const ProtoStruct reply = motor_->do_command(cmd);
     const ProtoStruct* const home = nested(reply, "home");
-    if (home == nullptr || !flag(*home, "homed")) {
-        return false;
-    }
-    home_revs_ = opt_num(*home, "revolutions", 0.0);
-    return true;
+    return home != nullptr && flag(*home, "homed");
 }
 
 // The axis state in one struct: its own millimetre view plus the motor's, so one call explains
@@ -188,7 +191,7 @@ ProtoStruct GantryAxis::get_status() {
     ProtoStruct status = motor_status();
     status.emplace("length_mm", ProtoValue(attrs_.length_mm));
     if (flag(status, "homed")) {
-        status.emplace("position_mm", ProtoValue(revs_to_mm(motor_->get_position({}))));
+        status.emplace("position_mm", ProtoValue(revs_to_mm(home_revs(status), motor_->get_position({}))));
     }
     return status;
 }
